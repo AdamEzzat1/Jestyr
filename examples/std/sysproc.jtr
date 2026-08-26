@@ -1,0 +1,652 @@
+// std/sysproc.jtr — a child process that runs BESIDE its parent.
+//
+// TIER: `sys`. Needs a process table. Capability-gated through a `Spawner`, the same
+// shape `std/process` uses and for the same reason.
+//
+// ─── Why this exists when `std/process` already runs commands ─────────────────
+//
+// `std/process` goes through the `run_command` intrinsic, which is `system()`, and
+// **`system()` blocks until the child exits.** That single fact is the ceiling under
+// everything above it:
+//
+//   * **No timeouts, anywhere.** A hung child hangs the parent, with no way to give up.
+//     `std/plugin`'s host cannot bound a wedged plugin and `jserve` cannot bound a slow
+//     client, because neither has a call that returns before the child does.
+//   * **No long-lived server.** `std/plugin` is one-process-per-call — not a design
+//     choice, a consequence: the only way to get an answer back is to let the child die.
+//   * **No concurrent loopback child.** The socket design `std/sysnet` would otherwise
+//     support needs a child running WHILE its parent is in `accept`, which is precisely
+//     what `system()` forbids.
+//
+// Nothing here replaces `std/process`. That module is the right answer when you want a
+// command run and its exit code, which is most of the time; this one is for when the
+// parent has to stay alive and in charge while the child runs.
+//
+// ─── The command means the same thing it means in `std/process` ───────────────
+//
+// A command goes through the platform SHELL — `/bin/sh -c <cmd>` on POSIX,
+// `cmd.exe /c <cmd>` on Windows — which is exactly what `system()` does on each. That is
+// a deliberate compatibility choice rather than a convenience: a caller moving a command
+// from `process.run` to `start` here must not have to re-learn how its own string is
+// parsed. The cost is the shell's quoting rules, and they are the platform's, not this
+// module's.
+//
+// **This is not a sandbox**, for the same reason `std/process` says so: `run_command` is
+// still an ambient intrinsic that any function can reach. What a `Spawner` buys is that
+// the honest path is also the documented one — `fn build(mut s: Spawner, …)` announces in
+// its type that it may start processes, and `fn parse(read src: str)` announces that it
+// may not.
+//
+// ─── `GetExitCodeProcess` CANNOT answer "is it still running" ─────────────────
+//
+// The obvious Windows liveness test is to ask for the exit code and compare against
+// `STILL_ACTIVE`. It is wrong, and it is wrong in a way that testing rarely catches:
+// `STILL_ACTIVE` is **259**, and a child that legitimately calls `exit(259)` is then
+// reported as running forever. Measured against the real header rather than recalled —
+// `the_windows_layout_constants_match_the_real_headers` pins it along with the struct
+// offsets.
+//
+// The correct test is `WaitForSingleObject(h, 0)`: it reports SIGNALLED or TIMEOUT and
+// has no in-band value to collide with. The exit code is read only AFTER that says the
+// process is done, which is the one moment `STILL_ACTIVE` cannot be ambiguous.
+//
+// ─── The bounded wait is a POLL on both platforms, on purpose ─────────────────
+//
+// Windows has a native bounded wait and POSIX has none — `waitpid` blocks or returns
+// immediately (`WNOHANG`) and there is nothing in between. The two ways to build one on
+// POSIX are `sigtimedwait` on `SIGCHLD`, which needs the signal blocked process-wide and
+// so makes a library reach into state it does not own, or a poll.
+//
+// So `wait_timeout` polls on BOTH platforms, even though Windows could pass the timeout
+// straight to `WaitForSingleObject`. The reason is that the loop is then the same code
+// on both, driven by the same `time.Clock`, so a test of the timeout LOGIC exercises the
+// shipped path everywhere instead of testing Windows and reasoning about POSIX. Only two
+// primitives are `@cfg`-split — "is it alive?" and "what did it exit with?" — and the
+// policy above them is written once.
+//
+// `wait` (unbounded) does NOT poll: it hands off to the platform's own blocking wait,
+// because there a poll would be a busy loop with nothing to gain.
+//
+// ─── A `Child` is a RESOURCE, and the language cannot say so yet ──────────────
+//
+// `Child` is a freely copyable struct holding an OS handle, so `release`-ing through one
+// copy leaves the other naming a handle the platform may already have reissued. That is
+// brief §2.1 — move-only resources — and this module is the SEVENTH type to owe it,
+// after `Socket`, `Dir`, `Reader`/`Writer`, `Watcher`, `alog.Log` and `plugin.Host`.
+// Giving it a `Drop` is not the fix on its own: a `Child` is meant to be passed around,
+// and closing at every scope exit is wrong for exactly that reason.
+//
+// Until then the invariant is `release` exactly once, and `is_live` reports whether that
+// has happened. On Windows a released `Child` also leaks nothing: `release` closes both
+// the process and thread handles, and forgetting the thread handle is the classic
+// `CreateProcess` leak.
+//
+// ─── `spawn` is a KEYWORD, so the central verb here is `start` ────────────────
+//
+// `spawn f(x)` is the concurrency grammar's task form, so `pub fn spawn` does not parse.
+// That is a fifth entry on the recorded list (`read`, `take`, `error`, `out`) and the
+// first one the declared-extern-alias design would NOT fix: this is a Jestyr name, not a
+// C symbol, so the fix is scoped keywords or nothing.
+//
+// ─── What is not here ─────────────────────────────────────────────────────────
+//
+// **Pipes.** Capturing a child's stdout is the next increment and the one that turns
+// `std/plugin` into a server; it needs `CreatePipe`/`pipe(2)`, inherited handles, and on
+// POSIX a `read(2)` this language cannot bind by name. Deliberately separated so that
+// "the parent stays alive" lands and can be tested on its own.
+//
+// No environment control, no working directory, no process groups. Each is a real thing
+// to want and none of them is needed to lift the ceiling this module exists to lift.
+//
+// **The environment a child inherits is NOT the same on both platforms**, and that is
+// stated rather than smoothed over: a Windows child gets its parent's whole environment
+// (`CreateProcessA` with a null environment inherits), a POSIX child gets `PATH` alone
+// (`posix_spawn` with a null `envp` would give it NOTHING, since that reaches `execve`
+// unchanged). See `start`'s POSIX branch. Closing the gap needs an `extern` that can bind
+// a GLOBAL — `environ` — which is a language increment, so it is recorded here instead of
+// being papered over with a null on both sides that means two different things.
+//
+// Worked example:  examples/std/sysproc_demo.jtr
+// Run the tests:   jestyrc test examples/std/sysproc_test.jtr
+
+import "syserr"
+import "time"
+
+// ---- the platform ------------------------------------------------------------------
+//
+// POSIX and Windows names are all distinct here, so unlike `std/sysnet` there is no
+// same-name pair to unify. The one binding that MUST match another module exactly is
+// `WaitForSingleObject`: `std/syswatch` already declares it, typeck keys its function
+// table on the BARE name, and a second declaration with a different signature would type
+// -check `syswatch`'s call sites against THIS module's idea of it. Same spelling, same
+// types, deliberately.
+//
+// The pin is `extern_signature_agreement::one_c_symbol_has_one_signature_across_the_whole
+// _std_corpus`, which sweeps EVERY extern in `examples/std` rather than this one pair, so
+// the next module to re-bind a shared symbol is caught without anyone remembering to look.
+// It was verified by BREAKING it — widening this line to `(h: i64, ms: i32)` and watching
+// the sweep name both files — because a corpus-wide rule that passes on its first run has
+// not yet been shown to be capable of failing.
+
+@cfg(posix) extern "spawn.h" fn posix_spawn(pid: cptr, path: cptr, fa: cptr, at: cptr, argv: cptr, envp: cptr) -> i32
+@cfg(posix) extern "sys/wait.h" fn waitpid(pid: i64, status: cptr, options: i32) -> i64
+@cfg(posix) extern "signal.h" fn kill(pid: i64, sig: i32) -> i32
+
+@cfg(windows) extern "windows.h" fn CreateProcessA(app: cptr, cmd: cptr, pa: cptr, ta: cptr, inherit: i32, flags: i32, env: cptr, cwd: cptr, si: cptr, pi: cptr) -> i32
+@cfg(windows) extern "windows.h" fn WaitForSingleObject(h: cptr, ms: u32) -> i32
+@cfg(windows) extern "windows.h" fn GetExitCodeProcess(h: cptr, code: cptr) -> i32
+@cfg(windows) extern "windows.h" fn TerminateProcess(h: cptr, code: u32) -> i32
+@cfg(windows) extern "windows.h" fn CloseHandle(h: cptr) -> i32
+
+// ---- the numbers -------------------------------------------------------------------
+//
+// Every Windows constant below was MEASURED against <windows.h> on x86-64 rather than
+// recalled, and `the_windows_layout_constants_match_the_real_headers` re-measures them so
+// a wrong number is a red test and not a mysterious failure to start anything.
+// (Prefixed because a module `const` is emitted under its bare name, so two modules
+// cannot share one — `std/process` already owns `PROC_`.)
+
+// STARTUPINFOA on x86-64: 104 bytes, `cb` first.
+const SPROC_STARTUPINFO_LEN: usize = 104
+// PROCESS_INFORMATION on x86-64: hProcess, hThread, dwProcessId, dwThreadId.
+const SPROC_PROCESS_INFO_LEN: usize = 24
+const SPROC_PI_HPROCESS_SLOT: usize = 0     // byte 0,  read as a 64-bit slot
+const SPROC_PI_HTHREAD_SLOT: usize = 1      // byte 8
+const SPROC_PI_PID_WORD: usize = 4          // byte 16, read as a 32-bit word
+
+const SPROC_WAIT_SIGNALED: i32 = 0          // WAIT_OBJECT_0
+const SPROC_WAIT_TIMEOUT: i32 = 258         // WAIT_TIMEOUT
+const SPROC_WAIT_FAILED: i32 = 0 - 1        // WAIT_FAILED is 0xFFFFFFFF
+const SPROC_KILL_CODE: u32 = 137            // what a terminated child is reported as
+
+// POSIX. `waitpid`'s status is the classic encoding: the low seven bits are the signal
+// that killed it (zero if it exited), and the next eight are the exit code. Linux and
+// macOS agree on this layout; it is decoded here rather than through `WIFEXITED` because
+// those are MACROS, and a macro is not a symbol an `extern` can bind.
+const SPROC_WNOHANG: i32 = 1
+const SPROC_SIGKILL: i32 = 9
+const SPROC_STATUS_SIGMASK: i32 = 127
+const SPROC_STATUS_CODESHIFT: i32 = 8
+const SPROC_STATUS_CODEMASK: i32 = 255
+
+// How long a bounded wait sleeps between liveness checks. One millisecond is below the
+// granularity either platform's sleep actually offers (Windows' default timer is ~15ms),
+// so this is a floor and not a promise — `wait_timeout` reports the elapsed time it
+// really observed rather than the one it asked for.
+const SPROC_POLL_NANOS: i64 = 1000000
+
+// ---- what a child is doing ---------------------------------------------------------
+
+// It has not exited.
+pub const SPROC_RUNNING: i32 = 0
+// It exited normally; `code` is its exit status.
+pub const SPROC_EXITED: i32 = 1
+// It was killed by a signal (POSIX) or terminated (Windows); `code` is the signal.
+pub const SPROC_SIGNALLED: i32 = 2
+
+// The answer to "what is it doing", as one value rather than two out-parameters.
+//
+// A `state` plus a `code` rather than a single integer with reserved sentinels, because
+// the sentinel design is what made `std/process.run` document `-1` as "did not exit
+// normally" and then hope no command ever returns it. Here "still running" and "exited
+// with 259" are different STATES and cannot be confused whatever the number is.
+pub struct Status {
+    state: i32,
+    code: i32,
+}
+
+@no_alloc @no_os pub fn state_of(read s: Status) -> i32 { return s.state }
+@no_alloc @no_os pub fn code_of(read s: Status) -> i32 { return s.code }
+@no_alloc @no_os pub fn is_running(read s: Status) -> bool { return s.state == SPROC_RUNNING }
+@no_alloc @no_os pub fn is_exited(read s: Status) -> bool { return s.state == SPROC_EXITED }
+@no_alloc @no_os pub fn is_signalled(read s: Status) -> bool { return s.state == SPROC_SIGNALLED }
+
+// A human-readable state, for a log line or a diagnostic.
+@no_alloc @no_os pub fn state_name(state: i32) -> str {
+    if state == SPROC_RUNNING { return "running" }
+    if state == SPROC_EXITED { return "exited" }
+    if state == SPROC_SIGNALLED { return "signalled" }
+    return "unknown"
+}
+
+// ---- the capability ----------------------------------------------------------------
+
+// The authority to start processes. Scalars only: a Jestyr borrow is second-class, so a
+// handle cannot own borrowed storage — the same constraint that shapes `std/process`.
+pub struct Spawner {
+    allowed: bool,
+    started: i64,
+    refused: i64,
+}
+
+// A handle that can actually start processes. Named `host` rather than `new` because
+// acquiring the authority to run other programs should read like an act.
+pub fn host() -> Spawner {
+    return Spawner{ allowed: true, started: 0, refused: 0 }
+}
+
+// A handle that starts nothing and COUNTS every attempt, so a test can hand one to code
+// under test and afterwards assert both that nothing ran and that the right number of
+// attempts were made.
+pub fn denied() -> Spawner {
+    return Spawner{ allowed: false, started: 0, refused: 0 }
+}
+
+@no_alloc @no_os pub fn can_start(read s: Spawner) -> bool { return s.allowed }
+@no_alloc @no_os pub fn started(read s: Spawner) -> i64 { return s.started }
+@no_alloc @no_os pub fn refused(read s: Spawner) -> i64 { return s.refused }
+
+// ---- the child ---------------------------------------------------------------------
+
+// A running (or finished) child process.
+//
+// `h`/`th` are Windows HANDLEs carried as integers — the one pointer currency this
+// module uses, since `i64 as cptr` converts and `i64 as *mut u8` does not. On POSIX both
+// are zero and `pid` is the identity.
+pub struct Child {
+    h: i64,
+    th: i64,
+    pid: i64,
+    live: bool,
+    done: bool,
+    state: i32,
+    code: i32,
+}
+
+// A `Child` that names nothing. What `denied()` produces, and what a caller can compare
+// against without a separate optional.
+@no_alloc @no_os pub fn no_child() -> Child {
+    return Child{ h: 0, th: 0, pid: 0, live: false, done: true, state: SPROC_EXITED, code: 0 }
+}
+
+// Is this child's handle still ours? False before it started and after `release`.
+@no_alloc @no_os pub fn is_live(read c: Child) -> bool { return c.live }
+
+// The OS process id. Informational on Windows, the identity on POSIX.
+@no_alloc @no_os pub fn pid_of(read c: Child) -> i64 { return c.pid }
+
+// The status already known WITHOUT asking the OS again — `SPROC_RUNNING` until one of the
+// waits has observed an exit. Cheap, and the only query that is safe after `release`.
+@no_alloc @no_os pub fn last_status(read c: Child) -> Status {
+    if c.done { return Status{ state: c.state, code: c.code } }
+    return Status{ state: SPROC_RUNNING, code: 0 }
+}
+
+// ---- building the argument buffers --------------------------------------------------
+
+// Copy `s` into a fresh NUL-terminated heap buffer.
+//
+// Not `cstring.from_str`: that hands back a `CString` whose pointer is reachable only as
+// a `cstr`, and POSIX `argv` needs the ADDRESS as an integer to write into an array of
+// pointers. One currency (`*mut u8`, cast to `i64` or `cptr` at the call) is simpler than
+// two that cannot convert to each other.
+fn nul_copy(read s: str) -> *mut u8 {
+    var p: *mut u8 = alloc(u8, s.len + 1)
+    var i: usize = 0
+    for i < s.len {
+        unsafe { (p + i).* = s[i] }
+        i = i + 1
+    }
+    unsafe { (p + s.len).* = 0 }
+    return p
+}
+
+// `prefix` followed by `s`, NUL-terminated. The Windows command line is
+// `cmd.exe /c <cmd>` and CreateProcessA may WRITE to the buffer it is given, so this is
+// a fresh heap copy rather than any view of the caller's string.
+fn nul_join(read prefix: str, read s: str) -> *mut u8 {
+    var p: *mut u8 = alloc(u8, prefix.len + s.len + 1)
+    var i: usize = 0
+    for i < prefix.len {
+        unsafe { (p + i).* = prefix[i] }
+        i = i + 1
+    }
+    var k: usize = 0
+    for k < s.len {
+        unsafe { (p + prefix.len + k).* = s[k] }
+        k = k + 1
+    }
+    unsafe { (p + prefix.len + s.len).* = 0 }
+    return p
+}
+
+// Zero `n` bytes. `alloc` is `malloc`, not `calloc`, and a STARTUPINFOA with uninitialised
+// `dwFlags` tells CreateProcess to read std-handle fields that hold garbage.
+fn zero_bytes(p: *mut u8, n: usize) {
+    var i: usize = 0
+    for i < n {
+        unsafe { (p + i).* = 0 }
+        i = i + 1
+    }
+}
+
+// ---- starting ----------------------------------------------------------------------
+
+// Start `cmd` through the platform shell and return WITHOUT waiting for it.
+//
+// This is the whole point of the module: when this returns, the child is running and so
+// is the caller. A denied `Spawner` starts nothing, counts the attempt, and returns
+// `SysProcRefused` — distinguishable from a real failure, which carries the platform's
+// own error number.
+@cfg(posix) pub fn start(mut s: Spawner, read cmd: str) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+    if s.allowed == false {
+        s.refused = s.refused + 1
+        return err(SysProcRefused)
+    }
+
+    // argv = { "sh", "-c", cmd, NULL }. `posix_spawn` takes `char* const argv[]`, which
+    // is an array of POINTERS — written here as four 64-bit slots, since a pointer is
+    // eight bytes on every platform this module builds for.
+    var shp: *mut u8 = nul_copy("/bin/sh")
+    var a0: *mut u8 = nul_copy("sh")
+    var a1: *mut u8 = nul_copy("-c")
+    var a2: *mut u8 = nul_copy(cmd)
+    var argv: *mut i64 = alloc(i64, 4)
+    unsafe { (argv + 0).* = a0 as i64 }
+    unsafe { (argv + 1).* = a1 as i64 }
+    unsafe { (argv + 2).* = a2 as i64 }
+    unsafe { (argv + 3).* = 0 }
+
+    var pidp: *mut i64 = alloc(i64, 1)
+    unsafe { (pidp + 0).* = 0 }
+
+    // **envp = { "PATH=…", NULL }, and NOT NULL.**
+    //
+    // The two platforms disagree about what a null environment means, and letting that
+    // through would have made one module behave two ways. `CreateProcessA` with a NULL
+    // environment INHERITS the parent's; `posix_spawn` with a NULL `envp` hands the child
+    // an EMPTY one, because it reaches `execve` unchanged. So the obvious "pass null on
+    // both" is not symmetry, it is an asymmetry that happens to typecheck.
+    //
+    // Full inheritance on POSIX needs the `environ` global, and an `extern` binds
+    // FUNCTIONS. PATH is forwarded instead: it is the variable the shell needs to resolve
+    // a command at all, so without it `sh -c "sleep 2"` depends on whatever default path
+    // the shell falls back to — which is a different question on every libc.
+    //
+    // This is therefore a documented DIFFERENCE and not a hidden one: a Windows child sees
+    // its parent's whole environment and a POSIX child sees PATH. Closing it needs either
+    // an `extern` for a global or an intrinsic that enumerates the environment, and both
+    // are language increments rather than a line here.
+    let path: str = env_var("PATH")
+    var e0: *mut u8 = nul_join("PATH=", path)
+    var envp: *mut i64 = alloc(i64, 2)
+    unsafe { (envp + 0).* = e0 as i64 }
+    unsafe { (envp + 1).* = 0 }
+
+    let rc: i32 = posix_spawn(pidp as cptr, shp as cptr, null, null, argv as cptr, envp as cptr)
+    var pid: i64 = 0
+    unsafe { pid = (pidp + 0).* }
+
+    free_ptr(envp)
+    free_ptr(e0)
+    free_ptr(pidp)
+    free_ptr(argv)
+    free_ptr(a2)
+    free_ptr(a1)
+    free_ptr(a0)
+    free_ptr(shp)
+
+    // `posix_spawn` RETURNS the error number; it does not set errno. That is the one way
+    // it differs from every other call in the `sys` tier, and reading `syserr.last_raw()`
+    // here would report an unrelated earlier failure.
+    if rc != 0 { return err(SysProcFailed(rc)) }
+
+    s.started = s.started + 1
+    return ok(Child{ h: 0, th: 0, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0 })
+}
+
+@cfg(windows) pub fn start(mut s: Spawner, read cmd: str) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+    if s.allowed == false {
+        s.refused = s.refused + 1
+        return err(SysProcRefused)
+    }
+
+    var line: *mut u8 = nul_join("cmd.exe /c ", cmd)
+    var si: *mut u8 = alloc(u8, SPROC_STARTUPINFO_LEN)
+    var pi: *mut u8 = alloc(u8, SPROC_PROCESS_INFO_LEN)
+    zero_bytes(si, SPROC_STARTUPINFO_LEN)
+    zero_bytes(pi, SPROC_PROCESS_INFO_LEN)
+    // `cb` is the first field and CreateProcess rejects a STARTUPINFOA whose size it does
+    // not recognise, which is the API's version check.
+    let sw: *mut u32 = si as *mut u32
+    unsafe { (sw + 0).* = SPROC_STARTUPINFO_LEN as u32 }
+
+    // `lpApplicationName` NULL with a command line means "parse the first token as the
+    // program", which is how `cmd.exe` is found on PATH.
+    let rc: i32 = CreateProcessA(null, line as cptr, null, null, 0, 0, null, null, si as cptr, pi as cptr)
+    var code: i32 = 0
+    if rc == 0 { code = syserr.last_raw() }
+
+    var h: i64 = 0
+    var th: i64 = 0
+    var pid: i64 = 0
+    if rc != 0 {
+        let ps: *mut i64 = pi as *mut i64
+        unsafe { h = (ps + SPROC_PI_HPROCESS_SLOT).* }
+        unsafe { th = (ps + SPROC_PI_HTHREAD_SLOT).* }
+        let pw: *mut u32 = pi as *mut u32
+        var raw: u32 = 0
+        unsafe { raw = (pw + SPROC_PI_PID_WORD).* }
+        pid = raw as i64
+    }
+
+    free_ptr(pi)
+    free_ptr(si)
+    free_ptr(line)
+
+    if rc == 0 { return err(SysProcFailed(code)) }
+
+    s.started = s.started + 1
+    return ok(Child{ h: h, th: th, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0 })
+}
+
+// ---- the two platform primitives ----------------------------------------------------
+//
+// Everything above `wait_timeout` is written once and these are the only split parts:
+// "has it finished, and with what". Keeping the split this small is what makes the
+// polling policy the same code on both platforms rather than two policies that agree
+// today.
+
+// Has `c` finished? `SPROC_RUNNING` while it is alive; otherwise the real outcome.
+// Reports `SPROC_RUNNING` for a child whose state cannot be read at all, because a
+// caller's bounded wait must still terminate on its own timeout rather than on a lie.
+@cfg(posix) fn poll_once(read c: Child) -> Status {
+    var st: *mut i32 = alloc(i32, 1)
+    unsafe { (st + 0).* = 0 }
+    let got: i64 = waitpid(c.pid, st as cptr, SPROC_WNOHANG)
+    var raw: i32 = 0
+    unsafe { raw = (st + 0).* }
+    free_ptr(st)
+
+    // 0 means "alive, nothing to report". Negative means the wait itself failed — most
+    // often ECHILD, because something already reaped it — and there is no honest status
+    // to give, so it is reported as an exit with code 0 rather than as running forever.
+    if got == 0 { return Status{ state: SPROC_RUNNING, code: 0 } }
+    if got < 0 { return Status{ state: SPROC_EXITED, code: 0 } }
+    return decode_wait_status(raw)
+}
+
+// POSIX wait-status decoding. `WIFEXITED` and friends are macros, so they are not
+// bindable and the bit layout is spelled out here instead. Low seven bits: the signal
+// that killed it, zero if it exited normally. Next eight: the exit code.
+@no_alloc @no_os fn decode_wait_status(raw: i32) -> Status {
+    let sig: i32 = raw & SPROC_STATUS_SIGMASK
+    if sig == 0 {
+        let code: i32 = (raw >> SPROC_STATUS_CODESHIFT) & SPROC_STATUS_CODEMASK
+        return Status{ state: SPROC_EXITED, code: code }
+    }
+    return Status{ state: SPROC_SIGNALLED, code: sig }
+}
+
+@cfg(windows) fn poll_once(read c: Child) -> Status {
+    // `WaitForSingleObject(h, 0)` and NOT `GetExitCodeProcess`: STILL_ACTIVE is 259, so a
+    // child that exits with 259 is indistinguishable from a running one through the exit
+    // code alone. This call has no in-band value to collide with. See the header.
+    let w: i32 = WaitForSingleObject(c.h as cptr, 0)
+    if w == SPROC_WAIT_TIMEOUT { return Status{ state: SPROC_RUNNING, code: 0 } }
+    if w != SPROC_WAIT_SIGNALED { return Status{ state: SPROC_EXITED, code: 0 } }
+
+    var cw: *mut u32 = alloc(u32, 1)
+    unsafe { (cw + 0).* = 0 }
+    let rc: i32 = GetExitCodeProcess(c.h as cptr, cw as cptr)
+    var raw: u32 = 0
+    unsafe { raw = (cw + 0).* }
+    free_ptr(cw)
+    if rc == 0 { return Status{ state: SPROC_EXITED, code: 0 } }
+
+    // A Windows child has no signals; a terminated one is reported through whatever exit
+    // code the terminator chose, which is why `terminate` picks a fixed one.
+    if raw == SPROC_KILL_CODE { return Status{ state: SPROC_SIGNALLED, code: SPROC_SIGKILL } }
+    return Status{ state: SPROC_EXITED, code: raw as i32 }
+}
+
+// Block until `c` finishes, using the platform's own blocking wait. Not a poll: there is
+// nothing to gain from waking up early when the caller has said it will wait as long as
+// it takes.
+@cfg(posix) fn block_once(read c: Child) -> Status {
+    var st: *mut i32 = alloc(i32, 1)
+    unsafe { (st + 0).* = 0 }
+    let got: i64 = waitpid(c.pid, st as cptr, 0)
+    var raw: i32 = 0
+    unsafe { raw = (st + 0).* }
+    free_ptr(st)
+    if got < 0 { return Status{ state: SPROC_EXITED, code: 0 } }
+    return decode_wait_status(raw)
+}
+
+@cfg(windows) fn block_once(read c: Child) -> Status {
+    // 0xFFFFFFFF is INFINITE. Written as a `u32` maximum rather than as `-1` so the
+    // constant reads the way the header does.
+    WaitForSingleObject(c.h as cptr, 4294967295 as u32)
+    return poll_once(c)
+}
+
+@cfg(posix) fn signal_child(read c: Child) -> bool {
+    return kill(c.pid, SPROC_SIGKILL) == 0
+}
+
+@cfg(windows) fn signal_child(read c: Child) -> bool {
+    return TerminateProcess(c.h as cptr, SPROC_KILL_CODE) != 0
+}
+
+@cfg(posix) fn close_child(read c: Child) {
+    // Nothing to close: a POSIX child is named by a pid, and `wait`/`try_wait` already
+    // reaped it. The empty body is the platform difference, stated rather than hidden
+    // behind a guard at every call site.
+}
+
+@cfg(windows) fn close_child(read c: Child) {
+    // BOTH handles. Forgetting `hThread` is the classic CreateProcess leak: the process
+    // handle is the one everybody remembers and the thread handle is the one that keeps
+    // the kernel object alive.
+    if c.h != 0 { CloseHandle(c.h as cptr) }
+    if c.th != 0 { CloseHandle(c.th as cptr) }
+}
+
+// ---- waiting -----------------------------------------------------------------------
+
+// Has it finished YET? Returns immediately, whatever the answer.
+//
+// The status is cached, so a caller may ask repeatedly and a POSIX child is reaped
+// exactly once however many times this is called.
+pub fn try_wait(mut c: Child) -> Status {
+    if c.done { return Status{ state: c.state, code: c.code } }
+    if c.live == false { return Status{ state: SPROC_EXITED, code: 0 } }
+    let s: Status = poll_once(c)
+    if s.state != SPROC_RUNNING {
+        c.done = true
+        c.state = s.state
+        c.code = s.code
+    }
+    return s
+}
+
+// Block until it finishes. Never reports `SPROC_RUNNING`.
+pub fn wait(mut c: Child) -> Status {
+    if c.done { return Status{ state: c.state, code: c.code } }
+    if c.live == false { return Status{ state: SPROC_EXITED, code: 0 } }
+    let s: Status = block_once(c)
+    c.done = true
+    c.state = s.state
+    c.code = s.code
+    return s
+}
+
+// **Wait up to `timeout_nanos`.** The call this module exists to provide: it returns
+// `SPROC_RUNNING` when the child outlived the budget, and that is a normal answer rather
+// than an error — a caller that wanted to give up now knows it may.
+//
+// `clk` is taken rather than read from the OS so a test can drive the timeout with
+// `time.manual()` and assert on the loop without waiting for real seconds. Under a manual
+// clock nothing sleeps, so the loop spins the clock forward; under `time.host()` it
+// sleeps and the elapsed time is real. Both are the same code.
+//
+// A non-positive timeout is one liveness check and no sleeping, which makes
+// `wait_timeout(c, clk, 0)` a spelling of `try_wait` that a caller composing timeouts
+// does not have to special-case.
+pub fn wait_timeout(mut c: Child, mut clk: time.Clock, timeout_nanos: i64) -> Status {
+    if c.done { return Status{ state: c.state, code: c.code } }
+    if c.live == false { return Status{ state: SPROC_EXITED, code: 0 } }
+
+    var waited: i64 = 0
+    var s: Status = poll_once(c)
+    for s.state == SPROC_RUNNING {
+        if waited >= timeout_nanos { break }
+        var slice: i64 = SPROC_POLL_NANOS
+        let left: i64 = timeout_nanos - waited
+        if slice > left { slice = left }
+        // The clock reports what it ACTUALLY waited, which on Windows is routinely more
+        // than asked for. Adding the request instead would make a loop that believes it
+        // has waited a millisecond when 15 have passed.
+        waited = waited + time.wait(clk, slice)
+        s = poll_once(c)
+    }
+
+    if s.state != SPROC_RUNNING {
+        c.done = true
+        c.state = s.state
+        c.code = s.code
+    }
+    return s
+}
+
+// ---- ending ------------------------------------------------------------------------
+
+// Kill it. Returns whether the platform accepted the request — NOT whether the child is
+// gone, which is a different question and is answered by waiting afterwards.
+//
+// `SIGKILL` rather than `SIGTERM` on purpose: this is the call a timeout reaches for, and
+// a child that ignores `SIGTERM` is exactly the child that made the timeout fire. A
+// polite shutdown is a protocol, and a protocol belongs above this line.
+pub fn terminate(mut c: Child) -> bool {
+    if c.live == false { return false }
+    if c.done { return false }
+    return signal_child(c)
+}
+
+// Give the handles back. Idempotent, so it composes with a caller that is not sure —
+// the `std/list` teardown contract.
+//
+// **Call it exactly once per Child VALUE, not per copy.** `Child` is freely copyable and
+// the language cannot yet say otherwise (see the header); releasing through two copies
+// closes a handle the platform may already have reissued to something else.
+pub fn release(mut c: Child) {
+    if c.live == false { return }
+    close_child(c)
+    c.live = false
+}
+
+// Wait up to `timeout_nanos`, kill it if it is still running, then reap and release.
+//
+// The composition every caller of a bounded wait actually wants, written once because
+// getting it wrong leaks a process: a `terminate` without a following `wait` leaves a
+// zombie on POSIX, since the kernel keeps the entry until somebody collects it.
+pub fn wait_or_kill(mut c: Child, mut clk: time.Clock, timeout_nanos: i64) -> Status {
+    var s: Status = wait_timeout(c, clk, timeout_nanos)
+    if s.state == SPROC_RUNNING {
+        terminate(c)
+        s = wait(c)
+    }
+    release(c)
+    return s
+}

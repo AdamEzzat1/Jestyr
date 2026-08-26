@@ -1,0 +1,324 @@
+// std/sysproc_test.jtr — the unit suite for `std/sysproc`, written with `std/test`.
+//
+// A sibling file rather than colocated, per the convention in docs/stdlib-roadmap.md:
+// a `@test` function is emitted into every program that imports its module.
+//
+// These tests start real processes, because a module whose entire claim is about what
+// the OS does while the parent is still running cannot be tested against a fake. What
+// they do NOT do is depend on real elapsed time for anything except the one measurement
+// that is inherently about time — `time.manual()` drives the timeout LOOP, so the
+// polling logic is asserted without any test taking seconds.
+//
+// The commands are `exit N` and a platform sleep. `exit N` means the same thing in
+// `cmd.exe` and in `sh`; a sleep does not, so it is `@cfg`-split, which is also why this
+// file is in `CGEN_GOLDEN_ALLOWLIST`.
+//
+// Run:  jestyrc test examples/std/sysproc_test.jtr
+
+import "sysproc"
+import "time"
+import "test"
+import "test_report"
+import "fs"
+
+const SPT_REPORT_CAP: usize = 1024
+
+// ~2 seconds of child, long enough that "did the parent block on it" is not a judgement
+// call about scheduler noise.
+@cfg(posix) fn slow_cmd() -> str { return "sleep 2" }
+@cfg(windows) fn slow_cmd() -> str { return "ping -n 3 127.0.0.1 > nul" }
+
+// **THE test.** Everything else in this module is a convenience on top of this one fact:
+// `start` returns while the child is still running. Under `std/process` — that is, under
+// `system()` — the elapsed time below IS the child's runtime, so this is the assertion
+// that would have failed before the module existed.
+//
+// The bound is 500ms against a ~2000ms child: loose enough that a slow CI box cannot make
+// it flake, tight enough that a blocking implementation cannot slip under it.
+@test fn start_returns_while_the_child_is_still_running() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var clk: time.Clock = time.host()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    let t0: i64 = time.read_nanos(clk)
+    var ch: sysproc.Child = sysproc.start(sp, slow_cmd()) catch sysproc.no_child()
+    let spent_ms: i64 = (time.read_nanos(clk) - t0) / 1000000
+
+    test.is_true(c, rep, "the child started", sysproc.is_live(ch))
+    test.is_true(c, rep, "it has a pid", sysproc.pid_of(ch) != 0)
+    test.is_true(c, rep, "start() did not block on it", spent_ms < 500)
+    // And it really was still running — otherwise "start returned quickly" could just
+    // mean the command failed instantly and the timing proved nothing.
+    let s: sysproc.Status = sysproc.try_wait(ch)
+    test.is_true(c, rep, "and the child was genuinely still alive", sysproc.is_running(s))
+
+    sysproc.terminate(ch)
+    sysproc.wait(ch)
+    sysproc.release(ch)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A bounded wait gives up, and reports giving up as a STATE rather than as an error.
+@test fn wait_timeout_gives_up_on_a_slow_child() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var clk: time.Clock = time.host()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    var ch: sysproc.Child = sysproc.start(sp, slow_cmd()) catch sysproc.no_child()
+    let s: sysproc.Status = sysproc.wait_timeout(ch, clk, 150000000)
+    test.is_true(c, rep, "the budget ran out first", sysproc.is_running(s))
+    test.eq_str(c, rep, "and says so", sysproc.state_name(sysproc.state_of(s)), "running")
+
+    sysproc.wait_or_kill(ch, clk, 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **Anti-vacuity for the test above.** A `wait_timeout` that returned `running`
+// unconditionally would pass it. This is the same call with a child that finishes, and it
+// must report the exit — including the exit CODE, which is the other thing a bounded wait
+// could silently lose.
+@test fn wait_timeout_reports_a_child_that_finishes_in_budget() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var clk: time.Clock = time.host()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    var ch: sysproc.Child = sysproc.start(sp, "exit 7") catch sysproc.no_child()
+    let s: sysproc.Status = sysproc.wait_timeout(ch, clk, 10000000000)
+    test.is_true(c, rep, "it finished inside the budget", sysproc.is_exited(s))
+    test.eq_i64(c, rep, "with its own exit code", sysproc.code_of(s) as i64, 7)
+    sysproc.release(ch)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The blocking wait, and the exit code round-tripping through it. `exit 0` and `exit 7`
+// so that "always returns 0" and "always returns the same number" both fail.
+@test fn wait_reports_the_exit_code() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    var zero: sysproc.Child = sysproc.start(sp, "exit 0") catch sysproc.no_child()
+    let z: sysproc.Status = sysproc.wait(zero)
+    test.is_true(c, rep, "exit 0 exited", sysproc.is_exited(z))
+    test.eq_i64(c, rep, "exit 0 code", sysproc.code_of(z) as i64, 0)
+    sysproc.release(zero)
+
+    var seven: sysproc.Child = sysproc.start(sp, "exit 7") catch sysproc.no_child()
+    let s: sysproc.Status = sysproc.wait(seven)
+    test.eq_i64(c, rep, "exit 7 code", sysproc.code_of(s) as i64, 7)
+    sysproc.release(seven)
+
+    test.eq_i64(c, rep, "the spawner counted both", sysproc.started(sp), 2)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A killed child is reported as killed, and NOT as an ordinary exit. On Windows there are
+// no signals, so this is the convention `terminate` and `poll_once` agree on; if they ever
+// stop agreeing, this test is where it shows.
+@test fn a_terminated_child_is_reported_as_signalled() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var clk: time.Clock = time.host()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    var ch: sysproc.Child = sysproc.start(sp, slow_cmd()) catch sysproc.no_child()
+    test.is_true(c, rep, "the kill was accepted", sysproc.terminate(ch))
+    let s: sysproc.Status = sysproc.wait(ch)
+    test.is_true(c, rep, "and it did not exit normally", sysproc.is_signalled(s))
+    test.eq_str(c, rep, "state name", sysproc.state_name(sysproc.state_of(s)), "signalled")
+    sysproc.release(ch)
+
+    // `wait_or_kill` is the same thing composed, and must reach the same verdict.
+    var two: sysproc.Child = sysproc.start(sp, slow_cmd()) catch sysproc.no_child()
+    let t: sysproc.Status = sysproc.wait_or_kill(two, clk, 100000000)
+    test.is_true(c, rep, "wait_or_kill also reports signalled", sysproc.is_signalled(t))
+    test.is_false(c, rep, "and released the handle", sysproc.is_live(two))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **The timeout LOOP, with no real time spent.** `time.manual()` makes `time.wait`
+// advance a counter instead of sleeping, so this exercises the polling policy — budget
+// arithmetic, the loop's exit condition, the elapsed-time accumulation — in microseconds.
+//
+// It is also the test that would catch the loop adding the REQUESTED slice instead of the
+// one the clock reports: under a manual clock those are equal, so the assertion here is
+// about termination, and `waits_are_free` records why this is fast.
+@test fn the_bounded_wait_loop_runs_on_a_manual_clock() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var clk: time.Clock = time.manual(0)
+    var sp: sysproc.Spawner = sysproc.host()
+
+    test.is_true(c, rep, "the clock is deterministic", time.is_deterministic(clk))
+    test.is_true(c, rep, "and its waits cost nothing", time.waits_are_free(clk))
+
+    var ch: sysproc.Child = sysproc.start(sp, slow_cmd()) catch sysproc.no_child()
+    let s: sysproc.Status = sysproc.wait_timeout(ch, clk, 50000000)
+    test.is_true(c, rep, "the loop terminated on its budget", sysproc.is_running(s))
+    // The clock moved by the budget rather than by one slice, which is what proves the
+    // loop iterated instead of giving up after a single poll.
+    test.is_true(c, rep, "the clock advanced to the budget", time.read_nanos(clk) >= 50000000)
+
+    sysproc.terminate(ch)
+    sysproc.wait(ch)
+    sysproc.release(ch)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A zero budget is one liveness check and no sleeping — the spelling of `try_wait` that a
+// caller composing timeouts does not have to special-case.
+@test fn a_zero_budget_is_a_single_check() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var clk: time.Clock = time.manual(0)
+    var sp: sysproc.Spawner = sysproc.host()
+
+    var ch: sysproc.Child = sysproc.start(sp, slow_cmd()) catch sysproc.no_child()
+    let s: sysproc.Status = sysproc.wait_timeout(ch, clk, 0)
+    test.is_true(c, rep, "still running", sysproc.is_running(s))
+    test.eq_i64(c, rep, "and the clock never moved", time.read_nanos(clk), 0)
+
+    sysproc.terminate(ch)
+    sysproc.wait(ch)
+    sysproc.release(ch)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The status is cached after the first observation, so asking twice is safe. This is not
+// tidiness: a POSIX child is REAPED by `waitpid`, and a second reap of the same pid fails
+// with ECHILD — without the cache, the second question would get a different answer to
+// the first.
+@test fn the_status_is_cached_so_asking_twice_agrees() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    var ch: sysproc.Child = sysproc.start(sp, "exit 7") catch sysproc.no_child()
+    let first: sysproc.Status = sysproc.wait(ch)
+    let second: sysproc.Status = sysproc.wait(ch)
+    let third: sysproc.Status = sysproc.try_wait(ch)
+    test.eq_i64(c, rep, "first", sysproc.code_of(first) as i64, 7)
+    test.eq_i64(c, rep, "second agrees", sysproc.code_of(second) as i64, 7)
+    test.eq_i64(c, rep, "try_wait agrees", sysproc.code_of(third) as i64, 7)
+    test.is_true(c, rep, "and all three say exited", sysproc.is_exited(third))
+
+    // `last_status` answers from the cache without touching the OS, and keeps answering
+    // after release — the only query that is safe there.
+    sysproc.release(ch)
+    test.is_false(c, rep, "released", sysproc.is_live(ch))
+    test.eq_i64(c, rep, "last_status still knows", sysproc.code_of(sysproc.last_status(ch)) as i64, 7)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// `release` is idempotent, so it composes with a caller that is not sure whether an
+// earlier path already ran.
+@test fn release_is_idempotent() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    var ch: sysproc.Child = sysproc.start(sp, "exit 0") catch sysproc.no_child()
+    sysproc.wait(ch)
+    sysproc.release(ch)
+    sysproc.release(ch)
+    sysproc.release(ch)
+    test.is_false(c, rep, "still released", sysproc.is_live(ch))
+    // A released child cannot be terminated — there is no handle to terminate through,
+    // and returning `true` would be a lie a caller might act on.
+    test.is_false(c, rep, "terminate refuses", sysproc.terminate(ch))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **The capability must produce no EFFECT, not merely report failure.** The same shape as
+// `process_test`'s witness test, and for the same reason: without the `host` control, a
+// typo'd command would make the negative half pass for the wrong reason.
+@test fn denied_starts_nothing_where_host_does() -> bool {
+    let probe: str = "jestyr_sysproc_effect_test.tmp"
+    var craw: *mut u8 = alloc(u8, 256)
+    var cbuf: []u8 = slice(u8, craw, 256)
+    let n: usize = write_cmd(probe, cbuf)
+    let cmd: str = from_utf8(slice(u8, craw, n))
+
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // Control: the command genuinely works, so the negative result below means something.
+    fs.remove(probe)
+    var h: sysproc.Spawner = sysproc.host()
+    var made: sysproc.Child = sysproc.start(h, cmd) catch sysproc.no_child()
+    sysproc.wait(made)
+    sysproc.release(made)
+    test.is_true(c, rep, "host leaves the file", fs.exists(probe))
+    fs.remove(probe)
+
+    // The experiment: identical command, denied handle, no file.
+    var d: sysproc.Spawner = sysproc.denied()
+    var none: sysproc.Child = sysproc.start(d, cmd) catch sysproc.no_child()
+    test.is_false(c, rep, "denied leaves nothing", fs.exists(probe))
+    test.is_false(c, rep, "and hands back no live child", sysproc.is_live(none))
+    test.eq_i64(c, rep, "denied started", sysproc.started(d), 0)
+    test.eq_i64(c, rep, "denied counted the attempt", sysproc.refused(d), 1)
+    test.is_false(c, rep, "can_start(denied)", sysproc.can_start(d))
+
+    fs.remove(probe)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    free_ptr(craw)
+    return ok
+}
+
+// `echo x > <name>`, built into `buf`. Spelled identically in cmd.exe and sh, and only
+// the file's existence is ever checked, so shell quoting cannot matter.
+fn write_cmd(read name: str, mut buf: []u8) -> usize {
+    let head: str = "echo x > "
+    var n: usize = 0
+    for i in 0..head.len {
+        buf[n] = head[i] as u8
+        n = n + 1
+    }
+    for j in 0..name.len {
+        buf[n] = name[j] as u8
+        n = n + 1
+    }
+    return n
+}

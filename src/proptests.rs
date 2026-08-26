@@ -937,6 +937,264 @@ mod syswatch_debounced_trigger {
 /// back-end server disagree about where it ends, and the bytes after it (`GET /admin`) become a
 /// second request attributed to the next client on the connection. Every byte of it is
 /// well-formed, and a lenient parser answers 200.
+/// **`jbounded` — a command runner with a deadline, end to end through the real OS.**
+///
+/// `examples/std/sysproc_demo.jtr` is `std/sysproc`'s consumer, and it is a program that
+/// could not be written at all against `std/process`: `system()` does not return until the
+/// child is finished, so there is no moment in which to change one's mind about waiting.
+///
+/// **The subject of this test is a timing fact asserted as a boolean.** The demo starts a
+/// ~2000ms child and measures how long `start` itself took; a blocking implementation makes
+/// that number ~2000 and the printed `true` becomes `false`. The transcript is otherwise
+/// free of timings, pids and paths on purpose, so it can be asserted whole.
+#[cfg(all(test, feature = "c-oracle"))]
+mod sysproc_bounded_runner {
+    use super::*;
+
+    #[test]
+    fn jbounded_kills_a_command_that_outlives_its_deadline() {
+        let exe = super::c_oracle::build_exe("examples/std/sysproc_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the bounded runner must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jbounded --\n\
+                    a slow command, given 200ms\n\
+                    start returned while it was still running\n\
+                    true\n\
+                    and it really was still running\n\
+                    true\n\
+                    the deadline expired first\n\
+                    true\n\
+                    so the runner took the decision back\n\
+                    signalled\n\
+                    and the handle was released\n\
+                    true\n\
+                    -- the same runner, a prompt command --\n\
+                    it finished inside the deadline\n\
+                    true\n\
+                    with its own exit code\n\
+                    7\n\
+                    -- a denied spawner --\n\
+                    nothing started\n\
+                    0\n\
+                    one attempt counted\n\
+                    1\n\
+                    and no live child came back\n\
+                    true\n\
+                    -- and the host spawner started two --\n\
+                    2";
+        assert_eq!(out.trim_end(), want, "the bounded runner's transcript changed:\n{out}");
+
+        // Anti-vacuity: `true` appears often enough that a containment check would pass for
+        // a demo that printed it unconditionally. Every `false` would be a failed step.
+        assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
+        // And the outcome word must be the killed one. A `wait_or_kill` that quietly let
+        // the child finish would print `exited` here and every boolean above would still
+        // be true — this is the assertion that separates "bounded" from "patient".
+        assert!(out.contains("\nsignalled\n"), "the child must have been killed, not awaited:\n{out}");
+        assert!(!out.contains("\nexited\n"), "a killed child must not report as exited:\n{out}");
+    }
+
+    /// **The Win32 layout constants, re-measured against the real headers.**
+    ///
+    /// `std/sysproc` pokes `STARTUPINFOA` and `PROCESS_INFORMATION` byte by byte, so its
+    /// numbers are claims about a foreign struct's layout. They were measured with a C
+    /// probe rather than recalled, and this re-measures them so a wrong one is a red test
+    /// instead of a `CreateProcess` that mysteriously starts nothing.
+    ///
+    /// The constants are PARSED OUT OF THE SHIPPED SOURCE rather than restated here. A
+    /// test that hard-codes 104 alongside a module that hard-codes 104 proves only that
+    /// someone typed the same number twice.
+    ///
+    /// Windows-only: it includes `<windows.h>`. On POSIX the constants are unused (the
+    /// `@cfg(windows)` branch is emitted but `#if`-ed out), so there is nothing to check.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_layout_constants_match_the_real_headers() {
+        let src = std::fs::read_to_string("examples/std/sysproc.jtr").unwrap();
+        let konst = |name: &str| -> i64 {
+            let line = src
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("const {name}:")))
+                .unwrap_or_else(|| panic!("`{name}` is gone from examples/std/sysproc.jtr"));
+            let rhs = line.split('=').nth(1).expect("a const has a value");
+            // Strip a trailing `// comment` and parse what is left.
+            rhs.split("//").next().unwrap().trim().parse::<i64>().unwrap_or_else(|_| {
+                panic!("`{name}` is no longer a plain integer literal: {line}")
+            })
+        };
+
+        let probe = r#"
+#include <windows.h>
+#include <stdio.h>
+int main(void) {
+  STARTUPINFOA si; PROCESS_INFORMATION pi;
+  printf("%zu %zu %zu %zu %zu %d %d\n",
+    sizeof(STARTUPINFOA), sizeof(PROCESS_INFORMATION),
+    (size_t)((char*)&pi.hProcess - (char*)&pi) / 8,
+    (size_t)((char*)&pi.hThread  - (char*)&pi) / 8,
+    (size_t)((char*)&pi.dwProcessId - (char*)&pi) / 4,
+    (int)WAIT_OBJECT_0, (int)WAIT_TIMEOUT);
+  (void)si;
+  return 0;
+}
+"#;
+        let dir = std::env::temp_dir();
+        let cfile = dir.join("jestyr_sysproc_layout_probe.c");
+        let exe = dir.join(format!("jestyr_sysproc_layout_probe{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&cfile, probe).unwrap();
+        let cc = crate::find_c_compiler().expect("this test needs a C compiler on PATH");
+        let st = std::process::Command::new(&cc).arg(&cfile).arg("-o").arg(&exe).status().unwrap();
+        assert!(st.success(), "the layout probe must compile against <windows.h>");
+        let out = std::process::Command::new(&exe).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let got: Vec<i64> =
+            text.split_whitespace().map(|w| w.parse::<i64>().unwrap()).collect();
+        assert_eq!(got.len(), 7, "the probe's own output shape changed: {text}");
+
+        assert_eq!(konst("SPROC_STARTUPINFO_LEN"), got[0], "sizeof(STARTUPINFOA)");
+        assert_eq!(konst("SPROC_PROCESS_INFO_LEN"), got[1], "sizeof(PROCESS_INFORMATION)");
+        assert_eq!(konst("SPROC_PI_HPROCESS_SLOT"), got[2], "hProcess's 64-bit slot");
+        assert_eq!(konst("SPROC_PI_HTHREAD_SLOT"), got[3], "hThread's 64-bit slot");
+        assert_eq!(konst("SPROC_PI_PID_WORD"), got[4], "dwProcessId's 32-bit word");
+        assert_eq!(konst("SPROC_WAIT_SIGNALED"), got[5], "WAIT_OBJECT_0");
+        assert_eq!(konst("SPROC_WAIT_TIMEOUT"), got[6], "WAIT_TIMEOUT");
+
+        // The header's central warning, checked rather than only written down: the reason
+        // `poll_once` asks `WaitForSingleObject` instead of `GetExitCodeProcess` is that
+        // STILL_ACTIVE is an ordinary exit code a child may legitimately produce. If that
+        // ever stops being true the comment is wrong and should be revisited.
+        assert_eq!(
+            still_active(&cc, &dir),
+            259,
+            "STILL_ACTIVE is an in-band exit code, which is why liveness is not read from it"
+        );
+    }
+
+    /// `STILL_ACTIVE` as the real header defines it.
+    #[cfg(windows)]
+    fn still_active(cc: &str, dir: &std::path::Path) -> i64 {
+        let cfile = dir.join("jestyr_sysproc_still_active.c");
+        let exe = dir.join(format!("jestyr_sysproc_still_active{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(
+            &cfile,
+            "#include <windows.h>\n#include <stdio.h>\nint main(void){printf(\"%d\\n\",(int)STILL_ACTIVE);return 0;}\n",
+        )
+        .unwrap();
+        assert!(std::process::Command::new(cc).arg(&cfile).arg("-o").arg(&exe).status().unwrap().success());
+        String::from_utf8_lossy(&std::process::Command::new(&exe).output().unwrap().stdout)
+            .trim()
+            .parse()
+            .unwrap()
+    }
+}
+
+/// **Two modules must not bind one C symbol with two different signatures.**
+///
+/// `std/syswatch` and `std/sysproc` both need `WaitForSingleObject`, and typeck keys its
+/// function table on the BARE name — so the second declaration wins and BOTH modules' call
+/// sites are then checked against ONE signature. `std/sysnet`'s header records this being
+/// measured: its POSIX call sites were type-checked against its Windows extern and reported
+/// `expected i32, found u32`.
+///
+/// The two declarations are therefore identical on purpose, and this is the pin. It is a
+/// SOURCE-TEXT check because that is the level the hazard lives at: the day someone widens
+/// one of them to `i64` for convenience, the other module silently starts lying.
+#[cfg(test)]
+mod extern_signature_agreement {
+    /// Every `extern … fn <name>` in the std corpus, as (file, name, full declaration).
+    fn extern_decls() -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir("examples/std") else { return out };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("jtr") {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&p) else { continue };
+            for line in src.lines() {
+                let t = line.trim();
+                let Some(at) = t.find("extern ") else { continue };
+                if !(t.starts_with("extern ") || t.starts_with("@cfg")) {
+                    continue;
+                }
+                let rest = &t[at..];
+                let Some(fk) = rest.find(" fn ") else { continue };
+                let after = &rest[fk + 4..];
+                let name: String =
+                    after.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                if name.is_empty() {
+                    continue;
+                }
+                // The signature only — the header string differs legitimately (`windows.h`
+                // against `synchapi.h`) and is not what typeck keys on.
+                let sig = after[name.len()..].trim().to_string();
+                let file = p.file_name().unwrap().to_string_lossy().to_string();
+                out.push((file, name, sig));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn one_c_symbol_has_one_signature_across_the_whole_std_corpus() {
+        use std::collections::HashMap;
+        let mut by_name: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (file, name, sig) in extern_decls() {
+            by_name.entry(name).or_default().push((file, sig));
+        }
+
+        let mut clashes: Vec<String> = Vec::new();
+        for (name, decls) in &by_name {
+            // Within ONE file a `@cfg` pair may legitimately differ — that is exactly what
+            // `@cfg(posix)`/`@cfg(windows)` is for, and the guards make them disjoint. The
+            // hazard is ACROSS files, where nothing makes them disjoint and typeck keeps
+            // only one.
+            let mut per_file: HashMap<&str, Vec<&str>> = HashMap::new();
+            for (f, s) in decls {
+                per_file.entry(f.as_str()).or_default().push(s.as_str());
+            }
+            if per_file.len() < 2 {
+                continue;
+            }
+            let sigs: std::collections::BTreeSet<&str> =
+                decls.iter().map(|(_, s)| s.as_str()).collect();
+            if sigs.len() > 1 {
+                clashes.push(format!("`{name}` is declared differently in {per_file:?}"));
+            }
+        }
+
+        assert!(
+            clashes.is_empty(),
+            "two modules bind one C symbol with different signatures; typeck keys on the \
+             BARE name, so one of them is being type-checked against the other's idea of \
+             it:\n{}",
+            clashes.join("\n")
+        );
+    }
+
+    /// Anti-vacuity: the sweep above must actually be looking at something. If a refactor
+    /// changes how externs are spelled and the parser above stops matching, the clash test
+    /// passes by finding nothing at all.
+    #[test]
+    fn the_extern_sweep_sees_the_symbol_it_was_written_for() {
+        let decls = extern_decls();
+        assert!(decls.len() > 40, "the extern sweep found almost nothing: {}", decls.len());
+        let waits: Vec<&(String, String, String)> =
+            decls.iter().filter(|(_, n, _)| n == "WaitForSingleObject").collect();
+        assert_eq!(
+            waits.len(),
+            2,
+            "syswatch and sysproc should both bind WaitForSingleObject: {waits:?}"
+        );
+        assert_eq!(
+            waits[0].2, waits[1].2,
+            "the two WaitForSingleObject bindings must be identical"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "c-oracle"))]
 mod http_server {
     use super::*;
@@ -16863,6 +17121,15 @@ fn main() -> i32 {
         "log.jtr",
         "log_test.jtr",
         "log_demo.jtr",
+        // `sysproc.jtr` binds `posix_spawn`/`waitpid`/`kill` against
+        // `CreateProcessA`/`WaitForSingleObject` behind `@cfg`, and both its demo and its
+        // suite `@cfg`-split the platform sleep command, so
+        // `every_cfg_bearing_corpus_file_is_byte_identity_verified` requires all three.
+        // None of them builds a `[]T` over another module's struct, which is the shape
+        // that makes an entry here wrong (see the `syswatch_test` note below).
+        "sysproc.jtr",
+        "sysproc_test.jtr",
+        "sysproc_demo.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same

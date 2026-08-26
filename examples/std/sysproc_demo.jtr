@@ -1,0 +1,89 @@
+// examples/std/sysproc_demo.jtr — `jbounded`, a command runner with a DEADLINE.
+//
+// `std/sysproc`'s consumer, and the smallest program that could not be written at all
+// against `std/process`: it runs a command, gives it a fixed budget, and takes the
+// decision back when the budget expires. Under `system()` there is no such program,
+// because the call that starts the child does not return until the child is finished —
+// there is no moment in which to change one's mind.
+//
+// **The transcript is deterministic and contains no timings, pids, or paths.** Every
+// claim is printed as a `true` or as a fixed word, so `jbounded_kills_a_command_that_
+// outlives_its_deadline` can assert the whole thing as an exact string rather than
+// pattern-matching around noise. The numbers that ARE printed are counters whose values
+// are consequences of the run.
+//
+// Build and run:  jestyrc run examples/std/sysproc_demo.jtr
+
+import "sysproc"
+import "time"
+
+// There is no portable sleep: `sleep` is a POSIX utility and `cmd.exe` has none, so
+// Windows abuses `ping` against loopback the way every batch file always has. This is the
+// only platform difference in the program, and it is about the SHELL, not about sysproc.
+@cfg(posix) fn slow_cmd() -> str { return "sleep 2" }
+@cfg(windows) fn slow_cmd() -> str { return "ping -n 3 127.0.0.1 > nul" }
+
+// Run `cmd` with a deadline, reporting what became of it. The whole module in four lines,
+// and the shape every caller of a bounded wait actually wants.
+fn run_bounded(mut sp: sysproc.Spawner, mut clk: time.Clock, read cmd: str, budget: i64) -> sysproc.Status {
+    var ch: sysproc.Child = sysproc.start(sp, cmd) catch sysproc.no_child()
+    return sysproc.wait_or_kill(ch, clk, budget)
+}
+
+fn main() {
+    var clk: time.Clock = time.host()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    print_str("-- jbounded --")
+
+    // ---- a command that outlives its deadline -----------------------------------
+    //
+    // The timing is asserted rather than printed: a ~2000ms child, and `start` measured
+    // at under 500ms. Under `system()` that difference does not exist, which is why this
+    // boolean is the program's real subject.
+    print_str("a slow command, given 200ms")
+    let t0: i64 = time.read_nanos(clk)
+    var slow: sysproc.Child = sysproc.start(sp, slow_cmd()) catch sysproc.no_child()
+    let start_ms: i64 = (time.read_nanos(clk) - t0) / 1000000
+    print_str("start returned while it was still running")
+    print_bool(start_ms < 500)
+    print_str("and it really was still running")
+    print_bool(sysproc.is_running(sysproc.try_wait(slow)))
+
+    print_str("the deadline expired first")
+    print_bool(sysproc.is_running(sysproc.wait_timeout(slow, clk, 200000000)))
+
+    print_str("so the runner took the decision back")
+    let ended: sysproc.Status = sysproc.wait_or_kill(slow, clk, 0)
+    print_str(sysproc.state_name(sysproc.state_of(ended)))
+    print_str("and the handle was released")
+    print_bool(sysproc.is_live(slow) == false)
+
+    // ---- a command that finishes in time ----------------------------------------
+    //
+    // The other half, and the reason the half above means something: the same runner,
+    // the same deadline machinery, and a command that is left alone to finish.
+    print_str("-- the same runner, a prompt command --")
+    let quick: sysproc.Status = run_bounded(sp, clk, "exit 7", 10000000000)
+    print_str("it finished inside the deadline")
+    print_bool(sysproc.is_exited(quick))
+    print_str("with its own exit code")
+    print_int(sysproc.code_of(quick))
+
+    // ---- what the capability refuses --------------------------------------------
+    print_str("-- a denied spawner --")
+    var no: sysproc.Spawner = sysproc.denied()
+    var refused: sysproc.Child = sysproc.start(no, "exit 7") catch sysproc.no_child()
+    print_str("nothing started")
+    print_int(sysproc.started(no))
+    print_str("one attempt counted")
+    print_int(sysproc.refused(no))
+    print_str("and no live child came back")
+    print_bool(sysproc.is_live(refused) == false)
+
+    // Two: the slow one and the prompt one. The refused attempt went through `no`, so it
+    // is counted there and nowhere else — which is the whole point of a handle that
+    // counts rather than a flag that merely refuses.
+    print_str("-- and the host spawner started two --")
+    print_int(sysproc.started(sp))
+}
