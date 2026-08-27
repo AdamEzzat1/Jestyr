@@ -16,6 +16,7 @@
 
 import "sysproc"
 import "time"
+import "str"
 
 // There is no portable sleep: `sleep` is a POSIX utility and `cmd.exe` has none, so
 // Windows abuses `ping` against loopback the way every batch file always has. This is the
@@ -81,9 +82,35 @@ fn main() {
     print_str("and no live child came back")
     print_bool(sysproc.is_live(refused) == false)
 
-    // Two: the slow one and the prompt one. The refused attempt went through `no`, so it
-    // is counted there and nowhere else — which is the whole point of a handle that
-    // counts rather than a flag that merely refuses.
-    print_str("-- and the host spawner started two --")
+    // ---- talking to a child, not just starting it --------------------------------
+    //
+    // The other half of what `system()` made impossible. `sort` is a FILTER: it produces
+    // nothing at all until its input is closed, so this only works if the parent can hold
+    // both ends of a live conversation — write, signal EOF, then read the answer back.
+    print_str("-- a child we can talk to --")
+    var filt: sysproc.Child = sysproc.start_piped(sp, "sort") catch sysproc.no_child()
+    let payload: str = "pear\nfig\napple\n"
+    var pbuf: *mut u8 = alloc(u8, payload.len)
+    var i: usize = 0
+    for i < payload.len {
+        unsafe { (pbuf + i).* = payload[i] }
+        i = i + 1
+    }
+    sysproc.write_all(filt, slice(u8, pbuf, payload.len))
+    // `capture` closes the input first — the step the filter is waiting for — and then
+    // drains to EOF. That order is what avoids the deadlock the module header opens with.
+    var answer: String = sysproc.capture(filt)
+    sysproc.wait(filt)
+    sysproc.release(filt)
+    free_ptr(pbuf)
+
+    print_str("we sent it three lines out of order and it sent back:")
+    print_str(str.trim_end(string_view(answer)))
+    string_free(answer)
+
+    // Three: the slow one, the prompt one, and the filter. The refused attempt went
+    // through `no`, so it is counted there and nowhere else — which is the whole point of
+    // a handle that counts rather than a flag that merely refuses.
+    print_str("-- and the host spawner started three --")
     print_int(sysproc.started(sp))
 }

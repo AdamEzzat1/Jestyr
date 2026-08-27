@@ -982,8 +982,13 @@ mod sysproc_bounded_runner {
                     1\n\
                     and no live child came back\n\
                     true\n\
-                    -- and the host spawner started two --\n\
-                    2";
+                    -- a child we can talk to --\n\
+                    we sent it three lines out of order and it sent back:\n\
+                    apple\n\
+                    fig\n\
+                    pear\n\
+                    -- and the host spawner started three --\n\
+                    3";
         assert_eq!(out.trim_end(), want, "the bounded runner's transcript changed:\n{out}");
 
         // Anti-vacuity: `true` appears often enough that a containment check would pass for
@@ -994,6 +999,14 @@ mod sysproc_bounded_runner {
         // be true — this is the assertion that separates "bounded" from "patient".
         assert!(out.contains("\nsignalled\n"), "the child must have been killed, not awaited:\n{out}");
         assert!(!out.contains("\nexited\n"), "a killed child must not report as exited:\n{out}");
+        // **The pipe half, asserted as a REORDERING rather than as a presence.** The demo
+        // feeds `sort` the lines pear/fig/apple and prints what comes back. Checking that
+        // "apple" appears would pass for a program that merely echoed its own input; the
+        // order changing is what proves the bytes went into a child, were sorted there,
+        // and came back — a two-way conversation with a live process.
+        let a = out.find("apple").expect("the filter's output is missing");
+        let p = out.find("\npear").expect("the filter's output is missing");
+        assert!(a < p, "the child must have SORTED the lines, not echoed them:\n{out}");
     }
 
     /// **The Win32 layout constants, re-measured against the real headers.**
@@ -1069,6 +1082,76 @@ int main(void) {
             still_active(&cc, &dir),
             259,
             "STILL_ACTIVE is an in-band exit code, which is why liveness is not read from it"
+        );
+    }
+
+    /// **The pipe constants, re-measured against `<windows.h>` too.**
+    ///
+    /// `start_piped` pokes `SECURITY_ATTRIBUTES` and three more `STARTUPINFOA` fields, and
+    /// sets two flags. Every one of those is a claim about a foreign header, and getting
+    /// one wrong does not fail loudly — a missing `STARTF_USESTDHANDLES` makes Windows
+    /// ignore the handle fields entirely and give the child the parent's console, which
+    /// looks like the pipes simply produced nothing.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_pipe_constants_match_the_real_headers() {
+        let src = std::fs::read_to_string("examples/std/sysproc.jtr").unwrap();
+        let konst = |name: &str| -> i64 {
+            let line = src
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("const {name}:")))
+                .unwrap_or_else(|| panic!("`{name}` is gone from examples/std/sysproc.jtr"));
+            let rhs = line.split('=').nth(1).expect("a const has a value");
+            rhs.split("//").next().unwrap().trim().parse::<i64>().unwrap_or_else(|_| {
+                panic!("`{name}` is no longer a plain integer literal: {line}")
+            })
+        };
+
+        let probe = r#"
+#include <windows.h>
+#include <stddef.h>
+#include <stdio.h>
+int main(void) {
+  printf("%zu %zu %zu %zu %zu %lu %lu %d\n",
+    sizeof(SECURITY_ATTRIBUTES),
+    offsetof(SECURITY_ATTRIBUTES, bInheritHandle) / 4,
+    offsetof(STARTUPINFOA, dwFlags) / 4,
+    offsetof(STARTUPINFOA, hStdInput) / 8,
+    offsetof(STARTUPINFOA, hStdOutput) / 8,
+    (unsigned long)STARTF_USESTDHANDLES,
+    (unsigned long)HANDLE_FLAG_INHERIT,
+    (int)ERROR_BROKEN_PIPE);
+  return 0;
+}
+"#;
+        let dir = std::env::temp_dir();
+        let cfile = dir.join("jestyr_sysproc_pipe_probe.c");
+        let exe = dir.join(format!("jestyr_sysproc_pipe_probe{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&cfile, probe).unwrap();
+        let cc = crate::find_c_compiler().expect("this test needs a C compiler on PATH");
+        let st = std::process::Command::new(&cc).arg(&cfile).arg("-o").arg(&exe).status().unwrap();
+        assert!(st.success(), "the pipe probe must compile against <windows.h>");
+        let out = std::process::Command::new(&exe).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let got: Vec<i64> = text.split_whitespace().map(|w| w.parse::<i64>().unwrap()).collect();
+        assert_eq!(got.len(), 8, "the probe's own output shape changed: {text}");
+
+        assert_eq!(konst("SPROC_SA_LEN"), got[0], "sizeof(SECURITY_ATTRIBUTES)");
+        assert_eq!(konst("SPROC_SA_INHERIT_WORD"), got[1], "bInheritHandle's 32-bit word");
+        assert_eq!(konst("SPROC_SI_FLAGS_WORD"), got[2], "dwFlags' 32-bit word");
+        assert_eq!(konst("SPROC_SI_STDIN_SLOT"), got[3], "hStdInput's 64-bit slot");
+        assert_eq!(konst("SPROC_SI_STDOUT_SLOT"), got[4], "hStdOutput's 64-bit slot");
+        assert_eq!(konst("SPROC_STARTF_USESTDHANDLES"), got[5], "STARTF_USESTDHANDLES");
+        assert_eq!(konst("SPROC_HANDLE_FLAG_INHERIT"), got[6], "HANDLE_FLAG_INHERIT");
+        assert_eq!(konst("SPROC_ERROR_BROKEN_PIPE"), got[7], "ERROR_BROKEN_PIPE");
+
+        // `hStdError` sits one slot past `hStdOutput`; asserted separately because the
+        // module writes it and a probe that only checked the two it shares with stdin/out
+        // would miss a struct that grew between them.
+        assert_eq!(
+            konst("SPROC_SI_STDERR_SLOT"),
+            konst("SPROC_SI_STDOUT_SLOT") + 1,
+            "hStdError must be the slot after hStdOutput"
         );
     }
 
@@ -1258,6 +1341,114 @@ mod sys_handles_are_move_only {
     }
 }
 
+/// **`std/sysnet`'s failure sentinel, measured instead of asserted in a comment.**
+///
+/// `sysnet.jtr` unifies `socket()`'s return at `i64` across platforms and relies on a
+/// coincidence to make one comparison work for both: POSIX returns `int` `-1`, which
+/// sign-extends to `-1`; Windows returns a `SOCKET` (unsigned 64-bit) whose
+/// `INVALID_SOCKET` is all-bits-set, which reinterprets as `-1`. So `NET_INVALID` catches
+/// both.
+///
+/// **The header said that coincidence was "relied on and therefore CHECKED" by a test
+/// named `the_invalid_socket_sentinel_is_the_same_on_both` — and that test did not exist
+/// anywhere in the tree.** Found by grepping for it while writing the analogous pin for
+/// `std/sysproc`'s Win32 layout constants. A claimed guarantee with no test behind it is
+/// worse than an acknowledged gap, because it stops anyone from looking.
+///
+/// This is that test. Like the `sysproc` one it parses `NET_INVALID` out of the SHIPPED
+/// SOURCE rather than restating `-1`, so it tracks the constant instead of agreeing with a
+/// copy of it, and it asks the real platform header for the other half.
+#[cfg(test)]
+mod sysnet_sentinel {
+    /// `NET_INVALID` as `examples/std/sysnet.jtr` actually declares it.
+    fn net_invalid() -> i64 {
+        let src = std::fs::read_to_string("examples/std/sysnet.jtr").unwrap();
+        let line = src
+            .lines()
+            .find(|l| l.trim_start().starts_with("const NET_INVALID:"))
+            .expect("`NET_INVALID` is gone from examples/std/sysnet.jtr");
+        let rhs = line.split('=').nth(1).expect("a const has a value");
+        // Written `0 - 1`, because Jestyr has no negative literal.
+        let expr = rhs.split("//").next().unwrap().trim();
+        let (a, b) = expr.split_once('-').unwrap_or_else(|| {
+            panic!("`NET_INVALID` is no longer a `<a> - <b>` expression: {line}")
+        });
+        a.trim().parse::<i64>().unwrap() - b.trim().parse::<i64>().unwrap()
+    }
+
+    /// Compile and run a C probe, returning the single integer it prints.
+    fn probe(body: &str, stem: &str) -> i64 {
+        let cc = crate::find_c_compiler().expect("this test needs a C compiler on PATH");
+        let dir = std::env::temp_dir();
+        let cfile = dir.join(format!("jestyr_{stem}.c"));
+        let exe = dir.join(format!("jestyr_{stem}{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&cfile, body).unwrap();
+        let st = std::process::Command::new(&cc)
+            .arg(&cfile)
+            .arg("-o")
+            .arg(&exe)
+            .status()
+            .unwrap();
+        assert!(st.success(), "the sentinel probe must compile against the real header");
+        let out = std::process::Command::new(&exe).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    /// Windows: `INVALID_SOCKET` as `<winsock2.h>` defines it, widened the way the emitted
+    /// C widens it — `SOCKET` is unsigned 64-bit, so this is the reinterpretation the
+    /// header comment claims, not a restatement of `-1`.
+    #[cfg(windows)]
+    #[test]
+    fn the_invalid_socket_sentinel_is_the_same_on_both() {
+        let got = probe(
+            "#include <winsock2.h>\n#include <stdio.h>\n\
+             int main(void){ printf(\"%lld\\n\", (long long)(SOCKET)INVALID_SOCKET); return 0; }\n",
+            "sysnet_sentinel_win",
+        );
+        assert_eq!(
+            got,
+            net_invalid(),
+            "INVALID_SOCKET no longer reinterprets as NET_INVALID; sysnet's unified `i64` \
+             return can no longer detect a failed socket() on Windows"
+        );
+        // And the coincidence is exactly that: the POSIX half is a *different* value in C
+        // that lands on the same 64-bit integer. Checked here too so the claim is whole on
+        // whichever host runs the suite.
+        assert_eq!(
+            probe(
+                "#include <stdio.h>\nint main(void){ printf(\"%lld\\n\", (long long)(int)(-1)); return 0; }\n",
+                "sysnet_sentinel_int",
+            ),
+            net_invalid(),
+            "a POSIX `int` -1 must sign-extend to the same sentinel"
+        );
+    }
+
+    /// POSIX: the sentinel a genuinely FAILING `socket()` returns, widened. Stronger than
+    /// the Windows half — it is the real call's real failure value rather than a constant.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_invalid_socket_sentinel_is_the_same_on_both() {
+        let got = probe(
+            "#include <sys/socket.h>\n#include <stdio.h>\n\
+             int main(void){ printf(\"%lld\\n\", (long long)socket(-1, -1, -1)); return 0; }\n",
+            "sysnet_sentinel_posix",
+        );
+        assert_eq!(
+            got,
+            net_invalid(),
+            "a failed socket() no longer widens to NET_INVALID"
+        );
+    }
+
+    /// Anti-vacuity: the parser above must actually be reading the constant, not defaulting
+    /// to zero and agreeing with everything.
+    #[test]
+    fn the_sentinel_is_read_from_the_shipped_source() {
+        assert_eq!(net_invalid(), -1, "NET_INVALID is `0 - 1`; if it changed, so must the pin");
+    }
+}
+
 /// **Two modules must not bind one C symbol with two different signatures.**
 ///
 /// `std/syswatch` and `std/sysproc` both need `WaitForSingleObject`, and typeck keys its
@@ -1295,11 +1486,28 @@ mod extern_signature_agreement {
                 if name.is_empty() {
                     continue;
                 }
+                // **Keyed on the C SYMBOL, not the Jestyr name.** A declared alias
+                // (`fn sys_close = "close"(…)`) separates the two, and it is the SYMBOL
+                // that the linker — and the duplicate-definition hazard — cares about.
+                // Keying on the name would let `fn close(…)` in one module and
+                // `fn sys_close = "close"(…)` in another disagree about the same symbol
+                // and be reported as unrelated.
+                let tail = after[name.len()..].trim_start();
+                let (symbol, sig) = match tail.strip_prefix('=') {
+                    Some(rest) => {
+                        let rest = rest.trim_start();
+                        let end = rest[1..].find('"').map(|i| i + 1).unwrap_or(0);
+                        (rest[1..end].to_string(), rest[end + 1..].trim().to_string())
+                    }
+                    None => (name.clone(), tail.trim().to_string()),
+                };
+                if symbol.is_empty() {
+                    continue;
+                }
                 // The signature only — the header string differs legitimately (`windows.h`
                 // against `synchapi.h`) and is not what typeck keys on.
-                let sig = after[name.len()..].trim().to_string();
                 let file = p.file_name().unwrap().to_string_lossy().to_string();
-                out.push((file, name, sig));
+                out.push((file, symbol, sig));
             }
         }
         out

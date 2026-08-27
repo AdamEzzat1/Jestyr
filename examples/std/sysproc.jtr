@@ -92,12 +92,25 @@
 // first one the declared-extern-alias design would NOT fix: this is a Jestyr name, not a
 // C symbol, so the fix is scoped keywords or nothing.
 //
-// ─── What is not here ─────────────────────────────────────────────────────────
+// ─── PIPES: the child can be talked to, not just started ─────────────────────
 //
-// **Pipes.** Capturing a child's stdout is the next increment and the one that turns
-// `std/plugin` into a server; it needs `CreatePipe`/`pipe(2)`, inherited handles, and on
-// POSIX a `read(2)` this language cannot bind by name. Deliberately separated so that
-// "the parent stays alive" lands and can be tested on its own.
+// `start_piped` connects the child's stdin and stdout to this process, so a parent can
+// send a request and read the answer while the child stays alive. That is the shape a
+// long-lived plugin server needs, and the one `system()` made impossible — `std/plugin`
+// is one-process-per-call because the only way to get an answer back was to let the child
+// die.
+//
+// **The deadlock is the thing to understand, and it is not hypothetical.** A pipe's buffer
+// is finite (4KB on Linux, ~64KB on Windows). A child that outgrows it blocks in `write`
+// until somebody drains the other end; a parent sitting in `wait` never will. Neither side
+// is wrong and the program simply stops. So: `close_input`, then drain to EOF, THEN `wait`.
+// `capture` is those first two in one call, which is why it exists — the safe order should
+// be the short thing to write.
+//
+// stderr is merged into the stdout pipe on purpose: two pipes are two things to drain, and
+// draining two from one thread without a poll is the same deadlock with extra steps.
+//
+// ─── What is still not here ───────────────────────────────────────────────────
 //
 // No environment control, no working directory, no process groups. Each is a real thing
 // to want and none of them is needed to lift the ceiling this module exists to lift.
@@ -136,11 +149,50 @@ import "time"
 @cfg(posix) extern "sys/wait.h" fn waitpid(pid: i64, status: cptr, options: i32) -> i64
 @cfg(posix) extern "signal.h" fn kill(pid: i64, sig: i32) -> i32
 
+// The piped path (see `start_piped`). `fork`+`exec` rather than `posix_spawn`, because
+// redirecting a child's descriptors through `posix_spawn` needs a
+// `posix_spawn_file_actions_t` — an OPAQUE struct whose size differs between libcs (80
+// bytes on glibc, a bare pointer on macOS). Allocating a guessed number of bytes for it
+// would be exactly the layout claim `std/sysdir`'s header refuses to make. `fork`/`dup2`/
+// `execv` need no layout at all, and everything the child does between the two is
+// async-signal-safe, which is the rule that makes `fork` without `exec` dangerous and
+// `fork` immediately followed by `exec` fine.
+@cfg(posix) extern "unistd.h" fn pipe(fds: cptr) -> i32
+@cfg(posix) extern "unistd.h" fn fork() -> i64
+@cfg(posix) extern "unistd.h" fn dup2(oldfd: i64, newfd: i64) -> i32
+@cfg(posix) extern "unistd.h" fn execv(path: cptr, argv: cptr) -> i32
+
+// **Three declared aliases, for three different reasons — this module is the first real
+// consumer of that feature.**
+//
+//   * `read` is a Jestyr KEYWORD (the `read x: T` parameter mode), so `extern fn read`
+//     does not parse at all. This is the case the alias was built for; `std/syswatch`
+//     works around it by binding `readv` and driving it with a one-element iovec.
+//   * `_exit` starts with an underscore, which is a fine C symbol and an awkward Jestyr
+//     name.
+//   * `close` is neither — but `std/sysnet` and `std/syswatch` already bind it, and typeck
+//     keys its function table on the BARE name. Aliasing gives this module its own name
+//     for the same symbol instead of a fourth declaration that has to agree with three
+//     others forever.
+@cfg(posix) extern "unistd.h" fn sys_read = "read"(fd: i64, buf: cptr, n: usize) -> i64
+@cfg(posix) extern "unistd.h" fn sys_write = "write"(fd: i64, buf: cptr, n: usize) -> i64
+@cfg(posix) extern "unistd.h" fn sys_close = "close"(fd: i64) -> i32
+@cfg(posix) extern "unistd.h" fn sys_exit = "_exit"(code: i32)
+
 @cfg(windows) extern "windows.h" fn CreateProcessA(app: cptr, cmd: cptr, pa: cptr, ta: cptr, inherit: i32, flags: i32, env: cptr, cwd: cptr, si: cptr, pi: cptr) -> i32
 @cfg(windows) extern "windows.h" fn WaitForSingleObject(h: cptr, ms: u32) -> i32
 @cfg(windows) extern "windows.h" fn GetExitCodeProcess(h: cptr, code: cptr) -> i32
 @cfg(windows) extern "windows.h" fn TerminateProcess(h: cptr, code: u32) -> i32
 @cfg(windows) extern "windows.h" fn CloseHandle(h: cptr) -> i32
+
+// The piped path. `CreatePipe` hands back an inheritable pair; `SetHandleInformation`
+// then makes the PARENT's end non-inheritable, which is the step everyone forgets — a
+// child that inherits the read end of its own stdout pipe keeps that pipe open, so the
+// parent's read never sees EOF and a drain loop hangs forever.
+@cfg(windows) extern "windows.h" fn CreatePipe(rd: cptr, wr: cptr, sa: cptr, size: u32) -> i32
+@cfg(windows) extern "windows.h" fn SetHandleInformation(h: cptr, mask: u32, flags: u32) -> i32
+@cfg(windows) extern "windows.h" fn ReadFile(h: cptr, buf: cptr, n: u32, got: cptr, ov: cptr) -> i32
+@cfg(windows) extern "windows.h" fn WriteFile(h: cptr, buf: cptr, n: u32, put: cptr, ov: cptr) -> i32
 
 // ---- the numbers -------------------------------------------------------------------
 //
@@ -178,6 +230,38 @@ const SPROC_STATUS_CODEMASK: i32 = 255
 // so this is a floor and not a promise — `wait_timeout` reports the elapsed time it
 // really observed rather than the one it asked for.
 const SPROC_POLL_NANOS: i64 = 1000000
+
+// ---- pipes ---------------------------------------------------------------------------
+//
+// "No pipe" is **-1 on both platforms**, and that is a coincidence worth stating rather
+// than relying on quietly: a POSIX descriptor is a small non-negative int (0 is a perfectly
+// good fd — stdin), and a Windows `HANDLE` is never `INVALID_HANDLE_VALUE`, which is -1.
+// So -1 is unusable as a real value on either, and one sentinel serves both. Pinned by
+// `the_windows_pipe_constants_match_the_real_headers` along with everything below it.
+const SPROC_NO_PIPE: i64 = 0 - 1
+
+// SECURITY_ATTRIBUTES on x86-64: 24 bytes, `{ DWORD nLength; void* lpSD; BOOL bInherit; }`.
+// `bInheritHandle` must be TRUE for `CreatePipe` to hand back handles a child can inherit.
+const SPROC_SA_LEN: usize = 24
+const SPROC_SA_INHERIT_WORD: usize = 4      // byte 16, read as a 32-bit word
+
+// STARTUPINFOA fields the piped path fills in — measured, like the rest of that struct.
+const SPROC_SI_FLAGS_WORD: usize = 15       // byte 60
+const SPROC_SI_STDIN_SLOT: usize = 10       // byte 80,  read as a 64-bit slot
+const SPROC_SI_STDOUT_SLOT: usize = 11      // byte 88
+const SPROC_SI_STDERR_SLOT: usize = 12      // byte 96
+const SPROC_STARTF_USESTDHANDLES: u32 = 256
+const SPROC_HANDLE_FLAG_INHERIT: u32 = 1
+
+// What a Windows read reports when the child has closed its end. It is an ERROR return
+// with this code, not a zero-length read, so EOF has to be recognised rather than fallen
+// into — and a caller that treated it as a failure would turn every successful capture
+// into an error at the last step.
+const SPROC_ERROR_BROKEN_PIPE: i32 = 109
+
+// How much `capture` reads at a time. A pipe's own buffer is 4–64KB depending on platform,
+// so this is a chunk size and not a limit — `capture` loops.
+const SPROC_PIPE_CHUNK: usize = 4096
 
 // ---- what a child is doing ---------------------------------------------------------
 
@@ -255,12 +339,16 @@ pub fn denied() -> Spawner {
     done: bool,
     state: i32,
     code: i32,
+    // The parent's ends of the child's stdin and stdout, or `SPROC_NO_PIPE`. `start`
+    // leaves both absent; `start_piped` fills both in. Closed by `release`.
+    inp: i64,
+    outp: i64,
 }
 
 // A `Child` that names nothing. What `denied()` produces, and what a caller can compare
 // against without a separate optional.
 @no_alloc @no_os pub fn no_child() -> Child {
-    return Child{ h: 0, th: 0, pid: 0, live: false, done: true, state: SPROC_EXITED, code: 0 }
+    return Child{ h: 0, th: 0, pid: 0, live: false, done: true, state: SPROC_EXITED, code: 0, inp: SPROC_NO_PIPE, outp: SPROC_NO_PIPE }
 }
 
 // Is this child's handle still ours? False before it started and after `release`.
@@ -396,7 +484,7 @@ fn zero_bytes(p: *mut u8, n: usize) {
     if rc != 0 { return err(SysProcFailed(rc)) }
 
     s.started = s.started + 1
-    return ok(Child{ h: 0, th: 0, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0 })
+    return ok(Child{ h: 0, th: 0, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: SPROC_NO_PIPE, outp: SPROC_NO_PIPE })
 }
 
 @cfg(windows) pub fn start(mut s: Spawner, read cmd: str) -> Child !{ SysProcFailed(i32), SysProcRefused } {
@@ -441,7 +529,395 @@ fn zero_bytes(p: *mut u8, n: usize) {
     if rc == 0 { return err(SysProcFailed(code)) }
 
     s.started = s.started + 1
-    return ok(Child{ h: h, th: th, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0 })
+    return ok(Child{ h: h, th: th, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: SPROC_NO_PIPE, outp: SPROC_NO_PIPE })
+}
+
+// ---- pipes: talking to the child, not just starting it -------------------------------
+//
+// **READ THE OUTPUT BEFORE YOU WAIT. This is the one way to deadlock with this module.**
+//
+// A pipe has a finite buffer — 4KB on Linux by default, 64KB typical on Windows. A child
+// that produces more than that blocks inside `write` until somebody drains the other end.
+// A parent sitting in `wait` will never drain it. Neither side is buggy; together they are
+// stuck forever, and the program looks hung rather than wrong.
+//
+// So the order is: `close_input` (so the child sees EOF and can finish), then `capture` or
+// a `read_output` loop until it reports EOF, and only THEN `wait`. `capture` does the first
+// two, which is why it exists — the safe sequence should be the short one to write.
+//
+// Deadlocking on the WRITE side is the same hazard mirrored: `write_input` blocks once the
+// child's stdin buffer fills and the child is not reading. A protocol that sends more than
+// a buffer's worth before reading a reply needs two threads or a poll, and this module
+// deliberately provides neither — see the header.
+
+// Is this child holding a pipe the parent can still use?
+@no_alloc @no_os pub fn has_input(read c: Child) -> bool { return c.inp != SPROC_NO_PIPE }
+@no_alloc @no_os pub fn has_output(read c: Child) -> bool { return c.outp != SPROC_NO_PIPE }
+
+@cfg(windows) fn make_pipe(rd: *mut i64, wr: *mut i64, parent_end_is_read: bool) -> bool {
+    // `bInheritHandle` TRUE, so the pair CAN be inherited; then the parent's own end is
+    // made non-inheritable below. Both steps matter: without the first the child gets
+    // nothing, and without the second the child inherits the parent's end too, keeps it
+    // open, and the parent's drain loop never sees EOF.
+    var sa: *mut u8 = alloc(u8, SPROC_SA_LEN)
+    zero_bytes(sa, SPROC_SA_LEN)
+    let sw: *mut u32 = sa as *mut u32
+    unsafe { (sw + 0).* = SPROC_SA_LEN as u32 }
+    unsafe { (sw + SPROC_SA_INHERIT_WORD).* = 1 as u32 }
+
+    var pr: *mut i64 = alloc(i64, 1)
+    var pw: *mut i64 = alloc(i64, 1)
+    unsafe { (pr + 0).* = 0 }
+    unsafe { (pw + 0).* = 0 }
+    let rc: i32 = CreatePipe(pr as cptr, pw as cptr, sa as cptr, 0)
+    var r: i64 = 0
+    var w: i64 = 0
+    unsafe { r = (pr + 0).* }
+    unsafe { w = (pw + 0).* }
+    free_ptr(pw)
+    free_ptr(pr)
+    free_ptr(sa)
+    if rc == 0 { return false }
+
+    if parent_end_is_read {
+        SetHandleInformation(r as cptr, SPROC_HANDLE_FLAG_INHERIT, 0)
+    } else {
+        SetHandleInformation(w as cptr, SPROC_HANDLE_FLAG_INHERIT, 0)
+    }
+    unsafe { (rd + 0).* = r }
+    unsafe { (wr + 0).* = w }
+    return true
+}
+
+// Start `cmd` with its stdin and stdout connected to this process.
+//
+// The same command semantics as `start` — the platform shell — and the same capability
+// gate. What is different is that the parent can now talk to the child and read its
+// answer, which is what a long-lived plugin server needs and what `system()` made
+// impossible.
+//
+// **stderr goes to the same pipe as stdout**, deliberately: a second pipe is a second
+// thing to drain, and draining two of them from one thread without a poll is the deadlock
+// above with extra steps. A caller who needs them apart can redirect in the command.
+@cfg(windows) pub fn start_piped(mut s: Spawner, read cmd: str) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+    if s.allowed == false {
+        s.refused = s.refused + 1
+        return err(SysProcRefused)
+    }
+
+    // Four one-element slots rather than two pairs: `oh + 1` is raw-pointer arithmetic,
+    // and the unsafe ladder refuses it outside an `unsafe` block. Widening the block to
+    // cover a call would have made `unsafe` mean "and also this function", which is the
+    // opposite of what the extent is for.
+    var oh_r: *mut i64 = alloc(i64, 1)
+    var oh_w: *mut i64 = alloc(i64, 1)
+    var ih_r: *mut i64 = alloc(i64, 1)
+    var ih_w: *mut i64 = alloc(i64, 1)
+    unsafe { (oh_r + 0).* = 0 }
+    unsafe { (oh_w + 0).* = 0 }
+    unsafe { (ih_r + 0).* = 0 }
+    unsafe { (ih_w + 0).* = 0 }
+
+    var ok_out: bool = make_pipe(oh_r, oh_w, true)
+    var ok_in: bool = false
+    if ok_out { ok_in = make_pipe(ih_r, ih_w, false) }
+
+    var out_rd: i64 = 0
+    var out_wr: i64 = 0
+    var in_rd: i64 = 0
+    var in_wr: i64 = 0
+    unsafe { out_rd = (oh_r + 0).* }
+    unsafe { out_wr = (oh_w + 0).* }
+    unsafe { in_rd = (ih_r + 0).* }
+    unsafe { in_wr = (ih_w + 0).* }
+    free_ptr(ih_w)
+    free_ptr(ih_r)
+    free_ptr(oh_w)
+    free_ptr(oh_r)
+
+    if ok_out == false or ok_in == false {
+        let code: i32 = syserr.last_raw()
+        // A half-made pair still has to be given back.
+        if ok_out {
+            CloseHandle(out_rd as cptr)
+            CloseHandle(out_wr as cptr)
+        }
+        return err(SysProcFailed(code))
+    }
+
+    var line: *mut u8 = nul_join("cmd.exe /c ", cmd)
+    var si: *mut u8 = alloc(u8, SPROC_STARTUPINFO_LEN)
+    var pi: *mut u8 = alloc(u8, SPROC_PROCESS_INFO_LEN)
+    zero_bytes(si, SPROC_STARTUPINFO_LEN)
+    zero_bytes(pi, SPROC_PROCESS_INFO_LEN)
+    let sw: *mut u32 = si as *mut u32
+    unsafe { (sw + 0).* = SPROC_STARTUPINFO_LEN as u32 }
+    // Without STARTF_USESTDHANDLES the three handle fields are ignored entirely and the
+    // child quietly inherits the parent's console instead — which looks like it worked.
+    unsafe { (sw + SPROC_SI_FLAGS_WORD).* = SPROC_STARTF_USESTDHANDLES }
+    let ss: *mut i64 = si as *mut i64
+    unsafe { (ss + SPROC_SI_STDIN_SLOT).* = in_rd }
+    unsafe { (ss + SPROC_SI_STDOUT_SLOT).* = out_wr }
+    unsafe { (ss + SPROC_SI_STDERR_SLOT).* = out_wr }
+
+    // `bInheritHandles` TRUE — the whole point, and the flag `start` passes as 0.
+    let rc: i32 = CreateProcessA(null, line as cptr, null, null, 1, 0, null, null, si as cptr, pi as cptr)
+    var code: i32 = 0
+    if rc == 0 { code = syserr.last_raw() }
+
+    var h: i64 = 0
+    var th: i64 = 0
+    var pid: i64 = 0
+    if rc != 0 {
+        let ps: *mut i64 = pi as *mut i64
+        unsafe { h = (ps + SPROC_PI_HPROCESS_SLOT).* }
+        unsafe { th = (ps + SPROC_PI_HTHREAD_SLOT).* }
+        let pw: *mut u32 = pi as *mut u32
+        var raw: u32 = 0
+        unsafe { raw = (pw + SPROC_PI_PID_WORD).* }
+        pid = raw as i64
+    }
+
+    free_ptr(pi)
+    free_ptr(si)
+    free_ptr(line)
+
+    // **The parent closes the CHILD's ends immediately**, whether or not the spawn worked.
+    // Holding the write end of the child's stdout would keep that pipe open from this
+    // side, so the parent's own read would never see EOF — the classic hang.
+    CloseHandle(out_wr as cptr)
+    CloseHandle(in_rd as cptr)
+
+    if rc == 0 {
+        CloseHandle(out_rd as cptr)
+        CloseHandle(in_wr as cptr)
+        return err(SysProcFailed(code))
+    }
+
+    s.started = s.started + 1
+    return ok(Child{ h: h, th: th, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: in_wr, outp: out_rd })
+}
+
+@cfg(posix) pub fn start_piped(mut s: Spawner, read cmd: str) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+    if s.allowed == false {
+        s.refused = s.refused + 1
+        return err(SysProcRefused)
+    }
+
+    // Two pipes, each `{ read fd, write fd }`.
+    var op: *mut i32 = alloc(i32, 2)
+    var ip: *mut i32 = alloc(i32, 2)
+    if pipe(op as cptr) != 0 {
+        let c1: i32 = syserr.last_raw()
+        free_ptr(ip)
+        free_ptr(op)
+        return err(SysProcFailed(c1))
+    }
+    if pipe(ip as cptr) != 0 {
+        let c2: i32 = syserr.last_raw()
+        var o0: i32 = 0
+        var o1: i32 = 0
+        unsafe { o0 = (op + 0).* }
+        unsafe { o1 = (op + 1).* }
+        sys_close(o0 as i64)
+        sys_close(o1 as i64)
+        free_ptr(ip)
+        free_ptr(op)
+        return err(SysProcFailed(c2))
+    }
+    var out_rd: i64 = 0
+    var out_wr: i64 = 0
+    var in_rd: i64 = 0
+    var in_wr: i64 = 0
+    var t: i32 = 0
+    unsafe { t = (op + 0).* }  out_rd = t as i64
+    unsafe { t = (op + 1).* }  out_wr = t as i64
+    unsafe { t = (ip + 0).* }  in_rd = t as i64
+    unsafe { t = (ip + 1).* }  in_wr = t as i64
+    free_ptr(ip)
+    free_ptr(op)
+
+    // argv is built BEFORE the fork: allocating in the child between fork and exec is
+    // exactly the async-signal-unsafe thing that makes `fork` dangerous.
+    var shp: *mut u8 = nul_copy("/bin/sh")
+    var a0: *mut u8 = nul_copy("sh")
+    var a1: *mut u8 = nul_copy("-c")
+    var a2: *mut u8 = nul_copy(cmd)
+    var argv: *mut i64 = alloc(i64, 4)
+    unsafe { (argv + 0).* = a0 as i64 }
+    unsafe { (argv + 1).* = a1 as i64 }
+    unsafe { (argv + 2).* = a2 as i64 }
+    unsafe { (argv + 3).* = 0 }
+
+    let pid: i64 = fork()
+    if pid == 0 {
+        // **The child.** Everything from here to `execv` is async-signal-safe: `dup2`,
+        // `close`, `execv`, `_exit`. No allocation, no library state.
+        sys_close(out_rd)
+        sys_close(in_wr)
+        dup2(in_rd, 0)
+        dup2(out_wr, 1)
+        dup2(out_wr, 2)
+        sys_close(in_rd)
+        sys_close(out_wr)
+        execv(shp as cptr, argv as cptr)
+        // Only reachable if exec FAILED. 127 is the shell's own "command not found",
+        // which is the closest thing to a convention here.
+        sys_exit(127)
+    }
+
+    free_ptr(argv)
+    free_ptr(a2)
+    free_ptr(a1)
+    free_ptr(a0)
+    free_ptr(shp)
+
+    // The parent closes the child's ends — same reason as the Windows branch.
+    sys_close(in_rd)
+    sys_close(out_wr)
+
+    if pid < 0 {
+        let c3: i32 = syserr.last_raw()
+        sys_close(out_rd)
+        sys_close(in_wr)
+        return err(SysProcFailed(c3))
+    }
+
+    s.started = s.started + 1
+    return ok(Child{ h: 0, th: 0, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: in_wr, outp: out_rd })
+}
+
+// ---- reading and writing --------------------------------------------------------------
+
+@cfg(windows) fn pipe_read(h: i64, buf: *mut u8, n: usize) -> i64 {
+    var got: *mut u32 = alloc(u32, 1)
+    unsafe { (got + 0).* = 0 }
+    let rc: i32 = ReadFile(h as cptr, buf as cptr, n as u32, got as cptr, null)
+    var k: u32 = 0
+    unsafe { k = (got + 0).* }
+    free_ptr(got)
+    if rc != 0 { return k as i64 }
+    // **EOF is an ERROR return on Windows, not a zero-length read.** A caller that treated
+    // ERROR_BROKEN_PIPE as a failure would turn every successful capture into an error at
+    // the very last step.
+    if syserr.last_raw() == SPROC_ERROR_BROKEN_PIPE { return 0 }
+    return 0 - 1
+}
+
+@cfg(posix) fn pipe_read(h: i64, buf: *mut u8, n: usize) -> i64 {
+    return sys_read(h, buf as cptr, n)
+}
+
+@cfg(windows) fn pipe_write(h: i64, buf: *mut u8, n: usize) -> i64 {
+    var put: *mut u32 = alloc(u32, 1)
+    unsafe { (put + 0).* = 0 }
+    let rc: i32 = WriteFile(h as cptr, buf as cptr, n as u32, put as cptr, null)
+    var k: u32 = 0
+    unsafe { k = (put + 0).* }
+    free_ptr(put)
+    if rc == 0 { return 0 - 1 }
+    return k as i64
+}
+
+@cfg(posix) fn pipe_write(h: i64, buf: *mut u8, n: usize) -> i64 {
+    return sys_write(h, buf as cptr, n)
+}
+
+@cfg(windows) fn pipe_close(h: i64) { CloseHandle(h as cptr) }
+
+@cfg(posix) fn pipe_close(h: i64) { sys_close(h) }
+
+// Read up to `buf.len` bytes of the child's output.
+//
+// **Zero means EOF** — the child closed its end — and it is not an error. `-1` is a real
+// failure. That distinction is the reason this returns a count rather than a bool, and it
+// is the same shape `sysnet.recv_bytes` uses for a peer that closed cleanly.
+pub fn read_output(mut c: Child, mut buf: []u8) -> i64 {
+    if c.outp == SPROC_NO_PIPE { return 0 - 1 }
+    if buf.len == 0 { return 0 }
+    var scratch: *mut u8 = alloc(u8, buf.len)
+    let got: i64 = pipe_read(c.outp, scratch, buf.len)
+    if got > 0 {
+        var i: usize = 0
+        for i < got as usize {
+            var b: u8 = 0
+            unsafe { b = (scratch + i).* }
+            buf[i] = b
+            i = i + 1
+        }
+    }
+    free_ptr(scratch)
+    return got
+}
+
+// Write `data` to the child's input. Returns bytes written, or -1.
+//
+// A SHORT write is possible and is not an error: the pipe's buffer filled. `write_all`
+// is the loop, and it is separate for the same reason `sysnet` separates them — a caller
+// that must not block indefinitely wants to see the short write.
+pub fn write_input(mut c: Child, read data: []u8) -> i64 {
+    if c.inp == SPROC_NO_PIPE { return 0 - 1 }
+    if data.len == 0 { return 0 }
+    var scratch: *mut u8 = alloc(u8, data.len)
+    var i: usize = 0
+    for i < data.len {
+        unsafe { (scratch + i).* = data[i] }
+        i = i + 1
+    }
+    let put: i64 = pipe_write(c.inp, scratch, data.len)
+    free_ptr(scratch)
+    return put
+}
+
+// Keep writing until everything is gone. Returns what was written.
+pub fn write_all(mut c: Child, read data: []u8) -> i64 {
+    var off: usize = 0
+    for off < data.len {
+        let n: i64 = write_input(c, data[off .. data.len])
+        if n <= 0 { return off as i64 }
+        off = off + n as usize
+    }
+    return off as i64
+}
+
+// Send the child EOF on its stdin.
+//
+// **Usually required, not optional.** A filter — `sort`, `cat`, `wc` — reads until EOF
+// before it produces anything, so a parent that never closes the input waits for output
+// that will never come. Idempotent.
+pub fn close_input(mut c: Child) {
+    if c.inp == SPROC_NO_PIPE { return }
+    pipe_close(c.inp)
+    c.inp = SPROC_NO_PIPE
+}
+
+// Drain the child's output to EOF, as text.
+//
+// **This is the safe sequence, packaged**: it closes the input first (so a filter can
+// finish) and then reads until EOF, which is exactly the order that avoids the deadlock
+// this section opens with. Call it BEFORE `wait`.
+//
+// Returns what was read; a child that produced nothing gives an empty `String`, which is
+// not an error.
+pub fn capture(mut c: Child) -> String {
+    var s: String = string_new()
+    close_input(c)
+    if c.outp == SPROC_NO_PIPE { return s }
+    var scratch: *mut u8 = alloc(u8, SPROC_PIPE_CHUNK)
+    var going: bool = true
+    for going {
+        let got: i64 = pipe_read(c.outp, scratch, SPROC_PIPE_CHUNK)
+        if got <= 0 {
+            going = false
+        } else {
+            let chunk: []u8 = slice(u8, scratch, got as usize)
+            string_push(s, from_utf8(chunk))
+        }
+    }
+    free_ptr(scratch)
+    pipe_close(c.outp)
+    c.outp = SPROC_NO_PIPE
+    return s
 }
 
 // ---- the two platform primitives ----------------------------------------------------
@@ -635,6 +1111,14 @@ pub fn terminate(mut c: Child) -> bool {
 // the language cannot yet say otherwise (see the header); releasing through two copies
 // closes a handle the platform may already have reissued to something else.
 pub fn release(mut c: Child) {
+    // Pipes first, and OUTSIDE the `live` guard: `capture` may already have released the
+    // process handles through an earlier path, and a descriptor left open is a leak the
+    // `live` flag does not describe. Both closers are idempotent.
+    close_input(c)
+    if c.outp != SPROC_NO_PIPE {
+        pipe_close(c.outp)
+        c.outp = SPROC_NO_PIPE
+    }
     if c.live == false { return }
     close_child(c)
     c.live = false

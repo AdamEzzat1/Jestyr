@@ -20,6 +20,7 @@ import "time"
 import "test"
 import "test_report"
 import "fs"
+import "str"
 
 const SPT_REPORT_CAP: usize = 1024
 
@@ -304,6 +305,206 @@ const SPT_REPORT_CAP: usize = 1024
     let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     free_ptr(craw)
+    return ok
+}
+
+// ---- pipes ---------------------------------------------------------------------------
+
+// Capturing a child's stdout. `echo hello` is spelled the same in `cmd.exe` and `sh`; the
+// LINE ENDING is not, so the check is on the trimmed text.
+@test fn a_childs_output_can_be_captured() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    var ch: sysproc.Child = sysproc.start_piped(sp, "echo hello") catch sysproc.no_child()
+    test.is_true(c, rep, "the child has both pipes", sysproc.has_output(ch))
+    var got: String = sysproc.capture(ch)
+    let st: sysproc.Status = sysproc.wait(ch)
+    sysproc.release(ch)
+
+    test.eq_str(c, rep, "captured", str.trim_end(string_view(got)), "hello")
+    test.is_true(c, rep, "and it exited", sysproc.is_exited(st))
+    test.eq_i64(c, rep, "cleanly", sysproc.code_of(st) as i64, 0)
+    string_free(got)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **THE two-way test.** Write to the child's stdin, close it, read what the child made of
+// it. `sort` is the ideal subject: it is a FILTER, so it produces nothing at all until it
+// sees EOF — which means this fails if `close_input` does not really close, and it proves
+// the round trip rather than just the read.
+@test fn a_child_can_be_written_to_and_read_back() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    var ch: sysproc.Child = sysproc.start_piped(sp, "sort") catch sysproc.no_child()
+    let payload: str = "pear\nfig\napple\n"
+    var pbuf: *mut u8 = alloc(u8, payload.len)
+    var i: usize = 0
+    for i < payload.len {
+        unsafe { (pbuf + i).* = payload[i] }
+        i = i + 1
+    }
+    let data: []u8 = slice(u8, pbuf, payload.len)
+    let put: i64 = sysproc.write_all(ch, data)
+    test.eq_i64(c, rep, "wrote the whole payload", put, payload.len as i64)
+
+    // `capture` closes the input for us — the step a filter is waiting for.
+    var sorted: String = sysproc.capture(ch)
+    sysproc.wait(ch)
+    sysproc.release(ch)
+    free_ptr(pbuf)
+
+    // Compared line-by-line so CRLF against LF is not the thing under test.
+    let v: str = string_view(sorted)
+    test.is_true(c, rep, "apple came first", starts_with(v, "apple"))
+    test.is_true(c, rep, "fig is in there", contains(v, "fig"))
+    test.is_true(c, rep, "pear is in there", contains(v, "pear"))
+    // The ORDER is the proof the child did the work: the input was pear/fig/apple.
+    test.is_true(c, rep, "and the child sorted it", str.index_of(v, "apple") < str.index_of(v, "pear"))
+    string_free(sorted)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **A payload bigger than a pipe buffer, in both directions.** ~200KB does not fit in any
+// pipe buffer (4KB Linux, ~64KB Windows), so this is the test that catches a `capture`
+// which reads ONCE and calls it EOF, or a `write_all` that stops at the first short write.
+// On a small payload both bugs are invisible — everything fits, and a truncating reader
+// still returns the whole answer.
+//
+// **What it does NOT prove** is that concurrent reading and writing is safe: `sort` is a
+// filter, so it consumes all input before producing any output, and the two directions
+// never overlap. A child that interleaves — writing replies while still being fed — can
+// still deadlock a single-threaded parent, which is exactly what the module header says
+// and why it says a protocol like that needs a poll this module does not provide.
+//
+// If this test ever HANGS rather than fails, that is a deadlock — not a flake.
+@test fn a_large_output_does_not_deadlock() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    // The child echoes back far more than a pipe can hold. `sort` on a big input is the
+    // portable way to make a lot of output from a little command: it must read everything
+    // before writing anything, so the parent has to be draining concurrently.
+    var ch: sysproc.Child = sysproc.start_piped(sp, "sort") catch sysproc.no_child()
+    let line: str = "0123456789012345678901234567890123456789012345678901234567890123\n"
+    let rounds: usize = 3200                       // ~200KB
+    var lbuf: *mut u8 = alloc(u8, line.len)
+    var i: usize = 0
+    for i < line.len {
+        unsafe { (lbuf + i).* = line[i] }
+        i = i + 1
+    }
+    let one: []u8 = slice(u8, lbuf, line.len)
+    var sent: i64 = 0
+    var k: usize = 0
+    for k < rounds {
+        sent = sent + sysproc.write_all(ch, one)
+        k = k + 1
+    }
+    test.eq_i64(c, rep, "sent the whole payload", sent, (line.len * rounds) as i64)
+
+    var back: String = sysproc.capture(ch)
+    sysproc.wait(ch)
+    sysproc.release(ch)
+    free_ptr(lbuf)
+
+    // Every line comes back; the exact byte count differs by line ending, so the check is
+    // that nothing was LOST.
+    test.is_true(c, rep, "got it all back", string_view(back).len >= sent)
+    string_free(back)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A child started WITHOUT pipes has none, and the I/O calls say so rather than pretending.
+@test fn an_unpiped_child_reports_no_pipes() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    var ch: sysproc.Child = sysproc.start(sp, "exit 0") catch sysproc.no_child()
+    test.is_false(c, rep, "no input pipe", sysproc.has_input(ch))
+    test.is_false(c, rep, "no output pipe", sysproc.has_output(ch))
+
+    var buf: *mut u8 = alloc(u8, 16)
+    var b: []u8 = slice(u8, buf, 16)
+    test.eq_i64(c, rep, "read_output refuses", sysproc.read_output(ch, b), 0 - 1)
+    test.eq_i64(c, rep, "write_input refuses", sysproc.write_input(ch, b), 0 - 1)
+    free_ptr(buf)
+
+    // And `capture` on a pipe-less child is an empty String, not a failure — a caller
+    // composing over both kinds should not have to branch.
+    var empty: String = sysproc.capture(ch)
+    test.eq_usize(c, rep, "capture is empty", string_view(empty).len, 0)
+    string_free(empty)
+
+    sysproc.wait(ch)
+    sysproc.release(ch)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// `close_input` and `release` are both idempotent, and `release` gives the descriptors
+// back even when `capture` already closed them.
+@test fn pipe_teardown_is_idempotent() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    var ch: sysproc.Child = sysproc.start_piped(sp, "echo x") catch sysproc.no_child()
+    sysproc.close_input(ch)
+    sysproc.close_input(ch)
+    test.is_false(c, rep, "input closed", sysproc.has_input(ch))
+
+    var got: String = sysproc.capture(ch)
+    test.is_false(c, rep, "capture closed the output too", sysproc.has_output(ch))
+    string_free(got)
+
+    sysproc.wait(ch)
+    sysproc.release(ch)
+    sysproc.release(ch)
+    test.is_false(c, rep, "released", sysproc.is_live(ch))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A denied `Spawner` refuses the piped path exactly as it refuses the plain one — the
+// capability is not something a second entry point can walk around.
+@test fn denied_refuses_the_piped_path_too() -> bool {
+    var raw: *mut u8 = alloc(u8, SPT_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SPT_REPORT_CAP)
+    var c: test.Check = test.new()
+    var d: sysproc.Spawner = sysproc.denied()
+
+    var ch: sysproc.Child = sysproc.start_piped(d, "echo x") catch sysproc.no_child()
+    test.is_false(c, rep, "no live child", sysproc.is_live(ch))
+    test.is_false(c, rep, "and no pipes", sysproc.has_output(ch))
+    test.eq_i64(c, rep, "started", sysproc.started(d), 0)
+    test.eq_i64(c, rep, "counted the attempt", sysproc.refused(d), 1)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
     return ok
 }
 

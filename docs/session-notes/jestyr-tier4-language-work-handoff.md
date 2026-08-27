@@ -1,6 +1,6 @@
 # Tier 4's language queue — all four items
 
-Cold-start note. **§0 is what to do next.** Then the five increments (§1–§4b), what is
+Cold-start note. **§0 is what to do next.** Then the six increments (§1–§4c), what is
 left (§5), and the traps this arc bought (§6).
 
 ```bash
@@ -32,9 +32,9 @@ separate compiler follow-ups:
 | §4.3 | move-only resources (brief §2.1) | **DONE** — `@move`, all eight handle types |
 | §4.5 | the `@cfg` specificity rule | **DONE** — `linux`/`macos` exist |
 | §4.5 | the extern declared-alias | **DONE** — `fn sys_read = "read"(…)` |
+| §5.2 | pipes for `std/sysproc` | **DONE** — two-way, `start_piped`/`capture` (§4c) |
 
-**All four are done.** What is left is in §5, and the largest item there is pipes for
-`std/sysproc` (§5.2) — now unblocked, because binding `read(2)` was its prerequisite.
+**All four are done, plus the item they unblocked**: pipes for `std/sysproc` (§4c).
 
 ---
 
@@ -251,6 +251,47 @@ starter `spawn`. Scoped keywords are a separate question and nothing needs them 
 
 ---
 
+## §4c. Pipes — the child can be talked to, not just started
+
+`start_piped` connects the child's stdin and stdout to the parent, which is the shape a
+long-lived plugin server needs and the one `system()` made impossible. `capture` is the
+safe sequence packaged: close the input, then drain to EOF.
+
+**The deadlock is the design constraint, not a footnote.** A pipe's buffer is finite (4KB
+Linux, ~64KB Windows). A child that outgrows it blocks in `write` until somebody drains the
+other end; a parent sitting in `wait` never will. Neither side is wrong and the program
+simply stops. Hence: `close_input` → drain → `wait`, and `capture` doing the first two so
+the safe order is the short thing to write. stderr is merged into the stdout pipe on
+purpose — two pipes are two things to drain, and draining two from one thread without a
+poll is the same deadlock with extra steps.
+
+`a_large_output_does_not_deadlock` pushes ~200KB through, which is what catches a `capture`
+that reads once and calls it EOF. It explicitly does NOT prove concurrent read/write is
+safe: `sort` consumes all input before producing any output, so the directions never
+overlap. A protocol that interleaves still needs a poll this module does not provide, and
+the test says so rather than implying coverage it does not have.
+
+### `fork`+`exec`, not `posix_spawn`
+
+Redirecting descriptors through `posix_spawn` needs a `posix_spawn_file_actions_t` — an
+OPAQUE struct whose size differs between libcs (80 bytes on glibc, a pointer on macOS).
+Allocating a guessed number of bytes for it is exactly the layout claim `std/sysdir`'s
+header refuses to make. `fork`/`dup2`/`execv` need no layout at all, and everything the
+child does between the two is async-signal-safe.
+
+### The alias earned its keep immediately
+
+`std/sysproc` is its first real consumer, three times for three different reasons:
+`read` is a KEYWORD, `_exit` is an awkward Jestyr name, and `close` is already bound by
+`std/sysnet` and `std/syswatch` — so aliasing gives this module its own name for the same
+symbol instead of a fourth declaration that must agree with three others forever.
+
+That in turn forced a fix to `one_c_symbol_has_one_signature_across_the_whole_std_corpus`:
+it keyed on the Jestyr NAME, which an alias decouples from the symbol. It now keys on the
+SYMBOL, and was verified by making `sys_close = "close"` disagree with `sysnet`'s `close`.
+
+---
+
 ## §5. WHAT IS LEFT
 
 ### §5.1 — ADOPTING the alias. The feature landed; nothing uses it yet
@@ -265,12 +306,11 @@ binding here would ship a change nothing in reach can observe. Do it when you ca
 Linux ladder, not before — the mechanical part is trivial and the verification is the
 whole cost.
 
-### §5.2 — Pipes for `std/sysproc`, and the plugin server they unblock
+### §5.2 — ~~Pipes for `std/sysproc`~~ **DONE** — see §4c
 
-**The biggest remaining item, and it is now unblocked.** The module deliberately stops
-before capturing a child's stdout; that is what turns `std/plugin` from one-process-per-call
-into a server. It needs `CreatePipe` / `pipe(2)`, inherited handles, and `read(2)` — which
-§4's alias can finally name.
+`start_piped` / `read_output` / `write_input` / `write_all` / `close_input` / `capture`.
+What is left on top of it is `std/plugin` itself: the transport now exists, and rewriting
+that module's one-process-per-call host into a server is its own increment.
 
 ### §5.3 — A `mut` sub-slice as a call argument
 
@@ -308,10 +348,18 @@ fires.
 `var out: String` does not parse. The second cost a confusing parse-error cascade in the
 middle of a cgen change that had nothing to do with names.
 
-**A cited test must exist.** `sysnet.jtr`'s header says a relied-upon sentinel coincidence
-is "CHECKED" by `the_invalid_socket_sentinel_is_the_same_on_both` — **that test is nowhere
+**A cited test must exist.** `sysnet.jtr`'s header said a relied-upon sentinel coincidence
+was "CHECKED" by `the_invalid_socket_sentinel_is_the_same_on_both` — **that test was nowhere
 in the tree.** Found by grepping for it while writing an analogous pin. A claimed guarantee
-with no test is worse than an acknowledged gap. (Flagged as a separate task; still open.)
+with no test is worse than an acknowledged gap, because it stops anyone from looking.
+**Now written** (and verified by breaking it): it parses `NET_INVALID` out of the shipped
+source and asks the real header for the other half.
+
+**A surplus field in a struct literal is not checked.** `P{ x: 1, y: 2, z: 3 }` where `z`
+does not exist passes `jestyrc check` and is caught only by gcc — a degrades-to-gcc row,
+found because a careless bulk edit put `Child`'s new fields into a `Status` literal.
+(Missing fields are a FEATURE — §2.8 field defaults — so only the surplus half is a bug.)
+Fixed in its own increment; see the commit after this note.
 
 **Two modules must not bind one C symbol with two signatures.** Typeck keys on the BARE
 name, so the second declaration wins and the FIRST module's call sites are then checked
