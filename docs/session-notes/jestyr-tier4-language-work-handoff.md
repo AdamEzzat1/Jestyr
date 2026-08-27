@@ -1,19 +1,27 @@
 # Tier 4's language queue — all four items
 
-Cold-start note. **§0 is what to do next.** Then the six increments (§1–§4c), what is
+Cold-start note. **§0 is what to do next.** Then the seven increments (§1–§4d), what is
 left (§5), and the traps this arc bought (§6).
 
 ```bash
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1312 passed / 0 failed / 3 ignored**, and `jc_build_matrix` is **63 of 63**
+**1319 passed / 0 failed / 3 ignored**, and `jc_build_matrix` is **63 of 63**
 (`sysproc_demo` joined it). The 3 ignored are the deliberate slow numeric sweeps. Record
 the count before changing anything; if a failure appears later, assume it is yours.
 
-It was 1279 at the start of this arc — the arc's five commits are `3cd0126` (`@must_use`),
-the `std/sysproc` commit, `6233869` (`@move`), `a2a250c` (the `@cfg` specificity rule)
-and the extern-alias commit.
+It was **1279** at the start of this arc. The commits, in order:
+
+| commit | what |
+|---|---|
+| `3cd0126` | `@must_use` on a non-union return |
+| `a1f300a` | `std/sysproc` — spawn + bounded wait + kill |
+| `6233869` | `@move` — the eight OS handles |
+| `a2a250c` | the `@cfg` specificity rule (`linux`/`macos`) |
+| `4058fc6` | the extern declared alias |
+| `42719c9` | pipes, and the missing `sysnet` sentinel pin |
+| (this one) | the surplus-field check (§4d) |
 
 The predecessor note is `docs/session-notes/jestyr-std-v4-tier4-complete-handoff.md`; its
 §4 is the queue this session worked, in its own leverage order.
@@ -33,6 +41,7 @@ separate compiler follow-ups:
 | §4.5 | the `@cfg` specificity rule | **DONE** — `linux`/`macos` exist |
 | §4.5 | the extern declared-alias | **DONE** — `fn sys_read = "read"(…)` |
 | §5.2 | pipes for `std/sysproc` | **DONE** — two-way, `start_piped`/`capture` (§4c) |
+| — | a surplus field in a struct literal | **DONE** — found in passing (§4d) |
 
 **All four are done, plus the item they unblocked**: pipes for `std/sysproc` (§4c).
 
@@ -292,6 +301,46 @@ SYMBOL, and was verified by making `sys_close = "close"` disagree with `sysnet`'
 
 ---
 
+## §4d. A surplus field in a struct literal — a degrades-to-gcc row, closed
+
+`P{ x: 1, y: 2, z: 3 }` where `z` does not exist **passed `jestyrc check`**. The only thing
+that ever complained was the C compiler ("has no member named `j_z`"), so whether the
+mistake was caught depended on which compiler built the emitted C.
+
+Found by accident and worth recording as such: a careless bulk edit put `Child`'s two new
+pipe fields into a `Status` literal, and the front end said the program was fine. The bug
+was mine; the hole it fell into was the language's.
+
+**A MISSING field is NOT the same question and is not an error.** Field defaults (§2.8,
+`examples/defaults.jtr`) exist precisely so a literal may omit fields, and a field with no
+declared default zero-fills. Only naming something that is not there is a mistake — there
+is no reading under which it means anything.
+
+### THREE literal forms, and the count was measured
+
+The bug appeared in a plain `P{ … }`. Probing the other forms afterwards found the same
+hole in both:
+
+| form | owner lookup | was |
+|---|---|---|
+| `P{ … }` | `type_index` → `TypeKindG::Struct` | unchecked |
+| `Box(i32){ … }` | ctor fn → its `struct { … }` body | unchecked |
+| `Self{ … }` | recovered from `self_ty` (the path cannot name it) | unchecked |
+
+Fixing only the form the bug was found in would have shipped a third of a rule. The root
+cause is one shape repeated: `struct_field_decl_ty` and `gen_struct_field_decl_ty` both
+fold **"not a struct"** and **"no such field"** into one `None`, and the literal path read
+that `None` as "no expected type" and carried on. The fix adds `struct_has_field` /
+`gen_struct_has_field`, which answer only the second question, so the two cases cannot be
+confused again.
+
+**Reference-only**, like the assignability and fallible-discard rules: no corpus file has a
+surplus field, so the P3 typeck dump is unchanged and no C moves. No port mirror, no
+reseed. The corpus sweep finds exactly one hit — `typeerr.jtr`, where it is a field READ
+that was already reported.
+
+---
+
 ## §5. WHAT IS LEFT
 
 ### §5.1 — ADOPTING the alias. The feature landed; nothing uses it yet
@@ -355,11 +404,16 @@ with no test is worse than an acknowledged gap, because it stops anyone from loo
 **Now written** (and verified by breaking it): it parses `NET_INVALID` out of the shipped
 source and asks the real header for the other half.
 
-**A surplus field in a struct literal is not checked.** `P{ x: 1, y: 2, z: 3 }` where `z`
-does not exist passes `jestyrc check` and is caught only by gcc — a degrades-to-gcc row,
-found because a careless bulk edit put `Child`'s new fields into a `Status` literal.
-(Missing fields are a FEATURE — §2.8 field defaults — so only the surplus half is a bug.)
-Fixed in its own increment; see the commit after this note.
+**When one `None` answers two questions, one of them stops being asked.** `P{ x: 1, y: 2,
+z: 3 }` where `z` does not exist passed `jestyrc check`; only gcc complained. The cause:
+`struct_field_decl_ty` returns `None` for BOTH "not a struct" and "no such field", and the
+literal path read that `None` as "no expected type" and carried on. **Both generic and
+`Self` literals had the identical hole** — three forms, and the count was found by probing
+after fixing the first, not by reasoning. Closed in §4d by splitting the predicate so the
+two cases cannot be confused again. **My own bug found it**: a careless bulk edit put
+`Child`'s new pipe fields into a `Status` literal and the front end said the program was
+fine. (Missing fields are a FEATURE — §2.8 field defaults — so only the surplus half is a
+bug, and mixing the two up would have broken `defaults.jtr`.)
 
 **Two modules must not bind one C symbol with two signatures.** Typeck keys on the BARE
 name, so the second declaration wins and the FIRST module's call sites are then checked

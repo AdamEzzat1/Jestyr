@@ -3852,6 +3852,51 @@ impl<'a> TypeChecker<'a> {
                     None
                 };
                 for fi in fields {
+                    // **A field name that does not exist.** Until now this was a
+                    // degrades-to-gcc row: the literal named a field the struct has not
+                    // got, `expected` came back `None`, the value was inferred with no
+                    // expected type, and the only thing that ever complained was the C
+                    // compiler ("has no member named …"). Found when a careless bulk edit
+                    // put one struct's new fields into another struct's literal and
+                    // `jestyrc check` said the program was fine.
+                    //
+                    // A MISSING field is not the same question and is not an error: field
+                    // defaults (§2.8, `examples/defaults.jtr`) exist precisely so a literal
+                    // may omit fields. Only naming something that is not there is a
+                    // mistake, and it is one with no reading under which it means anything.
+                    //
+                    // **Three literal forms, not one.** `named_idx` is `None` for a
+                    // `Self { … }` literal — the path cannot name the enclosing type — so
+                    // the owner is recovered from `self_ty`, which is `Named` inside a
+                    // plain struct body and `GenStruct` inside a generic one. Checking
+                    // only the form the bug was found in would have left the other two
+                    // exactly as they were, which is the half-mirrored shape this tree
+                    // keeps meeting.
+                    let fname = fi.name.name.clone();
+                    let missing: Option<String> = match named_idx {
+                        Some(i) if self.struct_has_field(i, &fname) == Some(false) => {
+                            Some(self.table.types[i].name.clone())
+                        }
+                        Some(_) => None,
+                        None if path.name == "Self" => match self_ty {
+                            Ty::Named(i) if self.struct_has_field(*i, &fname) == Some(false) => {
+                                Some(self.table.types[*i].name.clone())
+                            }
+                            Ty::GenStruct { ctor, .. }
+                                if self.gen_struct_has_field(ctor, &fname) == Some(false) =>
+                            {
+                                Some(ctor.clone())
+                            }
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    if let Some(tname) = missing {
+                        self.error(
+                            fi.name.span,
+                            format!("no field `{fname}` on struct `{tname}`"),
+                        );
+                    }
                     let expected =
                         named_idx.and_then(|i| self.struct_field_decl_ty(i, &fi.name.name));
                     let prev = self.cur_expected.take();
@@ -3904,6 +3949,15 @@ impl<'a> TypeChecker<'a> {
                 // resolve through the right template (bare when nothing collides).
                 let ckey = self.canon_cur(&ctor.name);
                 for fi in fields {
+                    // The generic half of the surplus-field rule — see the `StructLit`
+                    // arm. `Box(i32){ v: 1, nope: 2 }` had exactly the same hole.
+                    if self.gen_struct_has_field(&ckey, &fi.name.name) == Some(false) {
+                        let fname = fi.name.name.clone();
+                        self.error(
+                            fi.name.span,
+                            format!("no field `{fname}` on struct `{ckey}`"),
+                        );
+                    }
                     let expected = self.gen_struct_field_decl_ty(&ckey, &args, &fi.name.name);
                     let prev = self.cur_expected.take();
                     self.cur_expected = expected;
@@ -4321,6 +4375,33 @@ impl<'a> TypeChecker<'a> {
     fn struct_field_decl_ty(&self, i: usize, fname: &str) -> Option<Ty> {
         let TypeKindG::Struct { fields } = &self.table.types.get(i)?.kind else { return None };
         fields.iter().find(|(n, _)| n == fname).map(|(_, t)| t.clone())
+    }
+
+    /// Does struct `i` declare a field named `fname`? `None` when `i` is not a struct at
+    /// all (a `distinct`, an enum), where "missing field" is not the right complaint.
+    ///
+    /// Separate from [`Self::struct_field_decl_ty`] because that one returns `None` for
+    /// BOTH "not a struct" and "no such field", and only the second is an error. Reading
+    /// its `None` as a diagnosis is how this check was missing in the first place: the
+    /// literal path already called it, threw the `None` away as "no expected type", and
+    /// carried on.
+    fn struct_has_field(&self, i: usize, fname: &str) -> Option<bool> {
+        let TypeKindG::Struct { fields } = &self.table.types.get(i)?.kind else { return None };
+        Some(fields.iter().any(|(n, _)| n == fname))
+    }
+
+    /// Does generic struct `ctor` declare a field named `fname`? `None` when `ctor` is not
+    /// a comptime constructor returning a `struct { … }` at all.
+    ///
+    /// The generic sibling of [`Self::struct_has_field`], and it exists for the same
+    /// reason: `gen_struct_field_decl_ty` folds "not a struct ctor" and "no such field"
+    /// into one `None`, and only the second is a mistake.
+    fn gen_struct_has_field(&self, ctor: &str, fname: &str) -> Option<bool> {
+        let cf = self.find_fn_decl(ctor)?;
+        let body = self.ctor_struct_body(cf)?;
+        Some(body.members.iter().any(|m| {
+            matches!(m, StructMember::Field { name, .. } if name.name == fname)
+        }))
     }
 
     /// The declared type of field `fname` of generic struct `ctor` *under the
@@ -6231,6 +6312,104 @@ mod tests {
             .find_map(|(i, e)| matches!(e.kind, ExprKind::Call { .. }).then_some(ExprId(i as u32)))
             .expect("the `f(n)` call");
         assert_eq!(info.type_of(call), &Ty::Prim("i32"), "call through the read field types as i32");
+    }
+
+    #[test]
+    /// **A struct literal naming a field the struct has not got.**
+    ///
+    /// This was a degrades-to-gcc row: `jestyrc check` passed and the only complaint came
+    /// from the C compiler ("has no member named …"). Found when a careless bulk edit put
+    /// one struct's new fields into another struct's literal and the front end said the
+    /// program was fine.
+    /// **THREE literal forms, and the count was measured.** The bug was found in a plain
+    /// `P{ … }`; probing the other two afterwards showed a generic `Box(i32){ … }` and a
+    /// `Self{ … }` had exactly the same hole. Fixing only the form it was found in would
+    /// have left two thirds of a rule — the half-mirrored shape this tree keeps meeting.
+    #[test]
+    fn a_surplus_field_in_a_struct_literal_is_refused() {
+        let plain = analyze(
+            "struct P { x: i32, y: i32 } fn f() { let p: P = P{ x: 1, y: 2, z: 3 } }",
+        );
+        assert!(
+            plain.1.iter().any(|m| m.message.contains("no field `z` on struct `P`")),
+            "plain literal: {:?}",
+            plain.1
+        );
+
+        // A generic struct's fields live on the ctor's `struct { … }` body, reached
+        // through a different lookup entirely.
+        let generic = analyze(
+            "fn Box(comptime T: type) -> type { return struct { v: T } } \
+             fn f() { let b = Box(i32){ v: 1, nope: 2 } }",
+        );
+        assert!(
+            generic.1.iter().any(|m| m.message.contains("no field `nope`")),
+            "generic literal: {:?}",
+            generic.1
+        );
+
+        // `Self { … }` names the enclosing type, which the literal's PATH cannot say — the
+        // owner has to be recovered from the method's self type.
+        let selfish = analyze(
+            "struct P { x: i32, y: i32, fn make() -> Self { Self{ x: 1, y: 2, nope: 3 } } } \
+             fn f() { let p: P = P.make() }",
+        );
+        assert!(
+            selfish.1.iter().any(|m| m.message.contains("no field `nope`")),
+            "Self literal: {:?}",
+            selfish.1
+        );
+    }
+
+    /// **A MISSING field is not the same question, and is not an error.** Field defaults
+    /// (§2.8, `examples/defaults.jtr`) exist precisely so a literal may omit fields; a
+    /// field with no declared default zero-fills, which is the feature working. The rule
+    /// above is about naming something that is not there, which has no reading under which
+    /// it means anything.
+    #[test]
+    fn an_omitted_field_is_still_legal() {
+        let (_i, d) = analyze("struct P { x: i32, y: i32 } fn f() { let p: P = P{ x: 1 } }");
+        assert!(
+            !d.iter().any(|m| m.message.contains("no field")),
+            "omitting a field is the defaults feature, not an error: {d:?}"
+        );
+    }
+
+    /// Anti-vacuity, three ways: a correct literal, a SPREAD literal (whose omitted fields
+    /// come from the spread rather than from defaults), and an enum STRUCT-VARIANT literal
+    /// — whose path is a variant, not a struct type, and which must not be dragged through
+    /// the struct-field lookup at all.
+    #[test]
+    fn correct_literal_forms_are_untouched() {
+        let plain = analyze("struct P { x: i32, y: i32 } fn f() { let p: P = P{ x: 1, y: 2 } }");
+        assert!(!plain.1.iter().any(|m| m.message.contains("no field")), "{:?}", plain.1);
+
+        let spread = analyze(
+            "struct P { x: i32, y: i32 } \
+             fn f() { let p: P = P{ x: 1, y: 2 } let q: P = P{ x: 9, ..p } }",
+        );
+        assert!(!spread.1.iter().any(|m| m.message.contains("no field")), "{:?}", spread.1);
+
+        let variant = analyze(
+            "enum Shape { circle(r: f64), rect(w: f64, h: f64) } \
+             fn f() { let c: Shape = circle { r: 2.0 } }",
+        );
+        assert!(!variant.1.iter().any(|m| m.message.contains("no field")), "{:?}", variant.1);
+
+        // And the two forms the rule reaches by a different route must stay clean when
+        // they are CORRECT — otherwise the three assertions above could all be passing
+        // because the rule fires on everything.
+        let generic = analyze(
+            "fn Box(comptime T: type) -> type { return struct { v: T } } \
+             fn f() { let b = Box(i32){ v: 1 } }",
+        );
+        assert!(!generic.1.iter().any(|m| m.message.contains("no field")), "{:?}", generic.1);
+
+        let selfish = analyze(
+            "struct P { x: i32, y: i32, fn make() -> Self { Self{ x: 1, y: 2 } } } \
+             fn f() { let p: P = P.make() }",
+        );
+        assert!(!selfish.1.iter().any(|m| m.message.contains("no field")), "{:?}", selfish.1);
     }
 
     #[test]
