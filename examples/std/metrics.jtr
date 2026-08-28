@@ -1,0 +1,423 @@
+// std/metrics.jtr — counters, gauges and histograms a service is GIVEN.
+//
+// **No ambient registry.** There is no `metrics.inc("x")` free function, no process-wide
+// default, and no initialization that happens on first use. A service takes a `Registry`
+// the way it already takes a `Logger`, a `Clock` and an `Allocator`, which is what makes
+// it testable: a test hands over its own and reads it back, with no global to reset
+// between cases and no order dependence between tests sharing one.
+//
+// That is the same argument `std/log`'s header makes, and it is worth restating because
+// metrics are the library most often built the other way — a static registry reachable
+// from anywhere is exactly what makes an observability layer untestable.
+//
+// ─── What it refuses ────────────────────────────────────────────────────────────────
+//
+// **A counter never goes down.** `inc` with a negative delta is refused rather than
+// applied, because a counter that can decrease is not a counter and every consumer of one
+// (rate, increase, reset-detection) computes nonsense from it.
+//
+// **A counter SATURATES rather than wrapping.** An i64 that wraps reports a rate spike of
+// about 1.8e19 to whatever is watching it, which is worse than a stuck maximum: one is
+// obviously broken, the other is an outage that never happened. `saturated` is the count
+// of adds that hit the ceiling, so a stuck counter is discoverable rather than merely
+// wrong.
+//
+// **Two metrics may not share a name.** Registration returns -1 for a duplicate. It is
+// also what lets `render` sort without allocating (see below).
+//
+// ─── Determinism ────────────────────────────────────────────────────────────────────
+//
+// `render` emits in NAME order, not registration order, so the same set of metrics
+// produces the same bytes no matter how the program was assembled. That is the property
+// worth having: it is what makes a golden comparison of an observability dump meaningful,
+// and `a_registry_renders_the_same_bytes_in_any_registration_order` builds one twice from
+// two different orders and compares every byte.
+//
+// The sort is a selection scan over "smallest name greater than the last one emitted",
+// which needs no scratch array and therefore no allocator in `render` — and it is correct
+// only because names are unique, which is the second reason duplicates are refused.
+//
+// ─── What it does NOT do ────────────────────────────────────────────────────────────
+//
+// No labels/dimensions. A labelled metric is a different data structure (a per-label-set
+// child registry) and a different rendering, and pretending one name is a family would
+// mean either string-concatenating labels into the name — which breaks the sort's meaning
+// — or a map this module does not have. No rate/quantile computation: those are the
+// scrape side's job and doing them here would need a clock this module deliberately does
+// not hold. No exporter, no push, no wire format beyond the text `render` writes.
+//
+// Histogram buckets are CUMULATIVE-free: each observation lands in exactly one bucket
+// (the first whose upper bound it is `<=`), plus an implicit overflow bucket. A consumer
+// wanting Prometheus's cumulative `le` semantics sums the prefix itself; storing the
+// prefix sums here would make every observation O(buckets) instead of a single increment.
+
+import "mem"
+import "list"
+import "sink"
+
+pub const MET_COUNTER: i32 = 0
+pub const MET_GAUGE: i32 = 1
+pub const MET_HISTOGRAM: i32 = 2
+
+// The saturation ceiling. Named rather than spelled inline so the test can assert against
+// the same constant the module clamps to instead of restating the digits.
+pub const MET_MAX: i64 = 9223372036854775807
+
+// Parallel arrays rather than a `List` of a metric struct: the shapes differ per kind (a
+// histogram needs two variable-length slices, a counter needs none), and a struct big
+// enough for all three would carry dead fields on every counter. This is the same arena
+// shape `parser.jtr` uses for items, for the same reason.
+pub struct Registry {
+    nb: List(u8),      // every name's bytes, concatenated once
+    ns: List(i32),     // name start into `nb`
+    ne: List(i32),     // name end into `nb`
+    mk: List(i32),     // MET_COUNTER | MET_GAUGE | MET_HISTOGRAM
+    val: List(i64),    // counter total | gauge value | histogram observation count
+    sum: List(i64),    // histogram sum of observations; 0 for the others
+    bs: List(i32),     // histogram: bucket-bound slice start into `bnd`
+    cs: List(i32),     // histogram: bucket-count slice start into `cnt`
+    bn: List(i32),     // histogram: number of bounds (the +Inf bucket is not counted)
+    bnd: List(i64),    // bucket upper bounds, ascending, per histogram
+    cnt: List(i64),    // bucket counts: bn + 1 per histogram, the last being overflow
+    sat: i64,          // adds that hit MET_MAX
+}
+
+// An empty registry bound to allocator `a`.
+pub fn make(read a: Allocator) -> Registry {
+    return Registry{
+        nb: list.make(u8, a),
+        ns: list.make(i32, a),
+        ne: list.make(i32, a),
+        mk: list.make(i32, a),
+        val: list.make(i64, a),
+        sum: list.make(i64, a),
+        bs: list.make(i32, a),
+        cs: list.make(i32, a),
+        bn: list.make(i32, a),
+        bnd: list.make(i64, a),
+        cnt: list.make(i64, a),
+        sat: 0,
+    }
+}
+
+// Release every arena. The registry is unusable afterwards.
+pub fn free(mut r: Registry) {
+    list.free(u8, r.nb)
+    list.free(i32, r.ns)
+    list.free(i32, r.ne)
+    list.free(i32, r.mk)
+    list.free(i64, r.val)
+    list.free(i64, r.sum)
+    list.free(i32, r.bs)
+    list.free(i32, r.cs)
+    list.free(i32, r.bn)
+    list.free(i64, r.bnd)
+    list.free(i64, r.cnt)
+}
+
+// How many metrics are registered.
+pub fn registered(read r: Registry) -> usize {
+    return list.len(i32, r.mk)
+}
+
+// How many adds hit the ceiling. Nonzero means at least one counter is stuck and its
+// value is a floor rather than a total.
+pub fn saturated(read r: Registry) -> i64 {
+    return r.sat
+}
+
+// Is `id` a metric in this registry?
+pub fn live(read r: Registry, id: i32) -> bool {
+    if id < 0 { return false }
+    return (id as usize) < list.len(i32, r.mk)
+}
+
+// The kind of `id`, or -1.
+pub fn kind_of(read r: Registry, id: i32) -> i32 {
+    if !live(r, id) { return 0 - 1 }
+    return list.get(i32, r.mk, id as usize)
+}
+
+// A counter's total, a gauge's value, or a histogram's observation count. -1 for an
+// unknown id — distinguishable from a real value only because no counter goes negative
+// and `live` answers the question directly.
+pub fn current(read r: Registry, id: i32) -> i64 {
+    if !live(r, id) { return 0 - 1 }
+    return list.get(i64, r.val, id as usize)
+}
+
+// A histogram's sum of observations; 0 for other kinds.
+pub fn total(read r: Registry, id: i32) -> i64 {
+    if !live(r, id) { return 0 }
+    return list.get(i64, r.sum, id as usize)
+}
+
+// Do the `nb` bytes of metric `x` equal `name`?
+fn name_is(read r: Registry, x: i32, read name: str) -> bool {
+    let st: i32 = list.get(i32, r.ns, x as usize)
+    let en: i32 = list.get(i32, r.ne, x as usize)
+    if ((en - st) as usize) != name.len { return false }
+    var i: i32 = 0
+    for st + i < en {
+        let a: i32 = list.get(u8, r.nb, (st + i) as usize) as i32
+        let b: i32 = name[i as usize] as i32
+        if a != b { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// The id registered under `name`, or -1.
+//
+// NOT `find`: that name shadows a compiler intrinsic, so an unqualified call would emit
+// the intrinsic and a qualified one would reach here, and the two spellings would disagree
+// silently. The front end warns about it, which is how this was caught.
+pub fn by_name(read r: Registry, read name: str) -> i32 {
+    var i: i32 = 0
+    let n: i32 = list.len(i32, r.mk) as i32
+    for i < n {
+        if name_is(r, i, name) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Register a metric of kind `k`, or -1 if the name is taken.
+fn add(mut r: Registry, read name: str, k: i32) -> i32 {
+    if by_name(r, name) >= 0 { return 0 - 1 }
+    let id: i32 = list.len(i32, r.mk) as i32
+    let st: i32 = list.len(u8, r.nb) as i32
+    var i: usize = 0
+    for i < name.len {
+        list.push(u8, r.nb, name[i])
+        i = i + 1
+    }
+    let en: i32 = list.len(u8, r.nb) as i32
+    list.push(i32, r.ns, st)
+    list.push(i32, r.ne, en)
+    list.push(i32, r.mk, k)
+    list.push(i64, r.val, 0)
+    list.push(i64, r.sum, 0)
+    list.push(i32, r.bs, 0 - 1)
+    list.push(i32, r.cs, 0 - 1)
+    list.push(i32, r.bn, 0)
+    return id
+}
+
+// A monotonic counter. -1 if the name is taken.
+pub fn counter(mut r: Registry, read name: str) -> i32 {
+    return add(r, name, MET_COUNTER)
+}
+
+// A settable gauge. -1 if the name is taken.
+pub fn gauge(mut r: Registry, read name: str) -> i32 {
+    return add(r, name, MET_GAUGE)
+}
+
+// A histogram over `bounds` (ascending upper bounds, each inclusive), plus an implicit
+// overflow bucket for anything larger. -1 if the name is taken or `bounds` is not strictly
+// ascending — an unsorted bound list would silently misplace observations, since `observe`
+// takes the FIRST bucket an observation fits.
+pub fn histogram(mut r: Registry, read name: str, read bounds: []i64) -> i32 {
+    var i: usize = 1
+    for i < bounds.len {
+        if bounds[i] <= bounds[i - 1] { return 0 - 1 }
+        i = i + 1
+    }
+    let id: i32 = add(r, name, MET_HISTOGRAM)
+    if id < 0 { return 0 - 1 }
+    let bstart: i32 = list.len(i64, r.bnd) as i32
+    var j: usize = 0
+    for j < bounds.len {
+        list.push(i64, r.bnd, bounds[j])
+        j = j + 1
+    }
+    let cstart: i32 = list.len(i64, r.cnt) as i32
+    var k: usize = 0
+    for k <= bounds.len {
+        list.push(i64, r.cnt, 0)
+        k = k + 1
+    }
+    list.set(i32, r.bs, id as usize, bstart)
+    list.set(i32, r.cs, id as usize, cstart)
+    list.set(i32, r.bn, id as usize, bounds.len as i32)
+    return id
+}
+
+// Add `by` to a counter. Refuses a negative delta (a counter that goes down is a lie) and
+// saturates at `MET_MAX` rather than wrapping, recording the fact in `saturated`.
+pub fn inc(mut r: Registry, id: i32, by: i64) -> bool {
+    if !live(r, id) { return false }
+    if list.get(i32, r.mk, id as usize) != MET_COUNTER { return false }
+    if by < 0 { return false }
+    let cur: i64 = list.get(i64, r.val, id as usize)
+    if by > 0 {
+        if cur > MET_MAX - by {
+            list.set(i64, r.val, id as usize, MET_MAX)
+            r.sat = r.sat + 1
+            return true
+        }
+    }
+    list.set(i64, r.val, id as usize, cur + by)
+    return true
+}
+
+// Set a gauge. Any i64 is legal — a gauge is a reading, not a total.
+pub fn set_gauge(mut r: Registry, id: i32, v: i64) -> bool {
+    if !live(r, id) { return false }
+    if list.get(i32, r.mk, id as usize) != MET_GAUGE { return false }
+    list.set(i64, r.val, id as usize, v)
+    return true
+}
+
+// Record one observation into a histogram: the first bucket whose upper bound it is `<=`,
+// or the overflow bucket. The observation count and sum both advance, and the sum
+// saturates on the same terms a counter does.
+pub fn observe(mut r: Registry, id: i32, v: i64) -> bool {
+    if !live(r, id) { return false }
+    if list.get(i32, r.mk, id as usize) != MET_HISTOGRAM { return false }
+    let n: i32 = list.get(i32, r.bn, id as usize)
+    let bstart: i32 = list.get(i32, r.bs, id as usize)
+    let cstart: i32 = list.get(i32, r.cs, id as usize)
+    var slot: i32 = n
+    var i: i32 = 0
+    for i < n {
+        if slot == n {
+            if v <= list.get(i64, r.bnd, (bstart + i) as usize) { slot = i }
+        }
+        i = i + 1
+    }
+    let at: usize = (cstart + slot) as usize
+    list.set(i64, r.cnt, at, list.get(i64, r.cnt, at) + 1)
+    list.set(i64, r.val, id as usize, list.get(i64, r.val, id as usize) + 1)
+    let s: i64 = list.get(i64, r.sum, id as usize)
+    if v > 0 {
+        if s > MET_MAX - v {
+            list.set(i64, r.sum, id as usize, MET_MAX)
+            r.sat = r.sat + 1
+            return true
+        }
+    }
+    list.set(i64, r.sum, id as usize, s + v)
+    return true
+}
+
+// Is metric `x`'s name lexicographically before `y`'s? Byte order, so the result does not
+// depend on a locale this module does not have.
+fn name_lt(read r: Registry, x: i32, y: i32) -> bool {
+    let xs: i32 = list.get(i32, r.ns, x as usize)
+    let xe: i32 = list.get(i32, r.ne, x as usize)
+    let ys: i32 = list.get(i32, r.ns, y as usize)
+    let ye: i32 = list.get(i32, r.ne, y as usize)
+    var i: i32 = 0
+    for xs + i < xe {
+        if ys + i >= ye { return false }
+        let a: i32 = list.get(u8, r.nb, (xs + i) as usize) as i32
+        let b: i32 = list.get(u8, r.nb, (ys + i) as usize) as i32
+        if a != b { return a < b }
+        i = i + 1
+    }
+    return (xe - xs) < (ye - ys)
+}
+
+// Write metric `x`'s name.
+fn put_name(mut s: sink.Sink, mut buf: []u8, read r: Registry, x: i32) {
+    let st: i32 = list.get(i32, r.ns, x as usize)
+    let en: i32 = list.get(i32, r.ne, x as usize)
+    var i: i32 = st
+    for i < en {
+        sink.put(s, buf, list.get(u8, r.nb, i as usize))
+        i = i + 1
+    }
+}
+
+// One metric's lines.
+fn put_one(mut s: sink.Sink, mut buf: []u8, read r: Registry, x: i32) {
+    let k: i32 = list.get(i32, r.mk, x as usize)
+    if k == MET_COUNTER {
+        sink.put_str(s, buf, "counter ")
+        put_name(s, buf, r, x)
+        sink.put_str(s, buf, " ")
+        sink.put_i64(s, buf, list.get(i64, r.val, x as usize))
+        sink.put_nl(s, buf)
+        return
+    }
+    if k == MET_GAUGE {
+        sink.put_str(s, buf, "gauge ")
+        put_name(s, buf, r, x)
+        sink.put_str(s, buf, " ")
+        sink.put_i64(s, buf, list.get(i64, r.val, x as usize))
+        sink.put_nl(s, buf)
+        return
+    }
+    let n: i32 = list.get(i32, r.bn, x as usize)
+    let bstart: i32 = list.get(i32, r.bs, x as usize)
+    let cstart: i32 = list.get(i32, r.cs, x as usize)
+    var i: i32 = 0
+    for i <= n {
+        sink.put_str(s, buf, "histogram ")
+        put_name(s, buf, r, x)
+        if i < n {
+            sink.put_str(s, buf, " le ")
+            sink.put_i64(s, buf, list.get(i64, r.bnd, (bstart + i) as usize))
+        } else {
+            sink.put_str(s, buf, " le +Inf")
+        }
+        sink.put_str(s, buf, " ")
+        sink.put_i64(s, buf, list.get(i64, r.cnt, (cstart + i) as usize))
+        sink.put_nl(s, buf)
+        i = i + 1
+    }
+    sink.put_str(s, buf, "histogram ")
+    put_name(s, buf, r, x)
+    sink.put_str(s, buf, " sum ")
+    sink.put_i64(s, buf, list.get(i64, r.sum, x as usize))
+    sink.put_nl(s, buf)
+    sink.put_str(s, buf, "histogram ")
+    put_name(s, buf, r, x)
+    sink.put_str(s, buf, " count ")
+    sink.put_i64(s, buf, list.get(i64, r.val, x as usize))
+    sink.put_nl(s, buf)
+}
+
+// Write every metric, in NAME order, into the caller's sink and buffer.
+//
+// The caller must check `sink.overflowed(s)` afterwards: a truncated dump that looks like
+// a complete one is the failure mode this whole module exists to avoid.
+//
+// Selection scan rather than a sorted index array, so `render` allocates nothing and takes
+// the registry by borrow. Correct only because names are unique — which registration
+// enforces — since "smallest name strictly greater than the last emitted" would otherwise
+// skip every duplicate after the first.
+pub fn render(mut s: sink.Sink, mut buf: []u8, read r: Registry) {
+    let n: i32 = list.len(i32, r.mk) as i32
+    var done: i32 = 0
+    var have_prev: bool = false
+    var prev: i32 = 0
+    for done < n {
+        var best: i32 = 0 - 1
+        var i: i32 = 0
+        for i < n {
+            var cand: bool = true
+            if have_prev {
+                if !name_lt(r, prev, i) { cand = false }
+            }
+            if cand {
+                if best < 0 {
+                    best = i
+                } else {
+                    if name_lt(r, i, best) { best = i }
+                }
+            }
+            i = i + 1
+        }
+        if best < 0 {
+            done = n
+        } else {
+            put_one(s, buf, r, best)
+            prev = best
+            have_prev = true
+            done = done + 1
+        }
+    }
+}

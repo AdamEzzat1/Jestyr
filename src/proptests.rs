@@ -937,6 +937,74 @@ mod syswatch_debounced_trigger {
 /// back-end server disagree about where it ends, and the bytes after it (`GET /admin`) become a
 /// second request attributed to the next client on the connection. Every byte of it is
 /// well-formed, and a lenient parser answers 200.
+/// **`jmetrics` — observability that is handed in, and a dump that does not depend on
+/// how the program was assembled.**
+///
+/// `std/metrics` has no ambient registry, which is what makes this assertable at all: the
+/// demo hands two registries their own metrics and reads both back, with no global to
+/// reset between them.
+///
+/// **The headline is the equality, not the dump.** Two registries are filled with the
+/// same three metrics in OPPOSITE registration orders and rendered; every byte must
+/// match. A `render` that walked registration order prints `false` there — verified by
+/// making exactly that change, which also reorders the dump above it.
+#[cfg(all(test, feature = "c-oracle"))]
+mod metrics_registry {
+    use super::*;
+
+    #[test]
+    fn jmetrics_renders_the_same_bytes_in_any_registration_order() {
+        let exe = super::c_oracle::build_exe("examples/std/metrics_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the metrics demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace('\r', "");
+
+        let want = "-- jmetrics --\n\
+                    counter jobs_done 5\n\
+                    gauge queue_depth 12\n\
+                    histogram request_ms le 10 1\n\
+                    histogram request_ms le 100 1\n\
+                    histogram request_ms le 1000 0\n\
+                    histogram request_ms le +Inf 1\n\
+                    histogram request_ms sum 4097\n\
+                    histogram request_ms count 3\n\
+                    \n\
+                    the dump is complete\n\
+                    true\n\
+                    registration order does not reach the bytes\n\
+                    true\n\
+                    a counter at the ceiling holds\n\
+                    true\n\
+                    and the saturation is counted\n\
+                    1\n\
+                    a counter refuses a negative delta\n\
+                    true\n\
+                    a duplicate name is refused\n\
+                    true";
+        assert_eq!(out.trim_end(), want, "the metrics transcript changed:\n{out}");
+
+        // Anti-vacuity: `true` appears often enough that a containment check would pass
+        // for a demo printing it unconditionally. Every `false` is a failed claim.
+        assert!(!out.contains("false"), "every claim must have held:\n{out}");
+
+        // **The dump is name-ordered, asserted as an ORDER rather than as presence.**
+        // All three names appear whatever `render` does; `jobs_done` before
+        // `queue_depth` before `request_ms` is what distinguishes a sorted dump from a
+        // registration-ordered one, and the demo registers them both ways.
+        let j = out.find("jobs_done").expect("the counter is missing");
+        let q = out.find("queue_depth").expect("the gauge is missing");
+        let m = out.find("request_ms").expect("the histogram is missing");
+        assert!(j < q && q < m, "the dump must be name-ordered:\n{out}");
+
+        // The bucket that stays EMPTY is the one that proves placement is `<=` the first
+        // fitting bound rather than every bound it fits: 4000 lands in overflow, so
+        // `le 1000` must be 0 while `le +Inf` is 1. A cumulative implementation prints 3
+        // and 0 here, and every other line in the transcript still matches.
+        assert!(out.contains("le 1000 0"), "an observation must land in ONE bucket:\n{out}");
+        assert!(out.contains("le +Inf 1"), "4000 belongs to overflow:\n{out}");
+    }
+}
+
 /// **`jbounded` — a command runner with a deadline, end to end through the real OS.**
 ///
 /// `examples/std/sysproc_demo.jtr` is `std/sysproc`'s consumer, and it is a program that
@@ -17770,6 +17838,10 @@ fn main() -> i32 {
         // also the ONLY corpus file that uses a declared alias, which makes it the thing
         // that stops the alias from being a reference-only feature the goldens cannot see.
         "extern_alias.jtr",
+        // The MODULE that declares the type, not its demo: `metrics_demo.jtr` holds a
+        // `metrics.Registry` — another module's struct — as a scope-local, which is the
+        // shape that degrades to `?` with imports unresolved.
+        "metrics.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same

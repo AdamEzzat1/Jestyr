@@ -29,21 +29,30 @@ Tier 5's definition of done opens with *"a service can start, report health, run
 background work, **shut down gracefully**, and be tested deterministically"*. §2 removed
 the reason the last clause was impossible. The next items, in leverage order:
 
-1. **Signals** — nothing in the tree installs a handler. `sigaction`/`signal(2)` are bound
-   nowhere; `SIGTERM` appears only as prose in `sysproc.jtr:1098`. Without it, "graceful
-   shutdown" is programmatic only, which is not what a deployment means by it.
+1. **Signals — and they are BLOCKED on a language increment, which is the finding.** A
+   POSIX handler must be async-signal-safe, which in practice means it may only write a
+   `volatile sig_atomic_t` at file scope. **Jestyr has nowhere to put one**: `extern` binds
+   functions, not globals, and there is no mutable module-level state — swept, and all 274
+   corpus files have const-only module scope. So "graceful shutdown on SIGTERM" cannot be
+   written today.
+
+   The fix is one of two increments, and **one of them closes two recorded blockers at
+   once**: letting `extern` bind a C GLOBAL gives both the signal flag and `environ`, the
+   latter being why a POSIX child inherits only `PATH` while a Windows child inherits the
+   parent's whole environment (`sysproc.jtr:120`). Do that one.
 2. **`select` needs a default arm.** §2 gave receivers an EOF but did not fix `select`,
    which polls `channel_len_i64(ch) > 0` and therefore spins forever over closed, drained
    channels. This is the other half of a terminating worker loop.
 3. **Refusing a send on a closed channel** — deferred deliberately in §2, and the reason
    is an ownership question, not effort. See §6.1.
-4. **Observability metrics** (`Counter`/`Gauge`/`Histogram`) — pure library work; the
-   `ctx + fn-pointer` vtable shape is already in `mem.Allocator`, `runtime.Poller`,
-   `walk.Visitor`. **Do not put it behind a trait**: `@no_alloc` passes vacuously through
-   a trait method, so a `core`-tier metrics interface behind one carries a marker that
-   proves nothing.
+4. ~~**Observability metrics**~~ — **DONE**, see §3b. What is left on top of it is **trace
+   spans**, and note the name is taken three times over (`http.Header` spans, `diag` source
+   spans, and the `@span` work-span attribute), so pick another word before writing a line.
 5. **The config merge layer.** `cli.jtr:38-43` refuses it explicitly, pending a precedence
    decision that is the actual work. `diag.jtr` already supplies source-spanned rendering.
+6. **A `Metrics` consumer inside a real service.** `metrics` has a demo, not yet a
+   service that reports its own health through one. That is the increment which turns
+   §3b from a library into Tier 5's "observability can be injected and asserted".
 
 **Half of the Tier 5 brief already exists on master.** Before building anything in it,
 read the inventory summary in §5 — this repo has twice rebuilt features that were already
@@ -167,6 +176,55 @@ The seed drift guard got the same treatment: run before refreshing, confirmed `S
 
 ---
 
+## §3b. `std/metrics` — observability a service is GIVEN
+
+Counters, gauges and histograms, following `log.jtr`'s design exactly: **no ambient
+registry, no process-wide default, no initialization on first use.** A service takes a
+`Registry` the way it already takes a `Logger`, a `Clock` and an `Allocator`, which is what
+makes it assertable — a test hands over its own and reads it back, with no global to reset
+and no order dependence between tests.
+
+Three claims a naive implementation gets wrong, each verified rather than described:
+
+* **The dump is NAME-ordered**, so registration order never reaches the bytes. Two
+  registries built in opposite orders render byte-identically. **Verified by breaking it**:
+  a registration-order `render` makes the demo print `false`.
+* **A counter saturates, never wraps.** A wrapped i64 reports a rate spike of ~1.8e19 —
+  an outage that never happened, which is worse than a stuck maximum because one is
+  obviously broken and the other is not. `saturated` counts the adds that hit the ceiling,
+  so a stuck counter is discoverable.
+* **An observation lands in exactly ONE bucket** (the first whose bound it is `<=`, else
+  overflow). `le 1000` staying `0` while `le +Inf` is `1` is the single line that
+  distinguishes this from a cumulative implementation; every other line matches either way.
+
+Also: **two metrics may not share a name.** That is a real bug when it happens, and it is
+also what lets `render` sort by a selection scan over "smallest name greater than the last
+emitted" — no scratch array, so `render` allocates nothing and takes the registry by
+borrow.
+
+`metrics.jtr` is in `CGEN_GOLDEN_ALLOWLIST` and **byte-identical between both backends**,
+measured before adding rather than discovered from a red ladder. `metrics_demo.jtr` is out:
+it holds a `metrics.Registry` as a scope-local, and another module's struct degrades to `?`
+with imports unresolved. `jc` builds the demo through its own loader (`BUILD_OK
+metrics_demo`) — but BUILD_OK is not correctness, so the claims ride on the transcript test.
+
+### Two recorded traps fired while writing it
+
+* **`pub fn find` shadows a compiler intrinsic.** *"An unqualified call emits the
+  intrinsic, not this function."* Same class as `pub fn ok` breaking `std/file`. The front
+  end warns, which is why it cost seconds. Renamed `by_name`.
+* **A range expression may not be a call ARGUMENT.** §5.3 of the Tier 4 note records this
+  as a `mut` sub-slice problem; **that is too narrow** — `bounds[0 .. 3]` passed to a
+  `read []i64` parameter fails identically. The boundary is argument position, not
+  mutability. The idiom is `alloc` + `slice(T, raw, N)` bound to a named local first, which
+  `census_cli.jtr` already uses.
+
+And the containment rule from §3 immediately applied to code written after it:
+`metrics.Registry` holds eleven `List` fields, `List(T)` has a blanket `Drop` impl, so the
+registry is transitively owning and copying one then freeing both is now refused.
+
+---
+
 ## §4. Comparison suites, rerun at this milestone
 
 * `examples/cpp_compare/verify_all.sh` — **15 matched, 0 failed**, `static_rejections`
@@ -268,3 +326,19 @@ The deterministic part is what carries the claim.
 **Fix a normalization at the smallest correct scope.** ~55 sites shared the pattern; only
 one had the relay shape. The sweep that established "one" is the evidence; changing all 55
 would have been unmeasured churn.
+
+**A recorded gap may be recorded too narrowly.** The Tier 4 note describes the range
+limitation as a **`mut`** sub-slice problem. It is not: `bounds[0 .. 3]` passed to a `read
+[]i64` parameter fails identically. The boundary is a range expression in ARGUMENT
+position. Re-measure the shape of a gap before designing around the recorded version of it.
+
+**Never round-trip a `.jtr` file through PowerShell `Get-Content`/`Set-Content`.** It adds
+a BOM and mangles every non-ASCII character in the header comments, and the compiler then
+reports `unexpected character` at 1:1. Use the editor.
+
+**`jc_build_matrix` failing on a new corpus file is the harness working.** It is
+hand-maintained on purpose so someone looks at the diff: the byte-identity goldens run with
+imports UNRESOLVED and never exercise the module-resolving `build` path, which is how nine
+programs were once byte-identity-verified and unbuildable at the same time. Read the moved
+line before regenerating with `JC_BUILD_MATRIX=1` — and remember BUILD_OK is not
+correctness, since gcc accepts a non-void function falling off its end.

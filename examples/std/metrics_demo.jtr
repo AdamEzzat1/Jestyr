@@ -1,0 +1,116 @@
+// examples/std/metrics_demo.jtr — `jmetrics`: what a service's observability looks like
+// when it is handed in rather than found.
+//
+//   jestyrc run examples/std/metrics_demo.jtr
+//
+// The subject is `std/metrics`'s two claims a naive implementation gets wrong, and both
+// are printed as facts rather than described:
+//
+//   1. **The dump is name-ordered**, so two registries built in OPPOSITE registration
+//      orders render byte-identically. The program builds both and compares every byte.
+//      A render that walked registration order prints `false` here.
+//   2. **A counter saturates instead of wrapping.** Adding to `MET_MAX` leaves the
+//      ceiling and increments `saturated`; a wrapping counter would print a large
+//      negative number and report a rate spike of about 1.8e19 to whatever watches it.
+//
+// A note on the buffer idiom, because it is a recorded language gap rather than a style
+// choice: a range expression may not be a call ARGUMENT ("the C backend does not support
+// ranges yet"), so every slice here is `alloc` + `slice(T, raw, N)` bound to a named local
+// first. Passing `buf[0 .. CAP]` inline is the shape that fails.
+import "mem"
+import "metrics"
+import "sink"
+import "str"
+
+const CAP: usize = 2048
+const NBOUNDS: usize = 3
+
+// Fill `r` with the same three metrics, but registered in the order `flip` selects.
+// Identical contents, different insertion order — which is the whole point.
+fn populate(mut r: metrics.Registry, mut bounds: []i64, flip: bool) {
+    if flip {
+        let h: i32 = metrics.histogram(r, "request_ms", bounds)
+        let g: i32 = metrics.gauge(r, "queue_depth")
+        let c: i32 = metrics.counter(r, "jobs_done")
+        metrics.observe(r, h, 7)
+        metrics.observe(r, h, 90)
+        metrics.observe(r, h, 4000)
+        metrics.set_gauge(r, g, 12)
+        metrics.inc(r, c, 5)
+    } else {
+        let c: i32 = metrics.counter(r, "jobs_done")
+        let g: i32 = metrics.gauge(r, "queue_depth")
+        let h: i32 = metrics.histogram(r, "request_ms", bounds)
+        metrics.inc(r, c, 5)
+        metrics.set_gauge(r, g, 12)
+        metrics.observe(r, h, 7)
+        metrics.observe(r, h, 90)
+        metrics.observe(r, h, 4000)
+    }
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+
+    var braw: *mut i64 = alloc(i64, NBOUNDS)
+    var bounds: []i64 = slice(i64, braw, NBOUNDS)
+    bounds[0] = 10
+    bounds[1] = 100
+    bounds[2] = 1000
+
+    print_str("-- jmetrics --")
+
+    // The dump itself, so the shape is visible and not merely asserted.
+    var r1: metrics.Registry = metrics.make(a)
+    populate(r1, bounds, false)
+    var raw1: *mut u8 = alloc(u8, CAP)
+    var b1: []u8 = slice(u8, raw1, CAP)
+    var s1: sink.Sink = sink.new()
+    metrics.render(s1, b1, r1)
+    let v1: str = sink.view(s1, b1)
+    print_str(v1)
+
+    print_str("the dump is complete")
+    var ok1: bool = true
+    if sink.overflowed(s1) { ok1 = false }
+    print_bool(ok1)
+
+    // The same three metrics, registered in the opposite order.
+    var r2: metrics.Registry = metrics.make(a)
+    populate(r2, bounds, true)
+    var raw2: *mut u8 = alloc(u8, CAP)
+    var b2: []u8 = slice(u8, raw2, CAP)
+    var s2: sink.Sink = sink.new()
+    metrics.render(s2, b2, r2)
+    let v2: str = sink.view(s2, b2)
+
+    print_str("registration order does not reach the bytes")
+    print_bool(str.eq(v1, v2))
+
+    // A counter at the ceiling stays there and says so.
+    let c2: i32 = metrics.counter(r2, "at_the_ceiling")
+    metrics.inc(r2, c2, metrics.MET_MAX)
+    let before: i64 = metrics.saturated(r2)
+    metrics.inc(r2, c2, 1)
+    print_str("a counter at the ceiling holds")
+    print_bool(metrics.current(r2, c2) == metrics.MET_MAX)
+    print_str("and the saturation is counted")
+    print_int((metrics.saturated(r2) - before) as i32)
+
+    // A counter refuses to go down.
+    print_str("a counter refuses a negative delta")
+    var refused: bool = true
+    if metrics.inc(r2, c2, 0 - 1) { refused = false }
+    print_bool(refused)
+
+    // A duplicate name is refused, so `render`'s sort stays well defined.
+    print_str("a duplicate name is refused")
+    print_bool(metrics.counter(r2, "jobs_done") < 0)
+
+    metrics.free(r1)
+    metrics.free(r2)
+    free_ptr(raw1)
+    free_ptr(raw2)
+    free_ptr(braw)
+    return 0
+}
