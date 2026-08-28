@@ -55,6 +55,7 @@ BUILD_OK cgen
 BUILD_OK channel
 BUILD_OK cli_demo
 BUILD_OK combinators
+BUILD_OK config_demo
 BUILD_OK ctfe_cli
 BUILD_OK demo
 BUILD_OK deque_demo

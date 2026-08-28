@@ -1,0 +1,127 @@
+// examples/std/config_demo.jtr — `jconf`: four sources merged in a fixed order, where a
+// value remembers where it came from.
+//
+//   jestyrc run examples/std/config_demo.jtr
+//
+// **The headline is order-independence.** The same four sources are applied twice, in
+// deliberately opposite orders, and the two configurations render byte-identically. That
+// is not decoration: a merge that simply overwrites — the obvious implementation — makes
+// the answer depend on the order the program happened to read its sources in, which is a
+// bug that reproduces only on the machine where an environment variable happened to be
+// set. Precedence is a property of the SOURCE here, so `apply` can be called in any order.
+//
+// The rest of the transcript is the three things a config layer must refuse: a key nobody
+// declared (a typo in someone's file, not a setting that silently does nothing), a value
+// of the wrong shape, and a secret reaching a log.
+import "mem"
+import "config"
+import "sink"
+import "str"
+
+const CAP: usize = 1024
+
+// Declare the schema. Redaction lives HERE, with the key, once — not at the call that
+// happens to print it.
+fn schema(mut c: config.Config) {
+    config.declare(c, "listen_port", config.CFG_INT, false)
+    config.declare(c, "queue_depth", config.CFG_INT, false)
+    config.declare(c, "verbose", config.CFG_BOOL, false)
+    config.declare(c, "region", config.CFG_STR, false)
+    config.declare(c, "api_token", config.CFG_STR, true)
+}
+
+// The same four sources, applied in the order `flip` selects. Every value is identical;
+// only the sequence of `apply` calls differs.
+fn sources(mut c: config.Config, flip: bool) {
+    if flip {
+        config.apply(c, "listen_port", "9999", config.CFG_CLI)
+        config.apply(c, "api_token", "s3cr3t", config.CFG_ENV)
+        config.apply(c, "queue_depth", "64", config.CFG_ENV)
+        config.apply(c, "region", "eu-west", config.CFG_FILE)
+        config.apply(c, "queue_depth", "16", config.CFG_FILE)
+        config.apply(c, "listen_port", "8080", config.CFG_DEFAULT)
+        config.apply(c, "verbose", "false", config.CFG_DEFAULT)
+        config.apply(c, "region", "us-east", config.CFG_DEFAULT)
+        config.apply(c, "queue_depth", "8", config.CFG_DEFAULT)
+    } else {
+        config.apply(c, "listen_port", "8080", config.CFG_DEFAULT)
+        config.apply(c, "verbose", "false", config.CFG_DEFAULT)
+        config.apply(c, "region", "us-east", config.CFG_DEFAULT)
+        config.apply(c, "queue_depth", "8", config.CFG_DEFAULT)
+        config.apply(c, "region", "eu-west", config.CFG_FILE)
+        config.apply(c, "queue_depth", "16", config.CFG_FILE)
+        config.apply(c, "queue_depth", "64", config.CFG_ENV)
+        config.apply(c, "api_token", "s3cr3t", config.CFG_ENV)
+        config.apply(c, "listen_port", "9999", config.CFG_CLI)
+    }
+}
+
+fn dump(mut sk: sink.Sink, mut buf: []u8, read c: config.Config) {
+    sink.reset(sk)
+    config.render(sk, buf, c)
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var raw: *mut u8 = alloc(u8, CAP)
+    var buf: []u8 = slice(u8, raw, CAP)
+    var sk: sink.Sink = sink.new()
+
+    print_str("-- jconf --")
+
+    var c1: config.Config = config.make(a)
+    schema(c1)
+    sources(c1, false)
+    dump(sk, buf, c1)
+    let v1: str = sink.view(sk, buf)
+    print_str(v1)
+
+    // The same sources, applied backwards.
+    var c2: config.Config = config.make(a)
+    schema(c2)
+    sources(c2, true)
+    var raw2: *mut u8 = alloc(u8, CAP)
+    var buf2: []u8 = slice(u8, raw2, CAP)
+    var sk2: sink.Sink = sink.new()
+    config.render(sk2, buf2, c2)
+    let v2: str = sink.view(sk2, buf2)
+
+    print_str("source order does not reach the result")
+    print_bool(str.eq(v1, v2))
+
+    // A stronger source wins wherever they disagree, and the WEAKER one is reported as
+    // shadowed rather than silently dropped.
+    let qd: i32 = config.by_name(c1, "queue_depth")
+    print_str("the strongest source won")
+    print_int(config.get_int(c1, qd) as i32)
+    print_str("and it knows which one that was")
+    print_str(config.origin_name(config.origin_of(c1, qd)))
+    print_str("a weaker source is shadowed, not dropped silently")
+    print_str(config.outcome_name(config.apply(c1, "queue_depth", "1", config.CFG_DEFAULT)))
+    print_str("and the value did not move")
+    print_int(config.get_int(c1, qd) as i32)
+
+    // The three refusals.
+    print_str("-- what it refuses --")
+    print_str(config.outcome_name(config.apply(c1, "quque_depth", "5", config.CFG_FILE)))
+    print_str(config.outcome_name(config.apply(c1, "listen_port", "80x", config.CFG_CLI)))
+    print_str(config.outcome_name(config.apply(c1, "verbose", "yes", config.CFG_CLI)))
+    print_str("every refusal was counted")
+    print_int(config.rejections(c1) as i32)
+
+    // A refused value must not have moved the setting it was aimed at.
+    let lp: i32 = config.by_name(c1, "listen_port")
+    print_str("and a refused value changed nothing")
+    print_int(config.get_int(c1, lp) as i32)
+
+    print_str("the dump is complete")
+    var whole: bool = true
+    if sink.overflowed(sk) { whole = false }
+    print_bool(whole)
+
+    config.free(c1)
+    config.free(c2)
+    free_ptr(raw)
+    free_ptr(raw2)
+    return 0
+}

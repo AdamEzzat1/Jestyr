@@ -1,0 +1,410 @@
+// std/config.jtr — defaults, file, environment and CLI merged in a fixed order, where a
+// value remembers WHERE it came from.
+//
+// `std/cli` has a "what it deliberately does not do" note naming exactly this, and the
+// reason it gave was right: the merge needs a precedence decision that one argument parser
+// cannot make alone. This module makes it.
+//
+// ─── Precedence is a property of the SOURCE, not of when it was applied ─────────────
+//
+// This is the whole design, and it is what makes the result deterministic:
+//
+//   default  <  file  <  env  <  cli
+//
+// `apply` compares the incoming origin against the origin already recorded and keeps the
+// stronger one, so **applying the same sources in any order produces the same
+// configuration.** A merge that simply overwrites — the obvious implementation — makes the
+// answer depend on the order the program happened to read its sources in, which is a bug
+// that reproduces only on the machine where an env var happened to be set.
+// `a_config_is_the_same_whatever_order_its_sources_arrive_in` builds one twice from two
+// deliberately opposite orders and compares every byte.
+//
+// Equal origins DO overwrite: two `--flag` occurrences on one command line mean the last
+// wins, which is what every shell user expects, and it is not the same question as a file
+// silently beating an environment variable.
+//
+// ─── An error names its source ──────────────────────────────────────────────────────
+//
+// A rejected value reports which source it came from, because "invalid value for
+// `queue_depth`" sends someone to the wrong file. Tier 5's requirement is that a config
+// error points at its origin, and an origin the module did not record cannot be pointed
+// at afterwards.
+//
+// ─── Secrets ────────────────────────────────────────────────────────────────────────
+//
+// A key declared secret renders as `****`. Redaction is a property of the DECLARATION, not
+// of the rendering call, so there is no code path that prints a secret by forgetting a
+// flag — the flag lives with the key, once, at the place that knows what the key means.
+//
+// ─── What it does NOT do ────────────────────────────────────────────────────────────
+//
+// No file format. `apply` takes a name and a text value, so a TOML/JSON/INI reader sits
+// above this and hands over pairs; building the parser in would tie the precedence rules
+// to one syntax. No nesting or sections — a flat key space, because the precedence
+// argument above is about single keys and a tree needs its own merge rules. No live
+// reload, no watch: `std/syswatch` exists and composing them is the caller's.
+
+import "mem"
+import "list"
+import "sink"
+import "str"
+
+pub const CFG_DEFAULT: i32 = 0
+pub const CFG_FILE: i32 = 1
+pub const CFG_ENV: i32 = 2
+pub const CFG_CLI: i32 = 3
+
+pub const CFG_STR: i32 = 0
+pub const CFG_INT: i32 = 1
+pub const CFG_BOOL: i32 = 2
+
+// `apply` outcomes. Distinct codes rather than a bool, because they are different events
+// for an operator: an unknown key is probably a typo in their file, a bad value is a typo
+// in the value, and a shadowed one is not a problem at all.
+pub const CFG_OK: i32 = 0
+pub const CFG_UNKNOWN: i32 = 1      // no such key was declared
+pub const CFG_BAD_INT: i32 = 2
+pub const CFG_BAD_BOOL: i32 = 3
+pub const CFG_SHADOWED: i32 = 4     // a stronger source already set this key
+
+pub struct Config {
+    nb: List(u8),      // declared key names, concatenated
+    ns: List(i32),
+    ne: List(i32),
+    kind: List(i32),   // CFG_STR | CFG_INT | CFG_BOOL
+    secret: List(i32), // 1 if the value must never be rendered
+    origin: List(i32), // where the current value came from; -1 = unset
+    vb: List(u8),      // value texts, concatenated (a replaced value leaks its old bytes)
+    vs: List(i32),
+    ve: List(i32),
+    num: List(i64),    // parsed value for CFG_INT / CFG_BOOL
+    rejected: i64,     // values refused, so a silently-empty config is discoverable
+}
+
+pub fn make(read a: Allocator) -> Config {
+    return Config{
+        nb: list.make(u8, a),
+        ns: list.make(i32, a),
+        ne: list.make(i32, a),
+        kind: list.make(i32, a),
+        secret: list.make(i32, a),
+        origin: list.make(i32, a),
+        vb: list.make(u8, a),
+        vs: list.make(i32, a),
+        ve: list.make(i32, a),
+        num: list.make(i64, a),
+        rejected: 0,
+    }
+}
+
+pub fn free(mut c: Config) {
+    list.free(u8, c.nb)
+    list.free(i32, c.ns)
+    list.free(i32, c.ne)
+    list.free(i32, c.kind)
+    list.free(i32, c.secret)
+    list.free(i32, c.origin)
+    list.free(u8, c.vb)
+    list.free(i32, c.vs)
+    list.free(i32, c.ve)
+    list.free(i64, c.num)
+}
+
+// How many keys are declared.
+pub fn declared(read c: Config) -> usize {
+    return list.len(i32, c.kind)
+}
+
+// How many values were refused. A config that looks empty because every value was
+// rejected is otherwise indistinguishable from one nobody configured.
+pub fn rejections(read c: Config) -> i64 {
+    return c.rejected
+}
+
+pub fn live(read c: Config, id: i32) -> bool {
+    if id < 0 { return false }
+    return (id as usize) < list.len(i32, c.kind)
+}
+
+fn name_is(read c: Config, x: i32, read name: str) -> bool {
+    let st: i32 = list.get(i32, c.ns, x as usize)
+    let en: i32 = list.get(i32, c.ne, x as usize)
+    if ((en - st) as usize) != name.len { return false }
+    var i: i32 = 0
+    for st + i < en {
+        let a: i32 = list.get(u8, c.nb, (st + i) as usize) as i32
+        let b: i32 = name[i as usize] as i32
+        if a != b { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// The id declared under `name`, or -1. This is the schema check: a key nobody declared is
+// not a key, which is what turns a typo in a config file into a diagnostic instead of a
+// setting that silently does nothing.
+pub fn by_name(read c: Config, read name: str) -> i32 {
+    var i: i32 = 0
+    let n: i32 = list.len(i32, c.kind) as i32
+    for i < n {
+        if name_is(c, i, name) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Declare a key. -1 if the name is already declared: two declarations of one key would
+// make which schema applies depend on lookup order.
+pub fn declare(mut c: Config, read name: str, k: i32, is_secret: bool) -> i32 {
+    if by_name(c, name) >= 0 { return 0 - 1 }
+    let id: i32 = list.len(i32, c.kind) as i32
+    let st: i32 = list.len(u8, c.nb) as i32
+    var i: usize = 0
+    for i < name.len {
+        list.push(u8, c.nb, name[i])
+        i = i + 1
+    }
+    list.push(i32, c.ns, st)
+    list.push(i32, c.ne, list.len(u8, c.nb) as i32)
+    list.push(i32, c.kind, k)
+    var sec: i32 = 0
+    if is_secret { sec = 1 }
+    list.push(i32, c.secret, sec)
+    list.push(i32, c.origin, 0 - 1)
+    list.push(i32, c.vs, 0)
+    list.push(i32, c.ve, 0)
+    list.push(i64, c.num, 0)
+    return id
+}
+
+// Parse `text` as a decimal integer with an optional leading `-`. Returns false on any
+// stray byte: a config value that is "8x" is a mistake, and reading it as 8 makes the
+// mistake invisible for as long as the program runs.
+fn parse_int(read text: str, outv: *mut i64) -> bool {
+    if text.len == 0 { return false }
+    var neg: bool = false
+    var i: usize = 0
+    if (text[0] as i32) == 45 {
+        neg = true
+        i = 1
+    }
+    if i >= text.len { return false }
+    var acc: i64 = 0
+    for i < text.len {
+        let d: i32 = text[i] as i32
+        if d < 48 { return false }
+        if d > 57 { return false }
+        acc = acc * 10 + ((d - 48) as i64)
+        i = i + 1
+    }
+    if neg { acc = 0 - acc }
+    unsafe { outv.* = acc }
+    return true
+}
+
+// `true`/`false` only. Not `1`/`0`/`yes`/`on`: every extra spelling is a spelling some
+// other tool reads the other way, and a boolean two tools disagree about is worse than a
+// rejected one.
+fn parse_bool(read text: str, outv: *mut i64) -> bool {
+    if str.eq(text, "true") {
+        unsafe { outv.* = 1 }
+        return true
+    }
+    if str.eq(text, "false") {
+        unsafe { outv.* = 0 }
+        return true
+    }
+    return false
+}
+
+// Offer `text` for `name` from `from`. Keeps the value only if `from` is at least as
+// strong as the origin already recorded — which is what makes the merge order-independent.
+pub fn apply(mut c: Config, read name: str, read text: str, from: i32) -> i32 {
+    let id: i32 = by_name(c, name)
+    if id < 0 {
+        c.rejected = c.rejected + 1
+        return CFG_UNKNOWN
+    }
+    let had: i32 = list.get(i32, c.origin, id as usize)
+    if had > from {
+        return CFG_SHADOWED
+    }
+    let k: i32 = list.get(i32, c.kind, id as usize)
+    var slot: *mut i64 = alloc(i64, 1)
+    unsafe { slot.* = 0 }
+    if k == CFG_INT {
+        if !parse_int(text, slot) {
+            free_ptr(slot)
+            c.rejected = c.rejected + 1
+            return CFG_BAD_INT
+        }
+    }
+    if k == CFG_BOOL {
+        if !parse_bool(text, slot) {
+            free_ptr(slot)
+            c.rejected = c.rejected + 1
+            return CFG_BAD_BOOL
+        }
+    }
+    let st: i32 = list.len(u8, c.vb) as i32
+    var i: usize = 0
+    for i < text.len {
+        list.push(u8, c.vb, text[i])
+        i = i + 1
+    }
+    list.set(i32, c.vs, id as usize, st)
+    list.set(i32, c.ve, id as usize, list.len(u8, c.vb) as i32)
+    list.set(i32, c.origin, id as usize, from)
+    var parsed: i64 = 0
+    unsafe { parsed = slot.* }
+    list.set(i64, c.num, id as usize, parsed)
+    free_ptr(slot)
+    return CFG_OK
+}
+
+// The source that supplied the current value, or -1 if nothing has.
+pub fn origin_of(read c: Config, id: i32) -> i32 {
+    if !live(c, id) { return 0 - 1 }
+    return list.get(i32, c.origin, id as usize)
+}
+
+// Has anything set this key?
+pub fn is_set(read c: Config, id: i32) -> bool {
+    return origin_of(c, id) >= 0
+}
+
+// A CFG_INT key's value, or 0.
+pub fn get_int(read c: Config, id: i32) -> i64 {
+    if !live(c, id) { return 0 }
+    return list.get(i64, c.num, id as usize)
+}
+
+// A CFG_BOOL key's value.
+pub fn get_bool(read c: Config, id: i32) -> bool {
+    if !live(c, id) { return false }
+    return list.get(i64, c.num, id as usize) != 0
+}
+
+// Does the current value's TEXT equal `s`? Offered instead of a `-> read str` accessor so
+// no caller ends up holding a borrow into an arena a later `apply` will append to.
+pub fn value_is(read c: Config, id: i32, read s: str) -> bool {
+    if !live(c, id) { return false }
+    if !is_set(c, id) { return false }
+    let st: i32 = list.get(i32, c.vs, id as usize)
+    let en: i32 = list.get(i32, c.ve, id as usize)
+    if ((en - st) as usize) != s.len { return false }
+    var i: i32 = 0
+    for st + i < en {
+        let a: i32 = list.get(u8, c.vb, (st + i) as usize) as i32
+        let b: i32 = s[i as usize] as i32
+        if a != b { return false }
+        i = i + 1
+    }
+    return true
+}
+
+pub fn origin_name(o: i32) -> str {
+    if o == CFG_DEFAULT { return "default" }
+    if o == CFG_FILE { return "file" }
+    if o == CFG_ENV { return "env" }
+    if o == CFG_CLI { return "cli" }
+    return "unset"
+}
+
+pub fn outcome_name(r: i32) -> str {
+    if r == CFG_OK { return "ok" }
+    if r == CFG_UNKNOWN { return "unknown key" }
+    if r == CFG_BAD_INT { return "not an integer" }
+    if r == CFG_BAD_BOOL { return "not a boolean" }
+    if r == CFG_SHADOWED { return "shadowed by a stronger source" }
+    return "?"
+}
+
+fn put_name(mut sk: sink.Sink, mut buf: []u8, read c: Config, x: i32) {
+    let st: i32 = list.get(i32, c.ns, x as usize)
+    let en: i32 = list.get(i32, c.ne, x as usize)
+    var i: i32 = st
+    for i < en {
+        sink.put(sk, buf, list.get(u8, c.nb, i as usize))
+        i = i + 1
+    }
+}
+
+// Is key `x`'s name before `y`'s? Byte order, so a dump does not depend on a locale.
+fn name_lt(read c: Config, x: i32, y: i32) -> bool {
+    let xs: i32 = list.get(i32, c.ns, x as usize)
+    let xe: i32 = list.get(i32, c.ne, x as usize)
+    let ys: i32 = list.get(i32, c.ns, y as usize)
+    let ye: i32 = list.get(i32, c.ne, y as usize)
+    var i: i32 = 0
+    for xs + i < xe {
+        if ys + i >= ye { return false }
+        let a: i32 = list.get(u8, c.nb, (xs + i) as usize) as i32
+        let b: i32 = list.get(u8, c.nb, (ys + i) as usize) as i32
+        if a != b { return a < b }
+        i = i + 1
+    }
+    return (xe - xs) < (ye - ys)
+}
+
+fn put_one(mut sk: sink.Sink, mut buf: []u8, read c: Config, x: i32) {
+    put_name(sk, buf, c, x)
+    sink.put_str(sk, buf, "=")
+    if list.get(i32, c.secret, x as usize) != 0 {
+        // Redaction is a property of the DECLARATION, so there is no path that prints a
+        // secret by forgetting a flag at the call site.
+        sink.put_str(sk, buf, "****")
+    } else {
+        if is_set(c, x) {
+            let st: i32 = list.get(i32, c.vs, x as usize)
+            let en: i32 = list.get(i32, c.ve, x as usize)
+            var i: i32 = st
+            for i < en {
+                sink.put(sk, buf, list.get(u8, c.vb, i as usize))
+                i = i + 1
+            }
+        }
+    }
+    sink.put_str(sk, buf, " (")
+    sink.put_str(sk, buf, origin_name(origin_of(c, x)))
+    sink.put_str(sk, buf, ")")
+    sink.put_nl(sk, buf)
+}
+
+// Write every key in NAME order with its value and the source it came from, secrets
+// redacted. Name-ordered for the same reason `std/metrics` is: the bytes must not depend
+// on the order the program happened to declare or apply things in.
+//
+// The caller must check `sink.overflowed(sk)`.
+pub fn render(mut sk: sink.Sink, mut buf: []u8, read c: Config) {
+    let n: i32 = list.len(i32, c.kind) as i32
+    var done: i32 = 0
+    var have_prev: bool = false
+    var prev: i32 = 0
+    for done < n {
+        var best: i32 = 0 - 1
+        var i: i32 = 0
+        for i < n {
+            var cand: bool = true
+            if have_prev {
+                if !name_lt(c, prev, i) { cand = false }
+            }
+            if cand {
+                if best < 0 {
+                    best = i
+                } else {
+                    if name_lt(c, i, best) { best = i }
+                }
+            }
+            i = i + 1
+        }
+        if best < 0 {
+            done = n
+        } else {
+            put_one(sk, buf, c, best)
+            prev = best
+            have_prev = true
+            done = done + 1
+        }
+    }
+}

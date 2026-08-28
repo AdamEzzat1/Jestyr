@@ -937,6 +937,86 @@ mod syswatch_debounced_trigger {
 /// back-end server disagree about where it ends, and the bytes after it (`GET /admin`) become a
 /// second request attributed to the next client on the connection. Every byte of it is
 /// well-formed, and a lenient parser answers 200.
+/// **`jconf` — four config sources merged in a fixed order, where a value remembers where
+/// it came from.**
+///
+/// `std/cli`'s header names this as deliberately absent and gives the right reason: the
+/// merge needs a precedence decision one argument parser cannot make alone.
+///
+/// **The headline is order-independence.** Precedence is a property of the SOURCE, not of
+/// when it was applied, so the same four sources applied in opposite orders produce
+/// byte-identical configurations. A merge that simply overwrites — the obvious
+/// implementation — makes the answer depend on the order the program happened to read its
+/// sources in, which is a bug that reproduces only on the machine where an environment
+/// variable happened to be set. Verified by making exactly that change: it prints `false`.
+#[cfg(all(test, feature = "c-oracle"))]
+mod config_precedence {
+    use super::*;
+
+    #[test]
+    fn jconf_merges_sources_in_a_fixed_order_whatever_order_they_arrive_in() {
+        let exe = super::c_oracle::build_exe("examples/std/config_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the config demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace('\r', "");
+
+        let want = "-- jconf --\n\
+                    api_token=**** (env)\n\
+                    listen_port=9999 (cli)\n\
+                    queue_depth=64 (env)\n\
+                    region=eu-west (file)\n\
+                    verbose=false (default)\n\
+                    \n\
+                    source order does not reach the result\n\
+                    true\n\
+                    the strongest source won\n\
+                    64\n\
+                    and it knows which one that was\n\
+                    env\n\
+                    a weaker source is shadowed, not dropped silently\n\
+                    shadowed by a stronger source\n\
+                    and the value did not move\n\
+                    64\n\
+                    -- what it refuses --\n\
+                    unknown key\n\
+                    not an integer\n\
+                    not a boolean\n\
+                    every refusal was counted\n\
+                    3\n\
+                    and a refused value changed nothing\n\
+                    9999\n\
+                    the dump is complete\n\
+                    true";
+        assert_eq!(out.trim_end(), want, "the config transcript changed:\n{out}");
+
+        // **The secret must not be in the output at all.** Asserting the `****` appears is
+        // not the same claim: a renderer that printed both the redaction and the value
+        // would satisfy it. The token's text is what must be absent.
+        assert!(
+            !out.contains("s3cr3t"),
+            "a secret reached the dump — redaction is declaration-level for exactly this:\n{out}"
+        );
+        assert!(out.contains("api_token=**** (env)"), "the secret's ORIGIN is still reportable:\n{out}");
+
+        // **Precedence asserted as the full ladder, not one comparison.** Each key is won
+        // by a different source, so an implementation with the order partly wrong still
+        // fails: cli > env > file > default, one key each.
+        for (line, why) in [
+            ("listen_port=9999 (cli)", "cli must beat default"),
+            ("queue_depth=64 (env)", "env must beat file and default"),
+            ("region=eu-west (file)", "file must beat default"),
+            ("verbose=false (default)", "an unset key keeps its default"),
+        ] {
+            assert!(out.contains(line), "{why}:\n{out}");
+        }
+
+        // A refusal must leave the setting it was aimed at alone. `listen_port` is 9999
+        // after `80x` was rejected — a parser that half-applied would print 80 or 0 here,
+        // and every other line in the transcript would still match.
+        assert!(out.contains("\n9999\n"), "a refused value must change nothing:\n{out}");
+    }
+}
+
 /// **`jserved` — a service that starts, reports health, runs background work, shuts down
 /// gracefully, and says WHY it stopped.**
 ///
@@ -17987,6 +18067,7 @@ fn main() -> i32 {
         // both a `service.Service` and a `metrics.Registry` and is out for the same reason.
         "metrics.jtr",
         "service.jtr",
+        "config.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same
