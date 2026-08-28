@@ -7,7 +7,7 @@ increments (§2–§4), what the research turned up (§5), what is left (§6), t
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1324 passed / 0 failed / 3 ignored.** It was **1319** at the start of this arc — but see
+**1330 passed / 0 failed / 3 ignored.** It was **1319** at the start of this arc — but see
 §1, because on Windows the recorded baseline was never actually green.
 
 | commit | what |
@@ -15,6 +15,10 @@ cargo build --release && cargo test --release --features "c-oracle,selfhost-fixp
 | `8fcdd1f` | the bounded runner's transcript survives a child that speaks CRLF |
 | `a883bd7` | a consumer can be told the producer is done, instead of told a count |
 | `39c2583` | a wrapper owns what it wraps |
+| `51d2a7e` | the Tier 5 arc gets its cold-start note |
+| `a8dde2d` | observability a service is given, not one it finds |
+| `ad2dcc8` | a spawned task may not hold a writable reference to a shared binding |
+| `b970b4c` | precedence is a property of the source, not of when it was applied |
 
 The predecessor note is `docs/session-notes/jestyr-tier4-language-work-handoff.md`.
 The research note this arc produced is
@@ -48,11 +52,13 @@ the reason the last clause was impossible. The next items, in leverage order:
 4. ~~**Observability metrics**~~ — **DONE**, see §3b. What is left on top of it is **trace
    spans**, and note the name is taken three times over (`http.Header` spans, `diag` source
    spans, and the `@span` work-span attribute), so pick another word before writing a line.
-5. **The config merge layer.** `cli.jtr:38-43` refuses it explicitly, pending a precedence
-   decision that is the actual work. `diag.jtr` already supplies source-spanned rendering.
-6. **A `Metrics` consumer inside a real service.** `metrics` has a demo, not yet a
-   service that reports its own health through one. That is the increment which turns
-   §3b from a library into Tier 5's "observability can be injected and asserted".
+5. ~~**The config merge layer.**~~ — **DONE**, see §3f. What is left on top is a FILE
+   FORMAT: `apply` takes name/value pairs, so a TOML or INI reader handing them over is the
+   next increment, and `diag.jtr` is what gives its errors real source spans (this module
+   records which SOURCE a value came from, not which line of which file).
+6. ~~**A `Metrics` consumer inside a real service.**~~ — **DONE**, see §3d.
+7. **Refusing a send on a closed channel** (§6.1) and **`select` termination** (§6.2) are
+   now the two oldest open items, both from §2.
 
 **Half of the Tier 5 brief already exists on master.** Before building anything in it,
 read the inventory summary in §5 — this repo has twice rebuilt features that were already
@@ -286,6 +292,42 @@ everything below the trigger is done.
 
 ---
 
+## §3f. `std/config` — precedence is a property of the SOURCE
+
+`cli.jtr:38-43` names config merging as deliberately absent and gives the right reason: it
+needs a precedence decision one argument parser cannot make alone. This is that decision.
+
+```
+default  <  file  <  env  <  cli
+```
+
+`apply` compares the incoming origin against the one already recorded and keeps the
+stronger, so **the same sources applied in any order produce the same configuration.** The
+obvious implementation — last write wins — is simpler, passes any test that applies sources
+in the documented order, and is wrong: it makes the answer depend on the order the program
+happened to READ its sources in. That is the config bug that reproduces only on the one
+machine where an env var happened to be set, and only after someone reorders two lines of
+startup code. **Verified by breaking it**: a last-write-wins merge prints `false`.
+
+**Equal origins DO overwrite** — two `--flag` occurrences on one command line means last
+wins, which is what every shell user expects, and is not the same question as a file
+silently beating an environment variable.
+
+**Redaction is a property of the DECLARATION**, so no code path leaks a secret by
+forgetting a flag at a call site. The test asserts the token's TEXT IS ABSENT rather than
+that `****` is present — a renderer printing both would satisfy the weaker claim.
+
+Three refusals as distinct codes rather than a bool, because they are different events for
+an operator: an unknown key is a typo in their file, a bad value is a typo in the value, a
+shadowed one is not a problem. A refused value provably moves nothing. Precedence is
+asserted as the full ladder — each key won by a DIFFERENT source — so an implementation
+with the order partly wrong still fails.
+
+No file format (a TOML/JSON/INI reader sits above and hands over pairs; building one in
+would tie precedence to one syntax), no nesting, no live reload.
+
+---
+
 ## §3e. A load-sensitive test, recorded rather than retuned
 
 `jstatus_serves_a_connection_without_starving_its_timers` failed once in six full-ladder
@@ -307,6 +349,9 @@ failure reproduced every time and load was a wrong guess; this one does not.
 ---
 
 ## §4. Comparison suites, rerun at this milestone
+
+Run twice this arc — after §3 and again after §3c, since both changed compiler semantics.
+Both green both times.
 
 * `examples/cpp_compare/verify_all.sh` — **15 matched, 0 failed**, `static_rejections`
   still refused with its 3 errors.
