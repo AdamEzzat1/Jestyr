@@ -1,0 +1,235 @@
+// std/service.jtr — the lifecycle a long-running program actually has, and the two health
+// questions a deployment asks it separately.
+//
+// ─── Readiness and liveness are NOT the same question ───────────────────────────────
+//
+// This is the whole reason the module exists, and conflating the two is a production
+// outage rather than an untidiness:
+//
+//   * **Ready** means "send me new work". A load balancer removes a not-ready instance
+//     from rotation.
+//   * **Live** means "I am not wedged; do not kill me". An orchestrator restarts a
+//     not-live instance.
+//
+// A DRAINING service is **live but not ready**, and that combination is the entire point.
+// It must stop receiving new requests while it finishes the ones it already accepted. A
+// service that reports a single "healthy" boolean has to choose: report unhealthy while
+// draining and be killed mid-drain — losing exactly the work it was trying to finish — or
+// report healthy and keep being sent traffic it has promised to refuse. Every rolling
+// deploy runs this path on every instance, so the shape is not a corner case.
+//
+// `accept` enforces it rather than documenting it: once draining, it refuses, and the
+// refusal is counted.
+//
+// ─── The exit reason is a fact, not a hope ──────────────────────────────────────────
+//
+// `halt` reports which of three things happened, computed from state rather than assumed:
+//
+//   * `SVC_CLEAN`     — everything accepted was completed.
+//   * `SVC_ABANDONED` — stopped with work still in flight. The count is the damage.
+//   * `SVC_FAILED`    — at least one unit of work reported failure.
+//
+// A service that always logs "shutdown complete" tells an operator nothing. ABANDONED is
+// the reason this returns a value at all: it is the difference between a deploy that
+// finished its queue and one that dropped it, and nothing else in the system can tell
+// them apart afterwards.
+//
+// ─── What it does NOT do ────────────────────────────────────────────────────────────
+//
+// **No signal handling**, and that is a language limit rather than a choice: a POSIX
+// handler may only write a `volatile sig_atomic_t` at file scope, and Jestyr has nowhere
+// to put one — `extern` binds functions rather than globals, and module scope is
+// const-only. So shutdown here is *initiated by the program*, and wiring it to SIGTERM
+// waits on that increment. Everything below the trigger is done.
+//
+// No restart policy, no supervision tree, no process management — `std/sysproc` owns
+// children, and a supervisor over it is a separate module. No clock of its own: `halt`
+// and `ready` are handed one, which is what lets a test drive a whole lifecycle in
+// microseconds through `time.manual()`.
+
+import "metrics"
+import "sink"
+import "time"
+
+pub const SVC_NEW: i32 = 0
+pub const SVC_READY: i32 = 1
+pub const SVC_DRAINING: i32 = 2
+pub const SVC_STOPPED: i32 = 3
+
+pub const SVC_CLEAN: i32 = 0
+pub const SVC_ABANDONED: i32 = 1
+pub const SVC_FAILED: i32 = 2
+
+// The metric ids are held rather than the registry itself: a `Registry` owns arenas, so
+// storing one here would make every `Service` transitively owning and force the lifecycle
+// calls to thread ownership they do not need. The registry is passed to the calls that
+// record, which also makes it obvious at each call site that a metric moved.
+pub struct Service {
+    phase: i32,
+    exit: i32,
+    inflight: i64,      // accepted but not yet completed
+    m_accepted: i32,
+    m_completed: i32,
+    m_failed: i32,
+    m_refused: i32,
+    m_inflight: i32,
+    started: i64,
+    stopped: i64,
+}
+
+// Register the service's own metrics into `m` and return a service in `SVC_NEW`.
+// Registration can only fail on a duplicate name, and a -1 id is inert in `metrics`, so a
+// name clash degrades to unrecorded rather than to a wrong number.
+pub fn make(mut m: metrics.Registry) -> Service {
+    return Service{
+        phase: SVC_NEW,
+        exit: SVC_CLEAN,
+        inflight: 0,
+        m_accepted: metrics.counter(m, "service_accepted"),
+        m_completed: metrics.counter(m, "service_completed"),
+        m_failed: metrics.counter(m, "service_failed"),
+        m_refused: metrics.counter(m, "service_refused"),
+        m_inflight: metrics.gauge(m, "service_inflight"),
+        started: 0,
+        stopped: 0,
+    }
+}
+
+// Begin accepting work. Idempotent only from `SVC_NEW`: coming back to ready from
+// draining would let a shutdown be cancelled halfway, which is how work gets accepted
+// after the load balancer has already been told to stop sending it.
+pub fn ready(mut s: Service, mut clk: time.Clock) -> bool {
+    if s.phase != SVC_NEW { return false }
+    s.phase = SVC_READY
+    s.started = time.read_nanos(clk)
+    return true
+}
+
+// Stop accepting new work while finishing what is in flight. From `SVC_READY` only.
+pub fn begin_drain(mut s: Service) -> bool {
+    if s.phase != SVC_READY { return false }
+    s.phase = SVC_DRAINING
+    return true
+}
+
+// Send me new work? True only while `SVC_READY`.
+pub fn is_ready(read s: Service) -> bool {
+    return s.phase == SVC_READY
+}
+
+// Am I wedged? True until stopped — **including while draining**, which is the whole
+// distinction this module exists for.
+pub fn is_live(read s: Service) -> bool {
+    return s.phase != SVC_STOPPED
+}
+
+// The current phase.
+pub fn phase_of(read s: Service) -> i32 {
+    return s.phase
+}
+
+// Work in flight: accepted and not yet completed.
+pub fn inflight_now(read s: Service) -> i64 {
+    return s.inflight
+}
+
+// Take on one unit of work, or refuse it. Refusing is counted, because an unreported
+// refusal is indistinguishable from work that never arrived.
+pub fn accept(mut s: Service, mut m: metrics.Registry) -> bool {
+    if s.phase != SVC_READY {
+        metrics.inc(m, s.m_refused, 1)
+        return false
+    }
+    s.inflight = s.inflight + 1
+    metrics.inc(m, s.m_accepted, 1)
+    metrics.set_gauge(m, s.m_inflight, s.inflight)
+    return true
+}
+
+// One unit of work finished, successfully or not. Completing more than was accepted is
+// refused rather than allowed to drive `inflight` negative — a negative gauge is a lie
+// that outlives the bug that produced it.
+pub fn completed(mut s: Service, mut m: metrics.Registry, ok: bool) -> bool {
+    if s.inflight <= 0 { return false }
+    s.inflight = s.inflight - 1
+    if ok {
+        metrics.inc(m, s.m_completed, 1)
+    } else {
+        metrics.inc(m, s.m_failed, 1)
+    }
+    metrics.set_gauge(m, s.m_inflight, s.inflight)
+    return true
+}
+
+// Stop, and report WHY rather than that it happened. `SVC_ABANDONED` when work was still
+// in flight; `SVC_FAILED` when any unit failed; `SVC_CLEAN` otherwise. Failure outranks
+// abandonment: a service that both failed and dropped work has a bug, and the bug is the
+// more actionable of the two.
+pub fn halt(mut s: Service, mut m: metrics.Registry, mut clk: time.Clock) -> i32 {
+    if s.phase == SVC_STOPPED { return s.exit }
+    s.stopped = time.read_nanos(clk)
+    s.phase = SVC_STOPPED
+    let failed: i64 = metrics.current(m, s.m_failed)
+    if failed > 0 {
+        s.exit = SVC_FAILED
+    } else {
+        if s.inflight > 0 {
+            s.exit = SVC_ABANDONED
+        } else {
+            s.exit = SVC_CLEAN
+        }
+    }
+    return s.exit
+}
+
+// The recorded exit reason; `SVC_CLEAN` before `halt`.
+pub fn exit_of(read s: Service) -> i32 {
+    return s.exit
+}
+
+// Nanoseconds between `ready` and `halt`, or 0 before it has stopped. Reads no clock:
+// both endpoints were recorded when they occurred, so this is a fact about the service
+// rather than about when it was asked.
+//
+// **Gated on the PHASE, not on the timestamps being nonzero.** The obvious guard is
+// `if s.started == 0 { return 0 }`, and it is wrong: `time.manual(0)` — the clock every
+// deterministic test uses — starts at exactly 0, so a service that really did start at
+// time 0 reports a lifetime of 0 forever. A sentinel that a legal value can equal is not
+// a sentinel, and here the legal value is the one the tests all use.
+pub fn ran_for(read s: Service) -> i64 {
+    if s.phase != SVC_STOPPED { return 0 }
+    return s.stopped - s.started
+}
+
+// The phase's name.
+pub fn phase_name(p: i32) -> str {
+    if p == SVC_NEW { return "new" }
+    if p == SVC_READY { return "ready" }
+    if p == SVC_DRAINING { return "draining" }
+    if p == SVC_STOPPED { return "stopped" }
+    return "?"
+}
+
+// The exit reason's name.
+pub fn exit_name(e: i32) -> str {
+    if e == SVC_CLEAN { return "clean" }
+    if e == SVC_ABANDONED { return "abandoned" }
+    if e == SVC_FAILED { return "failed" }
+    return "?"
+}
+
+// A health line: the two questions answered separately, which is the point.
+//
+// The caller must check `sink.overflowed(sk)` afterwards; a truncated health report that
+// looks whole is worse than none.
+pub fn render_health(mut sk: sink.Sink, mut buf: []u8, read s: Service) {
+    sink.put_str(sk, buf, "phase=")
+    sink.put_str(sk, buf, phase_name(s.phase))
+    sink.put_str(sk, buf, " ready=")
+    sink.put_bool(sk, buf, is_ready(s))
+    sink.put_str(sk, buf, " live=")
+    sink.put_bool(sk, buf, is_live(s))
+    sink.put_str(sk, buf, " inflight=")
+    sink.put_i64(sk, buf, s.inflight)
+    sink.put_nl(sk, buf)
+}

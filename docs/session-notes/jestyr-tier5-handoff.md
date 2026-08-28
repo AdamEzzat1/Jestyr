@@ -225,6 +225,87 @@ registry is transitively owning and copying one then freeing both is now refused
 
 ---
 
+## §3c. `spawn` may not take ANY `mut` parameter — a race gcc was hiding
+
+Found by writing the obvious first draft of a service worker: it takes
+`mut s: service.Service` and completes units through it. **`jestyrc check` reported every
+check passing** — resolution, arity, assignability, visibility, trait-bound, exhaustiveness
+and escape. What refused it was gcc, and only incidentally: the spawn thunk stores its
+arguments by value while the callee expects a `Service* restrict`.
+
+That is the worst form of degrades-to-gcc. It is not that the diagnostic came from the
+wrong tool — **fixing the C bug would have removed the refusal and left the race.**
+
+The rule existed, and its name was the bug: `check_spawn_no_shared_mut_slice` tested
+`matches!(p.ty, Ty::Slice(_))`, so it caught the aliasing-`ptr` case it was written for and
+let every `mut` struct through. It now stops at the first `mut`/`out` parameter of any
+kind, with two messages because they are two reasons for one verdict — a slice races
+through its aliased `ptr`, a plain binding because every task writes the one place.
+
+A raw `*mut T` parameter is untouched: it carries no `mut` conv, and that is the sanctioned
+hatch (`par_binned_sum` gives each task a disjoint region, under `unsafe`, so disjointness
+is the caller's stated claim).
+
+**Swept: exactly ONE new diagnostic across all 274 corpus files, and it was my own first
+draft.** The rule catches a real race and breaks nothing that ever worked. The demo now
+teaches it — workers accumulate into atomic cells and the service's state advances on the
+main thread after the join, where there is exactly one writer.
+
+Carried by `jestyr_spawn_mut_param_matches_reference`, **watched failing against the
+unwidened port** (`[]` against a rejection) before the mirror was written.
+
+---
+
+## §3d. `std/service` — the lifecycle, and the two health questions
+
+Readiness and liveness are **not the same question**, and conflating them is an outage:
+
+* **Ready** = "send me work". A load balancer removes a not-ready instance from rotation.
+* **Live** = "I am not wedged". An orchestrator restarts a not-live instance.
+
+A DRAINING service is **live but not ready**. A service reporting one `healthy` boolean has
+to choose: report unhealthy while draining and be killed mid-drain — losing exactly the work
+it was trying to finish — or report healthy and keep being sent traffic it has promised to
+refuse. Every rolling deploy runs this path on every instance. `accept` enforces it rather
+than documenting it, and the refusal is counted.
+
+The exit reason is computed from state: `SVC_CLEAN`, `SVC_ABANDONED` (stopped with work in
+flight — the difference between a deploy that finished its queue and one that dropped it,
+which nothing else can reconstruct afterwards) or `SVC_FAILED`, which outranks abandonment
+because a bug is more actionable than dropped work. All three appear in the transcript,
+because a demo that only reaches the happy verdict does not show the verdict is computed.
+
+**A bug of mine worth keeping:** `ran_for` guarded with `if s.started == 0 { return 0 }`,
+and `time.manual(0)` — the clock every deterministic test uses — starts at exactly 0, so a
+service that really started at t=0 reported a lifetime of 0 forever. **A sentinel a legal
+value can equal is not a sentinel**, and here the legal value was the one all the tests use.
+Now gated on the phase.
+
+No signals: see §0 item 1, it is a language blocker. Shutdown is initiated by the program;
+everything below the trigger is done.
+
+---
+
+## §3e. A load-sensitive test, recorded rather than retuned
+
+`jstatus_serves_a_connection_without_starving_its_timers` failed once in six full-ladder
+runs and **passes in isolation in 2.8s**. The mechanism is measured, not guessed:
+`sysnet_demo.jtr:119` schedules a **1ms** timer and polls with a **500ms** budget — a 500×
+margin. For `RT_FIRED` not to come back, the process must have lost the CPU for over half a
+second. The ladder runs dozens of gcc invocations in parallel and this arc added two more
+`c-oracle` tests that each compile and link, so **this work plausibly raised the flake
+probability without being its cause**.
+
+**Deliberately not retuned.** Nothing survives a half-second deschedule by margin alone, and
+silently widening a deadline is how a real starvation bug gets hidden later. The honest fix
+is that a wall-clock test should not run beside a compile farm — a harness question. If it
+recurs, that is the thread to pull, not the timeout.
+
+Note this is the OPPOSITE diagnosis from §1, and the difference is reproduction: the CRLF
+failure reproduced every time and load was a wrong guess; this one does not.
+
+---
+
 ## §4. Comparison suites, rerun at this milestone
 
 * `examples/cpp_compare/verify_all.sh` — **15 matched, 0 failed**, `static_rejections`
@@ -335,6 +416,24 @@ position. Re-measure the shape of a gap before designing around the recorded ver
 **Never round-trip a `.jtr` file through PowerShell `Get-Content`/`Set-Content`.** It adds
 a BOM and mangles every non-ASCII character in the header comments, and the compiler then
 reports `unexpected character` at 1:1. Use the editor.
+
+**Write the NAIVE version first.** §3c's race was found because the obvious first draft of
+a worker takes `mut s: Service` — which is what anyone would write, and what the front end
+accepted. A library written only in its final careful form never walks into the hole its
+users will.
+
+**A sentinel a legal value can equal is not a sentinel.** `ran_for` used `started == 0` to
+mean "never started", and `time.manual(0)` — the clock every deterministic test uses —
+starts at exactly 0. The failing case was not an edge; it was the default.
+
+**Reproduction is what separates the two timing diagnoses.** §1's CRLF failure reproduced
+every time, so "load flakiness" was a wrong guess to discard. §3e's poll failure passes in
+isolation and failed once in six runs, so it is one. Same symptom class, opposite verdicts,
+and only rerunning tells them apart.
+
+**Do not retune someone else's timing assertion to make your run green.** A 500× margin
+that fails is a saturated machine, not a tight deadline, and widening it hides the real
+starvation bug that shows up later.
 
 **`jc_build_matrix` failing on a new corpus file is the harness working.** It is
 hand-maintained on purpose so someone looks at the diff: the byte-identity goldens run with

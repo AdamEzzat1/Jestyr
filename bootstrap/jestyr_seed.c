@@ -18121,20 +18121,26 @@ void jestyr_check_spawn_slice(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jesty
                     j_is_slice = true;
                 }
             }
+            int32_t j_pns = jestyr_get__list__i32(j_p.j_iar, (size_t)((j_pbase + 2)));
+            int32_t j_pne = jestyr_get__list__i32(j_p.j_iar, (size_t)((j_pbase + 3)));
+            JestyrString j_sb = jestyr_rt_str_new();
+            jestyr_rt_str_push(&j_sb, JSTR("`spawn`: `"));
+            jestyr_rt_str_push(&j_sb, jestyr_rt_substr(j_src, j_cal.j_start, j_cal.j_end));
             if (j_is_slice)
             {
-                int32_t j_pns = jestyr_get__list__i32(j_p.j_iar, (size_t)((j_pbase + 2)));
-                int32_t j_pne = jestyr_get__list__i32(j_p.j_iar, (size_t)((j_pbase + 3)));
-                JestyrString j_sb = jestyr_rt_str_new();
-                jestyr_rt_str_push(&j_sb, JSTR("`spawn`: `"));
-                jestyr_rt_str_push(&j_sb, jestyr_rt_substr(j_src, j_cal.j_start, j_cal.j_end));
                 jestyr_rt_str_push(&j_sb, JSTR("` takes a `mut` slice `"));
                 jestyr_rt_str_push(&j_sb, jestyr_rt_substr(j_src, (size_t)(j_pns), (size_t)(j_pne)));
                 jestyr_rt_str_push(&j_sb, JSTR("` — a shared mutable slice can race across parallel tasks. Share mutable state through a raw `*mut T` in `unsafe` (each task a disjoint region, as `par_binned_sum` does), or pass it `read`."));
-                jestyr_ediag(&((*j_e)), j_cd.j_start, j_cd.j_end, jestyr_rt_str_view(&j_sb));
-                jestyr_rt_str_free(&j_sb);
-                return;
             }
+            else
+            {
+                jestyr_rt_str_push(&j_sb, JSTR("` takes `"));
+                jestyr_rt_str_push(&j_sb, jestyr_rt_substr(j_src, (size_t)(j_pns), (size_t)(j_pne)));
+                jestyr_rt_str_push(&j_sb, JSTR("` by `mut` — every task would hold a writable reference to one binding, which is a data race. Share mutable state through a raw `*mut T` in `unsafe`, or pass it `read` and have each task return what it produced."));
+            }
+            jestyr_ediag(&((*j_e)), j_cd.j_start, j_cd.j_end, jestyr_rt_str_view(&j_sb));
+            jestyr_rt_str_free(&j_sb);
+            return;
         }
         j_pi = (j_pi + 1);
     }

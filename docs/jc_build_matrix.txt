@@ -94,6 +94,7 @@ BUILD_OK process_demo
 BUILD_OK reductions
 BUILD_OK runtime_demo
 BUILD_OK select
+BUILD_OK service_demo
 BUILD_OK slice_algos
 BUILD_OK str_demo
 BUILD_OK strmap_demo

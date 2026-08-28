@@ -1203,7 +1203,19 @@ fn check_slice_alias(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, 
     string_free(seen2)
 }
 
-// A `spawn` target taking a `mut`/`out` SLICE parameter races — reject it.
+// A `spawn` target taking ANY `mut`/`out` parameter races — reject it.
+//
+// The slice restriction was the bug rather than the rule: a `mut` STRUCT walked past it,
+// so `spawn bump(b)` for `fn bump(mut b: Box)` passed every front-end check and was
+// stopped only by gcc, and only by accident — the spawn thunk stores its arguments by
+// value while the function expects a pointer. A racy program held out of the world by a C
+// type error is not a checked program.
+//
+// Stops at the FIRST `mut`/`out` parameter of either kind, which is what the reference
+// does; the two messages then differ because they are two reasons for one verdict — a
+// slice races through its aliased `ptr`, a plain binding because every task writes the one
+// place. A raw `*mut T` parameter carries no `mut` conv and is untouched: that is the
+// sanctioned hatch.
 fn check_spawn_slice(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, call: i32) {
     let cd: parser.ExprData = list.get(parser.ExprData, p.ex, call as usize)
     if cd.kind != 10 { return }
@@ -1224,19 +1236,23 @@ fn check_spawn_slice(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, 
                 let ptd: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
                 if ptd.kind == 3 { is_slice = true }              // Slice `[]T`
             }
+            let pns: i32 = list.get(i32, p.iar, (pbase + 2) as usize)
+            let pne: i32 = list.get(i32, p.iar, (pbase + 3) as usize)
+            var sb: String = string_new()
+            string_push(sb, "`spawn`: `")
+            string_push(sb, src[cal.start .. cal.end])
             if is_slice {
-                let pns: i32 = list.get(i32, p.iar, (pbase + 2) as usize)
-                let pne: i32 = list.get(i32, p.iar, (pbase + 3) as usize)
-                var sb: String = string_new()
-                string_push(sb, "`spawn`: `")
-                string_push(sb, src[cal.start .. cal.end])
                 string_push(sb, "` takes a `mut` slice `")
                 string_push(sb, src[pns as usize .. pne as usize])
                 string_push(sb, "` — a shared mutable slice can race across parallel tasks. Share mutable state through a raw `*mut T` in `unsafe` (each task a disjoint region, as `par_binned_sum` does), or pass it `read`.")
-                ediag(e, cd.start, cd.end, string_view(sb))
-                string_free(sb)
-                return
+            } else {
+                string_push(sb, "` takes `")
+                string_push(sb, src[pns as usize .. pne as usize])
+                string_push(sb, "` by `mut` — every task would hold a writable reference to one binding, which is a data race. Share mutable state through a raw `*mut T` in `unsafe`, or pass it `read` and have each task return what it produced.")
             }
+            ediag(e, cd.start, cd.end, string_view(sb))
+            string_free(sb)
+            return
         }
         pi = pi + 1
     }

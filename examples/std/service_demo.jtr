@@ -1,0 +1,210 @@
+// examples/std/service_demo.jtr — `jserved`: a service that starts, reports its health,
+// runs background work, shuts down gracefully, and says why it stopped — all of it
+// deterministic, because every dependency is handed in.
+//
+//   jestyrc run examples/std/service_demo.jtr
+//
+// This is the increment where the previous three add up. It uses `channel_close` (a worker
+// that drains until the producer is done, rather than one told a count), `std/metrics` (a
+// registry the service is given), and `time.manual()` (so a whole lifecycle runs in
+// microseconds and the transcript has no timings in it).
+//
+// **Three phases, and the middle one is the subject.** A draining service is LIVE BUT NOT
+// READY: it must refuse new work while finishing what it already accepted. A service with
+// one "healthy" boolean has to either report unhealthy while draining — and be killed
+// mid-drain, losing exactly the work it was trying to finish — or report healthy and keep
+// being sent traffic it has promised to refuse. Every rolling deploy runs this path.
+//
+// The last section is the counter-example on purpose: the same service halted with work
+// still in flight reports `abandoned` rather than `clean`, because a shutdown that always
+// claims success tells an operator nothing.
+import "mem"
+import "metrics"
+import "service"
+import "sink"
+import "sync"
+import "time"
+
+const CAP: usize = 1024
+
+// The background worker: drain until the producer closes. It is NOT told how many items
+// to expect — that is `channel_close`'s whole contribution, and before it this function
+// could not be written at all.
+//
+// **It reports through raw cells rather than touching the service, and that is enforced.**
+// The obvious first draft takes `mut s: service.Service` and calls `service.completed`
+// directly — and it is a data race, because every task would hold a writable reference to
+// one binding. `spawn` refuses it:
+//
+//   error: `spawn`: `worker` takes `s` by `mut` — every task would hold a writable
+//          reference to one binding, which is a data race.
+//
+// So the tasks accumulate into atomic cells (the sanctioned `*mut T` hatch) and the
+// service's own state is advanced by the main thread AFTER the join, where there is
+// exactly one writer. The lifecycle stays single-threaded; only the counting is parallel.
+fn worker(read ch: sync.Channel(i64), oks: *mut i64, fails: *mut i64) {
+    var slot: *mut i64 = alloc(i64, 1)
+    for sync.channel_recv_open(i64, ch, slot) {
+        // An odd unit is treated as a failure, so the `failed` path is exercised by real
+        // work rather than by a poke at the counter.
+        let v: i64 = atomic_load(slot)
+        if v % 2 != 0 {
+            atomic_add(fails, 1)
+        } else {
+            atomic_add(oks, 1)
+        }
+    }
+    free_ptr(slot)
+}
+
+fn health(mut sk: sink.Sink, mut buf: []u8, read s: service.Service) {
+    sink.reset(sk)
+    service.render_health(sk, buf, s)
+    let v: str = sink.view(sk, buf)
+    print_str(v)
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var clk: time.Clock = time.manual(0)
+    var m: metrics.Registry = metrics.make(a)
+    var raw: *mut u8 = alloc(u8, CAP)
+    var buf: []u8 = slice(u8, raw, CAP)
+    var sk: sink.Sink = sink.new()
+
+    print_str("-- jserved --")
+
+    var s: service.Service = service.make(m)
+    print_str("a new service is neither ready nor accepting")
+    print_bool(service.is_ready(s) == false)
+    var refused_early: bool = true
+    if service.accept(s, m) { refused_early = false }
+    print_bool(refused_early)
+
+    service.ready(s, clk)
+    health(sk, buf, s)
+
+    // Four units of work, accepted while ready and handed to a worker that drains until
+    // the channel closes. Two are odd, so two fail.
+    var ch = sync.channel_make(i64, 8)
+    var i: i64 = 1
+    for i <= 4 {
+        service.accept(s, m)
+        i = i + 1
+    }
+    print_str("four accepted, all in flight")
+    print_int(service.inflight_now(s) as i32)
+
+    // Draining: the middle phase, and the one that matters.
+    service.begin_drain(s)
+    health(sk, buf, s)
+    print_str("a draining service refuses new work")
+    var refused_draining: bool = true
+    if service.accept(s, m) { refused_draining = false }
+    print_bool(refused_draining)
+    print_str("but it is still live, so nothing should kill it")
+    print_bool(service.is_live(s))
+
+    // The producer feeds what was accepted and then CLOSES; the worker drains to EOF.
+    var oks: *mut i64 = alloc(i64, 1)
+    var fails: *mut i64 = alloc(i64, 1)
+    atomic_store(oks, 0)
+    atomic_store(fails, 0)
+    concurrent {
+        spawn worker(ch, oks, fails)
+        spawn feed(ch)
+    }
+    sync.channel_free(i64, ch)
+
+    // One writer, after the join: the service's own state never crosses a task boundary.
+    var n: i64 = 0
+    for n < atomic_load(oks) {
+        service.completed(s, m, true)
+        n = n + 1
+    }
+    var f: i64 = 0
+    for f < atomic_load(fails) {
+        service.completed(s, m, false)
+        f = f + 1
+    }
+    free_ptr(oks)
+    free_ptr(fails)
+    print_str("the workers drained everything accepted")
+    print_bool(service.inflight_now(s) == 0)
+
+    time.advance(clk, 5000)
+    let why: i32 = service.halt(s, m, clk)
+    health(sk, buf, s)
+    print_str("and it stopped because")
+    print_str(service.exit_name(why))
+
+    print_str("it ran for")
+    print_int(service.ran_for(s) as i32)
+
+    // The metrics the service kept about itself. Name-ordered, so this transcript does
+    // not depend on the order `service.make` happened to register them in.
+    sink.reset(sk)
+    metrics.render(sk, buf, m)
+    let dump: str = sink.view(sk, buf)
+    print_str(dump)
+
+    print_str("the health report is complete")
+    var whole: bool = true
+    if sink.overflowed(sk) { whole = false }
+    print_bool(whole)
+
+    // **The two counter-examples.** A demo that only ever prints the happy verdict is not
+    // showing that the verdict is COMPUTED, so both other reasons get a case.
+    //
+    // Abandoned: halted with work still in flight. That is the difference between a deploy
+    // that finished its queue and one that dropped it, and nothing else in the system can
+    // tell them apart afterwards.
+    var m2: metrics.Registry = metrics.make(a)
+    var s2: service.Service = service.make(m2)
+    service.ready(s2, clk)
+    service.accept(s2, m2)
+    service.accept(s2, m2)
+    service.completed(s2, m2, true)
+    print_str("halting with work in flight is not clean")
+    print_str(service.exit_name(service.halt(s2, m2, clk)))
+    print_str("and the count still in flight is the damage")
+    print_int(service.inflight_now(s2) as i32)
+
+    // Failed: a unit reported failure. Outranks abandonment on purpose — a service that
+    // both failed and dropped work has a bug, and the bug is the more actionable of the
+    // two, so it is the one the exit reason names.
+    var m3: metrics.Registry = metrics.make(a)
+    var s3: service.Service = service.make(m3)
+    service.ready(s3, clk)
+    service.accept(s3, m3)
+    service.completed(s3, m3, false)
+    print_str("and a unit that failed outranks everything else")
+    print_str(service.exit_name(service.halt(s3, m3, clk)))
+
+    // Completing more than was accepted is refused rather than driving the gauge negative.
+    print_str("over-completion is refused")
+    var over: bool = true
+    if service.completed(s3, m3, true) { over = false }
+    print_bool(over)
+
+    metrics.free(m)
+    metrics.free(m2)
+    metrics.free(m3)
+    free_ptr(raw)
+    return 0
+}
+
+// Send the four accepted units and close. Split out because `spawn` needs a plain
+// function, and it takes no count for the same reason the worker takes none.
+//
+// All four are even, so all four succeed and the headline path shuts down `clean`. The
+// other two exit reasons get their own cases at the end of `main`, because a demo that
+// only ever shows the happy verdict is not showing that the verdict is computed.
+fn feed(read ch: sync.Channel(i64)) {
+    var i: i64 = 2
+    for i <= 8 {
+        sync.channel_send(i64, ch, i)
+        i = i + 2
+    }
+    sync.channel_close(i64, ch)
+}

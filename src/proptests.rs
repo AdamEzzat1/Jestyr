@@ -937,6 +937,97 @@ mod syswatch_debounced_trigger {
 /// back-end server disagree about where it ends, and the bytes after it (`GET /admin`) become a
 /// second request attributed to the next client on the connection. Every byte of it is
 /// well-formed, and a lenient parser answers 200.
+/// **`jserved` — a service that starts, reports health, runs background work, shuts down
+/// gracefully, and says WHY it stopped.**
+///
+/// The increment where the rest add up: it uses `channel_close` (a worker that drains
+/// until the producer is done rather than one told a count), `std/metrics` (a registry the
+/// service is given), and `time.manual()` — so an entire lifecycle runs in microseconds
+/// and the transcript carries no timings, pids or paths and can be asserted whole.
+///
+/// **The middle phase is the subject.** A draining service is LIVE BUT NOT READY. A
+/// service reporting one "healthy" boolean must either report unhealthy while draining —
+/// and be killed mid-drain, losing exactly the work it was finishing — or report healthy
+/// and keep being sent traffic it has promised to refuse. Every rolling deploy runs this
+/// path on every instance.
+#[cfg(all(test, feature = "c-oracle"))]
+mod service_lifecycle {
+    use super::*;
+
+    #[test]
+    fn jserved_drains_gracefully_and_reports_why_it_stopped() {
+        let exe = super::c_oracle::build_exe("examples/std/service_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the service demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace('\r', "");
+
+        let want = "-- jserved --\n\
+                    a new service is neither ready nor accepting\n\
+                    true\n\
+                    true\n\
+                    phase=ready ready=true live=true inflight=0\n\
+                    \n\
+                    four accepted, all in flight\n\
+                    4\n\
+                    phase=draining ready=false live=true inflight=4\n\
+                    \n\
+                    a draining service refuses new work\n\
+                    true\n\
+                    but it is still live, so nothing should kill it\n\
+                    true\n\
+                    the workers drained everything accepted\n\
+                    true\n\
+                    phase=stopped ready=false live=false inflight=0\n\
+                    \n\
+                    and it stopped because\n\
+                    clean\n\
+                    it ran for\n\
+                    5000\n\
+                    counter service_accepted 4\n\
+                    counter service_completed 4\n\
+                    counter service_failed 0\n\
+                    gauge service_inflight 0\n\
+                    counter service_refused 2\n\
+                    \n\
+                    the health report is complete\n\
+                    true\n\
+                    halting with work in flight is not clean\n\
+                    abandoned\n\
+                    and the count still in flight is the damage\n\
+                    1\n\
+                    and a unit that failed outranks everything else\n\
+                    failed\n\
+                    over-completion is refused\n\
+                    true";
+        assert_eq!(out.trim_end(), want, "the service transcript changed:\n{out}");
+
+        // Anti-vacuity: `true` appears often enough that a containment check would pass
+        // for a demo printing it unconditionally. Every `false` here is a health FIELD
+        // (`ready=false`), never a failed claim, so the bare word must not appear alone.
+        assert!(!out.contains("\nfalse\n"), "every claim must have held:\n{out}");
+
+        // **The readiness/liveness split, asserted as the exact pair.** Both booleans are
+        // present in every phase line whatever the code does; `ready=false live=true` is
+        // the ONE combination that distinguishes a draining service from a dead one, and
+        // an implementation folding the two into a single "healthy" cannot produce it.
+        assert!(
+            out.contains("phase=draining ready=false live=true"),
+            "a draining service must be live but not ready:\n{out}"
+        );
+
+        // All three exit reasons must appear. A demo that only ever reaches `clean` does
+        // not show the verdict is computed rather than assumed.
+        for reason in ["clean", "abandoned", "failed"] {
+            assert!(out.contains(reason), "exit reason `{reason}` is missing:\n{out}");
+        }
+
+        // `ran_for` is 5000 because the manual clock advanced exactly that far. The guard
+        // it exercises is that a service really starting at t=0 — which every deterministic
+        // test does — is not mistaken for one that never started.
+        assert!(out.contains("\n5000\n"), "the manual clock must drive the lifetime:\n{out}");
+    }
+}
+
 /// **`jmetrics` — observability that is handed in, and a dump that does not depend on
 /// how the program was assembled.**
 ///
@@ -14264,6 +14355,58 @@ fn g(p: *mut i32) -> i32 {
         );
     }
 
+    /// **A `spawn` target may not take ANY `mut` parameter, differentially.**
+    ///
+    /// The rule used to reach only `mut` SLICES, so a `mut` struct crossing `spawn` was
+    /// accepted by every front-end check and stopped only by gcc — the thunk stores
+    /// arguments by value while the callee wants a pointer. That is a data race held out
+    /// of the world by a C type error, and fixing the thunk would have removed the
+    /// refusal without removing the race.
+    ///
+    /// No corpus file trips it (swept: the rule adds exactly one diagnostic across all 274
+    /// files, and that one is `service_demo.jtr`'s first draft, since corrected), so the
+    /// goldens agree whether or not the port has the widened reach. This probe is what
+    /// holds the two sides together, and it was watched FAILING against the unwidened port.
+    #[test]
+    fn jestyr_spawn_mut_param_matches_reference() {
+        let exe = build_exe("examples/std/escape_cli.jtr");
+        let racy = "struct Box { n: i64 } fn bump(mut b: Box) { b.n = b.n + 1 } \
+                    fn main() -> i32 { var b: Box = Box{ n: 0 } concurrent { spawn bump(b) } return 0 }";
+        let calm = "struct Box { n: i64 } fn peek(read b: Box) -> i64 { return b.n } \
+                    fn main() -> i32 { var b: Box = Box{ n: 0 } concurrent { spawn peek(b) } return 0 }";
+
+        let want = rust_escape_dump(racy);
+        // Anti-vacuity: `Box` says nothing about itself and there is no slice anywhere, so
+        // this fires only if the rule reaches past `Ty::Slice`.
+        assert!(
+            want.iter().any(|l| l.contains("by `mut`") && l.contains("data race")),
+            "the spawn probe no longer fires — a `mut` struct must be refused: {want:?}"
+        );
+        let f = std::env::temp_dir().join("jestyr_spawn_mut.jtr");
+        std::fs::write(&f, racy).unwrap();
+        assert_eq!(
+            jestyr_escape_dump(&exe, f.to_str().unwrap()),
+            want,
+            "the toolchains disagree about a `mut` param across `spawn`; \
+             the port's `check_spawn_slice` is the mirror"
+        );
+
+        // **The control**, and it is the difference between a rule and a blanket ban on
+        // structs crossing `spawn`: the same program by `read` must stay legal.
+        let ok = rust_escape_dump(calm);
+        assert!(
+            !ok.iter().any(|l| l.contains("data race")),
+            "a `read` struct across `spawn` must stay legal — the rule is over-reaching: {ok:?}"
+        );
+        let g = std::env::temp_dir().join("jestyr_spawn_read.jtr");
+        std::fs::write(&g, calm).unwrap();
+        assert_eq!(
+            jestyr_escape_dump(&exe, g.to_str().unwrap()),
+            ok,
+            "the toolchains disagree about a `read` struct across `spawn`"
+        );
+    }
+
     /// **The alias taint, differentially (item 5 residue (a))** — the corpus has no
     /// aliased-root store (route 3's pinned example uses the root directly), so the
     /// probes carry the rule: `var alias = h` inside the inner region then a store
@@ -17840,8 +17983,10 @@ fn main() -> i32 {
         "extern_alias.jtr",
         // The MODULE that declares the type, not its demo: `metrics_demo.jtr` holds a
         // `metrics.Registry` — another module's struct — as a scope-local, which is the
-        // shape that degrades to `?` with imports unresolved.
+        // shape that degrades to `?` with imports unresolved. `service_demo.jtr` holds
+        // both a `service.Service` and a `metrics.Registry` and is out for the same reason.
         "metrics.jtr",
+        "service.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same

@@ -1417,9 +1417,26 @@ impl<'a> Checker<'a> {
         })
     }
 
-    /// Reject a `spawn` whose target takes a `mut`/`out` **slice** parameter — a
-    /// shared mutable slice across parallel tasks can race (its `ptr` aliases). The
+    /// Reject a `spawn` whose target takes any `mut`/`out` parameter — every task
+    /// would hold a writable reference to one binding, which is a data race. The
     /// safe way to share mutable state across tasks is a raw `*mut T` in `unsafe`.
+    ///
+    /// **The slice restriction was the bug, not the rule.** This checked
+    /// `matches!(p.ty, Ty::Slice(_))`, so a `mut` STRUCT walked straight past it and
+    /// `spawn bump(b)` for `fn bump(mut b: Box)` was accepted — `jestyrc check`
+    /// reported every check passing. What stopped it was gcc, and only by accident:
+    /// the spawn thunk stores its arguments by value while the function expects a
+    /// `Box* restrict`, so the emitted C does not compile. A racy program held out of
+    /// the world by a C type error is the degrades-to-gcc shape this tree keeps
+    /// closing, and the race is the part that matters — the C error would disappear
+    /// the moment the thunk was fixed.
+    ///
+    /// Found by writing an ordinary service: a worker that completes units through a
+    /// `mut Service` is the obvious first draft, and it is a race.
+    ///
+    /// A raw `*mut T` parameter is untouched, because it carries no `mut` conv — that
+    /// is the sanctioned hatch (`par_binned_sum` gives each task a disjoint region),
+    /// and it is `unsafe` precisely so the disjointness is the caller's stated claim.
     fn check_spawn_no_shared_mut_slice(&mut self, call: ExprId) {
         let ExprKind::Call { callee, .. } = &self.ast.expr_at(call).kind else { return };
         // The recorded resolution, not a bare-`Name` match: a QUALIFIED spawn
@@ -1429,24 +1446,34 @@ impl<'a> Checker<'a> {
         // call checks above (Stage 3), same class of hole.
         let Some(name) = self.resolved_callee_name(call, *callee) else { return };
         let Some(sig) = self.info.table.fns.get(&name) else { return };
-        let mut hit: Option<String> = None;
+        let mut hit: Option<(String, bool)> = None;
         for p in &sig.params {
-            if matches!(p.conv, Conv::Mut | Conv::Out) && matches!(p.ty, Ty::Slice(_)) {
-                hit = Some(p.name.clone());
+            if matches!(p.conv, Conv::Mut | Conv::Out) {
+                hit = Some((p.name.clone(), matches!(p.ty, Ty::Slice(_))));
                 break;
             }
         }
-        if let Some(pname) = hit {
+        if let Some((pname, is_slice)) = hit {
             let span = self.ast.expr_at(call).span;
             let fname = name.clone();
-            self.error(
-                span,
+            // Two messages, because they are two different reasons for one verdict: a
+            // slice races through its aliased `ptr`, a plain binding races because every
+            // task writes the one place. Naming the actual hazard is what tells a caller
+            // which fix applies.
+            let msg = if is_slice {
                 format!(
                     "`spawn`: `{fname}` takes a `mut` slice `{pname}` — a shared mutable slice can \
                      race across parallel tasks. Share mutable state through a raw `*mut T` in \
                      `unsafe` (each task a disjoint region, as `par_binned_sum` does), or pass it `read`."
-                ),
-            );
+                )
+            } else {
+                format!(
+                    "`spawn`: `{fname}` takes `{pname}` by `mut` — every task would hold a writable \
+                     reference to one binding, which is a data race. Share mutable state through a raw \
+                     `*mut T` in `unsafe`, or pass it `read` and have each task return what it produced."
+                )
+            };
+            self.error(span, msg);
         }
     }
 
@@ -3660,6 +3687,38 @@ mod tests {
              concurrent { spawn w(s) } free_ptr(p) return 0 }",
         );
         assert!(d.iter().any(|m| m.message.contains("shared mutable slice")), "{:?}", d);
+    }
+
+    #[test]
+    fn rejects_spawn_with_mut_struct_param() {
+        // **The hole the slice restriction left.** `jestyrc check` reported every check
+        // passing for this program; the only thing that refused it was gcc, because the
+        // spawn thunk stores arguments by value while the callee wants a `Box*`. The race
+        // is the part that matters — fixing the thunk would have removed the refusal
+        // without removing the data race.
+        let d = escapes(
+            "struct Box { n: i64 } fn bump(mut b: Box) { b.n = b.n + 1 } \
+             fn main() -> i32 { var b: Box = Box{ n: 0 } concurrent { spawn bump(b) } return 0 }",
+        );
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(
+            d[0].message.contains("takes `b` by `mut`")
+                && d[0].message.contains("data race"),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn accepts_spawn_with_read_struct_param() {
+        // The control. Byte-identical but for the conv, and it must stay legal — a rule
+        // that rejected every struct crossing `spawn` would pass the test above while
+        // making the feature useless.
+        let d = escapes(
+            "struct Box { n: i64 } fn peek(read b: Box) -> i64 { return b.n } \
+             fn main() -> i32 { var b: Box = Box{ n: 0 } concurrent { spawn peek(b) } return 0 }",
+        );
+        assert!(d.is_empty(), "a `read` struct across `spawn` is fine: {:?}", d);
     }
 
     #[test]
