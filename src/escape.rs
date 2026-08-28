@@ -44,7 +44,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::*;
 use crate::diag::Diagnostic;
 use crate::span::Span;
-use crate::types::{Ty, TypeInfo};
+use crate::types::{Ty, TypeInfo, TypeKindG};
 
 pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
     let effects = effect_closures(ast, info);
@@ -1810,10 +1810,13 @@ impl<'a> Checker<'a> {
     /// The consuming rule's gate: does this type run drop glue the callee now
     /// owns? v1 answers "has a direct concrete `impl Drop`" — the first branch
     /// of cgen's `drop_key_of`, read from the same `impl_index` so the two
-    /// cannot drift on it. Transitively-droppable aggregates (a wrapper whose
-    /// FIELD has the impl) and blanket generic `impl[T] Drop` instances also
-    /// drop in cgen but are not yet gated here — that residue is pinned by
-    /// `transitively_droppable_reuse_is_v1_residue` so it cannot go unnoticed.
+    /// cannot drift on it. **This answers the DIRECT question only**, and that is
+    /// now deliberate rather than residue: the transitive walk lives one level up
+    /// in `owns_resource_at`, which asks this about every by-value field, so a
+    /// wrapper whose FIELD has the impl is gated there. Blanket generic
+    /// `impl[T] Drop` instances are handled by the constructor match below.
+    /// `a_wrapper_with_a_droppable_field_cannot_be_reused_after_consumption` is
+    /// the test that used to pin the gap as accepted.
     /// Drop-free non-Copy values stay unmarked ON PURPOSE: giving one to `take`
     /// is an implicit copy (MVS trivially-copyable semantics — the corpus's
     /// Option combinators reuse their inputs freely), and nothing observable is
@@ -1889,8 +1892,67 @@ impl<'a> Checker<'a> {
     /// is meant to see whether the bytes landed — so giving them a `Drop` to reach the
     /// first property would have discarded exactly the verdict `@must_use` exists to
     /// preserve, and would have closed them at every scope exit besides.
+    /// See `owns_resource_at`. Not a semantic bound — a guard against a cyclic type
+    /// table, which a legal program cannot produce.
+    const OWNS_RESOURCE_MAX_DEPTH: usize = 64;
+
     fn owns_resource(&self, ty: &Ty) -> bool {
-        self.droppable_ty(ty) || self.move_only_ty(ty)
+        self.owns_resource_at(ty, 0)
+    }
+
+    /// `owns_resource`, walking BY-VALUE fields and enum payloads.
+    ///
+    /// Both halves of the gate were declaration-local, and both were wrong in the
+    /// same way: a wrapper around an owning thing owns that thing. The two holes
+    /// that closes are one hole seen twice —
+    ///
+    ///   * `alog.Cursor` holds a `file.Reader`, which is `@move`, and `Cursor`
+    ///     itself carried no attribute — so it was freely copyable and a copy was a
+    ///     second name for one OS file descriptor. `alog.Log` holds a `file.Writer`
+    ///     and DID say `@move`, by hand, two hundred lines earlier in the same
+    ///     module. That is the convention failing in the one place best placed to
+    ///     remember it.
+    ///   * `transitively_droppable_reuse_is_v1_residue` pinned the other half: a
+    ///     wrapper with a droppable FIELD slipped the gate while cgen's `needs_drop`
+    ///     dropped it in the callee, so consume-then-reuse was a use-after-drop that
+    ///     escape accepted. That test now expects the rejection.
+    ///
+    /// Deliberately shaped to match cgen's `needs_drop`, because the two answer the
+    /// same question from opposite ends and drifting apart is what produced the
+    /// residue above:
+    ///
+    ///   * **Indirection is not followed.** Only `Ty::Named` aggregates are walked,
+    ///     so a `*mut Socket` or a `&Socket` field is a pointer to a resource, not
+    ///     ownership of one. Stopping at indirection is also what guarantees
+    ///     termination — a by-value aggregate cannot contain itself.
+    ///   * **`@copy` still wins.** An aggregate the author declared copyable is left
+    ///     alone, exactly as `needs_drop` leaves it alone. A `@copy` struct holding a
+    ///     `@move` field is a contradiction the language should reject outright; it
+    ///     is not in the corpus, and diagnosing it is its own increment rather than
+    ///     something to do silently from in here. Pinned by
+    ///     `a_copy_wrapper_around_a_resource_is_pinned_residue`.
+    ///
+    /// The depth cap is belt-and-braces against a malformed type table rather than a
+    /// real bound: nothing legal gets close to it, and a program that did would have
+    /// failed the size check in typeck first.
+    fn owns_resource_at(&self, ty: &Ty, depth: usize) -> bool {
+        if self.droppable_ty(ty) || self.move_only_ty(ty) {
+            return true;
+        }
+        if depth >= Self::OWNS_RESOURCE_MAX_DEPTH || ty.is_copy(&self.info.table) {
+            return false;
+        }
+        let Ty::Named(i) = ty else { return false };
+        let Some(decl) = self.info.table.types.get(*i) else { return false };
+        match &decl.kind {
+            TypeKindG::Struct { fields } => {
+                fields.iter().any(|(_, f)| self.owns_resource_at(f, depth + 1))
+            }
+            TypeKindG::Enum { variants } => variants
+                .iter()
+                .any(|(_, payload)| payload.iter().any(|f| self.owns_resource_at(f, depth + 1))),
+            _ => false,
+        }
     }
 
     /// The consuming rule's marking half: `arg` is being given to a `take`
@@ -3357,17 +3419,102 @@ mod tests {
     }
 
     #[test]
-    fn transitively_droppable_reuse_is_v1_residue() {
-        // PINNED RESIDUE, not an endorsement: a wrapper with a droppable FIELD
-        // but no direct `impl Drop` slips the v1 gate (`droppable_ty` reads only
-        // the impl_index), so consuming it and reusing the binding is still
-        // accepted — while cgen's `needs_drop` DOES drop it in the callee. When
-        // the gate learns the transitive walk, this test flips to a rejection.
+    fn a_wrapper_with_a_droppable_field_cannot_be_reused_after_consumption() {
+        // WAS `transitively_droppable_reuse_is_v1_residue`, which pinned this as
+        // ACCEPTED and said in as many words that it would flip to a rejection once
+        // the gate learned the transitive walk. It has.
+        //
+        // What it was pinning is a use-after-drop, not an untidiness: cgen's
+        // `needs_drop` DOES recurse, so `eat(w)` drops `w.dev` inside the callee —
+        // and then `main` read `w.dev.id`. The two halves of the compiler disagreed
+        // about whether a wrapper owns what it wraps, and escape's half was the
+        // permissive one.
         let d = escapes(&format!(
             "{DROPPY} struct Wrap {{ dev: Device }} fn eat(take w: Wrap) {{}} \
              fn main() -> i64 {{ let w = Wrap{{ dev: Device{{ id: 1 }} }} eat(w) return w.dev.id }}"
         ));
-        assert!(d.is_empty(), "v1 gate is direct-impl only (residue): {:?}", d);
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(
+            d[0].message.contains("cannot use `w` after it was given to a `take` parameter"),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn a_wrapper_with_a_move_only_field_cannot_be_reused_after_consumption() {
+        // The other half of the same walk, and the one with a live instance in the
+        // shipped library: `alog.Cursor` holds a `file.Reader`, which is `@move`,
+        // and `Cursor` carried no attribute of its own — so a copy of a Cursor was a
+        // second name for one OS file descriptor. `alog.Log` wraps a `file.Writer`
+        // and DID say `@move`, by hand, in the same module. That is the convention
+        // failing where it was best placed to hold.
+        //
+        // No `Drop` impl anywhere here: this is reached only through `move_only_ty`,
+        // so it fails if the walk consults just the droppable half.
+        let d = escapes(
+            "@move struct Handle { fd: i64 } struct Session { h: Handle, n: i64 } \
+             fn eat(take s: Session) {} \
+             fn main() -> i64 { let s = Session{ h: Handle{ fd: 3 }, n: 1 } eat(s) return s.n }",
+        );
+        assert_eq!(d.len(), 1, "a wrapper around a @move field owns it: {:?}", d);
+        assert!(
+            d[0].message.contains("cannot use `s` after it was given to a `take` parameter"),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn a_wrapper_around_nothing_owning_is_still_freely_reusable() {
+        // The positive control the rule owes. Same shape, same `take`, and the only
+        // difference is that the field owns nothing — so a walk that answered "owns
+        // a resource" for every aggregate would fail here and pass everything above,
+        // and the two tests together are what distinguish the rule from a blanket.
+        let d = escapes(
+            "struct Plain { n: i64 } struct Holder { p: Plain, m: i64 } \
+             fn eat(take h: Holder) {} \
+             fn main() -> i64 { let h = Holder{ p: Plain{ n: 1 }, m: 2 } eat(h) return h.m }",
+        );
+        assert!(d.is_empty(), "nothing here owns a resource: {:?}", d);
+    }
+
+    #[test]
+    fn indirection_is_not_ownership() {
+        // The walk stops at pointers, exactly as cgen's `needs_drop` does: a field
+        // that POINTS AT a resource does not own it, and following indirection is
+        // also what would let a by-value walk fail to terminate. A `Drop` impl that
+        // frees through the pointer is that impl's business, not the wrapper's.
+        let d = escapes(
+            "@move struct Handle { fd: i64 } struct ByPtr { h: *mut Handle, n: i64 } \
+             fn eat(take b: ByPtr) {} \
+             fn main() -> i64 { var x = Handle{ fd: 3 } let b = ByPtr{ h: &x, n: 1 } eat(b) return b.n }",
+        );
+        assert!(d.is_empty(), "a pointer field is not ownership: {:?}", d);
+    }
+
+    #[test]
+    fn a_copy_wrapper_around_a_resource_is_pinned_residue() {
+        // PINNED RESIDUE, and cited from `owns_resource_at`. An aggregate the author
+        // declared `@copy` is left alone by the walk, exactly as `needs_drop` leaves
+        // it alone — so `@copy` remains an escape hatch out of the containment rule.
+        //
+        // This is NOT an endorsement. A `@copy` struct holding a `@move` field is a
+        // contradiction and the right answer is to reject the DECLARATION, which is
+        // its own increment and a new diagnostic (so a port mirror). Keeping the walk
+        // in step with `needs_drop` matters more than closing it from in here: the
+        // two drifting apart is what produced the use-after-drop above. No corpus
+        // type is shaped this way: all 31 `@copy` declarations were swept and none
+        // holds a field of any of the eight `@move` handle types. (The droppable
+        // half of the same contradiction is not swept here — `@copy` already
+        // suppressed `needs_drop` before this walk existed, so that behaviour is
+        // unchanged rather than newly permitted.)
+        let d = escapes(
+            "@move struct Handle { fd: i64 } @copy struct Sneaky { h: Handle } \
+             fn eat(take s: Sneaky) {} \
+             fn main() -> i64 { let s = Sneaky{ h: Handle{ fd: 3 } } eat(s) return 0 }",
+        );
+        assert!(d.is_empty(), "@copy still wins over containment (residue): {:?}", d);
     }
 
     // --- route 4: giving a borrow to a `take` (owning) parameter ---

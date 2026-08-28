@@ -1180,6 +1180,8 @@ bool jestyr_is_os_intrinsic(JestyrStr j_src, size_t j_ns, size_t j_ne);
 bool jestyr_is_atomic_op(JestyrStr j_src, size_t j_ns, size_t j_ne);
 int32_t jestyr_mcall_row(Jestyr_Checker j_c, int32_t j_id);
 bool jestyr_attrs_has_move(Jestyr_Parser j_p, JestyrStr j_src, int32_t j_attr_start, int32_t j_attr_count);
+bool jestyr_attrs_has_copy(Jestyr_Parser j_p, JestyrStr j_src, int32_t j_attr_start, int32_t j_attr_count);
+bool jestyr_type_name_owns(Jestyr_Parser j_p, JestyrStr j_src, JestyrStr j_nm, int32_t j_depth);
 bool jestyr_droppable_expr(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_eid);
 bool jestyr_recv_is_take(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_id, int32_t j_callee);
 bool jestyr_arg_is_take(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_id, int32_t j_callee, int32_t j_ai);
@@ -17282,6 +17284,88 @@ bool jestyr_attrs_has_move(Jestyr_Parser j_p, JestyrStr j_src, int32_t j_attr_st
     return false;
 }
 
+bool jestyr_attrs_has_copy(Jestyr_Parser j_p, JestyrStr j_src, int32_t j_attr_start, int32_t j_attr_count)
+{
+    int32_t j_i = 0;
+    while ((j_i < j_attr_count))
+    {
+        int32_t j_base = (j_attr_start + (j_i * 4));
+        size_t j_ns = (size_t)(jestyr_get__list__i32(j_p.j_aar, (size_t)(j_base)));
+        size_t j_ne = (size_t)(jestyr_get__list__i32(j_p.j_aar, (size_t)((j_base + 1))));
+        if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_ns, j_ne), JSTR("copy")))
+        {
+            return true;
+        }
+        j_i = (j_i + 1);
+    }
+    return false;
+}
+
+bool jestyr_type_name_owns(Jestyr_Parser j_p, JestyrStr j_src, JestyrStr j_nm, int32_t j_depth)
+{
+    if ((j_depth > 8))
+    {
+        return false;
+    }
+    int32_t j_r = 0;
+    while ((j_r < jestyr_len__i32(j_p.j_roots)))
+    {
+        int32_t j_iid = jestyr_get__list__i32(j_p.j_roots, (size_t)(j_r));
+        Jestyr_ItemData j_it = jestyr_get__list__ItemData(j_p.j_it, (size_t)(j_iid));
+        if (((j_it.j_kind == 7) && (j_it.j_h <= 0)))
+        {
+            if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_it.j_x, j_it.j_y), JSTR("Drop")))
+            {
+                Jestyr_TypeData j_tt = jestyr_get__list__TypeData(j_p.j_ty, (size_t)(j_it.j_a));
+                if ((j_tt.j_kind == 0))
+                {
+                    if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_tt.j_start, j_tt.j_end), j_nm))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        if ((j_it.j_kind == 4))
+        {
+            if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_it.j_x, j_it.j_y), j_nm))
+            {
+                if (jestyr_attrs_has_move(j_p, j_src, j_it.j_u, j_it.j_v))
+                {
+                    return true;
+                }
+                if ((!jestyr_attrs_has_copy(j_p, j_src, j_it.j_u, j_it.j_v)))
+                {
+                    int32_t j_i = 0;
+                    while ((j_i < j_it.j_b))
+                    {
+                        int32_t j_base = (j_it.j_a + (j_i * 10));
+                        int32_t j_tag = jestyr_get__list__i32(j_p.j_mar, (size_t)(j_base));
+                        if ((j_tag != 1))
+                        {
+                            int32_t j_fty = jestyr_get__list__i32(j_p.j_mar, (size_t)((j_base + 4)));
+                            if ((j_fty >= 0))
+                            {
+                                Jestyr_TypeData j_ft = jestyr_get__list__TypeData(j_p.j_ty, (size_t)(j_fty));
+                                if ((j_ft.j_kind == 0))
+                                {
+                                    if (jestyr_type_name_owns(j_p, j_src, jestyr_rt_substr(j_src, j_ft.j_start, j_ft.j_end), (j_depth + 1)))
+                                    {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                        j_i = (j_i + 1);
+                    }
+                }
+            }
+        }
+        j_r = (j_r + 1);
+    }
+    return false;
+}
+
 bool jestyr_droppable_expr(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_eid)
 {
     int32_t j_tid = jestyr_get__list__i32(j_c.j_et, (size_t)(j_eid));
@@ -17296,38 +17380,7 @@ bool jestyr_droppable_expr(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_sr
     }
     int32_t j_tns = jestyr_get__list__i32(j_c.j_tdecl, (size_t)(((j_td.j_x * 10) + 0)));
     int32_t j_tne = jestyr_get__list__i32(j_c.j_tdecl, (size_t)(((j_td.j_x * 10) + 1)));
-    int32_t j_r = 0;
-    while ((j_r < jestyr_len__i32(j_p.j_roots)))
-    {
-        int32_t j_iid = jestyr_get__list__i32(j_p.j_roots, (size_t)(j_r));
-        Jestyr_ItemData j_it = jestyr_get__list__ItemData(j_p.j_it, (size_t)(j_iid));
-        if (((j_it.j_kind == 7) && (j_it.j_h <= 0)))
-        {
-            if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_it.j_x, j_it.j_y), JSTR("Drop")))
-            {
-                Jestyr_TypeData j_tt = jestyr_get__list__TypeData(j_p.j_ty, (size_t)(j_it.j_a));
-                if ((j_tt.j_kind == 0))
-                {
-                    if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_tt.j_start, j_tt.j_end), jestyr_rt_substr(j_src, (size_t)(j_tns), (size_t)(j_tne))))
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        if ((j_it.j_kind == 4))
-        {
-            if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_it.j_x, j_it.j_y), jestyr_rt_substr(j_src, (size_t)(j_tns), (size_t)(j_tne))))
-            {
-                if (jestyr_attrs_has_move(j_p, j_src, j_it.j_u, j_it.j_v))
-                {
-                    return true;
-                }
-            }
-        }
-        j_r = (j_r + 1);
-    }
-    return false;
+    return jestyr_type_name_owns(j_p, j_src, jestyr_rt_substr(j_src, (size_t)(j_tns), (size_t)(j_tne)), 0);
 }
 
 bool jestyr_recv_is_take(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_id, int32_t j_callee)

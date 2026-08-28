@@ -602,6 +602,21 @@ fn attrs_has_move(read p: parser.Parser, read src: str, attr_start: i32, attr_co
     return false
 }
 
+// The same walk for `@copy`. Kept separate rather than parameterised because the two ask
+// opposite questions of the containment walk below: `@move` ENDS it with a yes, `@copy`
+// ends it with a no.
+fn attrs_has_copy(read p: parser.Parser, read src: str, attr_start: i32, attr_count: i32) -> bool {
+    var i: i32 = 0
+    for i < attr_count {
+        let base: i32 = attr_start + i * 4
+        let ns: usize = list.get(i32, p.aar, base as usize) as usize
+        let ne: usize = list.get(i32, p.aar, (base + 1) as usize) as usize
+        if str_eq(src[ns .. ne], "copy") { return true }
+        i = i + 1
+    }
+    return false
+}
+
 // Does the expression's type own something that must not be DUPLICATED? Two independent
 // reasons, mirroring the reference's `owns_resource`:
 //
@@ -619,20 +634,42 @@ fn attrs_has_move(read p: parser.Parser, read src: str, attr_start: i32, attr_co
 // — it closes at every scope exit, and their close is FALLIBLE, so the verdict a caller
 // is meant to read would be discarded.
 //
-// Transitively-droppable aggregates, blanket generic `impl[T] Drop` instances, and
-// concrete-generic-instance impls are the reference gate's `impl_index` reach beyond
-// this — recorded residue, no corpus file distinguishes them. `@move` on a GENERIC struct
-// is residue of the same kind: the reference resolves it through `GenStruct`'s ctor and
-// the scan below is Named-only, and no corpus file declares one. Drop-free, move-free
-// values stay unmarked ON PURPOSE: giving one to `take` is an implicit copy (MVS; the
+// **Transitively-owning aggregates are no longer residue** — `type_name_owns` below walks
+// by-value fields on both halves, matching the reference's `owns_resource_at`. Blanket
+// generic `impl[T] Drop` instances and concrete-generic-instance impls remain the
+// reference gate's `impl_index` reach beyond this, and `@move` on a GENERIC struct is
+// residue of the same kind: the reference resolves it through `GenStruct`'s ctor and the
+// scan below is Named-only, and no corpus file declares one. Drop-free, move-free values
+// stay unmarked ON PURPOSE: giving one to `take` is an implicit copy (MVS; the
 // Option-combinator shape).
-fn droppable_expr(read p: parser.Parser, read c: typeck.Checker, read src: str, eid: i32) -> bool {
-    let tid: i32 = list.get(i32, c.et, eid as usize)
-    if tid < 0 { return false }
-    let td: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
-    if td.kind != 15 { return false }                 // Named
-    let tns: i32 = list.get(i32, c.tdecl, (td.x * 10 + 0) as usize)
-    let tne: i32 = list.get(i32, c.tdecl, (td.x * 10 + 1) as usize)
+//
+// Nothing in the corpus trips the containment walk — the whole-corpus diagnostic sweep is
+// byte-identical across all 274 files with and without it — so the goldens agree whether
+// or not this mirror exists. `jestyr_move_containment_matches_reference` is what actually
+// holds the two sides together, and it was watched FAILING against the unmirrored port
+// before this was written.
+// Does the type NAMED `nm` own a resource — directly, or through a BY-VALUE field?
+// Mirrors the reference's `owns_resource_at`. The recursion is the whole point: a wrapper
+// owns what it wraps, and both gates used to answer only about the declaration in hand.
+//
+// `alog.Cursor` is the live instance. It holds a `file.Reader`, which is `@move`, and said
+// nothing itself — so a copy of a Cursor was a second name for one OS descriptor, while
+// `alog.Log` wrapping a `file.Writer` DID say `@move`, by hand, in the same module.
+//
+// Three shapes of the walk, each matching the reference:
+//
+//   * **Indirection is not followed.** Only a Named field type (`TypeData` kind 0) is
+//     recursed into, so a `*mut Handle` field points at a resource without owning one.
+//     That is also what makes termination free — a by-value aggregate cannot contain
+//     itself, so the depth cap below is a guard against a malformed arena, not a bound
+//     any legal program approaches.
+//   * **`@copy` ends the walk with a no**, exactly as it suppresses cgen's `needs_drop`.
+//     A `@copy` struct holding a `@move` field is a contradiction that wants its own
+//     diagnostic; keeping this in step with the reference matters more than closing it
+//     from in here, because the two drifting apart is what produced the residue.
+//   * **A method member is skipped** — tag 1 in the `mar` 10-tuple is a fn, not a field.
+fn type_name_owns(read p: parser.Parser, read src: str, read nm: str, depth: i32) -> bool {
+    if depth > 8 { return false }
     var r: i32 = 0
     for r < list.len(i32, p.roots) {
         let iid: i32 = list.get(i32, p.roots, r as usize)
@@ -641,19 +678,47 @@ fn droppable_expr(read p: parser.Parser, read c: typeck.Checker, read src: str, 
             if str_eq(src[it.x .. it.y], "Drop") {
                 let tt: parser.TypeData = list.get(parser.TypeData, p.ty, it.a as usize)
                 if tt.kind == 0 {
-                    if str_eq(src[tt.start .. tt.end], src[tns as usize .. tne as usize]) { return true }
+                    if str_eq(src[tt.start .. tt.end], nm) { return true }
                 }
             }
         }
-        // The `@move` half: a struct declaration of this name carrying the attribute.
+        // The `@move` half: a struct declaration of this name carrying the attribute,
+        // and failing that, the containment walk over its fields.
         if it.kind == 4 {
-            if str_eq(src[it.x .. it.y], src[tns as usize .. tne as usize]) {
+            if str_eq(src[it.x .. it.y], nm) {
                 if attrs_has_move(p, src, it.u, it.v) { return true }
+                if !attrs_has_copy(p, src, it.u, it.v) {
+                    var i: i32 = 0
+                    for i < it.b {
+                        let base: i32 = it.a + i * 10
+                        let tag: i32 = list.get(i32, p.mar, base as usize)
+                        if tag != 1 {
+                            let fty: i32 = list.get(i32, p.mar, (base + 4) as usize)
+                            if fty >= 0 {
+                                let ft: parser.TypeData = list.get(parser.TypeData, p.ty, fty as usize)
+                                if ft.kind == 0 {
+                                    if type_name_owns(p, src, src[ft.start .. ft.end], depth + 1) { return true }
+                                }
+                            }
+                        }
+                        i = i + 1
+                    }
+                }
             }
         }
         r = r + 1
     }
     return false
+}
+
+fn droppable_expr(read p: parser.Parser, read c: typeck.Checker, read src: str, eid: i32) -> bool {
+    let tid: i32 = list.get(i32, c.et, eid as usize)
+    if tid < 0 { return false }
+    let td: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    if td.kind != 15 { return false }                 // Named
+    let tns: i32 = list.get(i32, c.tdecl, (td.x * 10 + 0) as usize)
+    let tne: i32 = list.get(i32, c.tdecl, (td.x * 10 + 1) as usize)
+    return type_name_owns(p, src, src[tns as usize .. tne as usize], 0)
 }
 
 // Is the method-sugar RECEIVER of call `id` a `take` receiver? Free-fn-methods answer from

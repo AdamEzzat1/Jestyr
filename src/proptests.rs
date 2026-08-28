@@ -14143,6 +14143,59 @@ fn g(p: *mut i32) -> i32 {
         );
     }
 
+    /// **Containment, differentially — a wrapper owns what it wraps.**
+    ///
+    /// The corpus cannot carry this one either, and for a sharper reason than `@move`
+    /// itself: the whole-corpus diagnostic sweep is byte-identical before and after
+    /// the rule landed, all 274 files, so *every* golden agrees whether or not the
+    /// port has the walk. This probe is the only thing that can tell the difference.
+    ///
+    /// The live instance is `alog.Cursor`, which holds a `@move file.Reader` and
+    /// declared nothing itself, while `alog.Log` holds a `file.Writer` and said
+    /// `@move` by hand in the same module. The control is what makes it a rule about
+    /// CONTAINMENT rather than about wrappers: the identical program whose field type
+    /// lacks the attribute must stay legal, or the checker is just rejecting every
+    /// aggregate passed to `take`.
+    #[test]
+    fn jestyr_move_containment_matches_reference() {
+        let exe = build_exe("examples/std/escape_cli.jtr");
+        let body = "fn mkw() -> W { return W { h: H { fd: 3 }, n: 1 } } \
+                    fn sink(take w: W) -> i64 { return w.n } \
+                    fn consumed() -> i64 { var c: W = mkw()  let n: i64 = sink(c)  return n + c.n }";
+        let wrapped = format!("@move struct H {{ fd: i64 }} struct W {{ h: H, n: i64 }} {body}");
+        let plain = format!("struct H {{ fd: i64 }} struct W {{ h: H, n: i64 }} {body}");
+
+        let want = rust_escape_dump(&wrapped);
+        // Anti-vacuity: `W` says nothing about itself, so this fires only if the gate
+        // walked into `h`. If it stops firing the probe has stopped testing the rule.
+        assert!(
+            want.iter().any(|l| l.contains("given to a `take` parameter")),
+            "the containment probe no longer fires — `W` must own its `@move` field: {want:?}"
+        );
+        let f = std::env::temp_dir().join("jestyr_move_containment.jtr");
+        std::fs::write(&f, &wrapped).unwrap();
+        assert_eq!(
+            jestyr_escape_dump(&exe, f.to_str().unwrap()),
+            want,
+            "the toolchains disagree about containment; the port's `droppable_expr` is the mirror"
+        );
+
+        // **The control**, and it is the whole difference between a rule and a blanket:
+        // the same wrapper around a field type that owns nothing must stay legal.
+        let ok = rust_escape_dump(&plain);
+        assert!(
+            !ok.iter().any(|l| l.contains("given to a `take` parameter")),
+            "a wrapper around a plain field must stay legal — the walk is over-reaching: {ok:?}"
+        );
+        let g = std::env::temp_dir().join("jestyr_move_containment_plain.jtr");
+        std::fs::write(&g, &plain).unwrap();
+        assert_eq!(
+            jestyr_escape_dump(&exe, g.to_str().unwrap()),
+            ok,
+            "the toolchains disagree about a wrapper around a plain field"
+        );
+    }
+
     /// **The alias taint, differentially (item 5 residue (a))** — the corpus has no
     /// aliased-root store (route 3's pinned example uses the root directly), so the
     /// probes carry the rule: `var alias = h` inside the inner region then a store
