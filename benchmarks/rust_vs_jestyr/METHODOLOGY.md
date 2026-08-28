@@ -49,6 +49,33 @@ in Rust, C, and Jestyr's lowering alike.
 - Single-digit-percent differences are code-layout noise. Do not narrate
   them as wins.
 
+### The measured noise floor
+
+The rule above was a judgement call until it was measured. It is now
+measured, and it is **larger than single digits between sessions**.
+
+Three runs exist (2026-08-13, 08-25, 08-27) on the same machine and
+toolchains. Twenty-five rows across the first two have **byte-identical
+binaries** — the same program, timed twice — which makes them an A/A
+test of the harness itself:
+
+| statistic | value |
+|---|---|
+| median run-to-run change, identical binaries | 8.4 % |
+| max run-to-run change, identical binaries | 25.2 % |
+| median spread of the Jestyr/Rust ratio over 3 runs | 11.5 % |
+| max spread of that ratio | 29.0 % |
+
+Interleaved min-of-7 suppresses noise *within* one run, which is what
+makes an A-vs-B comparison inside a single run meaningful. It does not
+suppress drift *between* sessions: absolute times moved ~35 % between
+08-25 and 08-27 while the ratios held to ~10 %, which is why **the ratio
+is the quantity worth quoting and the absolute milliseconds are not.**
+
+**Practical rule: do not report a runtime difference below ~1.3× as a
+result.** Six of the nine cases sit inside that band; they are
+indistinguishable at this harness's resolution, not equal.
+
 ## Compile time
 
 Cold single-crate/file compile, measured as wall time of:

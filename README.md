@@ -123,6 +123,33 @@ contract with a completed enforcement ladder. The escape checker's
 guarantee is stated precisely in
 [docs/escape-guarantee.md](docs/escape-guarantee.md).
 
+**6. Side-by-side with C++ and Rust.** Two suites of the same program
+written twice, so the comparison is a diff rather than an assertion.
+Both are in the repo and runnable.
+
+*Against C++* — [examples/cpp_compare/](examples/cpp_compare/README.md):
+15 pairs, plus a program C++ accepts and Jestyr refuses. Every pair
+produces byte-identical output. *Verify:*
+`bash examples/cpp_compare/verify_all.sh` — one command, exits non-zero
+on any divergence, and re-checks that the rejection program still fails
+to compile.
+
+*Against Rust* — [benchmarks/rust_vs_jestyr/](benchmarks/rust_vs_jestyr/README.md):
+9 ownership-shaped cases over three tracks (Rust, Jestyr, Jestyr on
+`std/list`), with `Cargo.lock` pinned and the borrow-checker rejection
+probes included. *Verify:*
+`powershell -File benchmarks/rust_vs_jestyr/scripts/run_all.ps1`.
+
+*Scope, and it is the part that matters:* the timing harness is
+interleaved min-of-7, but measured against itself across sessions it
+resolves only about **8 %** (25 % worst case) — so a difference inside
+roughly 1.3× is noise, not a result. The suite reports the cases where
+Jestyr **loses**: an arena-held AST at ~5.5–6× and a doubly-linked list
+at ~3×, both on the raw track, both closing to ~1.3× and parity when
+rewritten against `std/list`. The Rust runner is PowerShell-only today;
+the C++ checker is portable bash. See
+[METHODOLOGY.md](benchmarks/rust_vs_jestyr/METHODOLOGY.md).
+
 ## How to verify (the ladder)
 
 | Step | Command | Needs | Time |
@@ -150,6 +177,8 @@ Windows.
 | [docs/](docs/README.md) | topic docs: attributes, errors, unsafe contract, CTFE tiers, obligations, … |
 | [examples/](examples/README.md) | ~93 example programs, indexed by feature |
 | `examples/std/` | **the self-hosted compiler's own source** (plus the stdlib) — the `.jtr` files here *are* the compiler |
+| [examples/cpp_compare/](examples/cpp_compare/README.md) | 15 programs written twice, once in Jestyr and once in C++, plus one Jestyr refuses — `verify_all.sh` diffs them all |
+| [benchmarks/rust_vs_jestyr/](benchmarks/rust_vs_jestyr/README.md) | 9 ownership-shaped cases against Rust, three tracks, with the harness's own noise floor documented |
 | [bootstrap/](bootstrap/README.md) | the gcc-only bootstrap seed |
 | `src/` | the Rust reference compiler |
 | [HANDOFF.md](HANDOFF.md), [docs/handoffs/](docs/handoffs/), [docs/session-notes/](docs/session-notes/) | internal development logs, kept for provenance (numbers inside are historical) |
