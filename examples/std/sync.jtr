@@ -95,14 +95,14 @@ pub fn mutex_free(comptime T: type, read m: Mutex(T)) {
 // uniquely-owned `take` value ≈ Pony `iso`); combined with `concurrent { … }`, a
 // message can't be touched by its sender after it leaves.
 //
-// The control word packs the four shared counters into one `[4]i64` cell so a
+// The control word packs the five shared counters into one `[5]i64` cell so a
 // channel handle is two heap allocations (buffer + control), copied by value into
-// each task — every copy shares the same buffer, indices, and lock.
+// each task — every copy shares the same buffer, indices, lock and closed flag.
 
 pub fn Channel(comptime T: type) -> type {
     return struct {
         buf:  *mut T,    // `cap` slots, used as a ring
-        ctrl: *mut i64,  // [0]=head  [1]=tail  [2]=count  [3]=lock
+        ctrl: *mut i64,  // [0]=head [1]=tail [2]=count [3]=lock [4]=closed
         cap:  i64,
     }
 }
@@ -110,11 +110,12 @@ pub fn Channel(comptime T: type) -> type {
 // Make a channel that can buffer `cap` in-flight values (cap ≥ 1).
 pub fn channel_make(comptime T: type, cap: i64) -> Channel(T) {
     var b: *mut T = alloc(T, cap as usize)
-    var c: *mut i64 = alloc(i64, 4)
-    unsafe { atomic_store(c + 0, 0) }   // head  — next recv slot
-    unsafe { atomic_store(c + 1, 0) }   // tail  — next send slot
-    unsafe { atomic_store(c + 2, 0) }   // count — buffered items
-    unsafe { atomic_store(c + 3, 0) }   // lock  — unlocked
+    var c: *mut i64 = alloc(i64, 5)
+    unsafe { atomic_store(c + 0, 0) }   // head   — next recv slot
+    unsafe { atomic_store(c + 1, 0) }   // tail   — next send slot
+    unsafe { atomic_store(c + 2, 0) }   // count  — buffered items
+    unsafe { atomic_store(c + 3, 0) }   // lock   — unlocked
+    unsafe { atomic_store(c + 4, 0) }   // closed — still open
     return Channel(T){ buf: b, ctrl: c, cap: cap }
 }
 
@@ -160,6 +161,89 @@ pub fn channel_recv(comptime T: type, read ch: Channel(T)) -> T {
 // Number of buffered (not-yet-received) items — a snapshot, for draining loops.
 pub fn channel_len(comptime T: type, read ch: Channel(T)) -> i64 {
     return unsafe { atomic_load(ch.ctrl + 2) }
+}
+
+// --- Closing: how a receiver learns there will be no more values. ---
+//
+// Without this, `channel_recv` on an empty channel spins forever and nothing can
+// ever wake it, so every consumer has to be told IN ADVANCE how many items to
+// expect. That is not a stylistic limitation: "drain until the producer is done",
+// the shape every worker and every graceful shutdown needs, could not be written
+// at all. `examples/std/channel.jtr` part 3 is the consumer that could not exist
+// before this, and its drain loop takes no count.
+//
+// Closing is a fact about the CHANNEL, not about one sender: it is idempotent, any
+// holder may do it, and it does not discard what is already buffered.
+//
+// **What this does NOT do: refuse a send on a closed channel.** `channel_send` is
+// unchanged and will happily park a value in a channel nobody will drain. That is
+// a real hazard and it is left open deliberately rather than papered over, because
+// refusing the send raises an ownership question this increment does not answer:
+// `send` takes its value by `take`, so by the time the refusal is known the callee
+// already owns it, and returning `false` would leak it for any `T` whose teardown
+// matters. A correct refusal has to hand the value back, and that is its own
+// increment. Closing today signals EOF to RECEIVERS; it does not seal senders.
+//
+// `channel_recv` is also unchanged, and still spins forever on a closed, empty
+// channel. It keeps its signature because the `select` lowering calls
+// `channel_recv_i64` by that exact C name. New drain loops want `channel_recv_open`.
+//
+// `select` is not fixed by this either: it polls `channel_len_i64(ch) > 0`, which
+// is false forever once a channel is closed and drained, so a `select` over only
+// closed channels still spins. Termination there needs a default arm — separate work.
+
+// Mark the channel closed: no further values will be sent. Idempotent — closing
+// twice is not an error, which is what lets several producers race to be last
+// without coordinating. Taken under the lock so a receiver cannot observe "empty"
+// and "still open" from either side of this store.
+pub fn channel_close(comptime T: type, read ch: Channel(T)) {
+    unsafe { lock_acquire(ch.ctrl + 3) }
+    unsafe { atomic_store(ch.ctrl + 4, 1) }
+    unsafe { lock_release(ch.ctrl + 3) }
+}
+
+// Has the channel been closed? A snapshot, and NOT the same question as "is there
+// anything left to receive" — a closed channel still hands out whatever was already
+// buffered. Use `channel_recv_open` to drain; use this to report state.
+pub fn channel_is_closed(comptime T: type, read ch: Channel(T)) -> bool {
+    let shut: i64 = unsafe { atomic_load(ch.ctrl + 4) }
+    return shut != 0
+}
+
+// Receive the next value into `slot`, or report that there will never be one.
+// Blocks (spins) exactly as `channel_recv` does while the channel is open and
+// empty; returns `false` only when the channel is closed AND drained.
+//
+// **Draining after close is the point.** The buffered-items branch is tested
+// BEFORE the closed flag, so a producer that closes with values still in flight
+// does not destroy them — otherwise closing would be a race against the consumer
+// and shutdown would silently lose work. `false` therefore means "empty and no
+// more coming", which is the only condition under which a drain loop may stop.
+//
+// The out-pointer is not a stylistic choice: an error union would make every
+// caller a cross-module `catch`, and a `Recv(T)` result struct would be another
+// module's type — both disqualify a corpus file from the byte-identity golden,
+// which runs with imports unresolved. `sysproc.read_output` and `alog.next`
+// already report their outcome as an integer for the same reason.
+pub fn channel_recv_open(comptime T: type, read ch: Channel(T), slot: *mut T) -> bool {
+    for {
+        unsafe { lock_acquire(ch.ctrl + 3) }
+        let count: i64 = unsafe { atomic_load(ch.ctrl + 2) }
+        if count > 0 {
+            let head: i64 = unsafe { atomic_load(ch.ctrl + 0) }
+            let v: T = unsafe { load_cell(T, ch.buf + (head as usize)) }
+            unsafe { atomic_store(ch.ctrl + 0, (head + 1) % ch.cap) }
+            unsafe { atomic_store(ch.ctrl + 2, count - 1) }
+            unsafe { lock_release(ch.ctrl + 3) }
+            unsafe { slot.* = v }
+            return true
+        }
+        let shut: i64 = unsafe { atomic_load(ch.ctrl + 4) }
+        unsafe { lock_release(ch.ctrl + 3) }
+        if shut != 0 {
+            return false
+        }
+    }
 }
 
 // Monomorphic `i64` wrappers — the `select` lowering calls these by their stable

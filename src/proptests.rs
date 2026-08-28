@@ -19616,8 +19616,26 @@ fn main() -> i32 {
         // values, the main thread drains them → 264. Part 2: a cap-2 channel with a
         // concurrent producer + consumer (real backpressure) sums 1..=8 → 36. Both
         // are order-independent sums, so deterministic; repeated to shake out races.
+        //
+        // Part 3 is the drain loop that could not be written before `channel_close`:
+        // the producer sends five values and closes, and the consumer — told no count
+        // — reports both the sum (15) and how many it saw (5). That second number is
+        // the anti-vacuity half: it is a fact the consumer was never given and could
+        // only learn by draining to EOF, so a close that ended the loop early prints a
+        // smaller one and a close that never ended it hangs instead of printing.
+        //
+        // Part 4 pins the ORDERING with no concurrency, because part 3 alone cannot:
+        // it returns 15 whether the producer closed before or after the consumer
+        // started, so it does not distinguish "drains after close" from "was drained
+        // before close". In part 4 all three values are sent BEFORE the close, so a
+        // `channel_recv_open` that tested the closed flag ahead of the buffered-items
+        // branch prints 0 rather than 24 — verified by making exactly that change.
         for _ in 0..8 {
-            assert_eq!(toks("examples/std/channel.jtr"), ["264", "36"], "channel transfer wrong");
+            assert_eq!(
+                toks("examples/std/channel.jtr"),
+                ["264", "36", "15", "5", "24", "1"],
+                "channel transfer wrong"
+            );
         }
     }
     #[test]

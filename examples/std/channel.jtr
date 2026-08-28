@@ -7,11 +7,12 @@
 // the give-away rule), so message passing is race-free by the *existing* escape
 // analysis — no `Send`/`Sync`, no runtime detector.
 //
-//   jestyrc run examples/std/channel.jtr   →   264, 36
+//   jestyrc run examples/std/channel.jtr   →   264, 36, 15, 5
 //
 // Part 1 proves multi-producer move-passing; part 2 proves a bounded channel's
-// backpressure with a producer and consumer running *concurrently*. Both totals are
-// order-independent sums, so the results are deterministic.
+// backpressure with a producer and consumer running *concurrently*; part 3 proves
+// that a consumer can be told the producer is DONE rather than told a count up
+// front. Every total is an order-independent sum, so the results are deterministic.
 import "sync"
 
 // --- Part 1: four producers fill a channel, the main thread drains it. ---
@@ -45,6 +46,38 @@ fn drain(read ch: sync.Channel(i64), sink: *mut i64, n: i64) {
     }
 }
 
+// --- Part 3: the producer decides when it is done, and the consumer finds out. ---
+//
+// Note what parts 1 and 2 have in common: `n`. Both consumers are told in advance
+// how many values to expect, and that is not a stylistic choice -- until
+// `channel_close` existed it was the only thing the language allowed, because a
+// receiver on an empty channel spins forever with nothing able to wake it.
+
+// Send 1..=5 and then CLOSE. Nothing here tells the consumer how many that was.
+fn feed(read ch: sync.Channel(i64)) {
+    var i: i64 = 1
+    for i <= 5 {
+        sync.channel_send(i64, ch, i)
+        i = i + 1
+    }
+    sync.channel_close(i64, ch)
+}
+
+// Drain until the channel says there will be no more. **`n` is not a parameter**:
+// the loop ends because the producer closed, not because a count ran out. `seen`
+// is the anti-vacuity half -- it is a number this function was never told and can
+// only have learned by draining to EOF, so a `channel_recv_open` that returned
+// `false` early would print a smaller one, and one that never returned `false`
+// would hang instead of printing at all.
+fn drain_all(read ch: sync.Channel(i64), sum: *mut i64, seen: *mut i64) {
+    var slot: *mut i64 = alloc(i64, 1)
+    for sync.channel_recv_open(i64, ch, slot) {
+        atomic_add(sum, atomic_load(slot))
+        atomic_add(seen, 1)
+    }
+    free_ptr(slot)
+}
+
 fn main() -> i32 {
     // Part 1: capacity 16 holds every value, so producers never block; after the
     // nursery joins, all 16 are buffered and the main thread sums them.
@@ -76,5 +109,47 @@ fn main() -> i32 {
     print_int(atomic_load(acc) as i32)   // 36 = 1+2+…+8
     free_ptr(acc)
     sync.channel_free(i64, bc)
+
+    // Part 3: a producer that closes and a consumer that was never told a count.
+    // Capacity 8 holds all five, so `feed` may well finish and close before
+    // `drain_all` starts -- which is the case that matters: closing must not
+    // discard what is already buffered, or shutdown would race the consumer.
+    var cc = sync.channel_make(i64, 8)
+    var sum: *mut i64 = alloc(i64, 1)
+    var seen: *mut i64 = alloc(i64, 1)
+    atomic_store(sum, 0)
+    atomic_store(seen, 0)
+    concurrent {
+        spawn feed(cc)
+        spawn drain_all(cc, sum, seen)
+    }
+    print_int(atomic_load(sum) as i32)    // 15 = 1+2+3+4+5
+    print_int(atomic_load(seen) as i32)   // 5  — a count the consumer was never given
+    free_ptr(sum)
+    free_ptr(seen)
+    sync.channel_free(i64, cc)
+
+    // Part 4: closing does NOT discard what is already buffered, pinned with no
+    // concurrency at all so the scheduler cannot decide the answer. Part 3 gets 15
+    // whether `feed` closes before or after `drain_all` starts, so on its own it
+    // does not distinguish "drains after close" from "was drained before close".
+    // Here every value is sent BEFORE the close, so a `channel_recv_open` that
+    // checked the closed flag first would return `false` immediately and print 0.
+    var dc = sync.channel_make(i64, 4)
+    sync.channel_send(i64, dc, 7)
+    sync.channel_send(i64, dc, 8)
+    sync.channel_send(i64, dc, 9)
+    sync.channel_close(i64, dc)
+    var after: i64 = 0
+    var dslot: *mut i64 = alloc(i64, 1)
+    for sync.channel_recv_open(i64, dc, dslot) {
+        after = after + atomic_load(dslot)
+    }
+    free_ptr(dslot)
+    print_int(after as i32)               // 24 = 7+8+9, every one sent before the close
+    var shut: i64 = 0
+    if sync.channel_is_closed(i64, dc) { shut = 1 }
+    print_int(shut as i32)                // 1 — and it still reports closed once drained
+    sync.channel_free(i64, dc)
     return 0
 }
