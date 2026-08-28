@@ -956,7 +956,23 @@ mod sysproc_bounded_runner {
         let exe = super::c_oracle::build_exe("examples/std/sysproc_demo.jtr");
         let run = std::process::Command::new(&exe).output().unwrap();
         assert_eq!(run.status.code(), Some(0), "the bounded runner must exit cleanly");
-        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+        // **Strip every CR, not just the CRLF pairs.** This demo RELAYS a child's bytes to
+        // its own stdout, so on Windows the transcript crosses two line-ending conventions
+        // in a row: `sort` emits `apple\r\n`, the pipe carries that verbatim (a pipe is a
+        // byte channel, and carrying it unaltered is the module's whole claim), and then
+        // Jestyr's text-mode stdout turns the `\n` into `\r\n` while leaving the child's
+        // `\r` untouched. What arrives here is `apple\r\r\n`, so a single
+        // `.replace("\r\n", "\n")` collapses one pair and leaves a stray CR behind — the
+        // corruption is doubled and the normalization is not, so one pass cannot undo it.
+        // Measured on the wire rather than reasoned: `61 70 70 6C 65 0D 0D 0A`.
+        //
+        // Every other transcript test in this file may keep the pair-replace, because its
+        // subject prints only its own lines and each of those carries exactly one CR.
+        // `sysproc_demo` is the only corpus program that relays another process's output
+        // to stdout — swept for `capture`/`read_output` across `examples/std`, where
+        // `sysproc_test.jtr` compares in-process and `test_fixture.jtr` captures into a
+        // file, so neither crosses text-mode stdout. Nothing below asserts on a CR.
+        let out = String::from_utf8_lossy(&run.stdout).replace('\r', "");
 
         let want = "-- jbounded --\n\
                     a slow command, given 200ms\n\
