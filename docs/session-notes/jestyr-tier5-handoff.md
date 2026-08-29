@@ -418,13 +418,54 @@ counters to separate, and no corpus file had a second one until now.
 Same shape as the rebinding rule that survived two workstreams — a golden that passes is
 evidence about the corpus, not about agreement.
 
-**Mechanism NOT isolated**, and recorded rather than chased so it does not ride under a
-feature commit. To pick it up: bisect `select.jtr`'s part 2 by deleting statements until
-the two ids converge, then reduce to a minimal pair. The suspicion worth testing first is a
-construct that allocates a node on one side and not the other (a cast, a `let` with a bare
-`Name` initializer, a call with a comptime type argument). **Nothing that compiles today is
-wrong because of this** — the emitted symbol is internal and both sides are
-self-consistent — but any future corpus file with two `concurrent` blocks trips it.
+### MECHANISM ISOLATED — one node per `select` arm
+
+Measured by node-count delta per construct, with the construct placed before a single
+spawn so the first task id *is* the count:
+
+| construct | delta (port − reference) |
+|---|---|
+| `if` (0, 1, 2, 3 of them) | **0** |
+| `for` (0, 1, 2) | **0** |
+| `let` with a bare `Name` init | 0 |
+| a cast, a call with args | 0 |
+| **`select`, 1 arm** | **+1** |
+| **`select`, 2 arms** | **+2** |
+
+Exactly the 111-vs-109 gap on a two-arm select. The cause is a one-field asymmetry in the
+REFERENCE, not the port: `SelectArm.body` is an **inline `Block`**, while `parse_if`
+already wraps its `else` block as an `ExprKind::Block` *expression* — so a select arm is the
+one block in the language the reference does not allocate a node for, and the port (which
+allocates for every block it parses) ends up one ahead per arm.
+
+Minimal repro, import-free, in `/tmp` during the session: a locally-declared
+`Channel(comptime T)` struct, one `concurrent { spawn … }`, a one-arm `select`, a second
+`concurrent`. Reference `jestyr_task_26`, port `jestyr_task_27`.
+
+### The fix was ATTEMPTED and REVERTED, and the reason is a second divergence
+
+Changing `SelectArm.body` to an `ExprId` (wrapping the block exactly as `parse_if` wraps
+its `else`) **does converge the ids** — verified: all three repro files agreed afterwards,
+and the cgen golden then passed on a `select.jtr` carrying two `concurrent` blocks.
+
+It was reverted because it exposed a **deeper disagreement the id drift was masking: the
+two typecks do not agree about a select-arm block as a typed expression.** The whole-corpus
+typeck dump compares the type of EVERY expression, and the port types its select-arm block
+node while the reference does not. Neither `infer` (which records a type) nor `infer_block`
+on the extracted block (which leaves it unrecorded) aligns the streams — the first makes the
+reference emit one entry too many, the second still misaligns further along, and the port
+types a select-arm block where the reference yields `()`.
+
+So the real fix is not one field: it is agreeing what a select arm's body *is* — an
+expression with a type, or a block without one — and changing both compilers together.
+That is a two-sided typeck alignment increment, not a parser tidy-up, and it does not
+belong inside an unrelated feature.
+
+**Nothing that compiles today is wrong because of this.** The emitted symbol is internal
+and each compiler is self-consistent. The live constraint is narrow and worth knowing: **a
+corpus file with a `select` between two `concurrent` blocks cannot be byte-identity
+allowlisted** until this is closed. `select.jtr` avoids it by filling part 2's channels on
+the main thread.
 
 ---
 
