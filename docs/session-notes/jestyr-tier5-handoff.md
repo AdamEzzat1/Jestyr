@@ -7,7 +7,7 @@ increments (§2–§4), what the research turned up (§5), what is left (§6), t
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1330 passed / 0 failed / 3 ignored.** It was **1319** at the start of this arc — but see
+**1335 passed / 0 failed / 3 ignored.** It was **1319** at the start of this arc — but see
 §1, because on Windows the recorded baseline was never actually green.
 
 | commit | what |
@@ -19,6 +19,11 @@ cargo build --release && cargo test --release --features "c-oracle,selfhost-fixp
 | `a8dde2d` | observability a service is given, not one it finds |
 | `ad2dcc8` | a spawned task may not hold a writable reference to a shared binding |
 | `b970b4c` | precedence is a property of the source, not of when it was applied |
+| `a926da3` | a service can be told to stop by the operating system |
+| `cdfa1f1` | the breaking-change gate stops passing a removed trait method |
+| `bdb318f` | entropy from the OS, and a comparison that does not leak how far it got |
+| `62ea1c2` | a refused send hands the value back instead of eating it |
+| `9139900` | a select whose channels are all closed and drained stops waiting |
 
 The predecessor note is `docs/session-notes/jestyr-tier4-language-work-handoff.md`.
 The research note this arc produced is
@@ -33,17 +38,12 @@ Tier 5's definition of done opens with *"a service can start, report health, run
 background work, **shut down gracefully**, and be tested deterministically"*. §2 removed
 the reason the last clause was impossible. The next items, in leverage order:
 
-1. **Signals — and they are BLOCKED on a language increment, which is the finding.** A
-   POSIX handler must be async-signal-safe, which in practice means it may only write a
-   `volatile sig_atomic_t` at file scope. **Jestyr has nowhere to put one**: `extern` binds
-   functions, not globals, and there is no mutable module-level state — swept, and all 274
-   corpus files have const-only module scope. So "graceful shutdown on SIGTERM" cannot be
-   written today.
+1. ~~**Signals**~~ — **DONE** (§3g), via an intrinsic rather than the extern-global this
+   note originally proposed. See §3g for why those are two different mechanisms.
 
-   The fix is one of two increments, and **one of them closes two recorded blockers at
-   once**: letting `extern` bind a C GLOBAL gives both the signal flag and `environ`, the
-   latter being why a POSIX child inherits only `PATH` while a Windows child inherits the
-   parent's whole environment (`sysproc.jtr:120`). Do that one.
+   **`environ` is still open and is now the only thing wanting an extern-bound global.**
+   It is why a POSIX child inherits only `PATH` while a Windows child inherits the parent's
+   whole environment (`sysproc.jtr:120`).
 2. **`select` needs a default arm.** §2 gave receivers an EOF but did not fix `select`,
    which polls `channel_len_i64(ch) > 0` and therefore spins forever over closed, drained
    channels. This is the other half of a terminating worker loop.
@@ -57,8 +57,22 @@ the reason the last clause was impossible. The next items, in leverage order:
    next increment, and `diag.jtr` is what gives its errors real source spans (this module
    records which SOURCE a value came from, not which line of which file).
 6. ~~**A `Metrics` consumer inside a real service.**~~ — **DONE**, see §3d.
-7. **Refusing a send on a closed channel** (§6.1) and **`select` termination** (§6.2) are
-   now the two oldest open items, both from §2.
+7. ~~**Refusing a send on a closed channel**~~ and ~~**`select` termination**~~ — both
+   **DONE** (§3g).
+
+**What is actually left, in leverage order:**
+
+* **`environ`** — an `extern` binding a C global (item 1 above).
+* **The ExprId drift (§3h)** — not urgent, but it is a two-compiler disagreement and those
+  have a history here of surviving whole workstreams.
+* **A config FILE FORMAT** — `apply` takes name/value pairs; a TOML/INI reader above it,
+  with `diag.jtr` giving real line spans.
+* **Sanitizers (§6.4)** — still blocked on a machine that can run them.
+* **A `closed { … }` select arm** — sugar over §3g's termination; the expensive half is
+  the byte-exact port mirror against the no-allowlist P2 golden.
+* **Areas 5–9 of the brief** — package substrate (semver → resolver → lockfile → cache),
+  HTTP V2, storage V2, TLS. Each is a session; TLS is its own arc and wants an explicit
+  decision about whether Tier 5 claims it at all.
 
 **Half of the Tier 5 brief already exists on master.** Before building anything in it,
 read the inventory summary in §5 — this repo has twice rebuilt features that were already
@@ -348,6 +362,72 @@ failure reproduced every time and load was a wrong guess; this one does not.
 
 ---
 
+## §3g. Signals, attest, entropy, and the two channel items
+
+Five increments, in the order they were asked for.
+
+**Signals (`std/sysignal`, `signal_arm`/`signal_caught`/`signal_raise`).** §0 said
+`extern`-binds-a-global would close signals *and* `environ` in one increment. **That was
+wrong, and the correction is the useful part**: binding reaches a symbol that already
+exists, while a handler needs a flag that must be **defined**, and no standard external
+global serves as one. Two mechanisms, not one. A handler may touch only a
+`volatile sig_atomic_t`, which Jestyr has no spelling for — so the flag is emitted in the
+generated C, where it can have exactly the type the standard requires, and the language
+keeps its "no module-level mutable state" rule. `signal()` not `sigaction()`: C89, works on
+the Windows CRT, so no `@cfg` split and no `struct sigaction` layout to guess. The service
+demo now drains **because the OS asked**. `environ` remains open and is now the *only*
+thing wanting an extern-bound global.
+
+**attest's false negative.** Traits and impls emitted no records; the comment said their
+effect was "captured by the C hash". Measured: two programs differing only by a removed
+`pub` trait method gave different hashes and `no API changes`, **exit 0**. The hash is in
+the manifest but `diff` makes no `Change` from it, so it never reaches `has_breaking()` — a
+hash says *something moved*, true of every rebuild; only a record classifies. The method
+set goes **inside the signature** rather than one record per method, because `diff` calls a
+new key `added` → Compatible, and adding a trait method breaks every implementor.
+
+**`std/csrand`.** Binds the platform CSPRNG and provides `ct_eq`; invents nothing.
+`random_fill` returns a bool with the value through a pointer, because **0 is a legal
+draw** and a `-> i64` shape cannot report failure. `fill` is all-or-nothing so a caller
+who ignores the bool never gets a half-random buffer. Windows `rand_s` is hand-declared
+(the `_CRT_RAND_S` macro must precede `<stdlib.h>`) and needs no extra lib — which matters
+because `cc-flags` is locked and recorded in every manifest.
+
+**A refused send hands the value back.** `send` takes by `take`, so at the moment a
+refusal is known the callee already owns the value; returning `false` would leak it for any
+`T` whose teardown matters. `channel_try_send` writes it to `back` on both refusal paths.
+`FULL` and `CLOSED` stay distinct: a producer retries on one and gives up on the other.
+
+**`select` terminates.** One lowering site per side, checked last so closing stays
+non-destructive. A `closed { … }` arm would have changed `ExprKind::Select` across 22
+reference sites plus the parser and the no-allowlist P2 golden; it stays open as sugar.
+
+---
+
+## §3h. The two parsers allocate expression IDs differently
+
+**Found by a cgen golden failure that had nothing to do with the feature under test.** A
+second `concurrent` block in `select.jtr` produced `jestyr_task_111` on the port and
+`jestyr_task_109` on the reference — a spawn site's C symbol embeds its `ExprId`.
+
+Every parser golden passes, and **correctly so**: they compare tree SHAPE, not id VALUES,
+and two parsers can build the same tree while numbering its nodes differently. The drift is
+only observable when a file has a `concurrent` block positioned after enough code for the
+counters to separate, and no corpus file had a second one until now.
+
+Same shape as the rebinding rule that survived two workstreams — a golden that passes is
+evidence about the corpus, not about agreement.
+
+**Mechanism NOT isolated**, and recorded rather than chased so it does not ride under a
+feature commit. To pick it up: bisect `select.jtr`'s part 2 by deleting statements until
+the two ids converge, then reduce to a minimal pair. The suspicion worth testing first is a
+construct that allocates a node on one side and not the other (a cast, a `let` with a bare
+`Name` initializer, a call with a comptime type argument). **Nothing that compiles today is
+wrong because of this** — the emitted symbol is internal and both sides are
+self-consistent — but any future corpus file with two `concurrent` blocks trips it.
+
+---
+
 ## §4. Comparison suites, rerun at this milestone
 
 Run twice this arc — after §3 and again after §3c, since both changed compiler semantics.
@@ -458,9 +538,16 @@ limitation as a **`mut`** sub-slice problem. It is not: `bounds[0 .. 3]` passed 
 []i64` parameter fails identically. The boundary is a range expression in ARGUMENT
 position. Re-measure the shape of a gap before designing around the recorded version of it.
 
-**Never round-trip a `.jtr` file through PowerShell `Get-Content`/`Set-Content`.** It adds
-a BOM and mangles every non-ASCII character in the header comments, and the compiler then
-reports `unexpected character` at 1:1. Use the editor.
+**Never round-trip ANY source file through PowerShell `Get-Content`/`Set-Content`.** It
+reads UTF-8 as ANSI and re-encodes, so every em-dash becomes `â€"` — and it adds a BOM.
+Recorded here first for `.jtr` (where it produces `unexpected character` at 1:1) and then
+walked into again on three `.rs` files, where it corrupted 1,400 lines and **still
+compiled**, so only `git diff` caught it. Use the editor. If it happens, `git checkout` the
+files rather than trying to repair the mojibake.
+
+**`out` is a keyword.** `mut out: []u8` does not parse. Fifth on the recorded list with
+`read`, `take`, `error`, `spawn` — and reached for anyway while writing a buffer parameter,
+which is exactly the name the list predicts you will want.
 
 **Write the NAIVE version first.** §3c's race was found because the obvious first draft of
 a worker takes `mut s: Service` — which is what anyone would write, and what the front end
