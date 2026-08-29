@@ -1,0 +1,141 @@
+// examples/std/csrand_demo.jtr — `jrand`: OS entropy, and the comparison that must not
+// leak how far it got.
+//
+//   jestyrc run examples/std/csrand_demo.jtr
+//
+// Randomness cannot be asserted by value, so what is asserted is everything AROUND it:
+// that a draw succeeds, that two draws differ, that a denied capability refuses instead of
+// returning zeros, and that a refused fill leaves the buffer exactly as it was. The last
+// is the one that matters — a half-written buffer of mostly-zero bytes is the failure a
+// caller is most likely to mistake for a key.
+//
+// The `ct_eq` cases are chosen adversarially rather than for coverage: equal, differing in
+// the LAST byte, differing in the FIRST, and differing in length. An early-exit comparison
+// gets every one of these right, which is the point — correctness is not what constant-time
+// buys, so the test can only pin agreement, and the timing property is a claim about the
+// code's shape that a reader checks.
+import "mem"
+import "csrand"
+import "sink"
+
+const N: usize = 16
+const CAP: usize = 256
+
+fn all_zero(read b: []u8) -> bool {
+    var i: usize = 0
+    for i < b.len {
+        if (b[i] as i32) != 0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    print_str("-- jrand --")
+
+    var r: csrand.Random = csrand.host()
+
+    // Two draws, through the pointer, with the bool reporting success separately from the
+    // value — because 0 is a legal draw and could not otherwise be told from a failure.
+    var s1: *mut i64 = alloc(i64, 1)
+    var s2: *mut i64 = alloc(i64, 1)
+    print_str("a draw succeeds")
+    print_bool(csrand.next_u64(r, s1))
+    print_bool(csrand.next_u64(r, s2))
+    var v1: i64 = 0
+    var v2: i64 = 0
+    unsafe { v1 = s1.* }
+    unsafe { v2 = s2.* }
+    print_str("and two draws differ")
+    print_bool(v1 != v2)
+    print_str("both draws were counted")
+    print_int(csrand.draws(r) as i32)
+
+    // Filling a buffer.
+    var raw: *mut u8 = alloc(u8, N)
+    var buf: []u8 = slice(u8, raw, N)
+    var i: usize = 0
+    for i < N {
+        buf[i] = 0
+        i = i + 1
+    }
+    print_str("a filled buffer is not left zeroed")
+    print_bool(csrand.fill(r, buf))
+    print_bool(all_zero(buf) == false)
+
+    // **A denied capability refuses rather than returning zeros**, and leaves the buffer
+    // untouched. A `fill` that failed halfway would leave mostly-zero bytes that a caller
+    // could mistake for a key, which is why this is all-or-nothing.
+    var raw2: *mut u8 = alloc(u8, N)
+    var mark: []u8 = slice(u8, raw2, N)
+    var j: usize = 0
+    for j < N {
+        mark[j] = 7
+        j = j + 1
+    }
+    var d: csrand.Random = csrand.denied()
+    print_str("-- a denied capability --")
+    print_str("it refuses")
+    print_bool(csrand.fill(d, mark) == false)
+    print_str("and the buffer is untouched")
+    var kept: bool = true
+    var k: usize = 0
+    for k < N {
+        if (mark[k] as i32) != 7 { kept = false }
+        k = k + 1
+    }
+    print_bool(kept)
+    print_str("the refusal was counted")
+    print_int(csrand.refusals(d) as i32)
+    print_str("and nothing was drawn")
+    print_int(csrand.draws(d) as i32)
+
+    // ct_eq, adversarially.
+    var pa: *mut u8 = alloc(u8, 4)
+    var pb: *mut u8 = alloc(u8, 4)
+    var x: []u8 = slice(u8, pa, 4)
+    var y: []u8 = slice(u8, pb, 4)
+    var m: usize = 0
+    for m < 4 {
+        x[m] = 9
+        y[m] = 9
+        m = m + 1
+    }
+    print_str("-- ct_eq --")
+    print_str("equal")
+    print_bool(csrand.ct_eq(x, y))
+    y[3] = 8
+    print_str("differing in the LAST byte")
+    print_bool(csrand.ct_eq(x, y) == false)
+    y[3] = 9
+    y[0] = 8
+    print_str("differing in the FIRST byte")
+    print_bool(csrand.ct_eq(x, y) == false)
+    var short: []u8 = slice(u8, pb, 3)
+    print_str("differing in length")
+    print_bool(csrand.ct_eq(x, short) == false)
+
+    // Hex rendering, so a token can reach a log without a bespoke formatter.
+    var hraw: *mut u8 = alloc(u8, CAP)
+    var hbuf: []u8 = slice(u8, hraw, CAP)
+    var sk: sink.Sink = sink.new()
+    var fixed: *mut u8 = alloc(u8, 3)
+    var f3: []u8 = slice(u8, fixed, 3)
+    f3[0] = 0
+    f3[1] = 171
+    f3[2] = 255
+    csrand.put_hex(sk, hbuf, f3)
+    print_str("hex of 00 ab ff")
+    print_str(sink.view(sk, hbuf))
+
+    free_ptr(s1)
+    free_ptr(s2)
+    free_ptr(raw)
+    free_ptr(raw2)
+    free_ptr(pa)
+    free_ptr(pb)
+    free_ptr(hraw)
+    free_ptr(fixed)
+    return 0
+}

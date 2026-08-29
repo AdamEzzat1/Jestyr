@@ -561,6 +561,8 @@ fn is_os_intrinsic(read src: str, ns: usize, ne: usize) -> bool {
     if str_eq(n, "signal_arm") { return true }
     if str_eq(n, "signal_caught") { return true }
     if str_eq(n, "signal_raise") { return true }
+    // Entropy comes from the kernel, so a `@no_os` function must not reach it.
+    if str_eq(n, "random_fill") { return true }
     return false
 }
 fn is_atomic_op(read src: str, ns: usize, ne: usize) -> bool {

@@ -36,11 +36,13 @@
 //
 // ─── What it does NOT do ────────────────────────────────────────────────────────────
 //
-// **No signal handling**, and that is a language limit rather than a choice: a POSIX
-// handler may only write a `volatile sig_atomic_t` at file scope, and Jestyr has nowhere
-// to put one — `extern` binds functions rather than globals, and module scope is
-// const-only. So shutdown here is *initiated by the program*, and wiring it to SIGTERM
-// waits on that increment. Everything below the trigger is done.
+// **No signal handling of its own, and that is now a separation rather than a gap.**
+// `std/sysignal` owns the trigger — a handler may only write a `volatile sig_atomic_t`,
+// which the language has no spelling for, so the flag lives in the emitted C behind the
+// `signal_arm`/`signal_caught` intrinsics. This module deliberately does not reach for it:
+// a service that armed its own handlers could not be driven by a test, and the two belong
+// at different layers. `examples/std/service_demo.jtr` wires them together, and the
+// shutdown there begins because the OS asked rather than because the program decided to.
 //
 // No restart policy, no supervision tree, no process management — `std/sysproc` owns
 // children, and a supervisor over it is a separate module. No clock of its own: `halt`

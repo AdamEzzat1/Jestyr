@@ -1,0 +1,160 @@
+// std/csrand.jtr — OS entropy, and the comparison that must not leak how far it got.
+//
+// **This module invents no cryptography.** It binds the platform's CSPRNG and provides the
+// one primitive that is trivially easy to write wrongly (`ct_eq`). Hashing lives in
+// `std/sha256`; HMAC, signing and key exchange are not here, and a library that rolled its
+// own would be the single most dangerous file in the tree.
+//
+// ─── Entropy ────────────────────────────────────────────────────────────────────────
+//
+// `random_fill` is the seam. Not a PRNG: no seed, no state, nothing to reseed and nothing
+// to make fork-safe. Windows uses `rand_s` (documented cryptographically secure — it calls
+// RtlGenRandom); POSIX reads `/dev/urandom`.
+//
+// **Failure is reported, never papered over.** A draw returns `false` rather than a
+// value, because 0 is a legal random result and a zeroed buffer that looks like a key is
+// exactly the failure mode that ends up in production. `fill` leaves the buffer untouched
+// on failure rather than half-written, so a caller that ignores the bool gets its own
+// data back rather than a partially-random key it might mistake for a whole one.
+//
+// ─── Constant-time comparison ───────────────────────────────────────────────────────
+//
+// `ct_eq` is why this module exists as much as the entropy is. Comparing a MAC, a session
+// token or a password digest with an early-exit loop leaks HOW MANY LEADING BYTES MATCHED
+// through timing, and an attacker who can measure that recovers the secret one byte at a
+// time — turning a 2^256 search into 32 searches of 256. `ct_eq` ORs every difference into
+// an accumulator and looks at it once, so its running time depends on the length alone.
+//
+// **Length is not secret here, and the header says so rather than pretending.** Different
+// lengths return `false` immediately. For the things this is for — digests and MACs — the
+// length is fixed and public, so branching on it leaks nothing. If you are comparing
+// variable-length secrets where the length itself is sensitive, this is the wrong
+// primitive and you want a fixed-size digest of both sides instead.
+//
+// ─── What the tests can and cannot prove ────────────────────────────────────────────
+//
+// The suite proves `ct_eq` AGREES with a plain comparison on every case, including the
+// adversarial ones (differing only in the last byte, differing only in the first). It does
+// **not** measure timing: wall-clock on a loaded machine cannot distinguish a few hundred
+// nanoseconds, and a test that claimed to would be measuring the scheduler. Constant-time
+// here is a property of the CODE SHAPE — no early return, no branch on a data byte — and
+// that is what a reader should check.
+
+import "sink"
+
+// A capability handle: entropy is an OS effect, so a service is GIVEN the ability to draw
+// it and a test can hand over a denied one. Not `@move` — there is no descriptor to leak,
+// because the seam opens and closes per call.
+pub struct Random {
+    on: bool,
+    drawn: i64,
+    refused: i64,
+}
+
+// A handle that really draws from the OS.
+pub fn host() -> Random {
+    return Random{ on: true, drawn: 0, refused: 0 }
+}
+
+// A handle that refuses every draw. The positive control for a refusal test, and what a
+// deterministic test hands to code that must not consume real entropy.
+pub fn denied() -> Random {
+    return Random{ on: false, drawn: 0, refused: 0 }
+}
+
+pub fn can_draw(read r: Random) -> bool { return r.on }
+pub fn draws(read r: Random) -> i64 { return r.drawn }
+pub fn refusals(read r: Random) -> i64 { return r.refused }
+
+// 64 fresh bits through `slot`. False when the capability is denied or the OS refused, and
+// `slot` is untouched in both cases.
+pub fn next_u64(mut r: Random, slot: *mut i64) -> bool {
+    if !r.on {
+        r.refused = r.refused + 1
+        return false
+    }
+    if !random_fill(slot) {
+        r.refused = r.refused + 1
+        return false
+    }
+    r.drawn = r.drawn + 1
+    return true
+}
+
+// Fill `buf` with fresh bytes. **All-or-nothing**: on failure the buffer is left exactly
+// as it was rather than half-written, because a partially-random key is the one outcome a
+// caller is most likely to mistake for a whole one.
+//
+// Draws are taken eight bytes at a time and the tail takes what it needs from the last
+// draw. The unused bytes of that draw are discarded rather than carried forward — there is
+// no state here to carry them in, and discarding entropy is free.
+pub fn fill(mut r: Random, mut buf: []u8) -> bool {
+    if buf.len == 0 { return true }
+    if !r.on {
+        r.refused = r.refused + 1
+        return false
+    }
+    var slot: *mut i64 = alloc(i64, 1)
+    var at: usize = 0
+    var ok: bool = true
+    for at < buf.len {
+        if !random_fill(slot) {
+            ok = false
+            at = buf.len
+        } else {
+            var v: i64 = 0
+            unsafe { v = slot.* }
+            var k: usize = 0
+            for k < 8 {
+                if at + k < buf.len {
+                    // Shift the byte down, mask to 8 bits. `>>` on a negative i64 is
+                    // arithmetic, so the mask is what makes each lane a byte.
+                    let sh: i64 = (k as i64) * 8
+                    let byte: i64 = (v >> sh) & 255
+                    buf[at + k] = byte as u8
+                }
+                k = k + 1
+            }
+            at = at + 8
+        }
+    }
+    free_ptr(slot)
+    if !ok {
+        r.refused = r.refused + 1
+        return false
+    }
+    r.drawn = r.drawn + 1
+    return true
+}
+
+// Do `a` and `b` hold the same bytes, in time that does not depend on WHERE they differ?
+//
+// Every byte is compared and every difference is ORed into one accumulator, which is
+// inspected once at the end. No early return, no branch on a data byte. An early-exit
+// `==` leaks the length of the matching prefix through timing, which recovers a MAC one
+// byte at a time.
+//
+// Lengths are compared first and that branch is NOT constant-time — see the header: for a
+// digest or a MAC the length is fixed and public.
+@no_alloc @no_os pub fn ct_eq(read a: []u8, read b: []u8) -> bool {
+    if a.len != b.len { return false }
+    var diff: i32 = 0
+    var i: usize = 0
+    for i < a.len {
+        diff = diff | ((a[i] as i32) ^ (b[i] as i32))
+        i = i + 1
+    }
+    return diff == 0
+}
+
+// Lowercase hex of `buf`, into the caller's sink. Rendering a token or digest for a log
+// wants exactly this and nothing more; the caller checks `sink.overflowed`.
+// (`dst` rather than `out`: `out` is a parameter-convention KEYWORD, so `mut out: []u8`
+// does not parse. Fifth entry on the recorded list with `read`, `take`, `error`, `spawn`.)
+@no_alloc @no_os pub fn put_hex(mut s: sink.Sink, mut dst: []u8, read buf: []u8) {
+    var i: usize = 0
+    for i < buf.len {
+        sink.put_hex_u8(s, dst, buf[i])
+        i = i + 1
+    }
+}

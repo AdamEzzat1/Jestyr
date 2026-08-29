@@ -325,6 +325,13 @@ fn emit_program(
                 false
             }
         }),
+        uses_random: ast.exprs.iter().filter(|e| live(e)).any(|e| {
+            if let ExprKind::Call { callee, .. } = &e.kind {
+                matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "random_fill")
+            } else {
+                false
+            }
+        }),
         uses_signal: ast.exprs.iter().filter(|e| live(e)).any(|e| {
             if let ExprKind::Call { callee, .. } = &e.kind {
                 matches!(&ast.expr_at(*callee).kind,
@@ -799,6 +806,8 @@ struct Cgen<'a> {
     uses_env_var: bool,
     /// `mono_nanos() -> i64` is used — gate its runtime helper and `<time.h>`.
     uses_mono_nanos: bool,
+    /// `random_fill(out) -> bool` is used — gate the OS entropy helper.
+    uses_random: bool,
     /// `signal_arm(sig) -> bool` / `signal_caught() -> i32` are used — gate the
     /// handler, its flag and `<signal.h>`.
     ///
@@ -1303,6 +1312,35 @@ impl<'a> Cgen<'a> {
             self.raw("#include <sys/wait.h>\n");
             self.raw("static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); if (rc == -1) return -1; return WIFEXITED(rc) ? (int32_t)WEXITSTATUS(rc) : -1; }\n");
             self.raw("#endif\n");
+        }
+        // Cryptographically secure randomness, straight from the OS. **Not a PRNG**:
+        // no seed, no state, nothing to reseed or make fork-safe. That is deliberate —
+        // a seeded generator in a library is how key material ends up predictable, and
+        // Jestyr has no module-level state to keep a seed in anyway.
+        //
+        // **The value comes back through a pointer and the return is a bool**, which is
+        // not decoration: a `-> i64` shape has no way to report failure, because 0 is a
+        // legal random draw. A sentinel a legal value can equal is not a sentinel, and
+        // here a failed draw would be indistinguishable from an unlucky one — the worst
+        // possible direction for a CSPRNG.
+        if self.uses_random {
+            self.raw("/* OS entropy. Not a PRNG: no seed, no state. */\n");
+            // Windows: `rand_s` is documented as cryptographically secure (it calls
+            // RtlGenRandom) and lives in the CRT, so it needs no extra link library and
+            // therefore no change to the LOCKED `cc-flags` every attest manifest
+            // records. Declared BY HAND rather than by defining `_CRT_RAND_S`, because
+            // that macro must precede `<stdlib.h>` and the prelude already included it.
+            self.raw("#if defined(_WIN32)\n");
+            self.raw("int rand_s(unsigned int*);\n");
+            self.raw("static bool jestyr_rt_os_rand32(uint32_t* out) { unsigned int v = 0; if (rand_s(&v) != 0) return false; *out = (uint32_t)v; return true; }\n");
+            // POSIX: `/dev/urandom` rather than `getentropy`, which needs glibc 2.25 or
+            // macOS 10.12 and would put the floor at a version nobody here can check.
+            // Opened per call — correctness over speed, and there is no static to cache
+            // a descriptor in.
+            self.raw("#else\n");
+            self.raw("static bool jestyr_rt_os_rand32(uint32_t* out) { FILE* f = fopen(\"/dev/urandom\", \"rb\"); if (!f) return false; size_t n = fread(out, 1, 4, f); fclose(f); return n == 4; }\n");
+            self.raw("#endif\n");
+            self.raw("static bool jestyr_rt_random_fill(int64_t* out) { uint32_t a = 0, b = 0; if (!jestyr_rt_os_rand32(&a)) return false; if (!jestyr_rt_os_rand32(&b)) return false; *out = (int64_t)(((uint64_t)a << 32) | (uint64_t)b); return true; }\n");
         }
         // Signal delivery — the one place the language's "no module-level mutable
         // state" rule cannot hold, because the OS chooses the handler's signature and
@@ -6231,6 +6269,10 @@ impl<'a> Cgen<'a> {
                     return format!("jestyr_rt_signal_arm({s})");
                 }
                 "signal_caught" => return "jestyr_rt_signal_caught()".to_string(),
+                "random_fill" => {
+                    let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "NULL".to_string());
+                    return format!("jestyr_rt_random_fill({p})");
+                }
                 "signal_raise" => {
                     let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
                     return format!("jestyr_rt_signal_raise({s})");
@@ -10897,7 +10939,7 @@ pub fn is_intrinsic(name: &str) -> bool {
             | "arena_open" | "arena_alloc" | "arena_close"
             | "read_file" | "try_read_file" | "write_file" | "file_exists" | "remove_file"
             | "run_command" | "eprint_str"
-            | "signal_arm" | "signal_caught" | "signal_raise"
+            | "signal_arm" | "signal_caught" | "signal_raise" | "random_fill"
             | "arg_count" | "arg" | "env_var" | "mono_nanos"
     )
 }

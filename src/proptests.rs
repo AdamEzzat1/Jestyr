@@ -937,6 +937,82 @@ mod syswatch_debounced_trigger {
 /// back-end server disagree about where it ends, and the bytes after it (`GET /admin`) become a
 /// second request attributed to the next client on the connection. Every byte of it is
 /// well-formed, and a lenient parser answers 200.
+/// **`jrand` — OS entropy, and the comparison that must not leak how far it got.**
+///
+/// Randomness cannot be asserted by value, so the transcript asserts everything around it:
+/// a draw succeeds, two draws differ, a denied capability refuses instead of returning
+/// zeros, and a refused `fill` leaves the buffer **exactly as it was**. That last one is
+/// the load-bearing case — a half-written buffer of mostly-zero bytes is the failure a
+/// caller is most likely to mistake for a key.
+///
+/// The `ct_eq` cases are adversarial rather than for coverage: equal, differing in the
+/// LAST byte, differing in the FIRST, differing in length. An early-exit comparison passes
+/// every one, which is exactly the point — **correctness is not what constant-time buys**,
+/// so this can only pin agreement. The timing property is a claim about the code's shape
+/// (no early return, no branch on a data byte) and a reader checks it there. A test that
+/// claimed to measure a few hundred nanoseconds on a loaded machine would be measuring the
+/// scheduler.
+#[cfg(all(test, feature = "c-oracle"))]
+mod csrand_entropy {
+    use super::*;
+
+    #[test]
+    fn jrand_draws_refuses_and_compares_without_early_exit() {
+        let exe = super::c_oracle::build_exe("examples/std/csrand_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the entropy demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace('\r', "");
+
+        let want = "-- jrand --\n\
+                    a draw succeeds\n\
+                    true\n\
+                    true\n\
+                    and two draws differ\n\
+                    true\n\
+                    both draws were counted\n\
+                    2\n\
+                    a filled buffer is not left zeroed\n\
+                    true\n\
+                    true\n\
+                    -- a denied capability --\n\
+                    it refuses\n\
+                    true\n\
+                    and the buffer is untouched\n\
+                    true\n\
+                    the refusal was counted\n\
+                    1\n\
+                    and nothing was drawn\n\
+                    0\n\
+                    -- ct_eq --\n\
+                    equal\n\
+                    true\n\
+                    differing in the LAST byte\n\
+                    true\n\
+                    differing in the FIRST byte\n\
+                    true\n\
+                    differing in length\n\
+                    true\n\
+                    hex of 00 ab ff\n\
+                    00abff";
+        assert_eq!(out.trim_end(), want, "the entropy transcript changed:\n{out}");
+
+        // Anti-vacuity: `true` is most of this transcript, so a demo printing it
+        // unconditionally would pass a containment check. Every `false` must be absent.
+        assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
+
+        // **The denied path is the one worth stating twice.** A `fill` that returned
+        // false but had already written half the buffer would still print `it refuses`;
+        // only the untouched-buffer line separates a refusal from a partial write, and
+        // only `and nothing was drawn / 0` separates it from a draw that was discarded.
+        assert!(out.contains("and the buffer is untouched\ntrue\n"), "a refusal must not write:\n{out}");
+        assert!(out.contains("and nothing was drawn\n0"), "a denied handle must draw nothing:\n{out}");
+
+        // The hex vector is fixed, so it catches a nibble order that reversed — which
+        // every random-valued assertion above would happily tolerate.
+        assert!(out.contains("\n00abff"), "hex must be lowercase, high nibble first:\n{out}");
+    }
+}
+
 /// **`jconf` — four config sources merged in a fixed order, where a value remembers where
 /// it came from.**
 ///
@@ -18182,6 +18258,7 @@ fn main() -> i32 {
         // prelude — the flag, the handler and `<signal.h>` — is under byte-identity
         // rather than under a probe someone ran once.
         "sysignal.jtr",
+        "csrand.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same

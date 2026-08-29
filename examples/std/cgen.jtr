@@ -118,6 +118,22 @@ fn uses_eprint(read p: parser.Parser, read src: str, tmode: bool) -> bool {
     return false
 }
 
+// Does the program draw OS entropy? Gates the CSPRNG helper (mirrors `uses_random`).
+fn uses_random(read p: parser.Parser, read src: str, tmode: bool) -> bool {
+    var i: usize = 0
+    for i < list.len(parser.ExprData, p.ex) {
+        let e: parser.ExprData = list.get(parser.ExprData, p.ex, i)
+        if e.kind == 10 and !in_skipped_test(p, src, tmode, e.start, e.end) {
+            let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+            if callee.kind == 2 {
+                if str_eq(src[callee.start .. callee.end], "random_fill") { return true }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
 // Does the program touch signals? ONE gate for all three names (mirrors `uses_signal`),
 // because they are useless apart: arming without reading discards every delivery, reading
 // without arming answers 0 forever, and raising without arming just kills the process.
@@ -376,6 +392,28 @@ fn emit_prelude(mut sb: String, read p: parser.Parser, read src: str, read g: Cg
         string_push(sb, "#include <sys/wait.h>\n")
         string_push(sb, "static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); if (rc == -1) return -1; return WIFEXITED(rc) ? (int32_t)WEXITSTATUS(rc) : -1; }\n")
         string_push(sb, "#endif\n")
+    }
+    // Cryptographically secure randomness, straight from the OS. NOT a PRNG: no seed, no
+    // state, nothing to reseed. A seeded generator in a library is how key material ends
+    // up predictable, and Jestyr has no module-level state to keep a seed in anyway.
+    //
+    // The VALUE comes back through a pointer and the return is a bool, which is not
+    // decoration: a `-> i64` shape cannot report failure, because 0 is a legal random
+    // draw. A sentinel a legal value can equal is not a sentinel.
+    //
+    // Windows `rand_s` is documented as cryptographically secure (it calls RtlGenRandom)
+    // and lives in the CRT, so it needs no extra link library and therefore no change to
+    // the LOCKED cc-flags every attest manifest records. Declared BY HAND rather than by
+    // defining _CRT_RAND_S, which must precede <stdlib.h> -- already included above.
+    if uses_random(p, src, g.tmode) {
+        string_push(sb, "/* OS entropy. Not a PRNG: no seed, no state. */\n")
+        string_push(sb, "#if defined(_WIN32)\n")
+        string_push(sb, "int rand_s(unsigned int*);\n")
+        string_push(sb, "static bool jestyr_rt_os_rand32(uint32_t* out) { unsigned int v = 0; if (rand_s(&v) != 0) return false; *out = (uint32_t)v; return true; }\n")
+        string_push(sb, "#else\n")
+        string_push(sb, "static bool jestyr_rt_os_rand32(uint32_t* out) { FILE* f = fopen(\"/dev/urandom\", \"rb\"); if (!f) return false; size_t n = fread(out, 1, 4, f); fclose(f); return n == 4; }\n")
+        string_push(sb, "#endif\n")
+        string_push(sb, "static bool jestyr_rt_random_fill(int64_t* out) { uint32_t a = 0, b = 0; if (!jestyr_rt_os_rand32(&a)) return false; if (!jestyr_rt_os_rand32(&b)) return false; *out = (int64_t)(((uint64_t)a << 32) | (uint64_t)b); return true; }\n")
     }
     // Signal delivery -- the one place the language's "no module-level mutable state"
     // rule cannot hold, because the OS fixes the handler's signature and it has nowhere
@@ -2711,6 +2749,7 @@ fn intrinsic_helper(read nm: str) -> str {
     if str_eq(nm, "signal_arm") { return "jestyr_rt_signal_arm" }
     if str_eq(nm, "signal_caught") { return "jestyr_rt_signal_caught" }
     if str_eq(nm, "signal_raise") { return "jestyr_rt_signal_raise" }
+    if str_eq(nm, "random_fill") { return "jestyr_rt_random_fill" }
     if str_eq(nm, "env_var") { return "jestyr_rt_env_var" }
     if str_eq(nm, "mono_nanos") { return "jestyr_rt_mono_nanos" }
     if str_eq(nm, "write_file") { return "jestyr_rt_write_file" }
@@ -12417,7 +12456,7 @@ fn is_global_cname(read p: parser.Parser, read src: str, ns: usize, ne: usize) -
     string_push(probe, "|")
     string_push(probe, nm)
     string_push(probe, "|")
-    let hit: bool = contains("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|signal_arm|signal_caught|signal_raise|env_var|mono_nanos|arg_count|arg|", string_view(probe))
+    let hit: bool = contains("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|signal_arm|signal_caught|signal_raise|random_fill|env_var|mono_nanos|arg_count|arg|", string_view(probe))
     string_free(probe)
     return hit
 }

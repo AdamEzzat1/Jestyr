@@ -5363,6 +5363,9 @@ fn io_intrinsic_ret(name: &str) -> Option<Ty> {
         "signal_arm" => Ty::Prim("bool"),
         "signal_caught" => Ty::Prim("i32"),
         "signal_raise" => Ty::Prim("bool"),
+        // `random_fill(out) -> bool` — the VALUE arrives through the pointer, because a
+        // `-> i64` shape cannot report failure: 0 is a legal random draw.
+        "random_fill" => Ty::Prim("bool"),
         "arg_count" => Ty::Prim("i32"),
         "arg" => Ty::Prim("str"),
         // `env_var(name) -> str` — a view into the C runtime's environment

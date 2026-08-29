@@ -2343,6 +2343,8 @@ fn is_os_intrinsic(name: &str) -> bool {
             | "signal_arm"
             | "signal_caught"
             | "signal_raise"
+            // Entropy comes from the kernel, so a `@no_os` function must not reach it.
+            | "random_fill"
     )
 }
 

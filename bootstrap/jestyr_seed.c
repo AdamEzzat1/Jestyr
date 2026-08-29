@@ -1288,6 +1288,7 @@ bool jestyr_in_skipped_test(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode, si
 bool jestyr_uses_try_read(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode);
 bool jestyr_uses_run_command(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode);
 bool jestyr_uses_eprint(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode);
+bool jestyr_uses_random(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode);
 bool jestyr_uses_signal(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode);
 bool jestyr_uses_env_var(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode);
 bool jestyr_uses_mono_nanos(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode);
@@ -13997,6 +13998,10 @@ int32_t jestyr_intrinsic_ret(Jestyr_Checker* restrict j_c, JestyrStr j_t)
     {
         return jestyr_t_bool();
     }
+    if (jestyr_rt_str_eq(j_t, JSTR("random_fill")))
+    {
+        return jestyr_t_bool();
+    }
     if (jestyr_rt_str_eq(j_t, JSTR("arg_count")))
     {
         return jestyr_t_i32();
@@ -17250,6 +17255,10 @@ bool jestyr_is_os_intrinsic(JestyrStr j_src, size_t j_ns, size_t j_ne)
         return true;
     }
     if (jestyr_rt_str_eq(j_n, JSTR("signal_raise")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("random_fill")))
     {
         return true;
     }
@@ -20602,6 +20611,28 @@ bool jestyr_uses_eprint(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode)
     return false;
 }
 
+bool jestyr_uses_random(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode)
+{
+    size_t j_i = 0;
+    while ((j_i < jestyr_len__ExprData(j_p.j_ex)))
+    {
+        Jestyr_ExprData j_e = jestyr_get__list__ExprData(j_p.j_ex, j_i);
+        if (((j_e.j_kind == 10) && (!jestyr_in_skipped_test(j_p, j_src, j_tmode, j_e.j_start, j_e.j_end))))
+        {
+            Jestyr_ExprData j_callee = jestyr_get__list__ExprData(j_p.j_ex, (size_t)(j_e.j_a));
+            if ((j_callee.j_kind == 2))
+            {
+                if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_callee.j_start, j_callee.j_end), JSTR("random_fill")))
+                {
+                    return true;
+                }
+            }
+        }
+        j_i = (j_i + 1);
+    }
+    return false;
+}
+
 bool jestyr_uses_signal(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode)
 {
     size_t j_i = 0;
@@ -20901,6 +20932,17 @@ void jestyr_emit_prelude(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrS
         jestyr_rt_str_push(&(*j_sb), JSTR("#include <sys/wait.h>\n"));
         jestyr_rt_str_push(&(*j_sb), JSTR("static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); if (rc == -1) return -1; return WIFEXITED(rc) ? (int32_t)WEXITSTATUS(rc) : -1; }\n"));
         jestyr_rt_str_push(&(*j_sb), JSTR("#endif\n"));
+    }
+    if (jestyr_uses_random(j_p, j_src, j_g.j_tmode))
+    {
+        jestyr_rt_str_push(&(*j_sb), JSTR("/* OS entropy. Not a PRNG: no seed, no state. */\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("#if defined(_WIN32)\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("int rand_s(unsigned int*);\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("static bool jestyr_rt_os_rand32(uint32_t* out) { unsigned int v = 0; if (rand_s(&v) != 0) return false; *out = (uint32_t)v; return true; }\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("#else\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("static bool jestyr_rt_os_rand32(uint32_t* out) { FILE* f = fopen(\"/dev/urandom\", \"rb\"); if (!f) return false; size_t n = fread(out, 1, 4, f); fclose(f); return n == 4; }\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("#endif\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("static bool jestyr_rt_random_fill(int64_t* out) { uint32_t a = 0, b = 0; if (!jestyr_rt_os_rand32(&a)) return false; if (!jestyr_rt_os_rand32(&b)) return false; *out = (int64_t)(((uint64_t)a << 32) | (uint64_t)b); return true; }\n"));
     }
     if (jestyr_uses_signal(j_p, j_src, j_g.j_tmode))
     {
@@ -24035,6 +24077,10 @@ JestyrStr jestyr_intrinsic_helper(JestyrStr j_nm)
     if (jestyr_rt_str_eq(j_nm, JSTR("signal_raise")))
     {
         return JSTR("jestyr_rt_signal_raise");
+    }
+    if (jestyr_rt_str_eq(j_nm, JSTR("random_fill")))
+    {
+        return JSTR("jestyr_rt_random_fill");
     }
     if (jestyr_rt_str_eq(j_nm, JSTR("env_var")))
     {
@@ -36466,7 +36512,7 @@ bool jestyr_is_global_cname(Jestyr_Parser j_p, JestyrStr j_src, size_t j_ns, siz
     jestyr_rt_str_push(&j_probe, JSTR("|"));
     jestyr_rt_str_push(&j_probe, j_nm);
     jestyr_rt_str_push(&j_probe, JSTR("|"));
-    bool j_hit = jestyr_rt_contains(JSTR("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|signal_arm|signal_caught|signal_raise|env_var|mono_nanos|arg_count|arg|"), jestyr_rt_str_view(&j_probe));
+    bool j_hit = jestyr_rt_contains(JSTR("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|signal_arm|signal_caught|signal_raise|random_fill|env_var|mono_nanos|arg_count|arg|"), jestyr_rt_str_view(&j_probe));
     jestyr_rt_str_free(&j_probe);
     return j_hit;
 }
