@@ -20172,10 +20172,23 @@ fn main() -> i32 {
         // before close". In part 4 all three values are sent BEFORE the close, so a
         // `channel_recv_open` that tested the closed flag ahead of the buffered-items
         // branch prints 0 rather than 24 — verified by making exactly that change.
+        // Part 5 is the give-back. `send` takes by `take`, so a refusal that only
+        // returned `false` would have consumed the caller's binding and leaked the value
+        // for any `T` whose teardown matters. The two bare numbers — 30 after `full`, 40
+        // after `closed` — ARE the assertion: they are the refused values back in the
+        // caller's hands, and a refusal that dropped them prints 0 while every `sent` /
+        // `full` / `closed` word above still matches.
+        //
+        // FULL and CLOSED are checked as distinct words rather than as one failure,
+        // because a producer retries on the first and gives up on the second; collapsing
+        // them makes a shutdown look like backpressure and spins forever.
         for _ in 0..8 {
             assert_eq!(
                 toks("examples/std/channel.jtr"),
-                ["264", "36", "15", "5", "24", "1"],
+                [
+                    "264", "36", "15", "5", "24", "1",
+                    "sent", "sent", "full", "30", "sent", "closed", "40"
+                ],
                 "channel transfer wrong"
             );
         }

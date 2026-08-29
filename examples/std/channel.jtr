@@ -151,5 +151,31 @@ fn main() -> i32 {
     if sync.channel_is_closed(i64, dc) { shut = 1 }
     print_int(shut as i32)                // 1 — and it still reports closed once drained
     sync.channel_free(i64, dc)
+
+    // Part 5: a send that is REFUSED hands the value back. `send` takes by `take`, so a
+    // refusal that only returned `false` would have consumed the caller's binding and
+    // leaked the value for any `T` whose teardown matters — `back` is what makes the
+    // refusal correct rather than merely reported.
+    //
+    // FULL and CLOSED stay distinct answers on purpose: a producer retries on one and
+    // gives up on the other, and collapsing them would make a shutdown look like
+    // backpressure and spin forever against a closed channel.
+    var tc = sync.channel_make(i64, 2)
+    var back: *mut i64 = alloc(i64, 1)
+    print_str(sync.channel_send_outcome(sync.channel_try_send(i64, tc, 10, back)))
+    print_str(sync.channel_send_outcome(sync.channel_try_send(i64, tc, 20, back)))
+    atomic_store(back, 0)
+    print_str(sync.channel_send_outcome(sync.channel_try_send(i64, tc, 30, back)))
+    print_int(atomic_load(back) as i32)    // 30 — the refused value, back in the caller's hands
+    var tslot: *mut i64 = alloc(i64, 1)
+    sync.channel_recv_open(i64, tc, tslot) // make room, so FULL was about capacity
+    print_str(sync.channel_send_outcome(sync.channel_try_send(i64, tc, 30, back)))
+    sync.channel_close(i64, tc)
+    atomic_store(back, 0)
+    print_str(sync.channel_send_outcome(sync.channel_try_send(i64, tc, 40, back)))
+    print_int(atomic_load(back) as i32)    // 40 — refused for a DIFFERENT reason, still returned
+    free_ptr(back)
+    free_ptr(tslot)
+    sync.channel_free(i64, tc)
     return 0
 }

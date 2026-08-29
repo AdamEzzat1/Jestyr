@@ -139,6 +139,70 @@ pub fn channel_send(comptime T: type, read ch: Channel(T), take v: T) {
     }
 }
 
+// `channel_try_send` outcomes.
+pub const CH_SENT: i32 = 0
+pub const CH_CLOSED: i32 = 1
+pub const CH_FULL: i32 = 2
+
+// Offer `v` without blocking, and **hand it back if it cannot be taken**.
+//
+// ─── Why this is not just `channel_send` returning a bool ──────────────────────────
+//
+// `send` takes `v` by `take`, so by the time a refusal is known the callee ALREADY OWNS
+// the value. Returning `false` there would leak it for any `T` whose teardown matters —
+// the caller's binding was consumed at the call and there is nothing left to drop. A
+// correct refusal has to give ownership back, which is what `back` is for: on
+// `CH_CLOSED` or `CH_FULL` the value is written there and the caller owns it again; on
+// `CH_SENT` it moved into the buffer and `back` is untouched.
+//
+// That is the whole reason `channel_send` was left alone rather than made fallible. Its
+// signature cannot express the give-back, and changing it would break the `select`
+// lowering, which calls the monomorphic wrappers by their C names.
+//
+// ─── CLOSED and FULL are different answers ─────────────────────────────────────────
+//
+// A caller retries on FULL and gives up on CLOSED, and collapsing them into one `false`
+// makes a shutdown indistinguishable from backpressure — a producer would spin forever
+// against a closed channel believing it was merely busy.
+//
+// ─── Who may close ─────────────────────────────────────────────────────────────────
+//
+// **The producer owns the close**, and in the ordinary one-producer shape nothing else
+// closes, so `channel_send` after `channel_close` is a programmer error of the same
+// class as a use-after-free rather than something to check for. `try_send` exists for
+// the cases where that does not hold: several producers, or a shutdown triggered from
+// outside the producer.
+pub fn channel_try_send(comptime T: type, read ch: Channel(T), take v: T, back: *mut T) -> i32 {
+    var outcome: i32 = CH_FULL
+    unsafe { lock_acquire(ch.ctrl + 3) }
+    let closed: i64 = unsafe { atomic_load(ch.ctrl + 4) }
+    if closed != 0 {
+        outcome = CH_CLOSED
+    } else {
+        let count: i64 = unsafe { atomic_load(ch.ctrl + 2) }
+        if count < ch.cap {
+            let tail: i64 = unsafe { atomic_load(ch.ctrl + 1) }
+            unsafe { (ch.buf + (tail as usize)).* = v }   // ownership moves into the buffer
+            unsafe { atomic_store(ch.ctrl + 1, (tail + 1) % ch.cap) }
+            unsafe { atomic_store(ch.ctrl + 2, count + 1) }
+            outcome = CH_SENT
+        }
+    }
+    // The give-back, on BOTH refusal paths. Written under the lock for the same reason
+    // the send is: a `T` large enough to tear is torn by a concurrent reader otherwise.
+    if outcome != CH_SENT { unsafe { back.* = v } }
+    unsafe { lock_release(ch.ctrl + 3) }
+    return outcome
+}
+
+// The name of a `channel_try_send` outcome.
+pub fn channel_send_outcome(o: i32) -> str {
+    if o == CH_SENT { return "sent" }
+    if o == CH_CLOSED { return "closed" }
+    if o == CH_FULL { return "full" }
+    return "?"
+}
+
 // Receive the next value by move. Blocks (spins) until an item is available, then
 // reads it out *under the lock* (so no concurrent sender can overwrite the slot
 // mid-read) and advances the head. Ownership transfers to the caller.
