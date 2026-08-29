@@ -1,0 +1,151 @@
+// std/sysignal.jtr — asking the OS to tell you it wants you to stop.
+//
+// This is the piece `std/service` was missing. Its lifecycle was complete except for the
+// trigger: shutdown had to be initiated by the program, and a deployment initiates it with
+// a signal.
+//
+// ─── Why this is not a library binding ──────────────────────────────────────────────
+//
+// A signal handler may touch exactly one thing: an object of type `volatile
+// sig_atomic_t`. Everything else is undefined behaviour, because the handler runs between
+// two arbitrary machine instructions and async-signal-safety forbids nearly every library
+// call. **Jestyr has no spelling for such an object** — no module-level `var`, and its
+// `extern` binds FUNCTIONS rather than globals, with no external symbol serving as a user
+// flag. So the flag lives in the emitted C, where it can be given exactly the type the
+// standard requires, and the language keeps its "no module-level mutable state" rule
+// intact. `signal_arm` / `signal_caught` / `signal_raise` are the seam.
+//
+// ─── What a handler does, and what it must not ──────────────────────────────────────
+//
+// It stores the signal NUMBER and returns. It does not log, allocate, close a socket or
+// call back into Jestyr — every one of those is a way to deadlock inside a handler that
+// interrupted the allocator. **The shutdown itself happens on the main path**, when
+// somebody calls `caught` and decides what to do, which is why this module is a poller
+// rather than a callback registry.
+//
+// ─── The limits, stated ─────────────────────────────────────────────────────────────
+//
+// **Deliveries coalesce.** Two signals before a `caught` leave only the second. A
+// `sig_atomic_t` cannot promise a queue, and pretending otherwise would invent a
+// guarantee the platform does not offer.
+//
+// **`caught` does not clear.** Two readers would otherwise race for one delivery, and a
+// shutdown request is meant to stay requested — a flag that a health probe could
+// accidentally consume is worse than none.
+//
+// **SIGINT and SIGTERM only.** They are the two the Windows CRT also honours, so the
+// module needs no `@cfg` split, and they are the two a deployment actually sends. SIGKILL
+// is deliberately absent because it cannot be caught anywhere — offering it would be an
+// API that silently never fires. SIGHUP, SIGUSR1 and the rest are POSIX-only; adding them
+// means a platform split and a Windows branch nobody here can run, which is the untested
+// claim `std/sysdir`'s header argues against.
+//
+// **No `@cfg`, and that is load-bearing.** `signal()` is C89. The Windows CRT implements
+// it for SIGINT (raised by Ctrl+C) and SIGTERM (raised only by `raise`, since Windows has
+// no `kill`), so `arm` succeeds on both platforms and the difference is *who can send*
+// rather than *what compiles*.
+
+// The two signals both platforms honour. NOT recalled from memory: the numbers are a claim
+// about `<signal.h>`, and `the_signal_numbers_match_the_real_header` re-measures them
+// against the real header while PARSING these constants out of this file — so a wrong one
+// is a red test rather than a shutdown that never arrives.
+pub const SIG_INT: i32 = 2
+pub const SIG_TERM: i32 = 15
+
+// A capability handle, the same shape the rest of the `sys` tier uses: a service is GIVEN
+// the ability to trap signals rather than reaching for it, so a test can hand over a
+// denied one and assert the refusal.
+//
+// Not `@move`: this owns no OS handle. Arming is a process-wide effect with no descriptor
+// to leak, so a copy is not a second name for anything.
+pub struct Signals {
+    on: bool,
+    armed: i64,
+    refused: i64,
+}
+
+// A handle that really installs handlers.
+pub fn host() -> Signals {
+    return Signals{ on: true, armed: 0, refused: 0 }
+}
+
+// A handle that refuses. The positive control for any test asserting a refusal, and the
+// thing a library under test should be handed when the test does not want its process's
+// signal disposition changed for every later case.
+pub fn denied() -> Signals {
+    return Signals{ on: false, armed: 0, refused: 0 }
+}
+
+pub fn can_arm(read s: Signals) -> bool { return s.on }
+pub fn armed_count(read s: Signals) -> i64 { return s.armed }
+pub fn refused_count(read s: Signals) -> i64 { return s.refused }
+
+// Is `sig` one this module will handle? A closed list, so an unsupported number is refused
+// here rather than being passed to the platform to fail in its own way.
+pub fn is_supported(sig: i32) -> bool {
+    if sig == SIG_INT { return true }
+    if sig == SIG_TERM { return true }
+    return false
+}
+
+// Install the handler for `sig`. False when the capability is denied, the signal is not
+// one of the two supported, or the platform refused it.
+pub fn arm(mut s: Signals, sig: i32) -> bool {
+    if !s.on {
+        s.refused = s.refused + 1
+        return false
+    }
+    if !is_supported(sig) {
+        s.refused = s.refused + 1
+        return false
+    }
+    if !signal_arm(sig) {
+        s.refused = s.refused + 1
+        return false
+    }
+    s.armed = s.armed + 1
+    return true
+}
+
+// Arm both supported signals. Returns how many took, so a caller can tell "all set" from
+// "one of them is not available here" without guessing.
+pub fn arm_shutdown(mut s: Signals) -> i32 {
+    var n: i32 = 0
+    if arm(s, SIG_INT) { n = n + 1 }
+    if arm(s, SIG_TERM) { n = n + 1 }
+    return n
+}
+
+// The signal last delivered, or 0. Does not clear.
+pub fn caught(read s: Signals) -> i32 {
+    if !s.on { return 0 }
+    return signal_caught()
+}
+
+// Has anything been delivered? The question a service loop asks each pass.
+pub fn shutdown_requested(read s: Signals) -> bool {
+    return caught(s) != 0
+}
+
+// Send `sig` to this process. Real API, not test scaffolding: re-raising a signal after
+// cleanup — so the parent sees a wait status rather than a plain exit code — is the
+// standard way to finish a handled shutdown. It is also what lets a test prove DELIVERY
+// in-process and deterministically instead of only proving that arming succeeded.
+pub fn raise_self(mut s: Signals, sig: i32) -> bool {
+    if !s.on {
+        s.refused = s.refused + 1
+        return false
+    }
+    if !is_supported(sig) {
+        s.refused = s.refused + 1
+        return false
+    }
+    return signal_raise(sig)
+}
+
+pub fn signal_name(sig: i32) -> str {
+    if sig == SIG_INT { return "SIGINT" }
+    if sig == SIG_TERM { return "SIGTERM" }
+    if sig == 0 { return "none" }
+    return "?"
+}

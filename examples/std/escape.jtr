@@ -555,6 +555,12 @@ fn is_os_intrinsic(read src: str, ns: usize, ne: usize) -> bool {
     if str_eq(n, "print_str") { return true }
     if str_eq(n, "print_bool") { return true }
     if str_eq(n, "eprint_str") { return true }
+    // Signals are an OS effect in both directions: arming installs a handler in the
+    // process, and reading observes something only the kernel can have changed. A
+    // `@no_os` function must reach none of them.
+    if str_eq(n, "signal_arm") { return true }
+    if str_eq(n, "signal_caught") { return true }
+    if str_eq(n, "signal_raise") { return true }
     return false
 }
 fn is_atomic_op(read src: str, ns: usize, ne: usize) -> bool {

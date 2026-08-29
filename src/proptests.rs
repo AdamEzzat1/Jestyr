@@ -1049,6 +1049,13 @@ mod service_lifecycle {
                     \n\
                     four accepted, all in flight\n\
                     4\n\
+                    -- shutdown is requested from outside --\n\
+                    both signals armed\n\
+                    2\n\
+                    nothing has arrived yet\n\
+                    true\n\
+                    and now it has, by name\n\
+                    SIGTERM\n\
                     phase=draining ready=false live=true inflight=4\n\
                     \n\
                     a draining service refuses new work\n\
@@ -1105,6 +1112,64 @@ mod service_lifecycle {
         // it exercises is that a service really starting at t=0 — which every deterministic
         // test does — is not mistaken for one that never started.
         assert!(out.contains("\n5000\n"), "the manual clock must drive the lifetime:\n{out}");
+
+        // **The shutdown is TRIGGERED, not decided.** The service drains because a signal
+        // arrived, and the ordering in the transcript is what says so: the flag must read
+        // empty before the raise and name SIGTERM after it. A demo that armed a handler
+        // and then drained on its own would print both lines and still be wrong, so the
+        // `nothing has arrived yet / true` pair is the half that carries the claim.
+        let before = out.find("nothing has arrived yet").expect("the pre-signal read is missing");
+        let named = out.find("SIGTERM").expect("the delivered signal is not named");
+        let drain = out.find("phase=draining").expect("the service never drained");
+        assert!(before < named && named < drain, "the signal must PRECEDE the drain:\n{out}");
+    }
+
+    /// **The signal numbers are a claim about `<signal.h>`, so they are re-measured.**
+    ///
+    /// `std/sysignal` hard-codes `SIG_INT = 2` and `SIG_TERM = 15`. Those are right on
+    /// every platform this builds on, and they are still a claim about a header rather
+    /// than a fact about Jestyr — a wrong one produces a shutdown that never arrives,
+    /// which is invisible to every other test in the tree.
+    ///
+    /// The constants are **parsed out of the shipped source** rather than restated here,
+    /// because a test that hard-codes 15 beside a module that hard-codes 15 proves only
+    /// that someone typed it twice. Same discipline as `std/sysproc`'s Win32 offsets.
+    #[test]
+    fn the_signal_numbers_match_the_real_header() {
+        let src = std::fs::read_to_string("examples/std/sysignal.jtr").unwrap();
+        let shipped = |name: &str| -> i32 {
+            let pat = format!("pub const {name}: i32 = ");
+            let at = src.find(&pat).unwrap_or_else(|| panic!("`{name}` is no longer declared in sysignal.jtr"));
+            src[at + pat.len()..]
+                .lines()
+                .next()
+                .unwrap()
+                .trim()
+                .parse()
+                .expect("the constant is not a plain integer any more")
+        };
+        let (sint, sterm) = (shipped("SIG_INT"), shipped("SIG_TERM"));
+
+        // Ask the real header, through the same C compiler that builds the emitted C.
+        let dir = std::env::temp_dir();
+        let cfile = dir.join("jestyr_signums.c");
+        let exe = dir.join(format!("jestyr_signums{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(
+            &cfile,
+            "#include <signal.h>\n#include <stdio.h>\nint main(void){printf(\"%d %d\\n\", SIGINT, SIGTERM);return 0;}\n",
+        )
+        .unwrap();
+        let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
+        let built = std::process::Command::new(&cc).arg(&cfile).arg("-o").arg(&exe).output().unwrap();
+        assert!(built.status.success(), "the probe did not build: {}", String::from_utf8_lossy(&built.stderr));
+        let out = std::process::Command::new(&exe).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut it = text.split_whitespace();
+        let real_int: i32 = it.next().unwrap().parse().unwrap();
+        let real_term: i32 = it.next().unwrap().parse().unwrap();
+
+        assert_eq!(sint, real_int, "sysignal.jtr's SIG_INT disagrees with <signal.h>");
+        assert_eq!(sterm, real_term, "sysignal.jtr's SIG_TERM disagrees with <signal.h>");
     }
 }
 
@@ -18068,6 +18133,10 @@ fn main() -> i32 {
         "metrics.jtr",
         "service.jtr",
         "config.jtr",
+        // The signal intrinsics' only corpus consumer. In here so the PORT's gated
+        // prelude — the flag, the handler and `<signal.h>` — is under byte-identity
+        // rather than under a probe someone ran once.
+        "sysignal.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same

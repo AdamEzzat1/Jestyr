@@ -2337,6 +2337,12 @@ fn is_os_intrinsic(name: &str) -> bool {
             | "print_str"
             | "print_bool"
             | "eprint_str"
+            // Signals are an OS effect in both directions: arming installs a handler
+            // in the process, and reading observes something only the kernel can have
+            // changed. A `@no_os` function must reach neither.
+            | "signal_arm"
+            | "signal_caught"
+            | "signal_raise"
     )
 }
 

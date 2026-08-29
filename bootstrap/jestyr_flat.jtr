@@ -8404,6 +8404,11 @@ fn intrinsic_ret(mut c: Checker, t: str) -> i32 {
     if str_eq(t, "write_file") or str_eq(t, "file_exists") or str_eq(t, "remove_file") { return t_bool() }
     if str_eq(t, "run_command") { return t_i32() }
     if str_eq(t, "eprint_str") { return t_unit() }
+    // `signal_caught` returns the signal NUMBER, not a bool, so a caller can tell SIGINT
+    // from SIGTERM. Deliveries coalesce -- all `sig_atomic_t` can promise.
+    if str_eq(t, "signal_arm") { return t_bool() }
+    if str_eq(t, "signal_caught") { return t_i32() }
+    if str_eq(t, "signal_raise") { return t_bool() }
     if str_eq(t, "arg_count") { return t_i32() }
     if str_eq(t, "arg") { return t_str() }
     if str_eq(t, "env_var") { return t_str() }
@@ -10519,6 +10524,12 @@ fn is_os_intrinsic(read src: str, ns: usize, ne: usize) -> bool {
     if str_eq(n, "print_str") { return true }
     if str_eq(n, "print_bool") { return true }
     if str_eq(n, "eprint_str") { return true }
+    // Signals are an OS effect in both directions: arming installs a handler in the
+    // process, and reading observes something only the kernel can have changed. A
+    // `@no_os` function must reach none of them.
+    if str_eq(n, "signal_arm") { return true }
+    if str_eq(n, "signal_caught") { return true }
+    if str_eq(n, "signal_raise") { return true }
     return false
 }
 fn is_atomic_op(read src: str, ns: usize, ne: usize) -> bool {
@@ -13485,6 +13496,28 @@ fn uses_eprint(read p: Parser, read src: str, tmode: bool) -> bool {
     return false
 }
 
+// Does the program touch signals? ONE gate for all three names (mirrors `uses_signal`),
+// because they are useless apart: arming without reading discards every delivery, reading
+// without arming answers 0 forever, and raising without arming just kills the process.
+// Three gates would let a program emit half the machinery.
+fn uses_signal(read p: Parser, read src: str, tmode: bool) -> bool {
+    var i: usize = 0
+    for i < len(ExprData, p.ex) {
+        let e: ExprData = get__list(ExprData, p.ex, i)
+        if e.kind == 10 and !in_skipped_test(p, src, tmode, e.start, e.end) {
+            let callee: ExprData = get__list(ExprData, p.ex, e.a as usize)
+            if callee.kind == 2 {
+                let nm: str = src[callee.start .. callee.end]
+                if str_eq(nm, "signal_arm") { return true }
+                if str_eq(nm, "signal_caught") { return true }
+                if str_eq(nm, "signal_raise") { return true }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
 // Does the program call `env_var`? Gates its runtime helper (mirrors `uses_env_var`).
 fn uses_env_var(read p: Parser, read src: str, tmode: bool) -> bool {
     var i: usize = 0
@@ -13721,6 +13754,27 @@ fn emit_prelude(mut sb: String, read p: Parser, read src: str, read g: Cg) {
         string_push(sb, "#include <sys/wait.h>\n")
         string_push(sb, "static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); if (rc == -1) return -1; return WIFEXITED(rc) ? (int32_t)WEXITSTATUS(rc) : -1; }\n")
         string_push(sb, "#endif\n")
+    }
+    // Signal delivery -- the one place the language's "no module-level mutable state"
+    // rule cannot hold, because the OS fixes the handler's signature and it has nowhere
+    // to put a context pointer. A handler may touch only a `volatile sig_atomic_t`, and
+    // Jestyr has no spelling for one: it has no module-level `var`, and its `extern` binds
+    // FUNCTIONS rather than globals, with no external symbol serving as a user flag
+    // either. So the flag is emitted HERE, where it can be given exactly the type the C
+    // standard requires, and the language keeps its rule.
+    //
+    // `signal()` rather than `sigaction()`: it is C89 and works on the Windows CRT, so
+    // SIGINT and SIGTERM are reachable on both platforms with no `@cfg` split. `sigaction`
+    // would cost a `struct sigaction` whose layout differs per libc -- the guessed-layout
+    // claim `std/sysdir` refuses to make.
+    if uses_signal(p, src, g.tmode) {
+        string_push(sb, "/* Signal delivery: the flag a handler may legally write, and a way to read it. */\n")
+        string_push(sb, "#include <signal.h>\n")
+        string_push(sb, "static volatile sig_atomic_t jestyr_rt_sigflag = 0;\n")
+        string_push(sb, "static void jestyr_rt_sighandler(int s) { jestyr_rt_sigflag = (sig_atomic_t)s; }\n")
+        string_push(sb, "static bool jestyr_rt_signal_arm(int32_t s) { return signal((int)s, jestyr_rt_sighandler) != SIG_ERR; }\n")
+        string_push(sb, "static int32_t jestyr_rt_signal_caught(void) { return (int32_t)jestyr_rt_sigflag; }\n")
+        string_push(sb, "static bool jestyr_rt_signal_raise(int32_t s) { return raise((int)s) == 0; }\n")
     }
     // Environment lookup. The name must be NUL-terminated for getenv, so it goes
     // through `cpath`; the RESULT is OS-owned storage, returned as a borrowed
@@ -16032,6 +16086,9 @@ fn intrinsic_helper(read nm: str) -> str {
     if str_eq(nm, "read_file") { return "jestyr_rt_read_file" }
     if str_eq(nm, "run_command") { return "jestyr_rt_run_command" }
     if str_eq(nm, "eprint_str") { return "jestyr_rt_eprint_str" }
+    if str_eq(nm, "signal_arm") { return "jestyr_rt_signal_arm" }
+    if str_eq(nm, "signal_caught") { return "jestyr_rt_signal_caught" }
+    if str_eq(nm, "signal_raise") { return "jestyr_rt_signal_raise" }
     if str_eq(nm, "env_var") { return "jestyr_rt_env_var" }
     if str_eq(nm, "mono_nanos") { return "jestyr_rt_mono_nanos" }
     if str_eq(nm, "write_file") { return "jestyr_rt_write_file" }
@@ -25738,7 +25795,7 @@ fn is_global_cname(read p: Parser, read src: str, ns: usize, ne: usize) -> bool 
     string_push(probe, "|")
     string_push(probe, nm)
     string_push(probe, "|")
-    let hit: bool = contains("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|env_var|mono_nanos|arg_count|arg|", string_view(probe))
+    let hit: bool = contains("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|signal_arm|signal_caught|signal_raise|env_var|mono_nanos|arg_count|arg|", string_view(probe))
     string_free(probe)
     return hit
 }

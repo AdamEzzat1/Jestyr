@@ -325,6 +325,16 @@ fn emit_program(
                 false
             }
         }),
+        uses_signal: ast.exprs.iter().filter(|e| live(e)).any(|e| {
+            if let ExprKind::Call { callee, .. } = &e.kind {
+                matches!(&ast.expr_at(*callee).kind,
+                    ExprKind::Name(n) if n.name == "signal_arm"
+                        || n.name == "signal_caught"
+                        || n.name == "signal_raise")
+            } else {
+                false
+            }
+        }),
         uses_eprint: ast.exprs.iter().filter(|e| live(e)).any(|e| {
             if let ExprKind::Call { callee, .. } = &e.kind {
                 matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "eprint_str")
@@ -789,6 +799,13 @@ struct Cgen<'a> {
     uses_env_var: bool,
     /// `mono_nanos() -> i64` is used — gate its runtime helper and `<time.h>`.
     uses_mono_nanos: bool,
+    /// `signal_arm(sig) -> bool` / `signal_caught() -> i32` are used — gate the
+    /// handler, its flag and `<signal.h>`.
+    ///
+    /// **One flag for both**, because the two are useless apart: arming without
+    /// reading discards every delivery, and reading without arming answers 0
+    /// forever. Two gates would let a program emit half the machinery.
+    uses_signal: bool,
     /// task handles (`let h = spawn …`) live in the current `concurrent` scope,
     /// keyed by binding name — consumed by `await`. Saved/restored across nesting.
     task_handles: HashMap<String, TaskHandle>,
@@ -1286,6 +1303,46 @@ impl<'a> Cgen<'a> {
             self.raw("#include <sys/wait.h>\n");
             self.raw("static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); if (rc == -1) return -1; return WIFEXITED(rc) ? (int32_t)WEXITSTATUS(rc) : -1; }\n");
             self.raw("#endif\n");
+        }
+        // Signal delivery — the one place the language's "no module-level mutable
+        // state" rule cannot hold, because the OS chooses the handler's signature and
+        // it has nowhere to put a context pointer.
+        //
+        // **Why this is an intrinsic rather than a library binding.** A handler may
+        // only touch a `volatile sig_atomic_t`; every other type is undefined
+        // behaviour under a signal, and async-signal-safety forbids essentially
+        // everything else. Jestyr has no module-level `var` and its `extern` binds
+        // FUNCTIONS, not globals — so there is no spelling in the language for the
+        // one object a handler is allowed to write, and no external symbol that
+        // serves as one either. The flag is therefore emitted here, where it can be
+        // given exactly the type the C standard requires, and the language keeps its
+        // rule intact.
+        //
+        // The handler stores the signal NUMBER rather than setting a boolean, so a
+        // caller can tell SIGINT from SIGTERM. Deliveries coalesce: two signals
+        // before a read leave only the second, which is what `sig_atomic_t` can
+        // promise and no more. `signal_caught` does not clear — clearing would make
+        // two readers race for one delivery, and a shutdown flag is meant to stay
+        // set.
+        if self.uses_signal {
+            self.raw("/* Signal delivery: the flag a handler may legally write, and a way to read it. */\n");
+            self.raw("#include <signal.h>\n");
+            self.raw("static volatile sig_atomic_t jestyr_rt_sigflag = 0;\n");
+            self.raw("static void jestyr_rt_sighandler(int s) { jestyr_rt_sigflag = (sig_atomic_t)s; }\n");
+            // `signal()` rather than `sigaction()`: it is in C89 and works on the
+            // Windows CRT, so SIGINT and SIGTERM are reachable on both platforms with
+            // no `@cfg` split. `sigaction` would give restart semantics this does not
+            // need, at the cost of a `struct sigaction` whose layout differs per libc
+            // — the same guessed-layout claim `std/sysdir` refuses to make.
+            self.raw("static bool jestyr_rt_signal_arm(int32_t s) { return signal((int)s, jestyr_rt_sighandler) != SIG_ERR; }\n");
+            self.raw("static int32_t jestyr_rt_signal_caught(void) { return (int32_t)jestyr_rt_sigflag; }\n");
+            // `raise` is not test scaffolding: re-raising a signal after cleanup, so
+            // the parent sees the right wait status instead of a plain exit code, is
+            // the standard way to end a handled shutdown. It also makes delivery
+            // testable IN-PROCESS and deterministically — without it the suite could
+            // only check that arming succeeded, which is the half that was never in
+            // doubt.
+            self.raw("static bool jestyr_rt_signal_raise(int32_t s) { return raise((int)s) == 0; }\n");
         }
         // Environment lookup. The name must be NUL-terminated for getenv, so it
         // goes through `cpath`; the RESULT is OS-owned storage, returned as a
@@ -6169,6 +6226,15 @@ impl<'a> Cgen<'a> {
                     let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
                     return format!("jestyr_rt_eprint_str({s})");
                 }
+                "signal_arm" => {
+                    let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
+                    return format!("jestyr_rt_signal_arm({s})");
+                }
+                "signal_caught" => return "jestyr_rt_signal_caught()".to_string(),
+                "signal_raise" => {
+                    let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
+                    return format!("jestyr_rt_signal_raise({s})");
+                }
                 "env_var" => {
                     let n = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
                     return format!("jestyr_rt_env_var({n})");
@@ -10831,6 +10897,7 @@ pub fn is_intrinsic(name: &str) -> bool {
             | "arena_open" | "arena_alloc" | "arena_close"
             | "read_file" | "try_read_file" | "write_file" | "file_exists" | "remove_file"
             | "run_command" | "eprint_str"
+            | "signal_arm" | "signal_caught" | "signal_raise"
             | "arg_count" | "arg" | "env_var" | "mono_nanos"
     )
 }

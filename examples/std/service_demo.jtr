@@ -23,6 +23,7 @@ import "metrics"
 import "service"
 import "sink"
 import "sync"
+import "sysignal"
 import "time"
 
 const CAP: usize = 1024
@@ -95,8 +96,22 @@ fn main() -> i32 {
     print_str("four accepted, all in flight")
     print_int(service.inflight_now(s) as i32)
 
+    // **The trigger the lifecycle was missing.** Arm SIGINT and SIGTERM, then raise
+    // SIGTERM at ourselves — which is what a deployment does from outside, and what a
+    // handled shutdown re-raises at the end so the parent sees a wait status. The service
+    // begins draining because the OS asked it to, not because the program decided to.
+    var sig: sysignal.Signals = sysignal.host()
+    print_str("-- shutdown is requested from outside --")
+    print_str("both signals armed")
+    print_int(sysignal.arm_shutdown(sig))
+    print_str("nothing has arrived yet")
+    print_bool(sysignal.shutdown_requested(sig) == false)
+    sysignal.raise_self(sig, sysignal.SIG_TERM)
+    print_str("and now it has, by name")
+    print_str(sysignal.signal_name(sysignal.caught(sig)))
+
     // Draining: the middle phase, and the one that matters.
-    service.begin_drain(s)
+    if sysignal.shutdown_requested(sig) { service.begin_drain(s) }
     health(sk, buf, s)
     print_str("a draining service refuses new work")
     var refused_draining: bool = true

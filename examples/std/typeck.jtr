@@ -1641,6 +1641,11 @@ fn intrinsic_ret(mut c: Checker, t: str) -> i32 {
     if str_eq(t, "write_file") or str_eq(t, "file_exists") or str_eq(t, "remove_file") { return t_bool() }
     if str_eq(t, "run_command") { return t_i32() }
     if str_eq(t, "eprint_str") { return t_unit() }
+    // `signal_caught` returns the signal NUMBER, not a bool, so a caller can tell SIGINT
+    // from SIGTERM. Deliveries coalesce -- all `sig_atomic_t` can promise.
+    if str_eq(t, "signal_arm") { return t_bool() }
+    if str_eq(t, "signal_caught") { return t_i32() }
+    if str_eq(t, "signal_raise") { return t_bool() }
     if str_eq(t, "arg_count") { return t_i32() }
     if str_eq(t, "arg") { return t_str() }
     if str_eq(t, "env_var") { return t_str() }

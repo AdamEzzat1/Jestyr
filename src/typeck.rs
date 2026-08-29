@@ -5356,6 +5356,13 @@ fn io_intrinsic_ret(name: &str) -> Option<Ty> {
         // The self-hosted driver's plumbing: drive gcc, print diagnostics to stderr.
         "run_command" => Ty::Prim("i32"),
         "eprint_str" => Ty::Unit,
+        // `signal_arm(sig) -> bool` — false when the platform refuses that signal.
+        // `signal_caught() -> i32` — the number last delivered, or 0. A NUMBER rather
+        // than a bool so a caller can tell SIGINT from SIGTERM; deliveries coalesce,
+        // which is all `sig_atomic_t` can promise.
+        "signal_arm" => Ty::Prim("bool"),
+        "signal_caught" => Ty::Prim("i32"),
+        "signal_raise" => Ty::Prim("bool"),
         "arg_count" => Ty::Prim("i32"),
         "arg" => Ty::Prim("str"),
         // `env_var(name) -> str` — a view into the C runtime's environment

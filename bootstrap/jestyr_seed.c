@@ -1288,6 +1288,7 @@ bool jestyr_in_skipped_test(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode, si
 bool jestyr_uses_try_read(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode);
 bool jestyr_uses_run_command(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode);
 bool jestyr_uses_eprint(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode);
+bool jestyr_uses_signal(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode);
 bool jestyr_uses_env_var(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode);
 bool jestyr_uses_mono_nanos(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode);
 bool jestyr_uses_arena(Jestyr_Parser j_p, JestyrStr j_src);
@@ -13979,6 +13980,18 @@ int32_t jestyr_intrinsic_ret(Jestyr_Checker* restrict j_c, JestyrStr j_t)
     {
         return jestyr_t_unit();
     }
+    if (jestyr_rt_str_eq(j_t, JSTR("signal_arm")))
+    {
+        return jestyr_t_bool();
+    }
+    if (jestyr_rt_str_eq(j_t, JSTR("signal_caught")))
+    {
+        return jestyr_t_i32();
+    }
+    if (jestyr_rt_str_eq(j_t, JSTR("signal_raise")))
+    {
+        return jestyr_t_bool();
+    }
     if (jestyr_rt_str_eq(j_t, JSTR("arg_count")))
     {
         return jestyr_t_i32();
@@ -17220,6 +17233,18 @@ bool jestyr_is_os_intrinsic(JestyrStr j_src, size_t j_ns, size_t j_ne)
         return true;
     }
     if (jestyr_rt_str_eq(j_n, JSTR("eprint_str")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("signal_arm")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("signal_caught")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("signal_raise")))
     {
         return true;
     }
@@ -20572,6 +20597,37 @@ bool jestyr_uses_eprint(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode)
     return false;
 }
 
+bool jestyr_uses_signal(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode)
+{
+    size_t j_i = 0;
+    while ((j_i < jestyr_len__ExprData(j_p.j_ex)))
+    {
+        Jestyr_ExprData j_e = jestyr_get__list__ExprData(j_p.j_ex, j_i);
+        if (((j_e.j_kind == 10) && (!jestyr_in_skipped_test(j_p, j_src, j_tmode, j_e.j_start, j_e.j_end))))
+        {
+            Jestyr_ExprData j_callee = jestyr_get__list__ExprData(j_p.j_ex, (size_t)(j_e.j_a));
+            if ((j_callee.j_kind == 2))
+            {
+                JestyrStr j_nm = jestyr_rt_substr(j_src, j_callee.j_start, j_callee.j_end);
+                if (jestyr_rt_str_eq(j_nm, JSTR("signal_arm")))
+                {
+                    return true;
+                }
+                if (jestyr_rt_str_eq(j_nm, JSTR("signal_caught")))
+                {
+                    return true;
+                }
+                if (jestyr_rt_str_eq(j_nm, JSTR("signal_raise")))
+                {
+                    return true;
+                }
+            }
+        }
+        j_i = (j_i + 1);
+    }
+    return false;
+}
+
 bool jestyr_uses_env_var(Jestyr_Parser j_p, JestyrStr j_src, bool j_tmode)
 {
     size_t j_i = 0;
@@ -20840,6 +20896,16 @@ void jestyr_emit_prelude(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrS
         jestyr_rt_str_push(&(*j_sb), JSTR("#include <sys/wait.h>\n"));
         jestyr_rt_str_push(&(*j_sb), JSTR("static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); if (rc == -1) return -1; return WIFEXITED(rc) ? (int32_t)WEXITSTATUS(rc) : -1; }\n"));
         jestyr_rt_str_push(&(*j_sb), JSTR("#endif\n"));
+    }
+    if (jestyr_uses_signal(j_p, j_src, j_g.j_tmode))
+    {
+        jestyr_rt_str_push(&(*j_sb), JSTR("/* Signal delivery: the flag a handler may legally write, and a way to read it. */\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("#include <signal.h>\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("static volatile sig_atomic_t jestyr_rt_sigflag = 0;\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("static void jestyr_rt_sighandler(int s) { jestyr_rt_sigflag = (sig_atomic_t)s; }\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("static bool jestyr_rt_signal_arm(int32_t s) { return signal((int)s, jestyr_rt_sighandler) != SIG_ERR; }\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("static int32_t jestyr_rt_signal_caught(void) { return (int32_t)jestyr_rt_sigflag; }\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("static bool jestyr_rt_signal_raise(int32_t s) { return raise((int)s) == 0; }\n"));
     }
     if (jestyr_uses_env_var(j_p, j_src, j_g.j_tmode))
     {
@@ -23952,6 +24018,18 @@ JestyrStr jestyr_intrinsic_helper(JestyrStr j_nm)
     if (jestyr_rt_str_eq(j_nm, JSTR("eprint_str")))
     {
         return JSTR("jestyr_rt_eprint_str");
+    }
+    if (jestyr_rt_str_eq(j_nm, JSTR("signal_arm")))
+    {
+        return JSTR("jestyr_rt_signal_arm");
+    }
+    if (jestyr_rt_str_eq(j_nm, JSTR("signal_caught")))
+    {
+        return JSTR("jestyr_rt_signal_caught");
+    }
+    if (jestyr_rt_str_eq(j_nm, JSTR("signal_raise")))
+    {
+        return JSTR("jestyr_rt_signal_raise");
     }
     if (jestyr_rt_str_eq(j_nm, JSTR("env_var")))
     {
@@ -36383,7 +36461,7 @@ bool jestyr_is_global_cname(Jestyr_Parser j_p, JestyrStr j_src, size_t j_ns, siz
     jestyr_rt_str_push(&j_probe, JSTR("|"));
     jestyr_rt_str_push(&j_probe, j_nm);
     jestyr_rt_str_push(&j_probe, JSTR("|"));
-    bool j_hit = jestyr_rt_contains(JSTR("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|env_var|mono_nanos|arg_count|arg|"), jestyr_rt_str_view(&j_probe));
+    bool j_hit = jestyr_rt_contains(JSTR("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|signal_arm|signal_caught|signal_raise|env_var|mono_nanos|arg_count|arg|"), jestyr_rt_str_view(&j_probe));
     jestyr_rt_str_free(&j_probe);
     return j_hit;
 }
