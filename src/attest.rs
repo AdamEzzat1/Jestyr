@@ -96,6 +96,81 @@ pub fn manifest(source_id: &str, src: &str, ast: &Ast, info: &TypeInfo) -> Strin
     out
 }
 
+/// One trait method, rendered the way `doc::fn_sig` renders a free function — same
+/// parameter spelling, same `-> conv Ty`, same `!{ … }` error set — so a method moving
+/// between a trait and a free function does not read as a signature change when the
+/// contract is identical.
+///
+/// A `TraitMethod` is not a `FnDecl` (no visibility, no `@no_panic`, an optional default
+/// body), so this cannot call `doc::fn_sig` directly; it deliberately mirrors it.
+fn trait_method_sig(ast: &Ast, src: &str, m: &crate::ast::TraitMethod) -> String {
+    let mut s = String::new();
+    s.push_str("fn ");
+    s.push_str(&m.name.name);
+    s.push('(');
+    s.push_str(&doc::params_str(ast, src, &m.params));
+    s.push(')');
+    if let Some(t) = m.ret_ty {
+        s.push_str(" -> ");
+        if m.ret_conv != Conv::Default {
+            s.push_str(m.ret_conv.label());
+            s.push(' ');
+        }
+        s.push_str(&doc::ty_str(ast, t));
+    }
+    if let Some(es) = &m.errors {
+        let names: Vec<String> = es.names.iter().map(|n| doc::err_name_str(ast, n)).collect();
+        s.push_str(&format!(" !{{ {} }}", names.join(", ")));
+    }
+    // A default body is part of the contract: removing one turns an optional method
+    // into a required one, which breaks every implementor that relied on it.
+    if m.default_body.is_some() {
+        s.push_str(" { … }");
+    }
+    s
+}
+
+/// `trait Name { fn a(…); fn b(…) }` — the method SET inside the signature, so removing
+/// or adding one shows up as a signature change rather than as nothing at all.
+///
+/// Methods are rendered in DECLARATION order, not sorted. Reordering a trait's methods is
+/// an ABI change in a vtable-dispatched language, and this is the only record that can see
+/// it; sorting here would hide it.
+fn trait_sig(ast: &Ast, src: &str, t: &crate::ast::TraitDecl) -> String {
+    let mut s = String::new();
+    if t.is_pub {
+        s.push_str("pub ");
+    }
+    s.push_str("trait ");
+    s.push_str(&t.name.name);
+    s.push_str(" { ");
+    let ms: Vec<String> = t.methods.iter().map(|m| trait_method_sig(ast, src, m)).collect();
+    s.push_str(&ms.join("; "));
+    s.push_str(" }");
+    s
+}
+
+/// `impl[T] Trait for Ty { fn a(…); fn b(…) }`. The generic parameters matter: a blanket
+/// `impl[T] Drop for Vec(T)` and a concrete `impl Drop for Vec(i32)` cover different sets
+/// of instantiations, so a change from one to the other is a real ABI change.
+fn impl_sig(ast: &Ast, src: &str, i: &crate::ast::ImplDecl) -> String {
+    let mut s = String::new();
+    s.push_str("impl");
+    if !i.generics.is_empty() {
+        let gs: Vec<String> = i.generics.iter().map(|g| g.name.name.clone()).collect();
+        s.push_str(&format!("[{}]", gs.join(", ")));
+    }
+    s.push(' ');
+    s.push_str(&i.trait_name.name);
+    s.push_str(" for ");
+    s.push_str(&doc::ty_str(ast, i.ty));
+    s.push_str(" { ");
+    let ms: Vec<String> = i.methods.iter().map(|m| doc::fn_sig(ast, src, m)).collect();
+    s.push_str(&ms.join("; "));
+    s.push_str(" }");
+    s
+}
+
 /// Walk the top-level items into attestation records. Covers the value/ABI surface
 /// — `fn`, `const`, `struct`/`record`/`union`, `enum`, `extern` — tagging each with
 /// its visibility. (Traits/impls/distinct/import are not emitted as standalone C
@@ -148,8 +223,51 @@ fn collect_records(ast: &Ast, src: &str) -> Vec<Record> {
                 sig: doc::extern_sig(ast, e),
                 guarantees: Vec::new(),
             }),
-            // Not standalone C items: their behavior is attested via the C hash.
-            Item::Trait(_) | Item::Impl(_) | Item::Distinct(_) | Item::Import(_) => {}
+            // **A trait IS part of the ABI, and leaving it out was a false negative
+            // inside the tool whose whole job is finding breakage.**
+            //
+            // Measured before it was fixed: two programs differing only by a removed
+            // `pub` trait method produced DIFFERENT C hashes and `no API changes`,
+            // exit 0. The gate passed a change that breaks every caller through the
+            // trait. The old comment here said the effect was "captured by the C
+            // hash" — the hash is in the manifest, but `diff` produces no `Change`
+            // from it, so it can never reach `has_breaking()`. A hash cannot classify;
+            // it can only say *something* moved, which is true of every rebuild.
+            //
+            // One record per trait, with the method set rendered INTO the signature,
+            // rather than a record per method. That keeps the "one record per
+            // top-level item" shape the whole manifest — and the self-hosted port's
+            // `at_records` — is built on, and it still catches the case: removing a
+            // method changes the trait's `sig`, which `diff_item` reports as breaking.
+            // Adding one is breaking too, and correctly so: every existing implementor
+            // stops compiling.
+            Item::Trait(t) => records.push(Record {
+                kind: "trait",
+                name: t.name.name.clone(),
+                is_pub: t.is_pub,
+                sig: trait_sig(ast, src, t),
+                guarantees: Vec::new(),
+            }),
+            // An impl is the other half: a type that stops implementing a trait breaks
+            // every call through it, and that is invisible if only the trait is
+            // recorded. Named `<Trait> for <Type>` because coherence allows at most one
+            // per pair, which makes that string a key.
+            //
+            // **Recorded as `pub` unconditionally**, because an `impl` carries no
+            // visibility of its own and is reachable through any public trait. That is
+            // the conservative direction, and this file's contract is explicitly that
+            // only *provably* compatible changes get the compatible verdict.
+            Item::Impl(i) => records.push(Record {
+                kind: "impl",
+                name: format!("{} for {}", i.trait_name.name, doc::ty_str(ast, i.ty)),
+                is_pub: true,
+                sig: impl_sig(ast, src, i),
+                guarantees: Vec::new(),
+            }),
+            // Still not standalone C items, and neither carries a callable surface:
+            // a `distinct` is attested by the struct/fn records that mention it, and
+            // an `import` is the module graph's business (`jestyrc manifest`).
+            Item::Distinct(_) | Item::Import(_) => {}
         }
     }
     records

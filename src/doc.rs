@@ -539,7 +539,7 @@ pub(crate) fn extern_sig(ast: &Ast, e: &ExternFn) -> String {
     s
 }
 
-fn params_str(ast: &Ast, src: &str, params: &[Param]) -> String {
+pub(crate) fn params_str(ast: &Ast, src: &str, params: &[Param]) -> String {
     params
         .iter()
         .map(|p| {

@@ -5689,6 +5689,51 @@ mod attest_diff {
         assert!(d.contains("signature changed"), "{d}");
     }
 
+    /// **The false negative this tool used to have, pinned shut.**
+    ///
+    /// Traits and impls emitted NO records at all — the comment said their effect was
+    /// "captured by the C hash". Measured before the fix: two programs differing only by
+    /// a removed `pub` trait method produced different C hashes and a report reading
+    /// `no API changes`, **exit 0**. The gate passed a change that breaks every caller
+    /// through the trait.
+    ///
+    /// The hash cannot rescue it: it is carried in the report but produces no `Change`,
+    /// so it never reaches `has_breaking()`. A hash says *something moved*, which is true
+    /// of every rebuild; only a record can classify.
+    #[test]
+    fn removing_a_trait_method_is_breaking() {
+        let old = "pub trait Show { fn show(read self) -> i32  fn label(read self) -> i32 }";
+        let new = "pub trait Show { fn show(read self) -> i32 }";
+        let (v, d) = sole(&diff(old, new));
+        assert_eq!(v, Verdict::Breaking);
+        assert!(d.contains("signature changed"), "{d}");
+        // The method set must be IN the signature — that is the whole mechanism.
+        assert!(d.contains("label"), "the removed method must be named: {d}");
+    }
+
+    /// Adding one is breaking too, and correctly so: every existing implementor stops
+    /// compiling. This is the direction a naive "additions are compatible" rule gets
+    /// wrong, and it is why the method set lives in the SIGNATURE rather than being a
+    /// record per method — a per-method record would be classified `added` → Compatible.
+    #[test]
+    fn adding_a_trait_method_is_also_breaking() {
+        let old = "pub trait Show { fn show(read self) -> i32 }";
+        let new = "pub trait Show { fn show(read self) -> i32  fn label(read self) -> i32 }";
+        let (v, d) = sole(&diff(old, new));
+        assert_eq!(v, Verdict::Breaking);
+        assert!(d.contains("signature changed"), "{d}");
+    }
+
+    /// The control: a trait whose method set is untouched reports nothing, so the two
+    /// tests above are about the METHODS and not merely about traits now being recorded.
+    #[test]
+    fn an_unchanged_trait_reports_no_change() {
+        let same = "pub trait Show { fn show(read self) -> i32 }";
+        let r = diff(same, same);
+        assert!(r.changes.is_empty(), "a trait diffed against itself must be silent: {}", r.render());
+        assert!(!r.has_breaking());
+    }
+
     #[test]
     fn losing_no_panic_reports_once_not_also_as_a_sig_change() {
         // Regression: `@no_panic` is in the `sig:` line too; `sig_core` must strip it

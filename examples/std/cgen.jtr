@@ -14928,12 +14928,114 @@ fn at_guarantees(mut ob: String, read p: parser.Parser, read src: str, read it: 
     string_free(gb)
 }
 
-// The manifest kind tag of a top-level item, or "" if it isn't attested (trait/impl/
-// distinct/import are not standalone C items — the C hash captures their effect).
+// One trait method, rendered as `doc::fn_sig` renders a free function, from the `mar`
+// 8-tuple [name_s, name_e, param_start, param_count, ret_conv, ret_ty, body, err].
+// Mirrors the reference's `attest::trait_method_sig`.
+fn at_trait_method_sig(mut sb: String, read p: parser.Parser, read src: str, mb: i32) {
+    let mns: i32 = list.get(i32, p.mar, mb as usize)
+    let mne: i32 = list.get(i32, p.mar, (mb + 1) as usize)
+    let ps: i32 = list.get(i32, p.mar, (mb + 2) as usize)
+    let pc: i32 = list.get(i32, p.mar, (mb + 3) as usize)
+    let rc: i32 = list.get(i32, p.mar, (mb + 4) as usize)
+    let rt: i32 = list.get(i32, p.mar, (mb + 5) as usize)
+    let body: i32 = list.get(i32, p.mar, (mb + 6) as usize)
+    let merr: i32 = list.get(i32, p.mar, (mb + 7) as usize)
+    string_push(sb, "fn ")
+    string_push(sb, src[mns as usize .. mne as usize])
+    string_push(sb, "(")
+    at_params(sb, p, src, ps, pc)
+    string_push(sb, ")")
+    if rt >= 0 {
+        string_push(sb, " -> ")
+        if rc != 0 { string_push(sb, at_conv_label(rc)) string_push(sb, " ") }
+        at_ty(sb, p, src, rt)
+    }
+    if merr >= 0 {
+        string_push(sb, " !{ ")
+        at_errnames(sb, p, src, merr)
+        string_push(sb, " }")
+    }
+    // A default body is part of the contract: removing one turns an optional method into
+    // a required one, which breaks every implementor that relied on it.
+    if body >= 0 { string_push(sb, " { … }") }
+}
+
+// `[pub ]trait Name { fn a(…); fn b(…) }` — the method SET inside the signature.
+// Declaration order, NOT sorted: reordering a trait's methods is an ABI change in a
+// vtable-dispatched language and this is the only record that can see it.
+fn at_trait_sig(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    if it.is_pub != 0 { string_push(sb, "pub ") }
+    string_push(sb, "trait ")
+    string_push(sb, src[it.x as usize .. it.y as usize])
+    string_push(sb, " { ")
+    var m: i32 = 0
+    for m < it.b {
+        if m > 0 { string_push(sb, "; ") }
+        at_trait_method_sig(sb, p, src, it.a + m * 8)
+        m = m + 1
+    }
+    string_push(sb, " }")
+}
+
+// The `<Trait> for <Type>` name an impl record is keyed by. Coherence allows at most one
+// impl per pair, which is what makes this string a key.
+fn at_impl_name(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    string_push(sb, src[it.x as usize .. it.y as usize])
+    string_push(sb, " for ")
+    at_ty(sb, p, src, it.a)
+}
+
+// `impl[T] Trait for Ty { fn a(…); fn b(…) }`. The generic parameters matter: a blanket
+// `impl[T] Drop for Vec(T)` and a concrete `impl Drop for Vec(i32)` cover different sets
+// of instantiations. Methods are fn-ItemIds, so `at_fn_sig` renders them unchanged.
+fn at_impl_sig(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    string_push(sb, "impl")
+    if it.h > 0 {
+        string_push(sb, "[")
+        var g: i32 = 0
+        for g < it.h {
+            if g > 0 { string_push(sb, ", ") }
+            // 4 ints per generic: name start/end, then bound start/end. The reference
+            // renders only the NAME (`g.name.name`), so the bound span is skipped.
+            let gs: i32 = list.get(i32, p.gar, (it.g + g * 4) as usize)
+            let ge: i32 = list.get(i32, p.gar, (it.g + g * 4 + 1) as usize)
+            string_push(sb, src[gs as usize .. ge as usize])
+            g = g + 1
+        }
+        string_push(sb, "]")
+    }
+    string_push(sb, " ")
+    at_impl_name(sb, p, src, it)
+    string_push(sb, " { ")
+    var m: i32 = 0
+    for m < it.z {
+        if m > 0 { string_push(sb, "; ") }
+        let mid: i32 = list.get(i32, p.mar, (it.b + m) as usize)
+        let mit: parser.ItemData = list.get(parser.ItemData, p.it, mid as usize)
+        at_fn_sig(sb, p, src, mit)
+        m = m + 1
+    }
+    string_push(sb, " }")
+}
+
+// The manifest kind tag of a top-level item, or "" if it isn't attested.
+//
+// **`trait` and `impl` used to return "" here, and that was a FALSE NEGATIVE inside the
+// tool whose whole job is finding breakage.** Measured: two programs differing only by a
+// removed `pub` trait method produced different C hashes and `no API changes`, exit 0.
+// The old comment said the effect was "captured by the C hash" — the hash is in the
+// manifest, but `diff` produces no change record from it, so it can never reach the
+// breaking verdict. A hash cannot classify; it can only say something moved, which is
+// true of every rebuild.
+//
+// `distinct` and `import` stay out: neither carries a callable surface. A `distinct` is
+// attested by the struct/fn records that mention it, and imports are `jestyrc manifest`'s.
 fn at_kind_str(read it: parser.ItemData) -> str {
     if it.kind == 3 { return "fn" }
     if it.kind == 2 { return "const" }
     if it.kind == 5 { return "enum" }
+    if it.kind == 6 { return "trait" }
+    if it.kind == 7 { return "impl" }
     if it.kind == 8 { return "extern" }
     if it.kind == 4 {
         if it.op == 2 { return "union" }
@@ -14945,15 +15047,33 @@ fn at_kind_str(read it: parser.ItemData) -> str {
 
 // Order records by (kind, name) — the reference's sort key. Names are unique per
 // kind in a well-formed program, so this is a total order (stability irrelevant).
+// The name a record is keyed and sorted by. For everything but an `impl` that is the
+// item's own name span; an impl has no name of its own, so it is keyed `<Trait> for
+// <Type>` — unique because coherence allows at most one impl per pair.
+fn at_record_name(read p: parser.Parser, read src: str, read it: parser.ItemData) -> String {
+    var sb: String = string_new()
+    if it.kind == 7 {
+        at_impl_name(sb, p, src, it)
+    } else {
+        string_push(sb, src[it.x as usize .. it.y as usize])
+    }
+    return sb
+}
+
 fn at_lt(read p: parser.Parser, read src: str, ia: i32, ib: i32) -> bool {
     let da: parser.ItemData = list.get(parser.ItemData, p.it, ia as usize)
     let db: parser.ItemData = list.get(parser.ItemData, p.it, ib as usize)
     let ka: str = at_kind_str(da)
     let kb: str = at_kind_str(db)
-    if str_eq(ka, kb) {
-        return str_lt(src[da.x as usize .. da.y as usize], src[db.x as usize .. db.y as usize])
-    }
-    return str_lt(ka, kb)
+    if !str_eq(ka, kb) { return str_lt(ka, kb) }
+    var na: String = at_record_name(p, src, da)
+    var nb: String = at_record_name(p, src, db)
+    let va: str = string_view(na)
+    let vb: str = string_view(nb)
+    let r: bool = str_lt(va, vb)
+    string_free(na)
+    string_free(nb)
+    return r
 }
 
 // The per-item records section (`attest::collect_records` + the emit loop in
@@ -14989,11 +15109,20 @@ fn at_records(mut ob: String, read p: parser.Parser, read src: str, read a: Allo
         let ks: str = at_kind_str(it)
         string_push(ob, ks)
         string_push(ob, " ")
-        string_push(ob, src[it.x as usize .. it.y as usize])
+        var rn: String = at_record_name(p, src, it)
+        string_push(ob, string_view(rn))
+        string_free(rn)
         string_push(ob, "\n")
-        if it.is_pub != 0 { string_push(ob, "  vis: pub\n") } else { string_push(ob, "  vis: priv\n") }
+        // An `impl` carries no visibility of its own and is reachable through any public
+        // trait, so it records as `pub` — the conservative direction, matching this tool's
+        // contract that only PROVABLY compatible changes get the compatible verdict.
+        var vpub: bool = it.is_pub != 0
+        if it.kind == 7 { vpub = true }
+        if vpub { string_push(ob, "  vis: pub\n") } else { string_push(ob, "  vis: priv\n") }
         string_push(ob, "  sig: ")
         if it.kind == 3 { at_fn_sig(ob, p, src, it) }
+        if it.kind == 6 { at_trait_sig(ob, p, src, it) }
+        if it.kind == 7 { at_impl_sig(ob, p, src, it) }
         if it.kind == 2 { at_const_sig(ob, p, src, it) }
         if it.kind == 8 { at_extern_sig(ob, p, src, it) }
         if it.kind == 4 or it.kind == 5 {
