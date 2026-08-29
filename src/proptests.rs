@@ -20113,8 +20113,28 @@ fn main() -> i32 {
         // `select` over move-only channels on real threads: two spawned producers fill
         // two channels; the main thread drains all four via `select`. Order-independent
         // sum → deterministic: 11+12+21+22 = 66.
+        //
+        // **Part 2 is a loop that could not be written before `select` learned to end.**
+        // Readiness is `len > 0`, so once both channels were closed and drained a
+        // `select` had nothing to wait for and nothing to end it — entering it a fifth
+        // time spun forever, and a count agreed in advance (the `for n < 4` above) was
+        // the only thing the language allowed. Now it completes, so the consumer finds
+        // out for itself: 146 is the sum and **4 is the count it was never given**.
+        //
+        // That second number is the anti-vacuity half. A `select` that ended too early
+        // prints a smaller one; one that never ended hangs instead of printing at all —
+        // which is why this test having a result is itself part of the assertion.
+        //
+        // Part 2 fills and closes on THIS thread on purpose. Part 1 is the concurrent
+        // case; what is under test here is termination, and a producer racing the
+        // consumer could end the loop early for the wrong reason and still print a
+        // plausible number.
         for _ in 0..8 {
-            assert_eq!(toks("examples/std/select.jtr"), ["66"], "select result wrong");
+            assert_eq!(
+                toks("examples/std/select.jtr"),
+                ["66", "146", "4"],
+                "select result wrong"
+            );
         }
     }
     #[test]

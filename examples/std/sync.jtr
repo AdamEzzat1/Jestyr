@@ -314,6 +314,11 @@ pub fn channel_recv_open(comptime T: type, read ch: Channel(T), slot: *mut T) ->
 // (non-generic) C names, so the compiler need not synthesize a monomorphized call.
 pub fn channel_len_i64(read ch: Channel(i64)) -> i64 { return channel_len(i64, ch) }
 pub fn channel_recv_i64(read ch: Channel(i64)) -> i64 { return channel_recv(i64, ch) }
+// The third one the lowering needs: without it a `select` cannot tell "nothing ready yet"
+// from "nothing will ever be ready", and spins forever once every channel is closed and
+// drained. Paired with `channel_len_i64` at each arm, because a closed channel that still
+// holds values is not finished — draining outranks closing, as it does in `recv_open`.
+pub fn channel_is_closed_i64(read ch: Channel(i64)) -> bool { return channel_is_closed(i64, ch) }
 
 // Release the channel's heap cells. Call once, after every task sharing it has
 // joined and the buffer has been drained (any values still buffered are leaked —

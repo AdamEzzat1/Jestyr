@@ -37850,6 +37850,28 @@ void jestyr_emit_select(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrSt
         jestyr_line_at(&((*j_sb)), (j_depth + 2), JSTR("}"));
         j_k = (j_k + 1);
     }
+    if ((j_e.j_y > 0))
+    {
+        jestyr_indent(&((*j_sb)), (j_depth + 2));
+        jestyr_rt_str_push(&(*j_sb), JSTR("else if ("));
+        int32_t j_q = 0;
+        while ((j_q < j_e.j_y))
+        {
+            if ((j_q > 0))
+            {
+                jestyr_rt_str_push(&(*j_sb), JSTR(" && "));
+            }
+            jestyr_rt_str_push(&(*j_sb), JSTR("(jestyr_channel_is_closed_i64(_sel"));
+            jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_q));
+            jestyr_rt_str_push(&(*j_sb), JSTR(") && jestyr_channel_len_i64(_sel"));
+            jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_q));
+            jestyr_rt_str_push(&(*j_sb), JSTR(") == 0)"));
+            j_q = (j_q + 1);
+        }
+        jestyr_rt_str_push(&(*j_sb), JSTR(") {\n"));
+        jestyr_line_at(&((*j_sb)), (j_depth + 3), JSTR("_seldone = 1;"));
+        jestyr_line_at(&((*j_sb)), (j_depth + 2), JSTR("}"));
+    }
     jestyr_line_at(&((*j_sb)), (j_depth + 1), JSTR("}"));
     jestyr_line_at(&((*j_sb)), j_depth, JSTR("}"));
 }

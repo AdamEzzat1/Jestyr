@@ -8444,6 +8444,35 @@ impl<'a> Cgen<'a> {
             self.depth -= 1;
             self.line("}");
         }
+        // **The exit.** Without this the loop spins forever once every channel is closed
+        // and drained: readiness is `len > 0`, which is false for good at that point, so
+        // a `select` could be entered but never left. `channel_close` gave a receiver a
+        // way to learn the producer had finished; this is the same fact reaching the
+        // multi-channel form, and without it a terminating worker loop can be written
+        // over one channel and not over two.
+        //
+        // Checked LAST, after every readiness arm, which is what makes closing
+        // non-destructive: a channel that is closed but still holds buffered values is
+        // served by its own arm above and only counts as finished once drained. Testing
+        // it first would discard exactly the work a graceful shutdown is trying to
+        // finish — the same ordering rule `channel_recv_open` records.
+        //
+        // No arm runs and nothing binds: the `select` simply completes. Distinguishing
+        // "took a value" from "everything closed" is the caller's, via
+        // `channel_is_closed`, and a dedicated `closed { … }` ARM is sugar on top of this
+        // — a syntax change that crosses both parsers, where this is one lowering site.
+        if !arms.is_empty() {
+            let all_done: Vec<String> = (0..arms.len())
+                .map(|i| {
+                    format!("(jestyr_channel_is_closed_i64(_sel{i}) && jestyr_channel_len_i64(_sel{i}) == 0)")
+                })
+                .collect();
+            self.line(format!("else if ({}) {{", all_done.join(" && ")));
+            self.depth += 1;
+            self.line("_seldone = 1;");
+            self.depth -= 1;
+            self.line("}");
+        }
         self.depth -= 1;
         self.line("}");
         self.depth -= 1;

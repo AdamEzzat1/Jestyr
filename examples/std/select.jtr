@@ -15,6 +15,14 @@ fn fill(read ch: sync.Channel(i64), base: i64) {
     sync.channel_send(i64, ch, base + 2)
 }
 
+// The same, but saying so when it is finished — which is what lets Part 2's consumer
+// stop without being told a count.
+fn fill_close(read ch: sync.Channel(i64), base: i64) {
+    sync.channel_send(i64, ch, base + 1)
+    sync.channel_send(i64, ch, base + 2)
+    sync.channel_close(i64, ch)
+}
+
 fn main() -> i32 {
     var a = sync.channel_make(i64, 8)
     var b = sync.channel_make(i64, 8)
@@ -37,5 +45,44 @@ fn main() -> i32 {
 
     sync.channel_free(i64, a)
     sync.channel_free(i64, b)
+
+    // --- Part 2: the same drain, with NO COUNT ------------------------------------
+    //
+    // The loop above is told 4. It had to be: readiness is `len > 0`, so once both
+    // channels ran dry the `select` had nothing to wait for and nothing to end it —
+    // entering it a fifth time would have spun forever. A count agreed in advance was
+    // the only thing the language allowed, and the header above presented that as
+    // determinism rather than as the constraint it was.
+    //
+    // Now a `select` whose channels are ALL closed and drained completes instead of
+    // spinning, so the consumer can find out for itself. `seen` is the anti-vacuity
+    // half: it is a number this loop was never given and could only learn by draining
+    // to the end of both producers.
+    // Filled on this thread and closed before the drain begins — no `concurrent`, so the
+    // scheduler cannot decide the answer. Part 1 is the concurrent case; what is under
+    // test here is termination, and a producer racing the consumer would let the loop end
+    // early for the wrong reason and still print a plausible number.
+    var c = sync.channel_make(i64, 8)
+    var d = sync.channel_make(i64, 8)
+    fill_close(c, 30)            // 31, 32, then close
+    fill_close(d, 40)            // 41, 42, then close
+
+    var sum2: i64 = 0
+    var seen: i64 = 0
+    var going: bool = true
+    for going {
+        let before: i64 = seen
+        select {
+            recv(c) => p { sum2 = sum2 + p  seen = seen + 1 }
+            recv(d) => q { sum2 = sum2 + q  seen = seen + 1 }
+        }
+        // A select that took nothing is a select that found everything closed.
+        if seen == before { going = false }
+    }
+    print_int(sum2 as i32)       // 31 + 32 + 41 + 42 = 146
+    print_int(seen as i32)       // 4 — never told, only discovered
+
+    sync.channel_free(i64, c)
+    sync.channel_free(i64, d)
     return 0
 }

@@ -26803,6 +26803,29 @@ fn emit_select(mut sb: String, read p: Parser, read src: str, read c: Checker, m
         line_at(sb, depth + 2, "}")
         k = k + 1
     }
+    // THE EXIT. Without it the loop spins forever once every channel is closed and
+    // drained: readiness is `len > 0`, false for good at that point, so a `select` could
+    // be entered and never left. Checked LAST, after every readiness arm, which is what
+    // keeps closing non-destructive -- a channel that is closed but still holds buffered
+    // values is served by its own arm above and only counts as finished once drained.
+    // Testing it first would discard exactly the work a graceful shutdown is finishing.
+    if e.y > 0 {
+        indent(sb, depth + 2)
+        string_push(sb, "else if (")
+        var q: i32 = 0
+        for q < e.y {
+            if q > 0 { string_push(sb, " && ") }
+            string_push(sb, "(jestyr_channel_is_closed_i64(_sel")
+            push_uint__cgen(sb, q as i64)
+            string_push(sb, ") && jestyr_channel_len_i64(_sel")
+            push_uint__cgen(sb, q as i64)
+            string_push(sb, ") == 0)")
+            q = q + 1
+        }
+        string_push(sb, ") {\n")
+        line_at(sb, depth + 3, "_seldone = 1;")
+        line_at(sb, depth + 2, "}")
+    }
     line_at(sb, depth + 1, "}")
     line_at(sb, depth, "}")
 }
