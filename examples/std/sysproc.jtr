@@ -115,7 +115,11 @@
 // No environment control, no working directory, no process groups. Each is a real thing
 // to want and none of them is needed to lift the ceiling this module exists to lift.
 //
-// **The environment a child inherits is NOT the same on both platforms**, and that is
+// **The environment a child inherits is now the SAME on both platforms** (see `env_block`
+// at the `posix_spawn` call). What follows is the difference as it stood, kept because the
+// reasoning is why the fix is what it is rather than a null on both sides.
+//
+// ~~**The environment a child inherits is NOT the same on both platforms**~~, and that is
 // stated rather than smoothed over: a Windows child gets its parent's whole environment
 // (`CreateProcessA` with a null environment inherits), a POSIX child gets `PATH` alone
 // (`posix_spawn` with a null `envp` would give it NOTHING, since that reaches `execve`
@@ -450,27 +454,23 @@ fn zero_bytes(p: *mut u8, n: usize) {
     // an EMPTY one, because it reaches `execve` unchanged. So the obvious "pass null on
     // both" is not symmetry, it is an asymmetry that happens to typecheck.
     //
-    // Full inheritance on POSIX needs the `environ` global, and an `extern` binds
-    // FUNCTIONS. PATH is forwarded instead: it is the variable the shell needs to resolve
-    // a command at all, so without it `sh -c "sleep 2"` depends on whatever default path
-    // the shell falls back to — which is a different question on every libc.
+    // **CLOSED.** This used to forward `PATH` alone, because full inheritance needs the
+    // `environ` global and an `extern` binds FUNCTIONS. The header said the fix was
+    // "either an `extern` for a global or an intrinsic that enumerates the environment" —
+    // it is the second: `env_block()` hands back the `char**` the C runtime already has,
+    // with the `extern char** environ` declaration living in the emitted C where the
+    // standard puts it.
     //
-    // This is therefore a documented DIFFERENCE and not a hidden one: a Windows child sees
-    // its parent's whole environment and a POSIX child sees PATH. Closing it needs either
-    // an `extern` for a global or an intrinsic that enumerates the environment, and both
-    // are language increments rather than a line here.
-    let path: str = env_var("PATH")
-    var e0: *mut u8 = nul_join("PATH=", path)
-    var envp: *mut i64 = alloc(i64, 2)
-    unsafe { (envp + 0).* = e0 as i64 }
-    unsafe { (envp + 1).* = 0 }
-
-    let rc: i32 = posix_spawn(pidp as cptr, shp as cptr, null, null, argv as cptr, envp as cptr)
+    // So the two platforms now agree on the OUTCOME rather than merely on the call: a
+    // child gets its parent's whole environment on both. Windows still passes null,
+    // because null is what `CreateProcessA` reads as "inherit" — the asymmetry was never
+    // that null meant nothing, it was that null meant two different things.
+    //
+    // `start_piped` never had this gap: it uses `fork`+`execv`, and `execv` passes the
+    // caller's `environ` by definition. Only this `posix_spawn` path had to say it aloud.
+    let rc: i32 = posix_spawn(pidp as cptr, shp as cptr, null, null, argv as cptr, env_block())
     var pid: i64 = 0
     unsafe { pid = (pidp + 0).* }
-
-    free_ptr(envp)
-    free_ptr(e0)
     free_ptr(pidp)
     free_ptr(argv)
     free_ptr(a2)

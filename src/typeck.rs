@@ -5366,6 +5366,11 @@ fn io_intrinsic_ret(name: &str) -> Option<Ty> {
         // `random_fill(out) -> bool` — the VALUE arrives through the pointer, because a
         // `-> i64` shape cannot report failure: 0 is a legal random draw.
         "random_fill" => Ty::Prim("bool"),
+        // `env_block() -> cptr` — the `char**` environment block, for handing a child the
+        // whole environment. `env_var` looks ONE variable up; this is the block itself,
+        // which is the thing `extern` cannot bind because it is data rather than a
+        // function.
+        "env_block" => Ty::Prim("cptr"),
         "arg_count" => Ty::Prim("i32"),
         "arg" => Ty::Prim("str"),
         // `env_var(name) -> str` — a view into the C runtime's environment

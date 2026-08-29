@@ -1649,6 +1649,9 @@ fn intrinsic_ret(mut c: Checker, t: str) -> i32 {
     // The VALUE arrives through the pointer: a `-> i64` shape cannot report failure,
     // because 0 is a legal random draw.
     if str_eq(t, "random_fill") { return t_bool() }
+    // The `char**` environment block -- `env_var` looks ONE variable up; this is the block
+    // itself, which is the thing `extern` cannot bind because it is data, not a function.
+    if str_eq(t, "env_block") { return mk_ty(c, 2, 0 - 1, 0 - 1, 21, 0 - 1) }   // cptr
     if str_eq(t, "arg_count") { return t_i32() }
     if str_eq(t, "arg") { return t_str() }
     if str_eq(t, "env_var") { return t_str() }

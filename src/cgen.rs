@@ -325,6 +325,13 @@ fn emit_program(
                 false
             }
         }),
+        uses_env_block: ast.exprs.iter().filter(|e| live(e)).any(|e| {
+            if let ExprKind::Call { callee, .. } = &e.kind {
+                matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "env_block")
+            } else {
+                false
+            }
+        }),
         uses_random: ast.exprs.iter().filter(|e| live(e)).any(|e| {
             if let ExprKind::Call { callee, .. } = &e.kind {
                 matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "random_fill")
@@ -808,6 +815,8 @@ struct Cgen<'a> {
     uses_mono_nanos: bool,
     /// `random_fill(out) -> bool` is used — gate the OS entropy helper.
     uses_random: bool,
+    /// `env_block() -> cptr` is used — gate the `environ` accessor.
+    uses_env_block: bool,
     /// `signal_arm(sig) -> bool` / `signal_caught() -> i32` are used — gate the
     /// handler, its flag and `<signal.h>`.
     ///
@@ -1311,6 +1320,29 @@ impl<'a> Cgen<'a> {
             self.raw("#else\n");
             self.raw("#include <sys/wait.h>\n");
             self.raw("static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); if (rc == -1) return -1; return WIFEXITED(rc) ? (int32_t)WEXITSTATUS(rc) : -1; }\n");
+            self.raw("#endif\n");
+        }
+        // The environment BLOCK — the `char**` a child needs to inherit its parent's whole
+        // environment, rather than the single-variable lookup `env_var` provides.
+        //
+        // **This is the one thing `extern` cannot reach**: it binds functions, and
+        // `environ` is data. A general "extern binds a global" feature is the principled
+        // answer and remains open — but it is a new item kind, which is 252 `Item::` match
+        // sites across nine files here plus 42 in the port, so it is its own increment.
+        // `std/sysproc`'s header already names an intrinsic as the accepted alternative,
+        // and this is it: the `extern char** environ` declaration lives in the emitted C,
+        // where it is exactly the declaration the standard prescribes.
+        //
+        // Windows returns NULL deliberately rather than reaching for `_environ`: a NULL
+        // environment is what `CreateProcessA` already interprets as "inherit", so the
+        // platforms agree on the CALL rather than on the pointer.
+        if self.uses_env_block {
+            self.raw("/* The environment block: what a child needs to inherit the whole environment. */\n");
+            self.raw("#if defined(_WIN32)\n");
+            self.raw("static void* jestyr_rt_env_block(void) { return NULL; }\n");
+            self.raw("#else\n");
+            self.raw("extern char** environ;\n");
+            self.raw("static void* jestyr_rt_env_block(void) { return (void*)environ; }\n");
             self.raw("#endif\n");
         }
         // Cryptographically secure randomness, straight from the OS. **Not a PRNG**:
@@ -6269,6 +6301,7 @@ impl<'a> Cgen<'a> {
                     return format!("jestyr_rt_signal_arm({s})");
                 }
                 "signal_caught" => return "jestyr_rt_signal_caught()".to_string(),
+                "env_block" => return "jestyr_rt_env_block()".to_string(),
                 "random_fill" => {
                     let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "NULL".to_string());
                     return format!("jestyr_rt_random_fill({p})");
@@ -10968,7 +11001,7 @@ pub fn is_intrinsic(name: &str) -> bool {
             | "arena_open" | "arena_alloc" | "arena_close"
             | "read_file" | "try_read_file" | "write_file" | "file_exists" | "remove_file"
             | "run_command" | "eprint_str"
-            | "signal_arm" | "signal_caught" | "signal_raise" | "random_fill"
+            | "signal_arm" | "signal_caught" | "signal_raise" | "random_fill" | "env_block"
             | "arg_count" | "arg" | "env_var" | "mono_nanos"
     )
 }

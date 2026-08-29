@@ -563,6 +563,8 @@ fn is_os_intrinsic(read src: str, ns: usize, ne: usize) -> bool {
     if str_eq(n, "signal_raise") { return true }
     // Entropy comes from the kernel, so a `@no_os` function must not reach it.
     if str_eq(n, "random_fill") { return true }
+    // The environment block is process state the OS owns, exactly as `env_var` is.
+    if str_eq(n, "env_block") { return true }
     return false
 }
 fn is_atomic_op(read src: str, ns: usize, ne: usize) -> bool {

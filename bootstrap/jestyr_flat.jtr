@@ -8412,6 +8412,9 @@ fn intrinsic_ret(mut c: Checker, t: str) -> i32 {
     // The VALUE arrives through the pointer: a `-> i64` shape cannot report failure,
     // because 0 is a legal random draw.
     if str_eq(t, "random_fill") { return t_bool() }
+    // The `char**` environment block -- `env_var` looks ONE variable up; this is the block
+    // itself, which is the thing `extern` cannot bind because it is data, not a function.
+    if str_eq(t, "env_block") { return mk_ty__typeck(c, 2, 0 - 1, 0 - 1, 21, 0 - 1) }   // cptr
     if str_eq(t, "arg_count") { return t_i32() }
     if str_eq(t, "arg") { return t_str() }
     if str_eq(t, "env_var") { return t_str() }
@@ -10535,6 +10538,8 @@ fn is_os_intrinsic(read src: str, ns: usize, ne: usize) -> bool {
     if str_eq(n, "signal_raise") { return true }
     // Entropy comes from the kernel, so a `@no_os` function must not reach it.
     if str_eq(n, "random_fill") { return true }
+    // The environment block is process state the OS owns, exactly as `env_var` is.
+    if str_eq(n, "env_block") { return true }
     return false
 }
 fn is_atomic_op(read src: str, ns: usize, ne: usize) -> bool {
@@ -13501,6 +13506,23 @@ fn uses_eprint(read p: Parser, read src: str, tmode: bool) -> bool {
     return false
 }
 
+// Does the program ask for the environment BLOCK? Gates the `environ` accessor
+// (mirrors `uses_env_block`). Distinct from `uses_env_var`, which is a single lookup.
+fn uses_env_block(read p: Parser, read src: str, tmode: bool) -> bool {
+    var i: usize = 0
+    for i < len(ExprData, p.ex) {
+        let e: ExprData = get__list(ExprData, p.ex, i)
+        if e.kind == 10 and !in_skipped_test(p, src, tmode, e.start, e.end) {
+            let callee: ExprData = get__list(ExprData, p.ex, e.a as usize)
+            if callee.kind == 2 {
+                if str_eq(src[callee.start .. callee.end], "env_block") { return true }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
 // Does the program draw OS entropy? Gates the CSPRNG helper (mirrors `uses_random`).
 fn uses_random(read p: Parser, read src: str, tmode: bool) -> bool {
     var i: usize = 0
@@ -13774,6 +13796,23 @@ fn emit_prelude(mut sb: String, read p: Parser, read src: str, read g: Cg) {
         string_push(sb, "#else\n")
         string_push(sb, "#include <sys/wait.h>\n")
         string_push(sb, "static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); if (rc == -1) return -1; return WIFEXITED(rc) ? (int32_t)WEXITSTATUS(rc) : -1; }\n")
+        string_push(sb, "#endif\n")
+    }
+    // The environment BLOCK -- the `char**` a child needs to inherit the whole
+    // environment, as opposed to `env_var`'s single lookup. This is the one thing `extern`
+    // cannot reach: it binds FUNCTIONS, and `environ` is data. The `extern char** environ`
+    // declaration therefore lives in the emitted C, where the standard puts it.
+    //
+    // Windows returns NULL deliberately rather than reaching for `_environ`: NULL is what
+    // CreateProcessA already reads as "inherit", so the platforms agree on the CALL rather
+    // than on the pointer.
+    if uses_env_block(p, src, g.tmode) {
+        string_push(sb, "/* The environment block: what a child needs to inherit the whole environment. */\n")
+        string_push(sb, "#if defined(_WIN32)\n")
+        string_push(sb, "static void* jestyr_rt_env_block(void) { return NULL; }\n")
+        string_push(sb, "#else\n")
+        string_push(sb, "extern char** environ;\n")
+        string_push(sb, "static void* jestyr_rt_env_block(void) { return (void*)environ; }\n")
         string_push(sb, "#endif\n")
     }
     // Cryptographically secure randomness, straight from the OS. NOT a PRNG: no seed, no
@@ -16133,6 +16172,7 @@ fn intrinsic_helper(read nm: str) -> str {
     if str_eq(nm, "signal_caught") { return "jestyr_rt_signal_caught" }
     if str_eq(nm, "signal_raise") { return "jestyr_rt_signal_raise" }
     if str_eq(nm, "random_fill") { return "jestyr_rt_random_fill" }
+    if str_eq(nm, "env_block") { return "jestyr_rt_env_block" }
     if str_eq(nm, "env_var") { return "jestyr_rt_env_var" }
     if str_eq(nm, "mono_nanos") { return "jestyr_rt_mono_nanos" }
     if str_eq(nm, "write_file") { return "jestyr_rt_write_file" }
@@ -25839,7 +25879,7 @@ fn is_global_cname(read p: Parser, read src: str, ns: usize, ne: usize) -> bool 
     string_push(probe, "|")
     string_push(probe, nm)
     string_push(probe, "|")
-    let hit: bool = contains("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|signal_arm|signal_caught|signal_raise|random_fill|env_var|mono_nanos|arg_count|arg|", string_view(probe))
+    let hit: bool = contains("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|signal_arm|signal_caught|signal_raise|random_fill|env_block|env_var|mono_nanos|arg_count|arg|", string_view(probe))
     string_free(probe)
     return hit
 }
