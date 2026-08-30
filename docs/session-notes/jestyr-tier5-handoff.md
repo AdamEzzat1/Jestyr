@@ -7,8 +7,11 @@ increments (§2–§4), what the research turned up (§5), what is left (§6), t
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1335 passed / 0 failed / 3 ignored.** It was **1319** at the start of this arc — but see
+**1336 passed / 0 failed / 3 ignored.** It was **1319** at the start of this arc — but see
 §1, because on Windows the recorded baseline was never actually green.
+
+**On `master`** (fast-forwarded, 18 commits). Both comparison suites green: 15/15 C++ pairs
+with `static_rejections` still refused, and all 10 Rust-vs-Jestyr rejection probes refused.
 
 | commit | what |
 |---|---|
@@ -24,6 +27,9 @@ cargo build --release && cargo test --release --features "c-oracle,selfhost-fixp
 | `bdb318f` | entropy from the OS, and a comparison that does not leak how far it got |
 | `62ea1c2` | a refused send hands the value back instead of eating it |
 | `9139900` | a select whose channels are all closed and drained stops waiting |
+| `ad52e07` | the ExprId divergence is isolated to one node per select arm |
+| `bfcf0f6` | a posix child inherits its parent's whole environment |
+| `6560c8b` | a config error points at the line that caused it |
 
 The predecessor note is `docs/session-notes/jestyr-tier4-language-work-handoff.md`.
 The research note this arc produced is
@@ -60,24 +66,19 @@ the reason the last clause was impossible. The next items, in leverage order:
 7. ~~**Refusing a send on a closed channel**~~ and ~~**`select` termination**~~ — both
    **DONE** (§3g).
 
-**What is actually left, in leverage order:**
+**§6 is the complete register of what remains** — §6A everything that is WRONG (defects,
+divergences, unverified claims), §6B everything ABSENT. Read 6A first: an absent feature is
+a plan, a defect is a liability.
 
-* **`environ`** — an `extern` binding a C global (item 1 above).
-* **The ExprId drift (§3h)** — now ISOLATED (one node per `select` arm; the reference is
-  the inconsistent side) with a verified fix that was REVERTED because it exposed a second,
-  deeper divergence: the two typecks disagree about a select-arm block as a typed
-  expression. Closing it means agreeing what an arm body *is* and changing both compilers
-  together — a typeck alignment increment, not a parser tidy-up. Not urgent, but it is a
-  two-compiler disagreement and those
-  have a history here of surviving whole workstreams.
-* **A config FILE FORMAT** — `apply` takes name/value pairs; a TOML/INI reader above it,
-  with `diag.jtr` giving real line spans.
-* **Sanitizers (§6.4)** — still blocked on a machine that can run them.
-* **A `closed { … }` select arm** — sugar over §3g's termination; the expensive half is
-  the byte-exact port mirror against the no-allowlist P2 golden.
-* **Areas 5–9 of the brief** — package substrate (semver → resolver → lockfile → cache),
-  HTTP V2, storage V2, TLS. Each is a session; TLS is its own arc and wants an explicit
-  decision about whether Tier 5 claims it at all.
+The three at the top of it:
+
+1. **A1 — the ExprId drift and the typeck disagreement behind it.** The only live
+   two-compiler divergence. Isolated; the fix was verified and reverted because it exposed
+   the deeper one.
+2. **A10 — nothing has ever run a sanitizer over the emitted C.** Largest verification gap
+   in a tier themed on reliability. Blocked on a machine, not on effort.
+3. **B3 — the package substrate.** The largest genuinely-absent area, and the one the
+   tier's own "distribution" theme names.
 
 **Half of the Tier 5 brief already exists on master.** Before building anything in it,
 read the inventory summary in §5 — this repo has twice rebuilt features that were already
@@ -509,42 +510,166 @@ Full detail, with `file:line` citations, is in the research note.
 
 ---
 
-## §6. WHAT IS LEFT
+## §6. EVERYTHING REMAINING — the register
 
-### §6.1 — Refusing a send on a closed channel. An ownership question, not effort
+Two lists. **§6A is things that are WRONG** — defects, divergences and unverified claims,
+which is what to read before trusting any part of this. **§6B is things that are ABSENT** —
+features nobody has built yet. An absent feature is a plan; a defect is a liability, so 6A
+comes first even though 6B is where the brief's remaining scope lives.
 
-`channel_send` takes by `take`, so by the time a refusal is known the callee already owns
-the value, and returning `false` leaks it for any `T` whose teardown matters. A correct
-refusal hands the value back. Deferred deliberately; the header says so rather than
-implying coverage.
+Nothing in 6A makes a program that compiles today wrong, except where it says so.
 
-### §6.2 — `select` termination
+---
 
-It polls `channel_len_i64(ch) > 0`, false forever once a channel is closed and drained.
-Needs a default arm.
+### §6A. DEFECTS AND OPEN DIVERGENCES
 
-### §6.3 — `@copy` over a `@move` field
+#### A1. The two parsers allocate ExprIds differently — and a typeck disagreement behind it
 
-A contradiction that should be refused at the DECLARATION. New diagnostic, so a port
-mirror. Pinned as residue today.
+**The only live two-compiler divergence, and the most important item in this section.**
+Isolated to one node per `select` arm (§3h). The fix is known and was verified to converge
+the ids, then **reverted**, because it exposed a second disagreement the drift was masking:
+the two typecks do not agree about a select-arm block as a typed expression.
 
-### §6.4 — Sanitizers. NOT shipped, and the reason is the machine
+Closing it means deciding what an arm body *is* — an expression with a type, or a block
+without one — and changing both compilers together. A typeck alignment increment, not a
+parser tidy-up.
 
-Nothing has ever run ASan/UBSan/TSan — or even `-Wall` — over the emitted C. Verified: no
-`fsanitize`, `-Wall` or `-Wextra` anywhere in `.github/workflows` or `src`. The harness is
-already there (`selfhost_fixpoint_subset` gcc-builds and RUNS every allowlisted program
-comparing stdout and exit code), so a sanitizer leg is a flag list and a second job.
+**Live constraint:** a corpus file with a `select` between two `concurrent` blocks cannot
+be byte-identity allowlisted. `select.jtr` sidesteps it by filling part 2's channels on the
+main thread. Nothing that compiles today is wrong; each compiler is self-consistent.
 
-**It was not added, because this machine cannot run it**: mingw gcc 8.3.0 (Strawberry Perl)
-has no `libasan`/`libubsan` — `ld: cannot find -lasan`. Shipping a CI-only gate nobody here
-can observe is the same untested claim `sysdir.jtr`'s header refuses to make about macOS.
-Do it when you can watch the Linux ladder.
+#### A2. `environ` on POSIX is unverified — owed to the Linux ladder
 
-### §6.5 — `alog.Cursor` is now move-only, and its header does not say so
+`bfcf0f6` makes a POSIX child inherit the parent's full environment. Verified here: the
+emitted C carries `extern char** environ;`, the Windows half is unchanged and still passes,
+both compilers agree byte-for-byte. **NOT verified here: that a POSIX child actually
+inherits it**, because `@cfg(posix)` only runs on the Linux runner. Flagged against this
+tree's own rule about shipping POSIX changes nobody in reach can watch.
 
-§3 makes it move-only by containment rather than by attribute, so a reader of `alog.jtr`
-gets the rejection with no explanation in the module. A header note is owed. Batch it with
-the next `examples/std` change rather than spending a ladder on a comment.
+#### A3. `@copy` over a `@move` field is a contradiction nobody diagnoses
+
+An aggregate declared `@copy` holding a `@move` field escapes the containment rule (§3),
+because `@copy` ends the walk exactly as it suppresses `needs_drop`. Should be refused at
+the DECLARATION. Pinned by `a_copy_wrapper_around_a_resource_is_pinned_residue`. New
+diagnostic → port mirror. Swept: no corpus type is shaped this way.
+
+#### A4. Windows: `capture` + print does not round-trip a child's bytes
+
+Recorded in §1 and NOT fixed. Text-mode stdout turns a relayed `\n` into `\r\n` while
+leaving the child's `\r`, so bytes read from a subprocess and printed come out doubled.
+Making stdout binary would change every `\n` the compiler emits on Windows and re-baseline
+many goldens — its own increment and its own decision.
+
+#### A5. Intrinsic shadowing silently replaces a user function
+
+Pre-existing (v3). A `pub fn` named for a cgen intrinsic is replaced at every UNQUALIFIED
+call with arguments discarded; a qualified call reaches the user's function, so the two
+spellings disagree. Typeck WARNS. The real fix is an emission change in a closure module →
+mirror + reseed + golden churn. `lexer.str_eq` and `set.contains` are grandfathered.
+**This bit twice this arc** — `pub fn find` in `std/metrics`, caught only by the warning.
+
+#### A6. `Self` in a trait parameter — `check` passes, `run` fails
+
+Pre-existing. Parses, type-checks as `Opaque("Self")`, and cgen refuses. The degrades-to-gcc
+class the tier has otherwise been closing.
+
+#### A7. A range expression may not be a call ARGUMENT
+
+Pre-existing, and **the recorded description was too narrow**: the Tier 4 note calls it a
+`mut` sub-slice problem, but `bounds[0 .. 3]` into a `read []i64` parameter fails
+identically. The boundary is argument position, not mutability. Workaround: `alloc` +
+`slice(T, raw, N)` bound to a named local.
+
+#### A8. `attest` accepts `@deprecated` and does nothing with it
+
+`src/attrs.rs` marks it Active; it reaches neither `doc::fn_guarantees` nor the manifest, so
+a deprecation is invisible to the breaking-change gate. Smaller than A1 and in the area the
+tier otherwise completed.
+
+#### A9. Smaller pre-existing language gaps, each recorded elsewhere
+
+* Multi-bounds `fn f[T: Hash + Eq]` do not parse — a parser change plus a **mandatory** port
+  mirror (the P2 golden has no allowlist). Why `hashmap` stores fn-pointer hash/eq.
+* Generic aliases refused → no way to newtype a container; why `std/set` is free functions
+  over `HashMap(T, bool)`.
+* **No uninitialized-memory facility at all**, so containers carry fake defaults
+  (`smallvec.jtr:77`). The hard part is the destructor rule for partially initialized
+  aggregates.
+* A `\u00XX` escape below 0x20 passes through to the emitted C verbatim; C rejects it.
+* `alog.Cursor` is move-only by containment now, and `alog.jtr`'s header does not say so.
+  A comment, owed on the next `examples/std` change rather than its own ladder.
+
+#### A10. VERIFICATION GAPS — not defects, but the reason a defect could hide
+
+* **Nothing has ever run a sanitizer, or even `-Wall`, over the emitted C.** Verified: no
+  `fsanitize`/`-Wall`/`-Wextra` anywhere in `.github/workflows` or `src`. The harness
+  exists — `selfhost_fixpoint_subset` already gcc-builds and RUNS every allowlisted program
+  comparing stdout and exit code — so this is a flag list and a second CI job. **Not added
+  because this machine cannot run it**: mingw gcc 8.3.0 has no `libasan`. For a tier whose
+  theme is reliability this is the largest single gap.
+* **One C compiler, ever.** `find_c_compiler` is first-match-wins; on `ubuntu-latest` `cc`
+  resolves to gcc, so clang is never exercised.
+* `jstatus_serves_a_connection_without_starving_its_timers` is load-sensitive (§3e): a 1ms
+  timer with a 500ms budget, so a failure means a half-second deschedule. Failed 1 of ~8
+  full-ladder runs; passes in isolation in 2.8s. **Do not widen the deadline** — a wall-clock
+  test should not run beside a compile farm, which is a harness question.
+
+---
+
+### §6B. ABSENT — unbuilt work, in leverage order
+
+#### B1. Cheap and adjacent to what just landed
+
+| item | size | note |
+|---|---|---|
+| `select` `closed { … }` arm | medium | Sugar over §3g's termination. Blocked behind **A1** — it is the same AST change. |
+| Trace spans | small | **`Span` is taken three times** (`http.Header`, `diag`, the `@span` attribute) — pick another word first. `@no_alloc` passes vacuously through a trait method, so use the fn-pointer vtable shape, not a trait. |
+| Config: live reload, nesting | small | `std/syswatch` exists; composing them is the caller's today. |
+| Service: restart policy, supervision tree | medium | The lifecycle is complete; a supervisor over `std/sysproc` is its own module. |
+| Sandbox: cwd, process groups, fs capability projection | medium | `sysproc.jtr:113` names all three. `fs.Fs` gates the parent; nothing projects it onto a child. |
+| attest: corpus minimizer, benchmark history | medium | `@bench` emits timings; nothing records them across runs. |
+
+#### B2. `extern` binding a C global — the language feature, SIZED
+
+Still the principled answer for foreign globals, and no longer needed for anything urgent
+(`environ` went through an intrinsic). **Measured before deferring**: a new item kind means
+252 `Item::` match sites across nine reference files plus 42 in the port, and it must also
+reach `attest` (a global is ABI) and `doc`. Larger than the select AST change in A1.
+
+#### B3. The brief's remaining areas — a session each
+
+* **Package substrate** (brief area 5) — semver → resolver → lockfile → content-addressed
+  cache. The largest genuinely-absent area and the one the tier's "distribution" theme
+  names. Content-hashing, `buildgraph`, `tar` and `sha256` are already underneath it.
+* **HTTP V2** (area 6) — routing, middleware, streaming bodies, keep-alive, timeouts,
+  static files, access logs, a test client/server. The parser is hardened and refuses
+  request smuggling; everything above the message is absent. `sysproc` timeouts and
+  `syspoll` readiness are now in place under it.
+* **Storage V2** (area 9) — KV, compaction, atomic batches, migrations, backup/export on
+  top of `alog`. Note `sysfs` has **no mtime**, deliberately (`struct stat` layout differs
+  per platform).
+* **Crypto beyond the boundary** (area 7) — HMAC, signing/verification, a hash *interface*.
+  `csrand` deliberately invents nothing; these are bindings, not algorithms to write.
+
+#### B4. TLS (area 8) — wants an explicit decision, not just effort
+
+Absent entirely, and **different in kind**: it means binding OpenSSL or schannel, which is
+a link-flag change — and `cc-flags` is LOCKED and recorded in every attest manifest, so
+adding `-lssl` churns every manifest in the corpus. Worth deciding whether Tier 5 claims
+TLS at all or whether it is its own arc.
+
+#### B5. Tier 4 leftovers still open
+
+* **Rewrite `std/plugin` as a server on the pipe transport.** It is one-process-per-call
+  only because the transport did not exist; it does now (`start_piped`/`capture`).
+* **Adopt the extern alias**: `std/syswatch` still binds `readv(2)` with a one-element
+  `iovec` to reach `read(2)`, and there are four separate `close`es across `std/file`,
+  `std/sysdir`, `std/sysnet`, `std/sysproc`. One-line changes, deliberately not made here —
+  those POSIX branches only run on the Linux runner (same rule as A2).
+* **Adopt `@cfg(linux)`/`@cfg(macos)`**: `sysdir`'s `D_NAME_OFFSET` and `syswatch`'s inotify
+  branch both still decline, now because a macOS branch nobody can run is an untested claim
+  rather than because the language cannot say it.
+* Brief §2.4 (runtime ownership) and §2.7 (concurrency with ownership) remain untouched.
 
 ---
 
