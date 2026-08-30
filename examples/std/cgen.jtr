@@ -12642,6 +12642,13 @@ fn ref_expr_id(read p: parser.Parser, eid: i32) -> i32 {
         } else if e.kind == 46 {                      // with alive: body + else are Block structs
             if e.b >= 0 and e.b < eid { off = off + 1 }
             if e.op >= 0 and e.op < eid { off = off + 1 }
+        } else if e.kind == 42 {                      // select: EVERY arm body is a Block struct in
+            var q: i32 = 0                            // the reference (`SelectArm.body`), so this
+            for q < e.y {                             // parser's per-arm block node has no counterpart
+                let ab: i32 = list.get(i32, p.par, (e.x + q * 4 + 3) as usize)
+                if ab >= 0 and ab < eid { off = off + 1 }
+                q = q + 1
+            }
         } else if e.kind == 16 {                      // struct-lit path: an Ident in Rust, a Name node
             if e.a >= 0 and e.a < eid { off = off + 1 }   // here. (A GenStructLit's ctor is NOT counted:
         }                                             // the Rust parser reaches `Name(args){` through the

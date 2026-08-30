@@ -72,9 +72,11 @@ a plan, a defect is a liability.
 
 The three at the top of it:
 
-1. **A1 — the ExprId drift and the typeck disagreement behind it.** The only live
-   two-compiler divergence. Isolated; the fix was verified and reverted because it exposed
-   the deeper one.
+1. ~~**A1 — the ExprId drift and the typeck disagreement behind it.**~~ — **CLOSED (§3j),
+   and it was never a typeck problem.** `cgen.jtr`'s `ref_expr_id` is a deliberate shim that
+   already reconciles the two parsers' block-node allocation for six constructs; `select`
+   was missing. One `else if`, port-only. §3h's diagnosis and its measurement table were
+   both wrong — read §3j before trusting anything §3h says.
 2. **A10 — the WARNING half is DONE (§3i); the SANITIZER half is not.** The item was
    recorded as one gap and was really two: warnings need no runtime library and are now a
    gate (277 emitted programs clean, watched refusing a broken `cgen`). Sanitizers still
@@ -415,7 +417,15 @@ reference sites plus the parser and the no-allowlist P2 golden; it stays open as
 
 ---
 
-## §3h. The two parsers allocate expression IDs differently
+## §3h. The two parsers allocate expression IDs differently — **CLOSED, and the diagnosis below was WRONG**
+
+> **RESOLVED in §3j.** Keep reading this section for the symptom, but **do not act on its
+> diagnosis or its proposed fix** — both were mistaken, and §3j records the measurement that
+> overturned them. Short version: the parsers are *supposed* to allocate differently,
+> `cgen.jtr`'s `ref_expr_id` is the deliberate shim that reconciles them, and it was simply
+> missing a case for `select`. A one-branch port-only fix. No typeck alignment, no AST
+> change, no reference change.
+
 
 **Found by a cgen golden failure that had nothing to do with the feature under test.** A
 second `concurrent` block in `select.jtr` produced `jestyr_task_111` on the port and
@@ -477,6 +487,92 @@ and each compiler is self-consistent. The live constraint is narrow and worth kn
 corpus file with a `select` between two `concurrent` blocks cannot be byte-identity
 allowlisted** until this is closed. `select.jtr` avoids it by filling part 2's channels on
 the main thread.
+
+---
+
+## §3j. A1 CLOSED — and the recorded diagnosis was wrong in an instructive way
+
+`select.jtr` can now carry a `select` between two `concurrent` blocks. §3h called that
+impossible pending "a two-sided typeck alignment increment". It was one missing `else if`
+in one Jestyr file.
+
+### What §3h got wrong
+
+§3h says the port "allocates for every block it parses", making a select arm "the one block
+in the language the reference does not allocate a node for". **Both halves are false**, and
+the table under them (if/for = 0, select = +1) was measured with a contaminated instrument.
+
+Measured directly this time — reading `ast.exprs.len()` on the reference against
+`list.len(ExprData, p.ex)` on the port, on generic-free probes:
+
+| probe | ref nodes | port nodes | port excess over base |
+|---|---|---|---|
+| bare `fn main` | 2 | 3 | — |
+| `{ … }` statement block | 6 | 7 | +0 |
+| `if c { … }` | 9 | 11 | **+1** |
+| `if c { … } else { … }` | 13 | 15 | **+1** |
+| `unsafe { … }` | 6 | 8 | **+1** |
+| `for c { … }` | 11 | 13 | **+1** |
+| `select`, 1 arm | 7 | 9 | **+1** |
+| `select`, 2 arms | 11 | 14 | **+2** |
+
+The port allocates one extra node for **every** AST field typed `Block` rather than
+`ExprId` — the `fn` body, `if.then`, `unsafe`, `for.body`, `region`, `with alive`, and one
+per select arm. `if.els` and a statement-position block agree because both sides already
+wrap those as expressions. **`select` is not special; it is one of six.**
+
+§3h's contrary table came from measuring `jestyr_task_<id>` on probes carrying a generic
+prelude. That prelude *also* diverges (the port materializes struct-literal paths and
+generic ctors as `Name` nodes), so the measurement was a NET of two independent differences
+that happened to cancel for `if` and `for`. **A derived instrument that shows zero may be
+showing two errors cancelling.**
+
+### The actual mechanism, and why the real fix is small
+
+The divergence is **designed in and already compensated.** `ref_expr_id` in `cgen.jtr`
+translates a port `ExprId` into the reference's numbering by subtracting exactly these
+block nodes, and it already enumerated `if`, `for` (body *and* else), `unsafe`,
+`concurrent`, `region`, `with alive` (body *and* else), struct-lit paths and FieldInit.
+
+It had no case for kind 42. `select` was added to the language and never added to the shim.
+
+```
+} else if e.kind == 42 {              // select: EVERY arm body is a Block struct
+    var q: i32 = 0                    // in the reference, so this parser's per-arm
+    for q < e.y {                     // block node has no counterpart
+        let ab: i32 = list.get(i32, p.par, (e.x + q * 4 + 3) as usize)
+        if ab >= 0 and ab < eid { off = off + 1 }
+        q = q + 1
+    }
+}
+```
+
+**Port-only.** No reference file, no AST, no parser, no typeck. Nothing about what a select
+arm *is* had to be decided — which is why §3h's attempt detonated a typeck disagreement: it
+changed `SelectArm.body` to an `ExprId` on the **reference** side, introducing a newly-typed
+node into the compared stream. It was fixing the side that was already right.
+
+### Why it hid for so long
+
+An `ExprId` reaches the output through exactly one path: a `spawn` trampoline's symbol
+(`jestyr_task_<id>`). So the divergence is observable **only** when a mis-translated
+construct sits between two spawn sites in one function. No corpus file did that until
+`select.jtr` grew a second `concurrent` block. The other five constructs were translated
+correctly, so they never produced a symptom even though the underlying arenas diverge for
+them too.
+
+`a_select_between_two_concurrent_blocks_agrees_on_both_backends` holds the shape
+permanently, and was **watched failing** against the unfixed `cgen.jtr` before being
+believed. Verified separately: the full emitted C for that program is byte-identical
+between backends once `#line` directives are stripped — the port still emits none, which is
+its own recorded gap and is orthogonal.
+
+**Still open, deliberately:** the six `Block`-vs-`ExprId` representation differences remain.
+They are correct-by-compensation, not by construction, and the next id-embedding emission
+added to the language will need `ref_expr_id` extended again. Making the two ASTs agree
+outright (or deriving the symbol from a per-spawn ordinal instead of an `ExprId`) would
+remove the class — the second is a small change on each side but churns every
+spawn-bearing golden and attest hash.
 
 ---
 
@@ -632,20 +728,26 @@ Nothing in 6A makes a program that compiles today wrong, except where it says so
 
 ### §6A. DEFECTS AND OPEN DIVERGENCES
 
-#### A1. The two parsers allocate ExprIds differently — and a typeck disagreement behind it
+#### A1. ~~The two parsers allocate ExprIds differently~~ — **CLOSED (§3j)**
 
-**The only live two-compiler divergence, and the most important item in this section.**
-Isolated to one node per `select` arm (§3h). The fix is known and was verified to converge
-the ids, then **reverted**, because it exposed a second disagreement the drift was masking:
-the two typecks do not agree about a select-arm block as a typed expression.
+Fixed by adding the missing `select` case to `ref_expr_id` in `cgen.jtr` — the deliberate
+shim that already translated the other six block-node differences. Port-only; no reference,
+AST, parser or typeck change. **There was no typeck disagreement to resolve**: §3h's
+attempted fix created one by changing `SelectArm.body` on the reference side, which was the
+side that was already right.
 
-Closing it means deciding what an arm body *is* — an expression with a type, or a block
-without one — and changing both compilers together. A typeck alignment increment, not a
-parser tidy-up.
+The live constraint is lifted: a corpus file may now hold a `select` between two
+`concurrent` blocks, pinned by
+`a_select_between_two_concurrent_blocks_agrees_on_both_backends` (watched failing first).
 
-**Live constraint:** a corpus file with a `select` between two `concurrent` blocks cannot
-be byte-identity allowlisted. `select.jtr` sidesteps it by filling part 2's channels on the
-main thread. Nothing that compiles today is wrong; each compiler is self-consistent.
+**What remains, as a latent trap rather than a defect:** the two ASTs still represent six
+inline blocks differently (`fn` body, `if.then`, `unsafe`, `for.body`, `region`,
+`with alive`, select arms). They agree only because `ref_expr_id` compensates, so **any new
+emission that embeds an `ExprId` in output must extend that shim** — and will be silently
+wrong until some program puts the construct between two spawn sites. Removing the class
+means either making the ASTs agree, or deriving spawn symbols from a per-spawn ordinal
+instead of an `ExprId` (small on each side, but churns every spawn-bearing golden and
+attest hash).
 
 #### A2. `environ` on POSIX is unverified — owed to the Linux ladder
 
@@ -720,7 +822,15 @@ tier otherwise completed.
 * **One C compiler, ever.** `find_c_compiler` is first-match-wins; on `ubuntu-latest` `cc`
   resolves to gcc, so clang is never exercised. **This now costs more than it did**: the
   §3i gate is only as good as the analysis behind it, and clang's `-W` set finds shapes
-  gcc's does not. Cheapest real improvement left in this section.
+  gcc's does not.
+
+  **But it is CI-only from here, and that is the A2 shape.** Measured on this machine:
+  there is no `clang`, no `clang-cl`, and no `cc` — only `gcc` resolves, so
+  `find_c_compiler`'s first-match-wins has never had a choice to make locally. Visual
+  Studio 2022 is installed, but `cl.exe` accepts neither `-std=c11` nor `-Werror=`, so it
+  is a different job rather than a second entry in the same matrix. Adding a clang leg
+  means writing a job nobody in reach can watch run — worth doing, but with the same
+  caveat A2 carries, and **not** the cheap local win it looks like from the register.
 * `jstatus_serves_a_connection_without_starving_its_timers` is load-sensitive (§3e): a 1ms
   timer with a 500ms budget, so a failure means a half-second deschedule. Failed 1 of ~8
   full-ladder runs; passes in isolation in 2.8s. **Do not widen the deadline** — a wall-clock
@@ -734,7 +844,7 @@ tier otherwise completed.
 
 | item | size | note |
 |---|---|---|
-| `select` `closed { … }` arm | medium | Sugar over §3g's termination. Blocked behind **A1** — it is the same AST change. |
+| `select` `closed { … }` arm | medium | Sugar over §3g's termination. **No longer blocked behind A1** — that turned out to be a shim gap, not an AST change (§3j). Still its own two-sided AST increment: `ExprKind::Select` across 22 reference sites + the parser + the no-allowlist P2 golden. |
 | Trace spans | small | **`Span` is taken three times** (`http.Header`, `diag`, the `@span` attribute) — pick another word first. `@no_alloc` passes vacuously through a trait method, so use the fn-pointer vtable shape, not a trait. |
 | Config: live reload, nesting | small | `std/syswatch` exists; composing them is the caller's today. |
 | Service: restart policy, supervision tree | medium | The lifecycle is complete; a supervisor over `std/sysproc` is its own module. |
@@ -859,6 +969,27 @@ correctness, since gcc accepts a non-void function falling off its end. **(That 
 clause is now false by construction: §3i's `-Werror=return-type` refuses it. The trap it
 described is closed; the reason it existed — BUILD_OK asks a weaker question than
 correctness — still stands.)**
+
+**A DERIVED instrument that reads zero may be showing two errors cancelling.** §3h measured
+per-construct node divergence via `jestyr_task_<id>` on probes carrying a generic prelude —
+but that prelude diverges too, in the opposite direction, and the net was zero for `if` and
+`for`. The conclusion drawn ("only select arms diverge") was false, and it made the fix look
+like a language-semantics decision. Reading the two arenas' lengths directly took one
+temporary print on each side and overturned the whole section. **Prefer the instrument that
+measures the quantity itself over the one that measures a consequence of it.**
+
+**A recorded diagnosis is worth less than a recorded symptom, and may be worth less than
+nothing.** §3h's symptom (`jestyr_task_111` vs `109`) was real and reproducible. Its
+diagnosis sent the next session at a two-sided typeck alignment; the actual fix was one
+`else if` in one file. **Re-derive a recorded mechanism before building on it** — and note
+this is the third time this tree has recorded that rule (`environ`, the range limitation,
+now this).
+
+**Look for an existing compensation layer before concluding two implementations disagree.**
+`ref_expr_id` had reconciled six block-node differences for as long as the port has existed.
+Nothing in §3h mentions it, so the drift read as a newly-discovered disagreement rather than
+a known one with a missing case. **When two implementations agree everywhere except one
+construct, suspect an enumeration with a gap, not a semantic split.**
 
 **A recorded gap may be two gaps wearing one sentence.** A10 read *"nothing has ever run a
 sanitizer, or even `-Wall`"* and was deferred whole, because the blocker cited — no

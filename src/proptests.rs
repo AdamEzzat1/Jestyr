@@ -19033,6 +19033,90 @@ fn main() -> i32 {
         eprintln!("selfhost fixpoint subset: jc1's C built + ran identical for {checked} program(s)");
     }
 
+    /// **A `select` between two `concurrent` blocks emits the same C on both compilers.**
+    ///
+    /// The handoff note recorded this exact program shape as *impossible* to byte-identity
+    /// allowlist, and diagnosed it as the two parsers disagreeing about `ExprId`s — with a
+    /// fix that "means agreeing what a select arm's body *is* … and changing both compilers
+    /// together."
+    ///
+    /// **That diagnosis was wrong, and the shape of the error is the reason this test
+    /// exists.** The parsers are *supposed* to disagree: this parser allocates a node for
+    /// every inline block, the reference stores a `Block` struct, and `ref_expr_id` in
+    /// `cgen.jtr` is the deliberate translation layer that subtracts the difference. It
+    /// already handled `if`, `for`, `unsafe`, `concurrent`, `region` and `with alive` —
+    /// `select` was simply never added when `select` landed. One missing arm in a shim, not
+    /// a semantic disagreement.
+    ///
+    /// The divergence was invisible because an `ExprId` only reaches the output through a
+    /// `spawn` trampoline's symbol, so it shows up **only** when a construct sits between
+    /// two spawn sites in one function. No corpus file did that until `select.jtr` grew a
+    /// second `concurrent` block. This test is that shape, held permanently.
+    ///
+    /// `#line` directives are stripped before comparing: the port emits none (a separately
+    /// recorded gap), and it is orthogonal to what this test pins.
+    #[cfg(feature = "selfhost-fixpoint")]
+    #[test]
+    fn a_select_between_two_concurrent_blocks_agrees_on_both_backends() {
+        let jc1 = build_exe("examples/std/cgen.jtr");
+        // A local `Channel` so the probe needs no imports — the port's dump mode does not
+        // resolve them, and this must compare the two backends on ONE source.
+        let src = r#"fn Channel(comptime T: type) -> type {
+    return struct { buf: *mut T, ctrl: *mut i64, cap: i64 }
+}
+fn mk(comptime T: type) -> Channel(T) {
+    var b: *mut T = alloc(T, 8 as usize)
+    var c: *mut i64 = alloc(i64, 5)
+    return Channel(T){ buf: b, ctrl: c, cap: 8 }
+}
+fn work(x: i64) { }
+
+fn main() -> i32 {
+    var a = mk(i64)
+    var b = mk(i64)
+    var n: i64 = 0
+    concurrent { spawn work(1) }
+    select {
+        recv(a) => x { n = 1 }
+        recv(b) => y { n = 2 }
+    }
+    concurrent { spawn work(2) }
+    return 0
+}
+"#;
+        let probe = std::env::temp_dir().join("jestyr_select_between_concurrent.jtr");
+        std::fs::write(&probe, src).unwrap();
+        let path = probe.to_str().unwrap();
+
+        let strip = |s: String| -> Vec<String> {
+            s.replace("\r\n", "\n")
+                .lines()
+                .filter(|l| !l.starts_with("#line"))
+                .map(|l| l.to_string())
+                .collect()
+        };
+        // The reference runs in-process through the same pipeline `jestyrc emit-c` uses.
+        let prog = crate::module::load(path);
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "probe must load cleanly");
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "probe must type-check");
+        assert!(
+            !crate::escape::check(&prog.ast, &info).iter().any(|d| d.is_error()),
+            "probe must pass the escape checker"
+        );
+        let (c_src, _) = crate::cgen::emit(&prog.ast, &info);
+        let want = strip(c_src);
+        let got =
+            strip(String::from_utf8(Command::new(&jc1).arg(path).output().unwrap().stdout).unwrap());
+
+        // Teeth: the shape only pins anything if the probe really produced two trampolines.
+        let tasks: Vec<&String> =
+            want.iter().filter(|l| l.contains("jestyr_task_")).collect();
+        assert!(tasks.len() >= 2, "probe must emit two spawn trampolines, got {tasks:?}");
+
+        assert_eq!(got, want, "the two backends disagree on a select between two concurrent blocks");
+    }
+
     /// **P2 depth guard.** The Jestyr parser bounds AST *height* at `MAX_EXPR_DEPTH`
     /// (like the reference), so adversarially-deep input terminates with a bounded tree
     /// instead of overflowing. Two shapes stress different stacks: a left-deep fold

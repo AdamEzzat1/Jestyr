@@ -5,6 +5,45 @@ versions are snapshots, not stability promises.
 
 ## Unreleased
 
+### Fixed
+
+- **The two backends agree on a `select` between two `concurrent` blocks.** The last live
+  two-compiler divergence: a `spawn` trampoline's C symbol embeds an `ExprId`, and the
+  self-hosted backend numbered select arms one ahead per arm, so the same program emitted
+  `jestyr_task_111` on one side and `109` on the other.
+
+  **The recorded diagnosis was wrong, and correcting it is most of the value here.** The
+  note held that the two parsers disagreed about what a select arm's body *is*, and that
+  closing it meant "a two-sided typeck alignment increment". In fact the parsers are
+  *supposed* to allocate differently — this one allocates a node for every inline block,
+  the reference stores a `Block` struct — and `ref_expr_id` in `examples/std/cgen.jtr` is
+  the deliberate shim that subtracts the difference. It already enumerated `if.then`, `for`
+  body *and* else, `unsafe`, `concurrent`, `region`, and `with alive` body *and* else.
+  `select` was added to the language and never added to the shim. **One `else if`,
+  port-only** — no reference file, no AST, no parser, no typeck touched.
+
+  The earlier attempt detonated a typeck disagreement precisely because it changed
+  `SelectArm.body` to an `ExprId` on the **reference** side, i.e. the side that was already
+  correct.
+
+  Measurement overturned the note's table too. It reported `if`/`for` diverging by zero and
+  select by one; reading the two expression arenas directly shows the port allocates one
+  extra node for **every** inline-`Block` field — `fn` body, `if.then`, `unsafe`,
+  `for.body`, `region`, `with alive`, and one per select arm. The old table used
+  `jestyr_task_<id>` on probes carrying a generic prelude that *also* diverges, in the
+  opposite direction, so the net read zero. `select` was never special; it was the only one
+  the shim had missed.
+
+  It hid because an `ExprId` reaches the output through exactly one path — a spawn symbol —
+  so it is observable only when a mis-translated construct sits between two spawn sites in
+  one function. No corpus file did that until `select.jtr` grew a second `concurrent` block.
+
+  `a_select_between_two_concurrent_blocks_agrees_on_both_backends` holds the shape
+  permanently and was watched failing against the unfixed backend first. The full emitted C
+  for that program is byte-identical between backends modulo `#line` directives, which the
+  port still does not emit (a separate, already-recorded gap). Bootstrap seed refreshed
+  after confirming the drift guard reported `STALE`.
+
 ### Added
 
 - **The emitted C is now judged by the C compiler's own analysis.** Until now nothing in

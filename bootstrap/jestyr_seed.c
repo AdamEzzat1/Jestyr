@@ -36775,6 +36775,20 @@ int32_t jestyr_ref_expr_id(Jestyr_Parser j_p, int32_t j_eid)
             }
         }
         else
+        if ((j_e.j_kind == 42))
+        {
+            int32_t j_q = 0;
+            while ((j_q < j_e.j_y))
+            {
+                int32_t j_ab = jestyr_get__list__i32(j_p.j_par, (size_t)(((j_e.j_x + (j_q * 4)) + 3)));
+                if (((j_ab >= 0) && (j_ab < j_eid)))
+                {
+                    j_off = (j_off + 1);
+                }
+                j_q = (j_q + 1);
+            }
+        }
+        else
         if ((j_e.j_kind == 16))
         {
             if (((j_e.j_a >= 0) && (j_e.j_a < j_eid)))
