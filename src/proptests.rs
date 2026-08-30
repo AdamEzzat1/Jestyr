@@ -21088,3 +21088,312 @@ mod cst_props {
         );
     }
 }
+
+/// **The emitted C, put through the C compiler's own analysis.**
+///
+/// Every other gate in this tree asks whether the backend's output is *stable*
+/// (byte-identity goldens), *buildable* (`jc_build_matrix`), or *right* on the inputs a
+/// demo happens to use (the `c-oracle` transcripts). None of them asks whether the C is
+/// **well-formed**, and the difference is not academic: `docs/jc_build_matrix.txt` records
+/// that "BUILD_OK is not correctness, since gcc accepts a non-void function falling off
+/// its end", and `cc_base_flags` records the `int`-fallback miscompile arriving four
+/// separate times. Both are things a C compiler will say out loud when asked.
+///
+/// So this module asks. It is two tests and they are inseparable: one sweeps the corpus
+/// and must pass, the other feeds the gate deliberate defects and must see every one
+/// refused. Without the second, a typo in a flag name produces a gate that passes because
+/// it checks nothing — and since the corpus is *already* clean, that failure mode would be
+/// completely invisible.
+#[cfg(all(test, feature = "c-oracle"))]
+mod emitted_c_warning_gate {
+    use crate::{cc_base_flags, cc_strict_flags, find_c_compiler, CC_FLAGS, CC_STRICT_WARNINGS};
+    use std::process::Command;
+
+    /// Compile `c_src` for diagnostics only, discarding the object. Returns gcc's stderr
+    /// on refusal, `None` when it is accepted.
+    fn compile_probe(cc: &str, flags: &[&str], c_src: &str, stem: &str) -> Option<String> {
+        let cfile = std::env::temp_dir().join(format!("jestyr_warngate_{stem}.c"));
+        std::fs::write(&cfile, c_src).unwrap();
+        let out = Command::new(cc)
+            .args(flags)
+            .arg("-c")
+            .arg("-o")
+            .arg(if cfg!(windows) { "NUL" } else { "/dev/null" })
+            .arg(&cfile)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&cfile);
+        if out.status.success() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&out.stderr).into_owned())
+        }
+    }
+
+    /// **Every gate flag names a real compiler option.**
+    ///
+    /// The cheap half of the anti-vacuity story, and it covers all of
+    /// [`CC_STRICT_WARNINGS`] at once: gcc **hard-errors** on an unrecognized `-Werror=`
+    /// name (`error: -Werror=xyz: no option -Wxyz`) before it looks at the source, so a
+    /// single compile of a trivially-valid file proves no flag in the set is misspelled or
+    /// unsupported by the installed toolchain.
+    ///
+    /// Worth stating because the obvious assumption is the opposite one — that an unknown
+    /// warning name is ignored, the way an unknown `-f` option often is. It is not, which
+    /// is why the behavioural probes below can be scoped to *"does this flag catch what I
+    /// claim it catches"* rather than having to shoulder typo-detection too.
+    #[test]
+    fn every_gate_flag_is_a_real_compiler_option() {
+        let cc = find_c_compiler().expect("the warning gate needs a C compiler on PATH");
+        let refusal = compile_probe(
+            &cc,
+            &cc_strict_flags(),
+            "int main(void) { return 0; }\n",
+            "flagcheck",
+        );
+        assert!(
+            refusal.is_none(),
+            "the gate's own flags were refused on a trivially-valid program — a flag is \
+             misspelled or this toolchain lacks it:\n{}",
+            refusal.unwrap()
+        );
+    }
+
+    /// **Anti-vacuity: the gate must be watched REFUSING.**
+    ///
+    /// The corpus passes this gate on the day it is written, so a green sweep on its own
+    /// says nothing about whether the flags that matter are doing any work. Typos are
+    /// already excluded by `every_gate_flag_is_a_real_compiler_option`; what this test adds
+    /// is the behavioural claim — that each marquee flag actually refuses the defect it was
+    /// chosen for, on this compiler, at this optimization level.
+    ///
+    /// That last clause is not decoration. The first draft of the `uninitialized` probe
+    /// (`int v; if (c) v = 1; return v;`) was **accepted**: gcc 8.3.0 at `-O2` folds it away
+    /// and never reports it. The probe looked obviously correct and proved nothing, which is
+    /// precisely the failure this test exists to make loud.
+    ///
+    /// Each probe is checked in **both** directions: accepted under the ordinary build
+    /// flags, refused under the strict ones. Only the pair proves the refusal came from
+    /// the gate rather than from the snippet being invalid C to begin with.
+    #[test]
+    fn the_dangerous_warning_set_has_teeth() {
+        let cc = find_c_compiler().expect("the warning gate needs a C compiler on PATH");
+        let base = cc_base_flags();
+        let strict = cc_strict_flags();
+
+        // (name, snippet, the flag whose whole purpose is to catch it)
+        let probes: &[(&str, &str, &str)] = &[
+            // The four-time miscompile: no declaration, so C assumes `int`, and a
+            // 64-bit return is truncated at the call site.
+            (
+                "implicit_decl",
+                "long long f(void) { return undeclared_helper(); }\n",
+                "implicit-function-declaration",
+            ),
+            // The trap `jc_build_matrix.txt` names by hand: gcc otherwise accepts this.
+            ("fall_off_end", "int f(int x) { if (x) return 1; }\n", "return-type"),
+            // Unconditionally uninitialized. The conditional form is NOT usable here —
+            // see this test's doc comment for why it was measured and discarded.
+            ("uninitialized", "int f(void) { int v; return v; }\n", "uninitialized"),
+            // The dataflow half, which only reports under the optimizer. The loop is the
+            // canonical shape: `v` is assigned on every iteration and there may be none.
+            (
+                "maybe_uninitialized",
+                "int f(int n) { int v; for (int i = 0; i < n; i++) v = i; return v; }\n",
+                "maybe-uninitialized",
+            ),
+            (
+                "int_conversion",
+                "void* f(void) { return 7; }\n",
+                "int-conversion",
+            ),
+            (
+                "bad_pointer_type",
+                "int* f(double* p) { return p; }\n",
+                "incompatible-pointer-types",
+            ),
+            // The class that is only checkable because `cc_strict_flags` defines
+            // `__USE_MINGW_ANSI_STDIO` on Windows.
+            (
+                "format_mismatch",
+                "#include <stdio.h>\nvoid f(void) { printf(\"%d\\n\", \"not an int\"); }\n",
+                "format",
+            ),
+        ];
+
+        for (stem, src, flag) in probes {
+            assert!(
+                compile_probe(&cc, &base, src, stem).is_none(),
+                "probe `{stem}` must be ACCEPTED under the ordinary build flags — otherwise \
+                 its refusal below proves nothing about -W{flag}"
+            );
+            let refused = compile_probe(&cc, &strict, src, stem).unwrap_or_else(|| {
+                panic!(
+                    "the gate ACCEPTED `{stem}`: -Werror={flag} is not in force. A misspelled \
+                     flag name is silently ignored by gcc, so this is what a vacuous gate \
+                     looks like."
+                )
+            });
+            assert!(
+                refused.contains(flag),
+                "probe `{stem}` was refused, but not by -W{flag}:\n{refused}"
+            );
+        }
+        eprintln!("warning gate: {} deliberate defects, all refused", probes.len());
+    }
+
+    /// **The gate flags must never drift into the locked determinism seam.**
+    ///
+    /// `CC_FLAGS` is hashed into every `jestyr attest` manifest as reproducible-build
+    /// provenance, so a flag added there re-baselines the corpus — the same cost that
+    /// defers TLS. These are pure analysis: they change no emitted byte, no rounding, and
+    /// no linked symbol, so they belong alongside the seam, never inside it.
+    #[test]
+    fn strict_warnings_stay_out_of_the_determinism_seam() {
+        for f in CC_STRICT_WARNINGS {
+            assert!(
+                !CC_FLAGS.contains(f),
+                "`{f}` must stay out of CC_FLAGS — it would churn every attest manifest"
+            );
+            assert!(
+                f.starts_with("-Werror="),
+                "`{f}` must be an ERROR: a warning in a 30k-line generated file is invisible"
+            );
+        }
+        // The seam itself survives intact inside the strict command.
+        let strict = cc_strict_flags();
+        assert!(
+            CC_FLAGS.iter().all(|f| strict.contains(f)),
+            "the strict compile must still carry the locked FP flags: {strict:?}"
+        );
+        // `-Wmaybe-uninitialized` is dataflow-driven and reports nothing without the
+        // optimizer, so the gate silently loses a class if `-O2` ever leaves CC_FLAGS.
+        assert!(
+            strict.contains(&"-O2"),
+            "-Wmaybe-uninitialized needs the optimizer to see anything: {strict:?}"
+        );
+        // The mingw format-checking define is a diagnostics-only affordance. In a real
+        // build it changes which `printf` is linked, so it must never reach CC_FLAGS.
+        assert!(
+            !CC_FLAGS.iter().any(|f| f.contains("__USE_MINGW_ANSI_STDIO")),
+            "the format-checking define must stay out of CC_FLAGS: {CC_FLAGS:?}"
+        );
+    }
+
+    /// Every corpus file the backend can lower, as `(path, emitted C)`.
+    ///
+    /// Uses the same pipeline as `jestyrc emit-c` — `module::load` resolves imports, so an
+    /// import-bearing file is swept in its REAL form rather than the degenerate
+    /// single-file shape the byte-identity goldens compare. That matters here: the
+    /// goldens run with imports unresolved and so have never seen most of this C.
+    ///
+    /// A file that fails any check is skipped, not failed: the corpus deliberately
+    /// contains programs that must be REFUSED (`static_rejections`, the parse-error
+    /// fixtures), and codegen never runs on them.
+    ///
+    /// **Known coverage limit, recorded rather than papered over:** this walks
+    /// `cgen::emit` only. `cgen::emit_tests`/`emit_tests_filtered` (the `@test`/`@bench`
+    /// harness `main`), `emit_show_drops` and `emit_error_traces` are separate emission
+    /// paths, so a defect confined to one of them is invisible here. Extending to the test
+    /// harness is the obvious next step and roughly doubles the runtime — deliberately not
+    /// taken in the increment that introduced the gate.
+    fn emitted_corpus() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            let Ok(rd) = std::fs::read_dir(dir) else { continue };
+            let mut paths: Vec<_> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jtr"))
+                .collect();
+            paths.sort();
+            for p in paths {
+                let rel = p.to_string_lossy().replace('\\', "/");
+                let prog = crate::module::load(&rel);
+                if prog.diags.iter().any(|d| d.is_error()) {
+                    continue;
+                }
+                let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+                if td.iter().any(|d| d.is_error())
+                    || crate::escape::check(&prog.ast, &info).iter().any(|d| d.is_error())
+                {
+                    continue;
+                }
+                let (c_src, cd) = crate::cgen::emit(&prog.ast, &info);
+                if !cd.is_empty() {
+                    continue;
+                }
+                out.push((rel, c_src));
+            }
+        }
+        out
+    }
+
+    /// **The corpus's emitted C is well-formed, judged by the C compiler.**
+    ///
+    /// Sweeps every lowerable file and refuses any that trips [`CC_STRICT_WARNINGS`]. It
+    /// passes on the day it lands — the corpus was measured clean across all 277 files
+    /// before the gate existed — so its value is entirely in what it refuses NEXT: it
+    /// converts a property that has held by luck, and audibly broken four times, into one
+    /// the ladder enforces.
+    ///
+    /// Read `the_dangerous_warning_set_has_teeth` alongside this. A green run here is only
+    /// evidence if the flags are actually in force, and that is the test which proves it.
+    #[test]
+    fn emitted_c_is_clean_under_the_dangerous_warning_set() {
+        let cc = find_c_compiler().expect("the warning gate needs a C compiler on PATH");
+        let strict = cc_strict_flags();
+        let corpus = emitted_corpus();
+        assert!(corpus.len() > 200, "expected the whole corpus, emitted {}", corpus.len());
+
+        // The gcc invocations are the entire cost (~0.7s each, serially several minutes)
+        // and are wholly independent, so they fan out. Each thread owns a distinct temp
+        // filename, keyed by index, so two runs of the suite cannot collide either.
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
+        let chunks: Vec<&[(String, String)]> =
+            corpus.chunks(corpus.len().div_ceil(workers)).collect();
+        let failures: Vec<String> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunks
+                .iter()
+                .enumerate()
+                .map(|(w, chunk)| {
+                    let (cc, strict) = (&cc, &strict);
+                    s.spawn(move || {
+                        let mut bad = Vec::new();
+                        for (i, (path, c_src)) in chunk.iter().enumerate() {
+                            let stem = format!("corpus_{w}_{i}");
+                            if let Some(err) = compile_probe(cc, strict, c_src, &stem) {
+                                bad.push(format!("{path}\n{err}"));
+                            }
+                        }
+                        bad
+                    })
+                })
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+
+        // A defect in the emitted PRELUDE reproduces in every file, so an untruncated
+        // report is 277 copies of one message. Show a few and say how many followed —
+        // measured while watching this gate catch a deliberately-broken `cgen`.
+        if !failures.is_empty() {
+            let shown = failures.len().min(3);
+            let mut msg = format!(
+                "the backend emitted C that gcc refuses under the dangerous-warning gate \
+                 ({} of {} file(s)):\n\n{}",
+                failures.len(),
+                corpus.len(),
+                failures[..shown].join("\n\n")
+            );
+            if failures.len() > shown {
+                msg.push_str(&format!(
+                    "\n\n… and {} more. Failing in EVERY file points at the emitted runtime \
+                     prelude rather than at any one program.",
+                    failures.len() - shown
+                ));
+            }
+            panic!("{msg}");
+        }
+        eprintln!("warning gate: {} emitted programs, all clean", corpus.len());
+    }
+}

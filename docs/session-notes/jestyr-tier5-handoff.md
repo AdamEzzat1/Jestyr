@@ -75,8 +75,13 @@ The three at the top of it:
 1. **A1 — the ExprId drift and the typeck disagreement behind it.** The only live
    two-compiler divergence. Isolated; the fix was verified and reverted because it exposed
    the deeper one.
-2. **A10 — nothing has ever run a sanitizer over the emitted C.** Largest verification gap
-   in a tier themed on reliability. Blocked on a machine, not on effort.
+2. **A10 — the WARNING half is DONE (§3i); the SANITIZER half is not.** The item was
+   recorded as one gap and was really two: warnings need no runtime library and are now a
+   gate (277 emitted programs clean, watched refusing a broken `cgen`). Sanitizers still
+   need a `libasan` this machine lacks, so that half is a CI-only increment and inherits
+   the A2 caveat — nobody in reach can watch it run. **The cheapest real improvement left
+   here is a second C compiler**, not the sanitizer: clang's `-W` set finds shapes gcc's
+   does not, and the gate is only as good as the analysis behind it.
 3. **B3 — the package substrate.** The largest genuinely-absent area, and the one the
    tier's own "distribution" theme names.
 
@@ -475,6 +480,110 @@ the main thread.
 
 ---
 
+## §3i. The emitted C, judged by the C compiler — A10's warning half
+
+§6A10 recorded that **nothing had ever run `-Wall` over the backend's output**, and
+deferred the whole item because this machine has no `libasan`. That bundling was wrong in
+a useful way: sanitizers need a runtime library, **warnings need nothing**. The warning
+half was fully closeable here, and is now closed. The sanitizer half is untouched and stays
+recorded — as an A2-shaped item, a claim nobody in reach can watch run.
+
+`CC_STRICT_WARNINGS` in `src/main.rs` promotes 23 classes to errors; the
+`emitted_c_warning_gate` module in `src/proptests.rs` (feature `c-oracle`, so the existing
+CI job picks it up with no workflow change) sweeps every lowerable corpus file through
+them. **277 emitted programs, all clean**, in ~70s — the gcc calls fan out across threads
+because serially it is 3½ minutes.
+
+Two classes are named for the traps they close. `-Werror=return-type` refutes
+`docs/jc_build_matrix.txt`'s own warning — *"BUILD_OK is not correctness, since gcc accepts
+a non-void function falling off its end"* — so the matrix can no longer bless a program
+that returns garbage. `-Werror=implicit-function-declaration` names the `int`-fallback
+miscompile `cc_base_flags` records arriving **four** times.
+
+**Kept out of `CC_FLAGS` deliberately.** That const is the reproducible-build provenance
+hashed into every attest manifest — `cgen.jtr:15959` writes it as the `cc-flags` line — so
+a flag added there re-baselines the corpus, the same cost that defers TLS (§6B4). These
+change no emitted byte, no rounding and no linked symbol, so they ride alongside the seam
+exactly as `-g` does. No emission moved: **no golden churn, no seed refresh, no port
+mirror owed** (the port hardcodes the same four flags and knows nothing of warnings).
+
+### It went green on the first run, which is exactly why it needed teeth
+
+Three tests carry the claim, and they do different jobs:
+
+* `every_gate_flag_is_a_real_compiler_option` — the cheap guard, and it turned out to be
+  **total**. gcc *hard-errors* on an unrecognized `-Werror=` name (`no option -Wxyz`)
+  before it reads the source, so one compile of a trivial file proves all 23 names are
+  real. This is the opposite of the usual assumption — that an unknown warning name is
+  ignored the way an unknown `-f` often is — and being wrong about it changed the design:
+  typo-detection is free, so the behavioural probes only have to prove the flags catch
+  what they claim.
+* `the_dangerous_warning_set_has_teeth` — seven deliberate defects, each checked in
+  **both** directions: accepted under the ordinary build flags, refused under the strict
+  ones. Only the pair proves the refusal came from the gate rather than from the snippet
+  being bad C to begin with.
+* `strict_warnings_stay_out_of_the_determinism_seam` — pins the attest-provenance
+  boundary, and that `-O2` survives (`-Wmaybe-uninitialized` reports nothing without the
+  optimizer, so the gate would silently lose a class).
+
+**The teeth test earned itself on its first run.** The obvious `uninitialized` probe —
+`int v; if (c) v = 1; return v;` — was **accepted**: gcc 8.3.0 at `-O2` folds it away and
+never reports it. It looks correct and proves nothing, which on an already-clean corpus is
+invisible. Replaced with the unconditional form, plus a loop for the `maybe-` half.
+
+And the gate was **watched catching a real backend regression**, not just handwritten C: a
+prelude function calling an undeclared helper was temporarily added to `cgen.rs`, and
+277 of 277 files refused. (That run is also why the failure report truncates at three —
+a prelude defect reproduces in every file, so the untruncated output was 277 copies of one
+message.)
+
+### The census — what the corpus actually emits, and why most of it is not a defect
+
+The full `-Wall -Wextra` sweep produces **9,835 warnings**. Almost none are backend bugs,
+and the classification is the deliverable as much as the gate is:
+
+| class | count | verdict |
+|---|---|---|
+| `-Wunused-function`/`-parameter`/`-variable`/`-const-variable` | 8,851 | **Noise by construction.** A flattened module closure emits everything reachable; the linker drops the dead. |
+| `-Wformat=` + `-Wformat-extra-args` | 1,662 | **Windows false positive, proven.** See below. |
+| `-Wsign-compare` | 64 | **A language question, not a backend defect.** |
+| `-Wmissing-field-initializers` | 49 | Valid C — a partial initializer zero-fills the rest by standard. |
+| `-Wtautological-compare` | 5 | `examples/distinct_ops.jtr` asserts `a == a` **on purpose**. |
+| `-Wunused-label` | 3 | The loop lowering emits `__continue` whether or not anything jumps to it. |
+| `-Wmissing-braces` | 1 | Valid C. |
+| **every dangerous class** | **0** | Which is why the gate goes green — and why it is about the future. |
+
+Two of those deserve to be carried forward.
+
+**The format warnings are an artifact of the measuring machine.** All 1,662 are mingw
+checking format strings against the **pre-C99 MSVCRT `printf`**, which has no `ll` length
+modifier — so the backend's entirely correct `printf("%lld", (long long)x)` draws *unknown
+conversion type character 'l'*. Measured, not assumed: the compiled program prints
+`1234567890123` correctly, and `-std=gnu11` does **not** fix it — only
+`-D__USE_MINGW_ANSI_STDIO=1` does. **The largest single finding in the sweep was a
+property of the toolchain doing the sweep.** The gate recovers the class anyway by
+defining that macro, which is safe *only* because it compiles with `-c -o /dev/null`: in a
+real build the macro swaps in mingw's own `printf` and changes what gets linked, so it must
+never reach `CC_FLAGS`.
+
+### Known coverage limit
+
+The gate walks `cgen::emit` only. `emit_tests`/`emit_tests_filtered` (the `@test`/`@bench`
+harness `main`), `emit_show_drops` and `emit_error_traces` are **separate emission paths**,
+so a defect confined to one of them is still invisible. Extending to the test harness is
+the obvious next step and roughly doubles the runtime; deliberately not taken in the
+increment that introduced the gate, and recorded rather than left to be discovered.
+
+**The 64 `-Wsign-compare` are the OPEN int→int conversion decision, surfacing in the C.**
+`list.len` really does return `usize` (`std/list.jtr:61`), the loop counters really are
+`i32`, and Jestyr's typeck really does accept `i32 < usize`. Every site is in the
+self-hosted compiler's own sources (`cgen.jtr`, `typeck.jtr`, `escape.jtr` and their CLIs).
+The gate deliberately does **not** include this class: deciding it is a language change,
+and a test flag must not pre-empt it. Recorded here because it is the first time that open
+decision has been given a concrete, countable cost.
+
+---
+
 ## §4. Comparison suites, rerun at this milestone
 
 Run twice this arc — after §3 and again after §3c, since both changed compiler semantics.
@@ -601,14 +710,17 @@ tier otherwise completed.
 
 #### A10. VERIFICATION GAPS — not defects, but the reason a defect could hide
 
-* **Nothing has ever run a sanitizer, or even `-Wall`, over the emitted C.** Verified: no
-  `fsanitize`/`-Wall`/`-Wextra` anywhere in `.github/workflows` or `src`. The harness
-  exists — `selfhost_fixpoint_subset` already gcc-builds and RUNS every allowlisted program
-  comparing stdout and exit code — so this is a flag list and a second CI job. **Not added
-  because this machine cannot run it**: mingw gcc 8.3.0 has no `libasan`. For a tier whose
-  theme is reliability this is the largest single gap.
+* ~~**Nothing has ever run a sanitizer, or even `-Wall`, over the emitted C.**~~ — the
+  **warning half is DONE**, see §3i. The gap was recorded as one item and is really two:
+  warnings need no runtime library and were fully closeable here; **sanitizers still are
+  not** (mingw gcc 8.3.0 has no `libasan`), and remain open as a CI-only increment — which
+  is the A2 shape, a claim nobody in reach can watch. `selfhost_fixpoint_subset` is still
+  the right harness for it: it already gcc-builds and RUNS every allowlisted program
+  comparing stdout and exit code, so a sanitizer job is that loop plus `-fsanitize`.
 * **One C compiler, ever.** `find_c_compiler` is first-match-wins; on `ubuntu-latest` `cc`
-  resolves to gcc, so clang is never exercised.
+  resolves to gcc, so clang is never exercised. **This now costs more than it did**: the
+  §3i gate is only as good as the analysis behind it, and clang's `-W` set finds shapes
+  gcc's does not. Cheapest real improvement left in this section.
 * `jstatus_serves_a_connection_without_starving_its_timers` is load-sensitive (§3e): a 1ms
   timer with a 500ms budget, so a failure means a half-second deschedule. Failed 1 of ~8
   full-ladder runs; passes in isolation in 2.8s. **Do not widen the deadline** — a wall-clock
@@ -743,4 +855,32 @@ hand-maintained on purpose so someone looks at the diff: the byte-identity golde
 imports UNRESOLVED and never exercise the module-resolving `build` path, which is how nine
 programs were once byte-identity-verified and unbuildable at the same time. Read the moved
 line before regenerating with `JC_BUILD_MATRIX=1` — and remember BUILD_OK is not
-correctness, since gcc accepts a non-void function falling off its end.
+correctness, since gcc accepts a non-void function falling off its end. **(That last
+clause is now false by construction: §3i's `-Werror=return-type` refuses it. The trap it
+described is closed; the reason it existed — BUILD_OK asks a weaker question than
+correctness — still stands.)**
+
+**A recorded gap may be two gaps wearing one sentence.** A10 read *"nothing has ever run a
+sanitizer, or even `-Wall`"* and was deferred whole, because the blocker cited — no
+`libasan` on this machine — is real. It is real for **sanitizers**. Warnings need no
+runtime library at all, and that half was closeable in an afternoon. Before accepting a
+recorded blocker, check it applies to every clause it was written across.
+
+**The biggest finding may be a property of the machine doing the measuring.** The
+`-Wall -Wextra` sweep's largest non-noise class was 1,662 format-string errors, which look
+exactly like a code generator emitting bad `printf` calls. They are mingw checking against
+the pre-C99 MSVCRT `printf`; the emitted program prints the right digits. Falsify a
+finding against the platform before believing it — and note the first fix guessed
+(`-std=gnu11`) did nothing, so *"a plausible fix failed"* is not evidence the diagnosis
+was right.
+
+**A probe that looks obviously correct can prove nothing.** `int v; if (c) v = 1; return v;`
+is the textbook uninitialized-read, and gcc 8.3.0 at `-O2` folds it away and stays silent.
+It was caught only because the teeth test asserts the refusal actually *mentions the flag*
+rather than just that a refusal happened. On a corpus that is already clean, a vacuous
+probe is indistinguishable from a working gate.
+
+**gcc hard-errors on an unknown `-Werror=` name.** Assumed the opposite (that it would be
+ignored, like an unknown `-f` often is) and designed around it; measuring took one command
+and made typo-detection free and total. Worth knowing before writing elaborate machinery
+to defend against a failure the tool already forbids.

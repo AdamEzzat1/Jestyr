@@ -1079,6 +1079,105 @@ const CC_FLAGS: &[&str] = &["-O2", "-std=c11", "-ffp-contract=off", "-fno-fast-m
 /// of the FP-lock invariant. `-g` does not affect the locked rounding behavior.
 const DEBUG_FLAG: &str = "-g";
 
+/// **The dangerous-warning gate: C diagnostics that mean the backend emitted a bug.**
+///
+/// A code generator's output is never read by a human, so the only thing standing between
+/// a malformed emission and a silent miscompile is the C compiler's own analysis — and
+/// until now nothing in this tree ever asked for it. The recorded history is three
+/// separate bites from ONE shape: a missing declaration makes C assume `int`, the linker
+/// accepts it, and a 64-bit handle is truncated at runtime (`JestyrArr_T_8`, the
+/// array-index paths, the missing `#include`; see [`cc_base_flags`]'s Windows note for the
+/// fourth, `WSAPoll`). `-Wimplicit-function-declaration` names exactly that shape.
+///
+/// **Errors, not warnings.** A warning in a 30,000-line generated file is invisible; the
+/// corpus emits ~9,800 of them in benign classes, so one real diagnostic would drown. The
+/// gate promotes only the classes where a hit is a DEFECT, and leaves the noise off
+/// entirely rather than allowlisting it.
+///
+/// **Deliberately NOT in [`CC_FLAGS`].** That const is hashed into every `jestyr attest`
+/// manifest as the reproducible-build provenance, so adding a flag there re-baselines the
+/// whole corpus. These change no emitted byte and no rounding behavior — they are pure
+/// analysis — so they ride alongside, exactly as [`DEBUG_FLAG`] does, and
+/// `strict_warnings_stay_out_of_the_determinism_seam` pins that they never drift inward.
+///
+/// **What is excluded, and why** — each measured over the 277-file corpus, not assumed:
+///
+/// - `-Wunused-function`/`-parameter`/`-variable`/`-const-variable` (8,851): a flattened
+///   module closure emits every function it can reach; the linker drops the dead ones.
+///   Noise by construction, and suppressing it would mean touching every emission.
+/// - `-Wsign-compare` (64): `list.len` really does return `usize`, and Jestyr's typeck
+///   accepts `i32 < usize`. That is the OPEN int→int conversion decision showing through
+///   into the C — a language question, not a backend defect, so the gate must not
+///   pre-empt it.
+/// - `-Wtautological-compare` (5): `examples/distinct_ops.jtr` asserts `a == a` on
+///   purpose. The warning is correct and the code is intentional.
+/// - `-Wmissing-field-initializers` (49), `-Wmissing-braces` (1), `-Wunused-label` (3):
+///   valid C. A partial initializer zero-fills the rest by standard, and the loop
+///   lowering emits a `__continue` label whether or not anything jumps to it.
+const CC_STRICT_WARNINGS: &[&str] = &[
+    // The `int`-fallback family — the shape that has bitten this tree four times.
+    "-Werror=implicit-function-declaration",
+    "-Werror=implicit-int",
+    "-Werror=int-conversion",
+    "-Werror=incompatible-pointer-types",
+    "-Werror=pointer-sign",
+    "-Werror=discarded-qualifiers",
+    // A non-void function that falls off its end. Named because `docs/jc_build_matrix.txt`
+    // records the exact trap: "BUILD_OK is not correctness, since gcc ACCEPTS a non-void
+    // function falling off its end." This is the flag that turns that acceptance into a
+    // refusal, so the build matrix stops being able to bless a program that returns garbage.
+    "-Werror=return-type",
+    // Reading storage the emission never wrote. `-Wmaybe-uninitialized` needs the
+    // optimizer, which `CC_FLAGS`'s `-O2` supplies.
+    "-Werror=uninitialized",
+    "-Werror=maybe-uninitialized",
+    // Indexing past a bound the C compiler can see statically.
+    "-Werror=array-bounds",
+    // Unsequenced writes, and shifts with no defined value.
+    "-Werror=sequence-point",
+    "-Werror=shift-count-overflow",
+    "-Werror=shift-count-negative",
+    "-Werror=div-by-zero",
+    // Passing NULL where a callee is declared `nonnull`.
+    "-Werror=nonnull",
+    // `printf`-family argument/format mismatches. See `cc_strict_flags` for why this
+    // class needs an extra define before it can be checked at all on Windows.
+    "-Werror=format",
+    "-Werror=format-extra-args",
+    // Shapes that are legal C but always a mistake: `&arr` as a truth value,
+    // `!x == y`, `sizeof(ptr)` handed to `memcpy`, `memset(p, n, 0)`.
+    "-Werror=address",
+    "-Werror=logical-not-parentheses",
+    "-Werror=sizeof-pointer-memaccess",
+    "-Werror=memset-transposed-args",
+    "-Werror=bool-compare",
+];
+
+/// The full command for a **diagnostics-only** compile of emitted C: the ordinary build
+/// flags plus [`CC_STRICT_WARNINGS`]. Callers pair this with `-c -o <null>` — the object
+/// file is discarded and never linked or run.
+///
+/// **That is what makes `__USE_MINGW_ANSI_STDIO` safe to define here.** Without it, mingw
+/// checks format strings against the pre-C99 MSVCRT `printf`, which has no `ll` length
+/// modifier — so the backend's entirely correct `printf("%lld", (long long)x)` draws
+/// `unknown conversion type character 'l'`, 1,662 times across the corpus, and the whole
+/// format class becomes uncheckable on Windows. (Measured, including that the emitted
+/// program still prints the right digits; `-std=gnu11` does not fix it.) Defining the
+/// macro in a *real* build would swap in mingw's own `printf` implementation and change
+/// what gets linked — which is exactly why it must never reach [`CC_FLAGS`]. A compile
+/// that throws its object away has no link step to perturb, so here it costs nothing and
+/// buys back a class the gate would otherwise have to abandon.
+fn cc_strict_flags() -> Vec<&'static str> {
+    let mut flags = cc_base_flags();
+    // Debug info is pure overhead for a compile whose output is discarded.
+    flags.retain(|f| *f != DEBUG_FLAG);
+    if cfg!(windows) {
+        flags.push("-D__USE_MINGW_ANSI_STDIO=1");
+    }
+    flags.extend_from_slice(CC_STRICT_WARNINGS);
+    flags
+}
+
 /// The full flag list prepended to every cc invocation: the locked determinism
 /// seam ([`CC_FLAGS`]) followed by debug info ([`DEBUG_FLAG`]). A pure function so
 /// a test can assert the command carries **both** the FP flags and `-g` without

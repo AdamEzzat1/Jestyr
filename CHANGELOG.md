@@ -7,6 +7,44 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **The emitted C is now judged by the C compiler's own analysis.** Until now nothing in
+  this tree had ever run `-Wall` — let alone anything stricter — over the backend's output,
+  which the readiness register called the largest single gap in a tier themed on
+  reliability. `CC_STRICT_WARNINGS` (`src/main.rs`) promotes 23 diagnostic classes to
+  errors, and `emitted_c_warning_gate` (`src/proptests.rs`, `c-oracle`) sweeps every
+  lowerable corpus file through them: **277 emitted programs, all clean.**
+
+  **It went green on the first run, which is the whole reason it needed teeth.** Three
+  tests carry the claim rather than one. `every_gate_flag_is_a_real_compiler_option`
+  excludes typos wholesale — gcc *hard-errors* on an unrecognized `-Werror=` name before it
+  reads the source, which is the opposite of the usual assumption and makes the cheap guard
+  total. `the_dangerous_warning_set_has_teeth` then feeds the gate seven deliberate defects,
+  each checked in **both** directions: accepted under the ordinary build flags, refused
+  under the strict ones — only the pair proves the refusal came from the gate rather than
+  from the snippet being bad C. And the gate was watched catching a deliberately-broken
+  `cgen` (a prelude function calling an undeclared helper): 277 of 277 files refused.
+
+  That teeth test earned itself immediately. The first `uninitialized` probe —
+  `int v; if (c) v = 1; return v;` — was **accepted**, because gcc 8.3.0 at `-O2` folds it
+  away and never reports it. A probe that looks obviously correct and proves nothing is
+  exactly the failure mode a gate on an already-clean corpus cannot otherwise see.
+
+  Two classes are named for what they close. `-Werror=return-type` refutes the trap
+  recorded in `docs/jc_build_matrix.txt` — *"BUILD_OK is not correctness, since gcc accepts
+  a non-void function falling off its end"* — the build matrix can no longer bless a
+  program that returns garbage. `-Werror=implicit-function-declaration` names the
+  `int`-fallback miscompile that `cc_base_flags` records arriving **four** separate times
+  (`JestyrArr_T_8`, the array-index paths, a missing `#include`, `WSAPoll`); the corpus is
+  clean of it today, so the gate's job is that it stays that way.
+
+  **Not in `CC_FLAGS`, deliberately.** That const is hashed into every `jestyr attest`
+  manifest as reproducible-build provenance — `cgen.jtr:15959` writes it into the
+  `cc-flags` line — so a flag added there re-baselines the whole corpus. These change no
+  emitted byte, no rounding and no linked symbol, so they ride alongside the seam exactly
+  as `-g` does, and `strict_warnings_stay_out_of_the_determinism_seam` pins that they never
+  drift inward. No emission moved: no golden churn, no seed refresh, and no port mirror
+  owed (the port hardcodes the same four flags and knows nothing of warnings).
+
 - **`std/sysnet` + `std/syspoll` + `runtime.Pollable` — Jestyr answers a socket and keeps
   its timers.** `sysnet.jtr` (5 cases), `syspoll.jtr` (3 cases), and `sysnet_demo.jtr`:
   a local status server that services a connection *and* fires its own timers on one thread.
