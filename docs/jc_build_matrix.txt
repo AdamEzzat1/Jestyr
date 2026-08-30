@@ -73,6 +73,7 @@ BUILD_OK format_float
 BUILD_OK hashmap_demo
 BUILD_OK http_demo
 BUILD_OK impl_body_calls
+BUILD_OK ini_demo
 BUILD_OK intern_demo
 BUILD_OK lexer
 BUILD_OK log_demo

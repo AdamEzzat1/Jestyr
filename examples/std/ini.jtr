@@ -1,0 +1,244 @@
+// std/ini.jtr — a config FILE above `std/config`, whose errors carry byte spans.
+//
+// `std/config` merges named values and records which SOURCE each came from. What it could
+// not say was WHERE in a file — "invalid value for `queue_depth`" sends someone to the
+// wrong line of the right file, or the wrong file entirely. This module keeps a byte range
+// for every problem it finds, which `std/diag` turns into `file:line:col` with a caret
+// under the offending text.
+//
+// ─── INI, not TOML, and the reason is honesty ───────────────────────────────────────
+//
+// TOML is a large specification — typed arrays, inline tables, six datetime forms,
+// multi-line strings with escape processing. A partial TOML parser that accepts most files
+// is worse than an INI parser that accepts INI, because the failures are silent and
+// version-dependent: someone writes valid TOML, this reads it differently, and nothing
+// says so. INI is small enough to implement completely, so a file this rejects is a file
+// that is wrong.
+//
+// ─── Sections are a NAMING convention, not a tree ───────────────────────────────────
+//
+// `[server]` + `port = 8080` becomes the flat key `server.port`. `std/config` has a flat
+// key space on purpose — its precedence argument is about single keys, and a tree needs
+// its own merge rules — so flattening here keeps one merge order rather than inventing a
+// second. It also means an env var or a CLI flag can address the same setting by the same
+// name, which a nested representation would make ambiguous.
+//
+// ─── What it accepts ────────────────────────────────────────────────────────────────
+//
+//   # comment          ;  also a comment
+//   [section]
+//   key = value        surrounding spaces trimmed on both
+//
+// A value is raw text; `std/config` decides whether it is an integer or a boolean, because
+// the schema lives there. Quotes are NOT stripped: `x = "5"` is the four-character value
+// `"5"` and a `CFG_INT` key rejects it, which is better than guessing that the quotes were
+// decoration and silently accepting a string where a number was declared.
+//
+// ─── Every problem is a span ────────────────────────────────────────────────────────
+//
+// A malformed line, an empty key, an unterminated section, and a value `config` refused
+// are all recorded with the byte range of the part that is wrong — the KEY for a rejected
+// value, the whole line for a malformed one. Nothing is thrown away and nothing stops the
+// parse: a file with three mistakes reports three, because fixing them one run at a time
+// is the experience this is trying to avoid.
+
+import "mem"
+import "list"
+import "config"
+
+pub const INI_OK: i32 = 0
+pub const INI_NO_EQUALS: i32 = 1     // a line that is neither comment, section, nor `k = v`
+pub const INI_EMPTY_KEY: i32 = 2     // `= value`
+pub const INI_BAD_SECTION: i32 = 3   // `[server` with no closing bracket
+pub const INI_REFUSED: i32 = 4       // well-formed, but `config` would not take it
+
+pub struct Ini {
+    codes: List(i32),   // INI_*
+    cfgs: List(i32),    // the `config.apply` outcome for INI_REFUSED, else -1
+    ss: List(i32),      // problem span start
+    se: List(i32),      // problem span end
+    applied: i64,
+    refused: i64,
+}
+
+pub fn make(read a: Allocator) -> Ini {
+    return Ini{
+        codes: list.make(i32, a),
+        cfgs: list.make(i32, a),
+        ss: list.make(i32, a),
+        se: list.make(i32, a),
+        applied: 0,
+        refused: 0,
+    }
+}
+
+pub fn free(mut x: Ini) {
+    list.free(i32, x.codes)
+    list.free(i32, x.cfgs)
+    list.free(i32, x.ss)
+    list.free(i32, x.se)
+}
+
+pub fn applied_count(read x: Ini) -> i64 { return x.applied }
+pub fn refused_count(read x: Ini) -> i64 { return x.refused }
+pub fn problem_count(read x: Ini) -> usize { return list.len(i32, x.codes) }
+
+pub fn problem_code(read x: Ini, i: usize) -> i32 {
+    if i >= list.len(i32, x.codes) { return 0 - 1 }
+    return list.get(i32, x.codes, i)
+}
+
+// The `config.apply` outcome behind an `INI_REFUSED`, or -1. Kept separate from the INI
+// code because "this line is malformed" and "this value is not an integer" are different
+// problems with different fixes, and folding them together would lose the second.
+pub fn problem_cfg(read x: Ini, i: usize) -> i32 {
+    if i >= list.len(i32, x.cfgs) { return 0 - 1 }
+    return list.get(i32, x.cfgs, i)
+}
+
+pub fn problem_start(read x: Ini, i: usize) -> usize {
+    if i >= list.len(i32, x.ss) { return 0 }
+    return list.get(i32, x.ss, i) as usize
+}
+
+pub fn problem_end(read x: Ini, i: usize) -> usize {
+    if i >= list.len(i32, x.se) { return 0 }
+    return list.get(i32, x.se, i) as usize
+}
+
+pub fn code_name(k: i32) -> str {
+    if k == INI_OK { return "ok" }
+    if k == INI_NO_EQUALS { return "expected `key = value`" }
+    if k == INI_EMPTY_KEY { return "a key may not be empty" }
+    if k == INI_BAD_SECTION { return "unterminated `[section]`" }
+    if k == INI_REFUSED { return "refused by the schema" }
+    return "?"
+}
+
+@no_alloc @no_os fn is_space(b: i32) -> bool {
+    if b == 32 { return true }
+    if b == 9 { return true }
+    if b == 13 { return true }
+    return false
+}
+
+fn note(mut x: Ini, code: i32, cfg: i32, s: usize, e: usize) {
+    list.push(i32, x.codes, code)
+    list.push(i32, x.cfgs, cfg)
+    list.push(i32, x.ss, s as i32)
+    list.push(i32, x.se, e as i32)
+}
+
+// Parse `src` and offer every `key = value` to `c` at precedence `origin`. Returns how
+// many were accepted. Problems are recorded rather than raised, and the parse always
+// reaches the end of the file.
+pub fn load(mut x: Ini, mut c: config.Config, read src: str, origin: i32) -> i64 {
+    var sec: String = string_new()
+    var at: usize = 0
+    for at <= src.len {
+        // The line is [at, e); `e` lands on the newline or the end.
+        var e: usize = at
+        var scanning: bool = true
+        for scanning {
+            if e >= src.len {
+                scanning = false
+            } else {
+                if (src[e] as i32) == 10 { scanning = false } else { e = e + 1 }
+            }
+        }
+
+        // Trim both ends.
+        var ls: usize = at
+        var trimf: bool = true
+        for trimf {
+            if ls < e {
+                if is_space(src[ls] as i32) { ls = ls + 1 } else { trimf = false }
+            } else { trimf = false }
+        }
+        var le: usize = e
+        var trimb: bool = true
+        for trimb {
+            if le > ls {
+                if is_space(src[le - 1] as i32) { le = le - 1 } else { trimb = false }
+            } else { trimb = false }
+        }
+
+        if ls < le {
+            let first: i32 = src[ls] as i32
+            if first == 35 or first == 59 {
+                // `#` or `;` — a comment, and not an error.
+                ls = ls
+            } else {
+                if first == 91 {
+                    // `[section]`
+                    if (src[le - 1] as i32) == 93 {
+                        string_free(sec)
+                        sec = string_new()
+                        string_push(sec, src[ls + 1 .. le - 1])
+                    } else {
+                        note(x, INI_BAD_SECTION, 0 - 1, ls, le)
+                        x.refused = x.refused + 1
+                    }
+                } else {
+                    // `key = value`
+                    var eq: usize = ls
+                    var looking: bool = true
+                    for looking {
+                        if eq >= le { looking = false }
+                        else {
+                            if (src[eq] as i32) == 61 { looking = false } else { eq = eq + 1 }
+                        }
+                    }
+                    if eq >= le {
+                        note(x, INI_NO_EQUALS, 0 - 1, ls, le)
+                        x.refused = x.refused + 1
+                    } else {
+                        var ke: usize = eq
+                        var kt: bool = true
+                        for kt {
+                            if ke > ls {
+                                if is_space(src[ke - 1] as i32) { ke = ke - 1 } else { kt = false }
+                            } else { kt = false }
+                        }
+                        var vs: usize = eq + 1
+                        var vt: bool = true
+                        for vt {
+                            if vs < le {
+                                if is_space(src[vs] as i32) { vs = vs + 1 } else { vt = false }
+                            } else { vt = false }
+                        }
+                        if ke <= ls {
+                            note(x, INI_EMPTY_KEY, 0 - 1, ls, le)
+                            x.refused = x.refused + 1
+                        } else {
+                            // `[sec]` + `key` -> `sec.key`, so one flat key space serves
+                            // the file, the environment and the command line alike.
+                            var full: String = string_new()
+                            let secv: str = string_view(sec)
+                            if secv.len > 0 {
+                                string_push(full, secv)
+                                string_push(full, ".")
+                            }
+                            string_push(full, src[ls .. ke])
+                            let r: i32 = config.apply(c, string_view(full), src[vs .. le], origin)
+                            string_free(full)
+                            if r == config.CFG_OK {
+                                x.applied = x.applied + 1
+                            } else {
+                                // The KEY's span, not the line's: the key is what the
+                                // reader has to change, and a caret under the value would
+                                // point at the symptom for an unknown-key error.
+                                note(x, INI_REFUSED, r, ls, ke)
+                                x.refused = x.refused + 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        at = e + 1
+    }
+    string_free(sec)
+    return x.applied
+}

@@ -1,0 +1,89 @@
+// examples/std/ini_demo.jtr — `jini`: a config file whose errors point AT THEMSELVES.
+//
+//   jestyrc run examples/std/ini_demo.jtr
+//
+// `std/config` records which SOURCE a value came from. That is enough to say "the
+// environment set this" and not enough to say WHERE — "invalid value for queue_depth"
+// sends someone to the wrong line of the right file. `std/ini` keeps a byte range for
+// every problem, and `std/diag` turns it into `file:line:col` with a caret under the
+// offending text.
+//
+// The file below has four mistakes and one correct section, and **all four are reported
+// from one parse**. Stopping at the first would make fixing a config a sequence of runs,
+// which is the experience this exists to remove.
+import "mem"
+import "config"
+import "ini"
+import "diag"
+import "sink"
+
+const CAP: usize = 4096
+
+// A small file with one good section and four distinct problems, one of each kind.
+fn text() -> str {
+    return "# jserved configuration\n[server]\nport = 8080\nverbose = true\n\n[limits]\nqueue_depth = 64\nretries = 3x\n= 5\nbroken line\n[unterminated\n"
+}
+
+fn schema(mut c: config.Config) {
+    config.declare(c, "server.port", config.CFG_INT, false)
+    config.declare(c, "server.verbose", config.CFG_BOOL, false)
+    config.declare(c, "limits.queue_depth", config.CFG_INT, false)
+    config.declare(c, "limits.retries", config.CFG_INT, false)
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var c: config.Config = config.make(a)
+    schema(c)
+
+    var x: ini.Ini = ini.make(a)
+    let src: str = text()
+    let n: i64 = ini.load(x, c, src, config.CFG_FILE)
+
+    print_str("-- jini --")
+    print_str("settings accepted")
+    print_int(n as i32)
+    print_str("problems found in one pass")
+    print_int(ini.problem_count(x) as i32)
+
+    // A section makes a FLAT key, so the file, the environment and the command line all
+    // address the same setting by the same name.
+    print_str("a section prefixes its keys")
+    print_bool(config.get_int(c, config.by_name(c, "server.port")) == 8080)
+    print_bool(config.get_int(c, config.by_name(c, "limits.queue_depth")) == 64)
+
+    // Now the payoff: every problem rendered against the real source, with a caret.
+    var m: diag.SourceMap = diag.map_new(a)
+    let f: diag.FileId = diag.add_file(m, "jserved.ini", src)
+    var raw: *mut u8 = alloc(u8, CAP)
+    var buf: []u8 = slice(u8, raw, CAP)
+    var s: sink.Sink = sink.new()
+
+    var i: usize = 0
+    for i < ini.problem_count(x) {
+        let sp: diag.Span = diag.span(f, ini.problem_start(x, i), ini.problem_end(x, i))
+        var d: diag.Diagnostic = diag.new_error(a, "E-INI", ini.code_name(ini.problem_code(x, i)))
+        // An INI_REFUSED carries the schema's own verdict, which is a different question
+        // from "this line is malformed" and wants its own words.
+        let cf: i32 = ini.problem_cfg(x, i)
+        if cf >= 0 {
+            diag.primary(d, sp, config.outcome_name(cf))
+        } else {
+            diag.primary(d, sp, "here")
+        }
+        sink.reset(s)
+        let used: usize = diag.render(s, buf, m, d, diag.plain())
+        print_str(sink.view(s, buf))
+        i = i + 1
+    }
+
+    print_str("every report is complete")
+    var whole: bool = true
+    if sink.overflowed(s) { whole = false }
+    print_bool(whole)
+
+    ini.free(x)
+    config.free(c)
+    free_ptr(raw)
+    return 0
+}

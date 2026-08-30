@@ -937,6 +937,74 @@ mod syswatch_debounced_trigger {
 /// back-end server disagree about where it ends, and the bytes after it (`GET /admin`) become a
 /// second request attributed to the next client on the connection. Every byte of it is
 /// well-formed, and a lenient parser answers 200.
+/// **`jini` — a config file whose errors point at themselves.**
+///
+/// `std/config` records which SOURCE a value came from, which is enough to say "the
+/// environment set this" and not enough to say WHERE. `std/ini` keeps a byte range per
+/// problem and `std/diag` renders it as `file:line:col` with a caret — the last gap in
+/// Tier 5's "config errors point to their source".
+///
+/// **All four problems come from ONE parse.** Stopping at the first would make fixing a
+/// config a sequence of runs, and the count is asserted separately from the reports so a
+/// parser that found one and rendered it four times could not pass.
+///
+/// The `retries = 3x` case is the one worth reading: the caret sits under the KEY, not the
+/// value, and the message is the SCHEMA's verdict (`not an integer`) rather than a parse
+/// error. The line is well-formed INI; what is wrong is the type, which only `std/config`
+/// knows — so this pins that the two layers compose rather than duplicating each other.
+#[cfg(all(test, feature = "c-oracle"))]
+mod ini_spans {
+    use super::*;
+
+    #[test]
+    fn jini_reports_every_problem_with_a_source_span() {
+        let exe = super::c_oracle::build_exe("examples/std/ini_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the ini demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace('\r', "");
+
+        // Accepted settings and problem count, asserted as numbers before the rendered
+        // reports: 3 of 7 lines took, and four distinct failures were found in one pass.
+        assert!(out.contains("settings accepted\n3\n"), "three settings must apply:\n{out}");
+        assert!(out.contains("problems found in one pass\n4\n"), "all four, one parse:\n{out}");
+
+        // **The span is the point.** Each report names the file, a line number that
+        // matches where the mistake actually is, and a column — none of which `std/config`
+        // could supply, because it never sees a file.
+        for (frag, why) in [
+            ("--> jserved.ini:8:1", "the bad value is on line 8"),
+            ("--> jserved.ini:9:1", "the empty key is on line 9"),
+            ("--> jserved.ini:10:1", "the malformed line is line 10"),
+            ("--> jserved.ini:11:1", "the unterminated section is line 11"),
+        ] {
+            assert!(out.contains(frag), "{why}:\n{out}");
+        }
+
+        // Four DISTINCT messages, so a parser that classified every failure the same way
+        // fails even though it found the right number of them.
+        for msg in [
+            "refused by the schema",
+            "a key may not be empty",
+            "expected `key = value`",
+            "unterminated `[section]`",
+        ] {
+            assert_eq!(out.matches(msg).count(), 1, "`{msg}` must appear exactly once:\n{out}");
+        }
+
+        // The caret sits under the KEY and carries the SCHEMA's verdict — the line is
+        // well-formed INI and only `std/config` knows the type is wrong, so this is what
+        // pins that the two layers compose instead of duplicating each other.
+        assert!(out.contains("^^^^^^^ not an integer"), "the caret must mark the key:\n{out}");
+        assert!(out.contains("retries = 3x"), "the offending line must be quoted back:\n{out}");
+
+        // A section prefixes its keys into ONE flat namespace, so a file, an env var and a
+        // CLI flag can all name the same setting.
+        assert!(out.contains("a section prefixes its keys\ntrue\ntrue\n"), "flat keys:\n{out}");
+        assert!(out.contains("every report is complete\ntrue"), "no report was truncated:\n{out}");
+        assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
+    }
+}
+
 /// **`jrand` — OS entropy, and the comparison that must not leak how far it got.**
 ///
 /// Randomness cannot be asserted by value, so the transcript asserts everything around it:
@@ -18259,6 +18327,7 @@ fn main() -> i32 {
         // rather than under a probe someone ran once.
         "sysignal.jtr",
         "csrand.jtr",
+        "ini.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same
