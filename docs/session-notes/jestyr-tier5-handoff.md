@@ -63,7 +63,12 @@ the reason the last clause was impossible. The next items, in leverage order:
 **What is actually left, in leverage order:**
 
 * **`environ`** — an `extern` binding a C global (item 1 above).
-* **The ExprId drift (§3h)** — not urgent, but it is a two-compiler disagreement and those
+* **The ExprId drift (§3h)** — now ISOLATED (one node per `select` arm; the reference is
+  the inconsistent side) with a verified fix that was REVERTED because it exposed a second,
+  deeper divergence: the two typecks disagree about a select-arm block as a typed
+  expression. Closing it means agreeing what an arm body *is* and changing both compilers
+  together — a typeck alignment increment, not a parser tidy-up. Not urgent, but it is a
+  two-compiler disagreement and those
   have a history here of surviving whole workstreams.
 * **A config FILE FORMAT** — `apply` takes name/value pairs; a TOML/INI reader above it,
   with `diag.jtr` giving real line spans.
