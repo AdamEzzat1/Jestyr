@@ -12044,12 +12044,7 @@ mod c_oracle {
         let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
         let mut cmd = Command::new(&cc);
         cmd.args(crate::CC_FLAGS);
-        // These helpers use `CC_FLAGS` directly rather than `cc_base_flags()`, so the
-        // Windows target baseline is repeated: mingw declares `WSAPoll` only at
-        // `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration returning
-        // `int` -- the silent `int`-fallback shape this tree keeps meeting.
-        #[cfg(windows)]
-        cmd.arg("-D_WIN32_WINNT=0x0600");
+        cmd.args(crate::cc_platform_defines());
         if c_src.contains("pthread") {
             cmd.arg("-pthread");
         }
@@ -12104,12 +12099,7 @@ mod c_oracle {
         let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
         let mut cmd = Command::new(&cc);
         cmd.args(crate::CC_FLAGS);
-        // These helpers use `CC_FLAGS` directly rather than `cc_base_flags()`, so the
-        // Windows target baseline is repeated: mingw declares `WSAPoll` only at
-        // `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration returning
-        // `int` -- the silent `int`-fallback shape this tree keeps meeting.
-        #[cfg(windows)]
-        cmd.arg("-D_WIN32_WINNT=0x0600");
+        cmd.args(crate::cc_platform_defines());
         // The Jestyr-written compiler recurses per expression-nesting level; give the exe the
         // same headroom the Rust reference gets from its 8MB main-thread stack (Windows
         // defaults to 1MB, which the deepest corpus files overflow). Harness-only — the locked
@@ -16659,6 +16649,7 @@ fn main() -> i32 {
         let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
         let st = Command::new(&cc)
             .args(crate::CC_FLAGS)
+            .args(crate::cc_platform_defines())
             .arg("-o")
             .arg(&exe)
             .arg(&cfile)
@@ -17058,6 +17049,7 @@ fn main() -> i32 {
             let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
             let out = Command::new(&cc)
                 .args(crate::CC_FLAGS)
+                .args(crate::cc_platform_defines())
                 .arg(&cfile)
                 .arg("-o")
                 .arg(&exe)
@@ -17213,6 +17205,7 @@ fn main() -> i32 {
         let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
         let out = Command::new(&cc)
             .args(crate::CC_FLAGS)
+            .args(crate::cc_platform_defines())
             .arg(&cfile)
             .arg("-o")
             .arg(&exe)
@@ -18682,6 +18675,7 @@ fn main() -> i32 {
         let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
         let st = Command::new(&cc)
             .args(crate::CC_FLAGS)
+            .args(crate::cc_platform_defines())
             .arg("-o")
             .arg(&out_exe)
             .arg(&cfile)
@@ -18794,12 +18788,7 @@ fn main() -> i32 {
         std::fs::write(&cfile, &c_src).unwrap();
         let mut cmd = Command::new(&cc);
         cmd.args(crate::CC_FLAGS);
-        // These helpers use `CC_FLAGS` directly rather than `cc_base_flags()`, so the
-        // Windows target baseline is repeated: mingw declares `WSAPoll` only at
-        // `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration returning
-        // `int` -- the silent `int`-fallback shape this tree keeps meeting.
-        #[cfg(windows)]
-        cmd.arg("-D_WIN32_WINNT=0x0600");
+        cmd.args(crate::cc_platform_defines());
         assert!(cmd.arg("-o").arg(&texe).arg(&cfile).status().unwrap().success(), "gcc failed on the test harness");
         let out = Command::new(&texe).output().unwrap();
         assert!(out.status.success(), "test harness exited non-zero");
@@ -19075,12 +19064,7 @@ fn main() -> i32 {
         std::fs::write(&cfile, &c1).unwrap();
         let mut cmd = Command::new(&cc);
         cmd.args(crate::CC_FLAGS);
-        // These helpers use `CC_FLAGS` directly rather than `cc_base_flags()`, so the
-        // Windows target baseline is repeated: mingw declares `WSAPoll` only at
-        // `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration returning
-        // `int` -- the silent `int`-fallback shape this tree keeps meeting.
-        #[cfg(windows)]
-        cmd.arg("-D_WIN32_WINNT=0x0600");
+        cmd.args(crate::cc_platform_defines());
         #[cfg(windows)]
         cmd.arg("-Wl,--stack,67108864");
         if c1.contains("pthread") {
@@ -19206,12 +19190,7 @@ fn main() -> i32 {
             std::fs::write(&cfile, &c_src).unwrap();
             let mut cmd = Command::new(&cc);
             cmd.args(crate::CC_FLAGS);
-        // These helpers use `CC_FLAGS` directly rather than `cc_base_flags()`, so the
-        // Windows target baseline is repeated: mingw declares `WSAPoll` only at
-        // `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration returning
-        // `int` -- the silent `int`-fallback shape this tree keeps meeting.
-        #[cfg(windows)]
-        cmd.arg("-D_WIN32_WINNT=0x0600");
+            cmd.args(crate::cc_platform_defines());
             assert!(
                 { link_and_finish(&mut cmd, &exe, &cfile, &c_src); cmd.status().unwrap().success() },
                 "gcc failed on jc1's C for {path}"
@@ -19361,12 +19340,7 @@ fn main() -> i32 {
         let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
         let mut cmd = Command::new(&cc);
         cmd.args(crate::CC_FLAGS);
-        // These helpers use `CC_FLAGS` directly rather than `cc_base_flags()`, so the
-        // Windows target baseline is repeated: mingw declares `WSAPoll` only at
-        // `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration returning
-        // `int` -- the silent `int`-fallback shape this tree keeps meeting.
-        #[cfg(windows)]
-        cmd.arg("-D_WIN32_WINNT=0x0600");
+        cmd.args(crate::cc_platform_defines());
         if c_src.contains("pthread") {
             cmd.arg("-pthread");
         }
@@ -21364,6 +21338,51 @@ mod cst_props {
         assert!(checked_files > 100, "expected the corpus, saw {checked_files} files");
         eprintln!(
             "stage-2 alignment: {checked_spans} spans across {checked_files} files, all exact"
+        );
+    }
+}
+
+/// **Every cc invocation in this file carries the platform's header baseline.**
+///
+/// A SOURCE-TEXT check, because that is the level the hazard lives at — the same shape as
+/// `extern_signature_agreement`, and for the same reason: what went wrong was duplication,
+/// not logic.
+///
+/// Ten helpers here assembled their own cc command from `CC_FLAGS` instead of calling
+/// `cc_base_flags()`, and each was supposed to re-add the platform baseline by hand. Six
+/// did (Windows only) and four did not. Nobody noticed, because the missing half was the
+/// POSIX one and the corpus is only ever compiled on Windows locally — the Linux runner
+/// reported 35 programs compiling `fileno`/`ftruncate`/`usleep`/`clock_gettime`/`kill` as
+/// implicit declarations, the `int`-fallback shape this tree has now met five times.
+///
+/// They all route through `cc_platform_defines()` now. This test is what stops an eleventh
+/// helper from being written the old way and quietly losing the baseline again.
+#[cfg(test)]
+mod cc_command_assembly {
+    #[test]
+    fn every_cc_invocation_carries_the_platform_defines() {
+        let src = include_str!("proptests.rs");
+        let mut orphans: Vec<usize> = Vec::new();
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, l) in lines.iter().enumerate() {
+            // The needle is SPLICED so that no line of this file contains it whole — a
+            // literal spelling matches the scan's own source and the test reports itself.
+            // (It did, twice: once on a bare mention, once on the narrowed form.)
+            if !l.contains(concat!("args(crate::CC_", "FLAGS)")) {
+                continue;
+            }
+            // The baseline must be added on the very next line — adjacency is the point:
+            // a few lines later is where the four that lost it went wrong.
+            let next = lines.get(i + 1).copied().unwrap_or("");
+            if !next.contains("cc_platform_defines") {
+                orphans.push(i + 1);
+            }
+        }
+        assert!(
+            orphans.is_empty(),
+            "cc invocation(s) at line(s) {orphans:?} use CC_FLAGS without following it with \
+             `cc_platform_defines()` — on glibc that silently drops every POSIX declaration \
+             (`-std=c11` sets __STRICT_ANSI__), and on mingw it drops the Vista baseline"
         );
     }
 }

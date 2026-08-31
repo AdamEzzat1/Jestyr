@@ -1183,24 +1183,49 @@ fn cc_strict_flags() -> Vec<&'static str> {
 /// a test can assert the command carries **both** the FP flags and `-g` without
 /// running a compiler (mirrors how `fp_determinism_flags_are_locked` inspects the
 /// const directly).
+/// **The platform's header baseline: what its libc needs defined before it will DECLARE
+/// the functions the emitted C calls.**
+///
+/// Not codegen, not determinism, not even a warning setting — purely which prototypes the
+/// system headers expose. It rides alongside [`CC_FLAGS`] and stays out of it for the usual
+/// reason: `CC_FLAGS` is hashed into every `jestyr attest` manifest, and a flag that changes
+/// no emitted byte has no business churning the provenance.
+///
+/// **Both entries exist for the same reason, on opposite platforms**, and that symmetry is
+/// the point — `-std=c11` is STRICT ISO C, so each libc hides everything that is not ISO:
+///
+/// - Windows/mingw: `<winsock2.h>` declares `WSAPoll` only at `_WIN32_WINNT >= 0x0600`, and
+///   below that it is an implicit declaration returning `int` — the silent `int`-fallback
+///   miscompile this tree has met four times. Vista is a floor with no reason to sit below.
+/// - glibc: `-std=c11` defines `__STRICT_ANSI__`, which switches `_DEFAULT_SOURCE` OFF. The
+///   emitted C calls `fileno`, `ftruncate`, `fsync`, `usleep`, `clock_gettime` and `kill` —
+///   every one POSIX, none ISO — so glibc declared none of them and gcc fell back to
+///   implicit `int`. Measured on the Linux runner: 35 of 278 corpus programs, five distinct
+///   functions. The includes were never missing; the declarations were switched off.
+///
+/// **`_DEFAULT_SOURCE`, deliberately not `_POSIX_C_SOURCE=200809L`.** The POSIX macro looks
+/// like the precise choice and is the wrong one: `usleep` was REMOVED in POSIX.1-2008, so
+/// glibc guards it behind `__USE_MISC` and `_POSIX_C_SOURCE=200809L` would leave that one
+/// function undeclared — fixing four of the five and hiding the fifth more firmly.
+/// `_DEFAULT_SOURCE` is what glibc enables by default and what `-std=c11` took away.
+///
+/// A `-D` is not a source change, so no emitted byte moves and no golden is affected.
+fn cc_platform_defines() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["-D_WIN32_WINNT=0x0600"]
+    } else {
+        &["-D_DEFAULT_SOURCE"]
+    }
+}
+
 fn cc_base_flags() -> Vec<&'static str> {
     let mut flags: Vec<&'static str> = CC_FLAGS.to_vec();
     flags.push(DEBUG_FLAG);
-    // **Windows target baseline: Vista.** mingw's `<winsock2.h>` declares `WSAPoll` only
-    // when `_WIN32_WINNT >= 0x0600`, and its default is lower — so `std/syspoll` compiled
-    // to an IMPLICIT DECLARATION, which C accepts and gives an `int` return. That is the
-    // `int`-fallback silent-miscompile shape this tree has been bitten by three times
-    // (`JestyrArr_T_8`, the array-index paths, the missing `#include`): a pointer-sized
-    // handle truncated through `int`, accepted by the linker, wrong at runtime.
-    //
-    // Set unconditionally on Windows rather than gated on the program's content, because a
+    // The platform's header baseline — see [`cc_platform_defines`] for why each side needs
+    // one. Set unconditionally rather than gated on the program's content, because a
     // per-program `-D` would make the same source compile differently depending on which
-    // modules it happened to import — and Vista is a floor this project has no reason to
-    // sit below. It is a compiler FLAG, not a source change, so no emitted byte moves and
-    // no golden is affected.
-    if cfg!(windows) {
-        flags.push("-D_WIN32_WINNT=0x0600");
-    }
+    // modules it happened to import.
+    flags.extend_from_slice(cc_platform_defines());
     flags
 }
 
@@ -1467,8 +1492,16 @@ mod fp_contract_tests {
         // Every flag is either the locked seam or one of the two sanctioned additions.
         let extra: Vec<&str> =
             flags.iter().copied().filter(|f| !CC_FLAGS.contains(f)).collect();
-        let want: &[&str] =
-            if cfg!(windows) { &["-g", "-D_WIN32_WINNT=0x0600"] } else { &["-g"] };
+        let want: &[&str] = if cfg!(windows) {
+            &["-g", "-D_WIN32_WINNT=0x0600"]
+        } else {
+            // glibc hides every POSIX declaration under `-std=c11`; see
+            // `cc_platform_defines`. Both platforms carry a header baseline now, and the
+            // non-Windows one was ABSENT until the Linux runner reported 35 corpus
+            // programs compiling `fileno`/`ftruncate`/`usleep`/`clock_gettime`/`kill` as
+            // implicit declarations.
+            &["-g", "-D_DEFAULT_SOURCE"]
+        };
         assert_eq!(extra, want, "only the sanctioned flags are added: {flags:?}");
         // `-g` is a usability flag, never part of the locked determinism/provenance set —
         // and neither is the platform baseline, for the same `attest` reason.

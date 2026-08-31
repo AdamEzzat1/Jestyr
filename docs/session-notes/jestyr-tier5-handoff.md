@@ -867,6 +867,57 @@ comment that describes it.
 
 ---
 
+## §3o. `-std=c11` hides POSIX, and ten helpers that each rebuilt the cc command
+
+The first Linux run of the §3i warning gate refused **35 of 278** corpus programs, with one
+class and nothing else: `-Werror=implicit-function-declaration`, over five functions —
+`fileno` (11), `ftruncate` (11), `usleep` (10), `clock_gettime` (9), `kill` (1).
+
+**The includes were never missing.** `#include <unistd.h>` is right there in the emitted C,
+and the source declares the header properly (`@cfg(posix) extern "unistd.h" fn ftruncate`).
+The cause is `-std=c11`: it defines `__STRICT_ANSI__`, which switches glibc's
+`_DEFAULT_SOURCE` OFF, and every one of those five is POSIX rather than ISO. The
+declarations were not absent — they were **switched off**, and gcc fell back to implicit
+`int`. This is the exact mirror of the mingw `__USE_MINGW_ANSI_STDIO` finding in §3i: one
+`-std=c11` strictness consequence per platform, found six weeks apart on opposite OSes.
+
+**`_DEFAULT_SOURCE`, and NOT `_POSIX_C_SOURCE=200809L`.** The POSIX macro is the obvious
+choice and is wrong: `usleep` was REMOVED in POSIX.1-2008, so glibc guards it behind
+`__USE_MISC`. Defining `_POSIX_C_SOURCE=200809L` fixes four of the five and hides the fifth
+more firmly than before. `_DEFAULT_SOURCE` is simply what glibc enables by default and what
+`-std=c11` took away.
+
+### The real defect was duplication, and it is the reason this went unseen
+
+`cc_base_flags()` had carried the Windows half of this for a while (`-D_WIN32_WINNT=0x0600`,
+same shape, same reason). But **ten helpers in `proptests.rs` assembled their own cc command
+from `CC_FLAGS` directly**, and each was expected to re-add the baseline by hand. Six did.
+Four did not. Nobody noticed, because the half that went missing was the POSIX one and the
+corpus is only ever compiled on Windows locally.
+
+Both platforms' defines now live in one place, `cc_platform_defines()`, and all ten helpers
+route through it. `every_cc_invocation_carries_the_platform_defines` is the guard — a
+SOURCE-TEXT check, like `extern_signature_agreement`, because what went wrong was
+duplication rather than logic. It requires the baseline on the line IMMEDIATELY after
+`CC_FLAGS`, since "a few lines later" is where the four that lost it went wrong.
+
+That guard needed its needle SPLICED (`concat!("args(crate::CC_", "FLAGS)")`) so no line of
+the file contains it whole — a literal spelling makes the scan match its own source and
+report itself. It did that twice before the splice, which at least demonstrated it can fail.
+
+**Kept out of `CC_FLAGS`, for the usual reason.** A `-D` that changes which prototypes a
+header exposes moves no emitted byte, so it has no business churning the attest provenance.
+It rides alongside, exactly as `-g` and the Windows baseline do.
+
+**What this does NOT explain.** The same CI run failed 13 other tests. Several are plausibly
+the same root cause (`time_demo` needs `clock_gettime`; `log_demo` showed the implicit
+declaration by name), but `time_demo` reported gcc *failing* rather than warning, and the
+runner is gcc **13.3.0**, where an implicit declaration is still a warning — so at least one
+other cause is unaccounted for. The previous run's logs are purged, so there is no baseline
+to diff against and no evidence those 13 are new. Do not assume this fix closes them.
+
+---
+
 ## §4. Comparison suites, rerun at this milestone
 
 Run twice this arc — after §3 and again after §3c, since both changed compiler semantics.
@@ -1393,3 +1444,23 @@ place where the self-hosted compiler is trusting a pass it does not have.
 moved from typeck to escape. Its typeck test moved with it, and typeck kept a test asserting
 it does NOT raise this any more — which is what stops the rule drifting back into the pass
 that cannot mirror it.
+
+**`-std=c11` is STRICT ISO, and each libc hides everything else behind its own macro.** It
+cost two separate findings on two platforms: mingw checks `printf` against the pre-C99
+MSVCRT unless `__USE_MINGW_ANSI_STDIO` is set, and glibc declares no POSIX function unless
+`_DEFAULT_SOURCE` is. Neither is a missing include; both are declarations SWITCHED OFF by
+the standard flag. If a call is not ISO C, ask what the platform wants defined before
+assuming the header is wrong.
+
+**`_POSIX_C_SOURCE=200809L` is not the safe superset it looks like.** `usleep` was REMOVED
+in POSIX.1-2008, so naming that version hides it. `_DEFAULT_SOURCE` is what glibc turns on
+when nothing asks otherwise, and is the right way to undo `-std=c11`'s strictness.
+
+**A flag list that is assembled in more than one place will drift, and the drift is
+invisible from one platform.** Ten cc invocations each rebuilt the command from `CC_FLAGS`;
+six re-added the Windows baseline and four did not, and nobody could see it because the
+missing half only mattered on the OS nobody compiles on locally. The fix is one function
+and a source-text guard requiring it ADJACENT to `CC_FLAGS`.
+
+**A source-scanning test finds its own needle.** Twice. Splice the literal
+(`concat!("args(crate::CC_", "FLAGS)")`) so no line of the file contains it whole.
