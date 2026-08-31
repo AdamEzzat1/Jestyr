@@ -574,6 +574,93 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// **A `@copy` aggregate may not contain something that owns a resource.**
+    ///
+    /// `@copy` says "duplicating this value is free". A field that owns something makes
+    /// that false, and the two failure modes are different but both wrong: a `@move` field
+    /// (an OS handle) gets DUPLICATED, so two copies name one descriptor and closing
+    /// through either leaves the other dangling; a droppable field gets LEAKED, because
+    /// `@copy` also suppresses `needs_drop`, so the wrapper's teardown never runs at all.
+    ///
+    /// **This is the transitive form of a rule that already existed.** `attrs::
+    /// validate_struct` refuses `@move` and `@copy` on the *same* declaration. Saying the
+    /// same contradiction one level down — `@copy struct S { h: Handle }` where `Handle` is
+    /// `@move` — was accepted, and `owns_resource_at` could not catch it at the USE site
+    /// because `@copy` ends that walk exactly as it suppresses `needs_drop`. Keeping those
+    /// two in step matters more than closing the hole from inside the walk (their drifting
+    /// apart is what produced the use-after-drop that widened `owns_resource` in the first
+    /// place), so the contradiction is refused at the DECLARATION instead.
+    ///
+    /// **Nested `@copy` is not followed, and that is not a hole**: an inner `@copy` type is
+    /// checked by this same rule at its own declaration, so if it is legal it owns nothing,
+    /// and if it is not the error is reported there. That also makes termination free.
+    ///
+    /// Swept before landing: all 31 `@copy` declarations in the corpus, and the `.rs` test
+    /// fixtures — no aggregate is shaped this way, so the rule refuses nothing that ever
+    /// worked. (The `.rs` half of that sweep is not paranoia: the A5 refusal was clean over
+    /// all 285 corpus files and still broke three tests whose fixtures live in Rust string
+    /// literals.)
+    fn check_copy_containment(&mut self, item: &Item) {
+        // (field-or-payload span, what to call it in the message, its resolved type)
+        let (tyname, parts): (&str, Vec<(Span, String)>) = match item {
+            Item::Struct { name, body, .. } => {
+                let spans: Vec<(Span, String)> = body
+                    .members
+                    .iter()
+                    .filter_map(|m| match m {
+                        // The FIELD NAME's span, not the field type's. Both are defensible
+                        // and the message names the type either way — but the port's table
+                        // stores the name span (`tch` field 3-tuples) and not the type's,
+                        // so reporting at the type would make the two sides disagree on a
+                        // span the P4 golden compares. Picking the one both can produce is
+                        // cheaper than threading a second span through the port's tables.
+                        StructMember::Field { name, ty: _, .. } => {
+                            Some((name.span, format!("field `{}`", name.name)))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                (name.name.as_str(), spans)
+            }
+            _ => return,
+        };
+        let Some(&i) = self.info.table.type_index.get(tyname) else { return };
+        let Some(decl) = self.info.table.types.get(i) else { return };
+        if !decl.is_copy {
+            return;
+        }
+        // The table's field order is the declaration order the AST spans came from, so
+        // the two zip. Types come from the table because it holds them already LOWERED;
+        // the AST holds `TypeId`s and there is no `TypeId → Ty` map to read instead.
+        let TypeKindG::Struct { fields } = &decl.kind else { return };
+        // **`!is_copy`, not `owns_resource`** — and the difference is the whole rule.
+        // `owns_resource` catches only `@move` and droppable types, so it would miss a
+        // plain `String` field: heap-owned, freely duplicated by a `@copy` wrapper, and
+        // no `Drop` impl to notice. The ENUM half of this same contradiction has always
+        // used `!is_copy` (see `@copy enum … carries a non-Copy payload`), so this is the
+        // struct form of a predicate the language already commits to, not a new one.
+        let offences: Vec<(Span, String)> = fields
+            .iter()
+            .zip(parts.iter())
+            .filter(|((_, fty), _)| !fty.is_copy(&self.info.table))
+            .map(|((_, fty), (span, what))| {
+                (*span, format!("{what} of type `{}`", fty.display(&self.info.table)))
+            })
+            .collect();
+        let tyname = tyname.to_string();
+        for (span, what) in offences {
+            self.error_help(
+                span,
+                format!(
+                    "`@copy` struct `{tyname}` carries a non-Copy {what} — a copy would duplicate a value that may not be duplicated; only Copy fields may ride a `@copy` struct"
+                ),
+                "`@copy` means the value may be freely duplicated, which cannot be true of \
+                 a field that owns a handle or needs teardown — drop the `@copy`, or hold a \
+                 borrow or an index instead of the owning value",
+            );
+        }
+    }
+
     fn check_item(&mut self, item: &Item) {
         match item {
             Item::Fn(f) => {
@@ -581,6 +668,7 @@ impl<'a> Checker<'a> {
                 self.check_fn(f)
             }
             Item::Struct { body, .. } => {
+                self.check_copy_containment(item);
                 for m in &body.members {
                     if let StructMember::Method(f) = m {
                         self.check_fn(f);
@@ -3567,28 +3655,49 @@ mod tests {
         assert!(d.is_empty(), "a pointer field is not ownership: {:?}", d);
     }
 
+    /// **The residue is closed: the contradiction is refused at the DECLARATION.**
+    ///
+    /// This test used to assert the opposite — that `@copy` won over containment — and
+    /// said so as pinned residue, because `@copy` ends `owns_resource_at`'s walk exactly
+    /// as it suppresses `needs_drop`, and keeping those two in step mattered more than
+    /// closing the hole from inside the walk. That reasoning still holds; the walk is
+    /// unchanged. What changed is that the contradiction is now caught one level earlier,
+    /// where it actually lives: you may not DECLARE a `@copy` aggregate over a non-Copy
+    /// field. See `check_copy_containment`.
     #[test]
-    fn a_copy_wrapper_around_a_resource_is_pinned_residue() {
-        // PINNED RESIDUE, and cited from `owns_resource_at`. An aggregate the author
-        // declared `@copy` is left alone by the walk, exactly as `needs_drop` leaves
-        // it alone — so `@copy` remains an escape hatch out of the containment rule.
-        //
-        // This is NOT an endorsement. A `@copy` struct holding a `@move` field is a
-        // contradiction and the right answer is to reject the DECLARATION, which is
-        // its own increment and a new diagnostic (so a port mirror). Keeping the walk
-        // in step with `needs_drop` matters more than closing it from in here: the
-        // two drifting apart is what produced the use-after-drop above. No corpus
-        // type is shaped this way: all 31 `@copy` declarations were swept and none
-        // holds a field of any of the eight `@move` handle types. (The droppable
-        // half of the same contradiction is not swept here — `@copy` already
-        // suppressed `needs_drop` before this walk existed, so that behaviour is
-        // unchanged rather than newly permitted.)
+    fn a_copy_wrapper_around_a_resource_is_refused_at_the_declaration() {
         let d = escapes(
             "@move struct Handle { fd: i64 } @copy struct Sneaky { h: Handle } \
              fn eat(take s: Sneaky) {} \
              fn main() -> i64 { let s = Sneaky{ h: Handle{ fd: 3 } } eat(s) return 0 }",
         );
-        assert!(d.is_empty(), "@copy still wins over containment (residue): {:?}", d);
+        assert!(
+            d.iter().any(|x| x.message.contains("carries a non-Copy field `h`")),
+            "a @copy wrapper over a @move field must be refused: {:?}",
+            d
+        );
+    }
+
+    /// The **droppable** half of the same contradiction, which the residue comment
+    /// explicitly did not sweep — and which the narrower predicate would have missed.
+    ///
+    /// `owns_resource` catches only `@move` and droppable types, so a plain `String`
+    /// field slips through it: heap-owned, freely duplicated by a `@copy` wrapper, and no
+    /// `Drop` impl to notice. The rule therefore uses `!is_copy`, which is the predicate
+    /// the ENUM form of this contradiction has always used. Both spellings must be refused
+    /// or the two halves of one rule disagree.
+    #[test]
+    fn a_copy_struct_over_a_heap_owning_field_is_refused() {
+        let d = escapes("@copy struct S { s: String } fn main() -> i64 { return 0 }");
+        assert!(
+            d.iter().any(|x| x.message.contains("carries a non-Copy field `s`")),
+            "a @copy struct over a String must be refused: {:?}",
+            d
+        );
+        // The control: an all-Copy `@copy` struct is the whole point of the attribute
+        // and must stay legal, or the rule is a blanket ban rather than a contradiction.
+        let ok = escapes("@copy struct P { x: i32, y: i32 } fn main() -> i64 { return 0 }");
+        assert!(ok.is_empty(), "an all-Copy @copy struct must stay legal: {:?}", ok);
     }
 
     // --- route 4: giving a borrow to a `take` (owning) parameter ---

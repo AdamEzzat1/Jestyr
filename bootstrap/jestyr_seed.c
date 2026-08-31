@@ -1211,6 +1211,7 @@ void jestyr_walk_methods(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Che
 bool jestyr_fn_has_attr(Jestyr_Parser j_p, JestyrStr j_src, Jestyr_ItemData j_f, JestyrStr j_name);
 void jestyr_check_fn(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_ItemData j_f);
 void jestyr_check_intrinsic_shadowing(Jestyr_Esc* restrict j_e, JestyrStr j_src, Jestyr_ItemData j_it);
+void jestyr_check_copy_containment(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_ItemData j_it);
 void jestyr_check_items(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src);
 Jestyr_Esc jestyr_check_program(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_Allocator j_a);
 bool jestyr_ub_is_ptr(Jestyr_Checker j_c, int32_t j_t);
@@ -19365,6 +19366,48 @@ void jestyr_check_intrinsic_shadowing(Jestyr_Esc* restrict j_e, JestyrStr j_src,
     jestyr_rt_str_free(&j_sb);
 }
 
+void jestyr_check_copy_containment(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_ItemData j_it)
+{
+    if ((jestyr_attrs_has_copy(j_p, j_src, j_it.j_u, j_it.j_v) == false))
+    {
+        return;
+    }
+    int32_t j_row = jestyr_find_type(j_c, j_src, (size_t)(j_it.j_x), (size_t)(j_it.j_y));
+    if ((j_row < 0))
+    {
+        return;
+    }
+    if ((jestyr_td(j_c, j_row, 2) != 0))
+    {
+        return;
+    }
+    int32_t j_fs = jestyr_td(j_c, j_row, 3);
+    int32_t j_fc = jestyr_td(j_c, j_row, 4);
+    JestyrStr j_nm = jestyr_rt_substr(j_src, (size_t)(j_it.j_x), (size_t)(j_it.j_y));
+    int32_t j_i = 0;
+    while ((j_i < j_fc))
+    {
+        int32_t j_base = (j_fs + (j_i * 3));
+        int32_t j_fns = jestyr_get__list__i32(j_c.j_tch, (size_t)(j_base));
+        int32_t j_fne = jestyr_get__list__i32(j_c.j_tch, (size_t)((j_base + 1)));
+        int32_t j_fty = jestyr_get__list__i32(j_c.j_tch, (size_t)((j_base + 2)));
+        if ((jestyr_ty_is_copy(j_c, j_fty) == false))
+        {
+            JestyrString j_sb = jestyr_rt_str_new();
+            jestyr_rt_str_push(&j_sb, JSTR("`@copy` struct `"));
+            jestyr_rt_str_push(&j_sb, j_nm);
+            jestyr_rt_str_push(&j_sb, JSTR("` carries a non-Copy field `"));
+            jestyr_rt_str_push(&j_sb, jestyr_rt_substr(j_src, (size_t)(j_fns), (size_t)(j_fne)));
+            jestyr_rt_str_push(&j_sb, JSTR("` of type `"));
+            jestyr_ty_str(j_src, j_c, j_fty, &(j_sb));
+            jestyr_rt_str_push(&j_sb, JSTR("` — a copy would duplicate a value that may not be duplicated; only Copy fields may ride a `@copy` struct"));
+            jestyr_ediag(&((*j_e)), (size_t)(j_fns), (size_t)(j_fne), jestyr_rt_str_view(&j_sb));
+            jestyr_rt_str_free(&j_sb);
+        }
+        j_i = (j_i + 1);
+    }
+}
+
 void jestyr_check_items(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src)
 {
     size_t j_r = 0;
@@ -19380,6 +19423,7 @@ void jestyr_check_items(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Chec
         else
         if ((j_it.j_kind == 4))
         {
+            jestyr_check_copy_containment(&((*j_e)), j_p, j_c, j_src, j_it);
             jestyr_walk_methods(&((*j_e)), j_p, j_c, j_src, j_it.j_a, j_it.j_b);
         }
         else

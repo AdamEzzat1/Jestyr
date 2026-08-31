@@ -7,6 +7,30 @@ versions are snapshots, not stability promises.
 
 ### Changed
 
+- **A `@copy` struct may no longer carry a non-Copy field.** `@copy` says duplicating the
+  value is free, and a non-Copy field makes that false in one of two ways: a `@move` field
+  (an OS handle) is DUPLICATED, so two copies name one descriptor and closing through either
+  leaves the other dangling; a heap-owning field is LEAKED, because `@copy` also suppresses
+  the drop, so teardown never runs at all. Refused at the declaration, on both toolchains.
+
+  **This is the transitive form of a rule that already existed.** `attrs::validate_struct`
+  refuses `@move` and `@copy` on the *same* declaration; saying the same contradiction one
+  level down was accepted. It could not be caught at the use site, because `@copy` ends
+  `owns_resource`'s walk exactly as it suppresses `needs_drop` — and keeping those two in
+  step is what stops the drift that produced an earlier use-after-drop, so the walk is
+  unchanged and the contradiction is caught at the declaration instead.
+
+  The predicate is **`!is_copy`**, not `owns_resource`. The narrower one catches only `@move`
+  and droppable types and would miss a plain `String` field. `is_copy` is what the ENUM form
+  of this same contradiction has always used, so this is the struct form of a predicate the
+  language already commits to. All 31 `@copy` declarations in the corpus were swept, plus the
+  Rust test fixtures; nothing that worked is refused.
+
+  **Known, recorded, NOT fixed here:** the enum form is checked only in the reference, so
+  `jc` still builds `@copy enum Bad { none, own(s: String) }` that `jestyrc` refuses — the
+  port's `ty_is_copy` trusts the flag (`// enum: @copy (validated by the reference)`), which
+  is false when `jc` is the only compiler. See §6A3b of the tier-5 handoff note.
+
 - **Naming a function after a compiler intrinsic is now a compile error.** It was a
   warning. The hazard: cgen dispatches intrinsics by NAME before it looks at user
   functions, so an unqualified call to a shadowing function emitted the intrinsic **with

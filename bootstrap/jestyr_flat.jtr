@@ -7142,12 +7142,12 @@ fn append_tch(mut c: Checker, read tmp: List(i32)) -> i32 {
 // ---- the global table (mirrors `build_table` / `GlobalTable`) ----
 
 // A tdecl row's slot (rows are 10-tuples).
-fn td(read c: Checker, row: i32, slot: i32) -> i32 {
+pub fn td(read c: Checker, row: i32, slot: i32) -> i32 {
     return get__list(i32, c.tdecl, (row * 10 + slot) as usize)
 }
 
 // The tdecl row whose declared name is `src[ns..ne]`, or -1 (the reference's `type_index`).
-fn find_type(read c: Checker, read src: str, ns: usize, ne: usize) -> i32 {
+pub fn find_type(read c: Checker, read src: str, ns: usize, ne: usize) -> i32 {
     let n: i32 = (len(i32, c.tdecl) / 10) as i32
     var i: i32 = 0
     for i < n {
@@ -8701,7 +8701,7 @@ fn push_uint__typeck(mut sb: String, v: i64) {
 }
 
 // Append the canonical display of TyId `id` to `sb` - field-for-field `Ty::display`.
-fn ty_str(read src: str, read c: Checker, id: i32, mut sb: String) {
+pub fn ty_str(read src: str, read c: Checker, id: i32, mut sb: String) {
     let d: TyData = get__list(TyData, c.tys, id as usize)
     let k: i32 = d.kind
     if k == 0 { string_push(sb, "?") }
@@ -11998,6 +11998,46 @@ fn check_intrinsic_shadowing(mut e: Esc, read src: str, read it: ItemData) {
     string_free(sb)
 }
 
+// **A `@copy` aggregate may not contain something non-Copy.** `@copy` says "duplicating
+// this value is free", and a non-Copy field makes that false in one of two ways: a `@move`
+// field (an OS handle) gets DUPLICATED so two copies name one descriptor, or a heap-owning
+// field gets LEAKED, because `@copy` also suppresses the drop. The transitive form of a
+// rule that already existed one level up -- `@move` and `@copy` on the SAME declaration is
+// refused -- and it is checked with `ty_is_copy`, the same predicate the enum form of this
+// contradiction uses. Mirrors `escape::Checker::check_copy_containment`.
+//
+// Reported at the FIELD NAME's span because that is what `tch`'s field 3-tuples store; the
+// reference reports there too, for exactly this reason.
+fn check_copy_containment(mut e: Esc, read p: Parser, read c: Checker, read src: str, read it: ItemData) {
+    if attrs_has_copy(p, src, it.u, it.v) == false { return }
+    let row: i32 = find_type(c, src, it.x as usize, it.y as usize)
+    if row < 0 { return }
+    if td(c, row, 2) != 0 { return }               // structs only (kind 0)
+    let fs: i32 = td(c, row, 3)                    // a_start: fields
+    let fc: i32 = td(c, row, 4)                    // a_count
+    let nm: str = src[it.x as usize .. it.y as usize]
+    var i: i32 = 0
+    for i < fc {
+        let base: i32 = fs + i * 3                        // (fname_start, fname_end, TyId)
+        let fns: i32 = get__list(i32, c.tch, base as usize)
+        let fne: i32 = get__list(i32, c.tch, (base + 1) as usize)
+        let fty: i32 = get__list(i32, c.tch, (base + 2) as usize)
+        if ty_is_copy(c, fty) == false {
+            var sb: String = string_new()
+            string_push(sb, "`@copy` struct `")
+            string_push(sb, nm)
+            string_push(sb, "` carries a non-Copy field `")
+            string_push(sb, src[fns as usize .. fne as usize])
+            string_push(sb, "` of type `")
+            ty_str(src, c, fty, sb)
+            string_push(sb, "` — a copy would duplicate a value that may not be duplicated; only Copy fields may ride a `@copy` struct")
+            ediag(e, fns as usize, fne as usize, string_view(sb))
+            string_free(sb)
+        }
+        i = i + 1
+    }
+}
+
 fn check_items(mut e: Esc, read p: Parser, read c: Checker, read src: str) {
     var r: usize = 0
     for r < len(i32, p.roots) {
@@ -12006,7 +12046,7 @@ fn check_items(mut e: Esc, read p: Parser, read c: Checker, read src: str) {
         // The shadowing check runs BEFORE the body walk, matching the reference's push
         // order in `check_item` -- the P4 golden compares diagnostics in walk order.
         if it.kind == 3 { check_intrinsic_shadowing(e, src, it)  check_fn(e, p, c, src, it) }  // Fn
-        else if it.kind == 4 { walk_methods(e, p, c, src, it.a, it.b) }   // Struct methods
+        else if it.kind == 4 { check_copy_containment(e, p, c, src, it)  walk_methods(e, p, c, src, it.a, it.b) }   // Struct
         else if it.kind == 7 {                                           // Impl method bodies
             // The reference's `Item::Impl` arm in `escape::check_item`. Both sides used
             // to skip these on a comment claiming Stage B checked them; it does not, so

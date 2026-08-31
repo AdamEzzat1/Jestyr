@@ -14754,6 +14754,50 @@ fn g(p: *mut i32) -> i32 {
         );
     }
 
+    /// **A `@copy` struct over a non-Copy field is refused identically by both toolchains.**
+    ///
+    /// Two spellings of one contradiction, and the second is the reason the predicate is
+    /// `is_copy` rather than `owns_resource`: a `@move` field is a duplicated OS handle,
+    /// while a plain `String` field is heap storage that `@copy` both duplicates AND stops
+    /// dropping. `owns_resource` sees the first and not the second.
+    #[test]
+    fn jestyr_copy_containment_matches_reference() {
+        let exe = build_exe("examples/std/escape_cli.jtr");
+        for (label, src) in [
+            ("@move field", "@move struct Handle { fd: i64 } @copy struct Sneaky { h: Handle } fn main() -> i64 { return 0 }"),
+            ("heap field", "@copy struct S1 { s: String } fn main() -> i64 { return 0 }"),
+        ] {
+            let want = rust_escape_dump(src);
+            assert!(
+                want.iter().any(|l| l.contains("carries a non-Copy field")),
+                "the {label} probe no longer fires — it has stopped testing the rule: {want:?}"
+            );
+            let f = std::env::temp_dir().join("jestyr_copy_containment.jtr");
+            std::fs::write(&f, src).unwrap();
+            assert_eq!(
+                jestyr_escape_dump(&exe, f.to_str().unwrap()),
+                want,
+                "the toolchains disagree on a @copy struct with a {label}"
+            );
+        }
+
+        // **The control**, and it is the whole difference between a rule and a blanket:
+        // an all-Copy `@copy` struct is what the attribute is FOR and must stay legal.
+        let ok_src = "@copy struct P { x: i32, y: i32 } fn main() -> i64 { return 0 }";
+        let ok = rust_escape_dump(ok_src);
+        assert!(
+            !ok.iter().any(|l| l.contains("carries a non-Copy field")),
+            "an all-Copy @copy struct must stay legal — the rule is over-reaching: {ok:?}"
+        );
+        let g = std::env::temp_dir().join("jestyr_copy_containment_ok.jtr");
+        std::fs::write(&g, ok_src).unwrap();
+        assert_eq!(
+            jestyr_escape_dump(&exe, g.to_str().unwrap()),
+            ok,
+            "the toolchains disagree about an all-Copy @copy struct"
+        );
+    }
+
     /// **The two toolchains refuse the SAME intrinsic name set.**
     ///
     /// The rule is only worth having if both compilers apply it: one that refuses what the

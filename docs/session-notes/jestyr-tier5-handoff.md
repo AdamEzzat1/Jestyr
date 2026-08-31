@@ -780,6 +780,48 @@ was watched reporting `STALE`.
 
 ---
 
+## §3m. `@copy` containment, and the predicate the recorded scope got wrong
+
+A3 was recorded as "`@copy` over a `@move` field is a contradiction nobody diagnoses".
+Both halves of that sentence needed correcting.
+
+**The predicate is `!is_copy`, not `owns_resource`.** The obvious implementation reuses
+`owns_resource_at` — it is right there, it is what the residue comment cited, and it makes
+the `@move` probe pass. It also silently misses `@copy struct S { s: String }`: `String` has
+no `Drop` impl and is not `@move`, so `owns_resource` returns false, while `@copy` happily
+duplicates the heap pointer *and* suppresses the teardown. Caught by writing the droppable
+probe before believing the `@move` one, and the fix is not a widening — `is_copy` is the
+predicate the **enum** form of this exact contradiction has used all along
+(`` `@copy` enum … carries a non-Copy payload ``). The struct form was simply missing.
+
+**The contradiction already existed one level up.** `attrs::validate_struct` refuses `@move`
+and `@copy` on the *same* declaration. A3 is the transitive case, so this is a rule the
+language had already committed to and enforced only at depth 0.
+
+**The walk was left alone deliberately.** `owns_resource_at` still stops at `@copy`, exactly
+as `needs_drop` does. Their drifting apart is what produced the use-after-drop that widened
+`owns_resource` in the first place, so the containment hole is closed at the DECLARATION
+rather than by teaching one of the two to disagree with the other.
+
+**Nested `@copy` is not followed, and that is not a hole**: an inner `@copy` type is checked
+by this same rule at its own declaration — if it is legal it owns nothing, and if it is not,
+the error is reported there. Termination is free as a side effect.
+
+**The span is the field NAME's, on both sides.** The reference could report at the field
+TYPE's span and initially did; the port's `tch` field 3-tuples store only the name span, and
+the P4 golden compares spans. Choosing the one both sides can produce was cheaper than
+threading a second span through the port's tables, and the message names the type anyway.
+
+**Three helpers became `pub` in `typeck.jtr`** (`td`, `find_type`, `ty_str`) so `escape.jtr`
+could ask the questions the reference asks of its type table.
+
+**And the enum half turned out to be an open divergence — see §6A3b.** `jc` builds
+`@copy enum Bad { none, own(s: String) }` that `jestyrc` refuses. Left for its own increment
+rather than bundled here: it is a MOVE of an existing diagnostic out of `typeck`, and the A5
+move surfaced six broken fixtures nobody predicted.
+
+---
+
 ## §4. Comparison suites, rerun at this milestone
 
 Run twice this arc — after §3 and again after §3c, since both changed compiler semantics.
@@ -857,12 +899,48 @@ both compilers agree byte-for-byte. **NOT verified here: that a POSIX child actu
 inherits it**, because `@cfg(posix)` only runs on the Linux runner. Flagged against this
 tree's own rule about shipping POSIX changes nobody in reach can watch.
 
-#### A3. `@copy` over a `@move` field is a contradiction nobody diagnoses
+#### A3. `@copy` over a non-Copy field — **CLOSED, both sides (§3m)**
 
-An aggregate declared `@copy` holding a `@move` field escapes the containment rule (§3),
-because `@copy` ends the walk exactly as it suppresses `needs_drop`. Should be refused at
-the DECLARATION. Pinned by `a_copy_wrapper_around_a_resource_is_pinned_residue`. New
-diagnostic → port mirror. Swept: no corpus type is shaped this way.
+A `@copy` struct holding a non-Copy field is refused at the DECLARATION, on both toolchains,
+pinned by `jestyr_copy_containment_matches_reference`. The walk in `owns_resource_at` is
+unchanged — keeping it in step with `needs_drop` is what stops the two drifting apart, which
+is what produced the original use-after-drop — so the contradiction is caught one level
+earlier instead, where it actually lives.
+
+**The recorded scope was too narrow, in the predicate.** The note said "`@copy` over a
+`@move` field". The rule uses **`!is_copy`**, not `owns_resource`, because `owns_resource`
+catches only `@move` and droppable types and would miss a plain `String` field — heap
+storage that `@copy` both duplicates *and* stops dropping. `is_copy` is also the predicate
+the ENUM form of this contradiction has always used, so this is the struct form of something
+the language already committed to rather than a new rule.
+
+Reported at the field NAME's span on both sides: the port's `tch` field 3-tuples store the
+name span and not the type's, and the P4 golden compares spans.
+
+Swept clean before landing: 31 `@copy` declarations across 285 corpus files, plus the `.rs`
+test fixtures.
+
+#### A3b. `@copy` ENUM with a non-Copy payload — the reference refuses it, `jc` BUILDS IT
+
+**Found while closing A3, pre-existing, and not fixed here.** The enum form of the same
+contradiction is checked in `typeck.rs` (`` `@copy` enum … carries a non-Copy payload ``) and
+the port has no mirror — so this is the same class as A1 and the A5 port gap. Verified:
+
+```
+@copy enum Bad { none, own(s: String) }
+fn main() -> i32 { return 0 }
+```
+
+`jestyrc` refuses it. `jc … build` **exits 0 and produces a working binary.** The port's own
+`ty_is_copy` says why, in a comment: `// enum: @copy (validated by the reference)` — it
+TRUSTS the flag, which is correct when the reference is in the pipeline and false when `jc`
+is the only compiler.
+
+The fix is the one A5 established: the rule belongs in `escape` on both sides, not in
+`typeck` (which has no diagnostic channel and therefore cannot mirror anything). `escape.rs`
+already reaches enum variants and `escape.jtr` already has `tdecl`'s variant rows, so it is
+the same shape as A3 — **it was left out only to keep a new rule and a moved rule in separate
+increments**, since the A5 move surfaced six broken fixtures nobody predicted.
 
 #### A4. Windows: `capture` + print does not round-trip a child's bytes
 
@@ -1226,3 +1304,20 @@ runs it" that `lexer.str_eq` relied on), but the cost is measurable and worth st
 than hiding: this rule will make people rename things they did not expect to rename, and the
 short intrinsic names -- `ok`, `err`, `arg`, `find`, `trim`, `split`, `bytes`, `contains` --
 are where it will happen.
+
+**Reuse the predicate the OTHER half of the rule already uses.** A3's obvious implementation
+reuses `owns_resource_at` — it is adjacent, the residue comment cites it, and it makes the
+`@move` probe pass. It misses `@copy struct S { s: String }` entirely. The correct predicate
+was not something to invent: the ENUM form of the identical contradiction had used
+`!is_copy` all along. When a rule has two halves and only one is implemented, read the
+implemented half before choosing how to write the other.
+
+**A probe that passes on the case you thought of proves the least.** The `@move` probe went
+green immediately and would have shipped a rule with a hole in it. The droppable probe was
+written because the residue comment said that half had never been SWEPT — the note flagged
+its own gap, and reading that sentence was worth more than the code around it.
+
+**Check whether the rule you are adding already exists at depth 0.** `@move` + `@copy` on one
+declaration was already refused in `attrs.rs`. Knowing that reframed A3 from "a new rule" to
+"an existing rule that stops at depth 0", which is a much easier thing to justify, scope, and
+word the diagnostic for.
