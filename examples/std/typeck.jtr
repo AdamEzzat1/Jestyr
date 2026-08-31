@@ -509,8 +509,10 @@ fn build_table(mut c: Checker, read p: parser.Parser, read src: str) {
             }
         } else if it.kind == 5 {                   // enum: row + tparam spans + variant names
             let row: i32 = push_tdecl(c, it.x, it.y, 1)
-            // `@copy` opts a PLAIN enum into Copy (slot 9 = 1, like the struct form;
-            // the reference validates payload copy-ness — its refusal runs first).
+            // `@copy` opts a PLAIN enum into Copy (slot 9 = 1, like the struct form).
+            // Payload copy-ness is validated by `escape.check_copy_containment` on BOTH
+            // toolchains now; this used to say "the reference validates it", which was
+            // true and was exactly the bug -- nothing validated it when jc ran alone.
             // A generic enum never: its instances are GenEnum, which stays non-Copy.
             if it.u >= 0 and it.a == 0 {
                 var eai: i32 = 0
@@ -3187,7 +3189,7 @@ pub fn ty_is_copy(read c: Checker, tyid: i32) -> bool {
     if k == 15 {                                   // Named: struct AND plain-enum @copy opt-ins;
         let kind: i32 = td(c, d.x, 2)              // a distinct inherits its base's copyness
         if kind == 0 { return td(c, d.x, 9) == 1 }
-        if kind == 1 { return td(c, d.x, 9) == 1 } // enum: @copy (validated by the reference)
+        if kind == 1 { return td(c, d.x, 9) == 1 } // enum: @copy (payloads validated in escape)
         if kind == 2 {
             let base: i32 = td(c, d.x, 9)
             if base >= 0 { return ty_is_copy(c, base) }

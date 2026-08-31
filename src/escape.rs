@@ -601,26 +601,33 @@ impl<'a> Checker<'a> {
     /// all 285 corpus files and still broke three tests whose fixtures live in Rust string
     /// literals.)
     fn check_copy_containment(&mut self, item: &Item) {
-        // (field-or-payload span, what to call it in the message, its resolved type)
-        let (tyname, parts): (&str, Vec<(Span, String)>) = match item {
+        // (offending span, how the message names it) per field/payload, in declaration
+        // order — the order the type table stores the lowered types in, so the two zip.
+        //
+        // The span is the FIELD/PAYLOAD TYPE's, which is where the contradiction actually
+        // is, and it is what the enum half already reported from typeck before it moved
+        // here. The port produces the same span from the PARSER's type arena (`p.ty`
+        // nodes carry start/end) while taking copy-ness from typeck's tables — the two are
+        // indexed by the same position, so it zips them exactly as this does.
+        // Plain loops rather than iterator chains: the closures would capture `&mut self`
+        // while `self.ast` is being read, and the diagnostics below need it mutably.
+        let mut parts: Vec<(Span, String)> = Vec::new();
+        let tyname: &str = match item {
             Item::Struct { name, body, .. } => {
-                let spans: Vec<(Span, String)> = body
-                    .members
-                    .iter()
-                    .filter_map(|m| match m {
-                        // The FIELD NAME's span, not the field type's. Both are defensible
-                        // and the message names the type either way — but the port's table
-                        // stores the name span (`tch` field 3-tuples) and not the type's,
-                        // so reporting at the type would make the two sides disagree on a
-                        // span the P4 golden compares. Picking the one both can produce is
-                        // cheaper than threading a second span through the port's tables.
-                        StructMember::Field { name, ty: _, .. } => {
-                            Some((name.span, format!("field `{}`", name.name)))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                (name.name.as_str(), spans)
+                for m in &body.members {
+                    if let StructMember::Field { name, ty, .. } = m {
+                        parts.push((self.ast.type_at(*ty).span, name.name.clone()));
+                    }
+                }
+                name.name.as_str()
+            }
+            Item::Enum(d) => {
+                for v in &d.variants {
+                    for (_, t) in &v.fields {
+                        parts.push((self.ast.type_at(*t).span, v.name.name.clone()));
+                    }
+                }
+                d.name.name.as_str()
             }
             _ => return,
         };
@@ -632,30 +639,51 @@ impl<'a> Checker<'a> {
         // The table's field order is the declaration order the AST spans came from, so
         // the two zip. Types come from the table because it holds them already LOWERED;
         // the AST holds `TypeId`s and there is no `TypeId → Ty` map to read instead.
-        let TypeKindG::Struct { fields } = &decl.kind else { return };
         // **`!is_copy`, not `owns_resource`** — and the difference is the whole rule.
         // `owns_resource` catches only `@move` and droppable types, so it would miss a
         // plain `String` field: heap-owned, freely duplicated by a `@copy` wrapper, and
-        // no `Drop` impl to notice. The ENUM half of this same contradiction has always
-        // used `!is_copy` (see `@copy enum … carries a non-Copy payload`), so this is the
-        // struct form of a predicate the language already commits to, not a new one.
-        let offences: Vec<(Span, String)> = fields
+        // no `Drop` impl to notice. `is_copy` is what the ENUM half of this same
+        // contradiction has always used, so this is one predicate for one rule, not two.
+        //
+        // Struct and enum keep their own wording because they fail differently: a copied
+        // field DUPLICATES a value, a copied payload DOUBLE-DROPS one. The enum sentence
+        // is carried over verbatim from typeck, so moving that check here changed where it
+        // is raised and nothing a user sees.
+        let (lowered, is_enum): (Vec<&Ty>, bool) = match &decl.kind {
+            TypeKindG::Struct { fields } => (fields.iter().map(|(_, f)| f).collect(), false),
+            TypeKindG::Enum { variants } => {
+                (variants.iter().flat_map(|(_, p)| p.iter()).collect(), true)
+            }
+            _ => return,
+        };
+        // Each half keeps its own sentence, because they fail differently: a copied field
+        // DUPLICATES a value the program may only hold once, a copied payload DOUBLE-DROPS
+        // one. The enum wording is carried over verbatim from typeck, so moving that check
+        // here changed where it is raised and nothing a user reads.
+        let offences: Vec<(Span, String)> = lowered
             .iter()
             .zip(parts.iter())
-            .filter(|((_, fty), _)| !fty.is_copy(&self.info.table))
-            .map(|((_, fty), (span, what))| {
-                (*span, format!("{what} of type `{}`", fty.display(&self.info.table)))
+            .filter(|(fty, _)| !fty.is_copy(&self.info.table))
+            .map(|(fty, (span, nm))| {
+                let shown = fty.display(&self.info.table);
+                let msg = if is_enum {
+                    format!(
+                        "`@copy` enum `{tyname}` carries a non-Copy payload `{shown}` in variant `{nm}` — a copy would double-drop it; only Copy payloads may ride a `@copy` enum"
+                    )
+                } else {
+                    format!(
+                        "`@copy` struct `{tyname}` carries a non-Copy field `{nm}` of type `{shown}` — a copy would duplicate a value that may not be duplicated; only Copy fields may ride a `@copy` struct"
+                    )
+                };
+                (*span, msg)
             })
             .collect();
-        let tyname = tyname.to_string();
-        for (span, what) in offences {
+        for (span, msg) in offences {
             self.error_help(
                 span,
-                format!(
-                    "`@copy` struct `{tyname}` carries a non-Copy {what} — a copy would duplicate a value that may not be duplicated; only Copy fields may ride a `@copy` struct"
-                ),
+                msg,
                 "`@copy` means the value may be freely duplicated, which cannot be true of \
-                 a field that owns a handle or needs teardown — drop the `@copy`, or hold a \
+                 a part that owns a handle or needs teardown — drop the `@copy`, or hold a \
                  borrow or an index instead of the owning value",
             );
         }
@@ -675,6 +703,7 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            Item::Enum(_) => self.check_copy_containment(item),
             // An `impl`'s method bodies. The comment here used to say they were
             // "escape-checked once their resolution lands (Stage B)"; Stage B is
             // `typeck::register_impls`, which reads signatures only, so in fact
@@ -3676,6 +3705,28 @@ mod tests {
             "a @copy wrapper over a @move field must be refused: {:?}",
             d
         );
+    }
+
+    /// **The enum half**, moved here from `typeck` — where it was correct and
+    /// UNMIRRORABLE. `typeck.jtr` has no diagnostic channel, so the self-hosted compiler
+    /// trusted the `@copy` flag (its `ty_is_copy` said so in a comment: *"enum: @copy
+    /// (validated by the reference)"*) and BUILT this program — exit 0, working binary —
+    /// while the reference refused it. The message and the payload-type span are carried
+    /// over verbatim, so the move changed which pass raises it and nothing else.
+    #[test]
+    fn a_copy_enum_over_a_non_copy_payload_is_refused() {
+        let d = escapes("@copy enum Bad { none, own(s: String) } fn main() -> i64 { return 0 }");
+        assert!(
+            d.iter().any(|x| x.message.contains("non-Copy payload `String`")),
+            "a droppable payload under @copy must be refused: {:?}",
+            d
+        );
+        // All-Copy payloads pass — genref and usize. This is the `dlist_genref.jtr` shape
+        // the `@copy` enum opt-in exists for, so refusing it would break the feature.
+        let ok = escapes(
+            "@copy enum Link { nil, at(n: &i64), idx(i: usize) } fn main() -> i64 { return 0 }",
+        );
+        assert!(ok.is_empty(), "all-Copy payloads (genref, usize) must pass: {:?}", ok);
     }
 
     /// The **droppable** half of the same contradiction, which the residue comment

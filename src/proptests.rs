@@ -14763,13 +14763,18 @@ fn g(p: *mut i32) -> i32 {
     #[test]
     fn jestyr_copy_containment_matches_reference() {
         let exe = build_exe("examples/std/escape_cli.jtr");
-        for (label, src) in [
-            ("@move field", "@move struct Handle { fd: i64 } @copy struct Sneaky { h: Handle } fn main() -> i64 { return 0 }"),
-            ("heap field", "@copy struct S1 { s: String } fn main() -> i64 { return 0 }"),
+        for (label, src, needle) in [
+            ("@move field", "@move struct Handle { fd: i64 } @copy struct Sneaky { h: Handle } fn main() -> i64 { return 0 }", "carries a non-Copy field"),
+            ("heap field", "@copy struct S1 { s: String } fn main() -> i64 { return 0 }", "carries a non-Copy field"),
+            // The ENUM half. It was checked in `typeck` and therefore unmirrorable, so
+            // `jc` BUILT this program — exit 0, working binary — while `jestyrc` refused
+            // it as a double-drop. Moving the rule to `escape` on both sides is what put
+            // it under this differential at all.
+            ("enum payload", "@copy enum Bad { none, own(s: String) } fn main() -> i64 { return 0 }", "carries a non-Copy payload"),
         ] {
             let want = rust_escape_dump(src);
             assert!(
-                want.iter().any(|l| l.contains("carries a non-Copy field")),
+                want.iter().any(|l| l.contains(needle)),
                 "the {label} probe no longer fires — it has stopped testing the rule: {want:?}"
             );
             let f = std::env::temp_dir().join("jestyr_copy_containment.jtr");
@@ -14777,25 +14782,31 @@ fn g(p: *mut i32) -> i32 {
             assert_eq!(
                 jestyr_escape_dump(&exe, f.to_str().unwrap()),
                 want,
-                "the toolchains disagree on a @copy struct with a {label}"
+                "the toolchains disagree on the `{label}` case of @copy containment"
             );
         }
 
-        // **The control**, and it is the whole difference between a rule and a blanket:
-        // an all-Copy `@copy` struct is what the attribute is FOR and must stay legal.
-        let ok_src = "@copy struct P { x: i32, y: i32 } fn main() -> i64 { return 0 }";
-        let ok = rust_escape_dump(ok_src);
-        assert!(
-            !ok.iter().any(|l| l.contains("carries a non-Copy field")),
-            "an all-Copy @copy struct must stay legal — the rule is over-reaching: {ok:?}"
-        );
-        let g = std::env::temp_dir().join("jestyr_copy_containment_ok.jtr");
-        std::fs::write(&g, ok_src).unwrap();
-        assert_eq!(
-            jestyr_escape_dump(&exe, g.to_str().unwrap()),
-            ok,
-            "the toolchains disagree about an all-Copy @copy struct"
-        );
+        // **The controls**, and they are the whole difference between a rule and a
+        // blanket: an all-Copy `@copy` aggregate is what the attribute is FOR.
+        for (label, ok_src) in [
+            ("struct", "@copy struct P { x: i32, y: i32 } fn main() -> i64 { return 0 }"),
+            // genref and usize payloads are Copy; this is the `dlist_genref.jtr` shape the
+            // `@copy` enum opt-in exists for in the first place.
+            ("enum", "@copy enum Link { nil, at(n: &i64), idx(i: usize) } fn main() -> i64 { return 0 }"),
+        ] {
+            let ok = rust_escape_dump(ok_src);
+            assert!(
+                !ok.iter().any(|l| l.contains("carries a non-Copy")),
+                "an all-Copy @copy {label} must stay legal — the rule is over-reaching: {ok:?}"
+            );
+            let g = std::env::temp_dir().join("jestyr_copy_containment_ok.jtr");
+            std::fs::write(&g, ok_src).unwrap();
+            assert_eq!(
+                jestyr_escape_dump(&exe, g.to_str().unwrap()),
+                ok,
+                "the toolchains disagree about an all-Copy @copy {label}"
+            );
+        }
     }
 
     /// **The two toolchains refuse the SAME intrinsic name set.**

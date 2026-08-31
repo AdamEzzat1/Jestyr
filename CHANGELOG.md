@@ -26,10 +26,15 @@ versions are snapshots, not stability promises.
   language already commits to. All 31 `@copy` declarations in the corpus were swept, plus the
   Rust test fixtures; nothing that worked is refused.
 
-  **Known, recorded, NOT fixed here:** the enum form is checked only in the reference, so
-  `jc` still builds `@copy enum Bad { none, own(s: String) }` that `jestyrc` refuses — the
-  port's `ty_is_copy` trusts the flag (`// enum: @copy (validated by the reference)`), which
-  is false when `jc` is the only compiler. See §6A3b of the tier-5 handoff note.
+  **The enum form of the same contradiction moved here too, and it was an open divergence.**
+  It was checked in `typeck.rs`, which `examples/std/typeck.jtr` cannot mirror — that module
+  has no diagnostic channel — so the self-hosted compiler trusted the `@copy` flag and BUILT
+  `@copy enum Bad { none, own(s: String) }` (exit 0, working binary) that `jestyrc` refuses
+  as a double-drop. The port's own source had been saying so all along: `// enum: @copy
+  (validated by the reference)`, true with the reference in the pipeline and false when `jc`
+  runs alone. Both toolchains now refuse it, with the message and the payload-type span
+  carried over verbatim — so a user sees no change, only a compiler that no longer disagrees
+  with itself.
 
 - **Naming a function after a compiler intrinsic is now a compile error.** It was a
   warning. The hazard: cgen dispatches intrinsics by NAME before it looks at user

@@ -1935,29 +1935,82 @@ fn check_copy_containment(mut e: Esc, read p: parser.Parser, read c: typeck.Chec
     if attrs_has_copy(p, src, it.u, it.v) == false { return }
     let row: i32 = typeck.find_type(c, src, it.x as usize, it.y as usize)
     if row < 0 { return }
-    if typeck.td(c, row, 2) != 0 { return }               // structs only (kind 0)
-    let fs: i32 = typeck.td(c, row, 3)                    // a_start: fields
-    let fc: i32 = typeck.td(c, row, 4)                    // a_count
+    let kind: i32 = typeck.td(c, row, 2)
     let nm: str = src[it.x as usize .. it.y as usize]
-    var i: i32 = 0
-    for i < fc {
-        let base: i32 = fs + i * 3                        // (fname_start, fname_end, TyId)
-        let fns: i32 = list.get(i32, c.tch, base as usize)
-        let fne: i32 = list.get(i32, c.tch, (base + 1) as usize)
-        let fty: i32 = list.get(i32, c.tch, (base + 2) as usize)
-        if typeck.ty_is_copy(c, fty) == false {
-            var sb: String = string_new()
-            string_push(sb, "`@copy` struct `")
-            string_push(sb, nm)
-            string_push(sb, "` carries a non-Copy field `")
-            string_push(sb, src[fns as usize .. fne as usize])
-            string_push(sb, "` of type `")
-            typeck.ty_str(src, c, fty, sb)
-            string_push(sb, "` — a copy would duplicate a value that may not be duplicated; only Copy fields may ride a `@copy` struct")
-            ediag(e, fns as usize, fne as usize, string_view(sb))
-            string_free(sb)
+    let astart: i32 = typeck.td(c, row, 3)
+    let acount: i32 = typeck.td(c, row, 4)
+
+    // The span is the FIELD/PAYLOAD TYPE's, read from the PARSER's type arena (`p.ty`
+    // nodes carry start/end) while copy-ness comes from typeck's tables. The two are
+    // indexed by the same declaration position, so they zip -- typeck's `tch` records a
+    // field's NAME span but not its type's, and the reference reports at the type.
+    if kind == 0 {                                        // struct: fields, 3-tuples in `tch`
+        var j: i32 = 0                                    // field index; methods are skipped
+        var i: i32 = 0
+        for i < it.b {                                    // (it.a, it.b) = mem_start/count
+            let mbase: i32 = it.a + i * 10
+            if list.get(i32, p.mar, mbase as usize) == 0 {          // tag 0 = field
+                let base: i32 = astart + j * 3
+                let fns: i32 = list.get(i32, c.tch, base as usize)
+                let fne: i32 = list.get(i32, c.tch, (base + 1) as usize)
+                let fty: i32 = list.get(i32, c.tch, (base + 2) as usize)
+                if typeck.ty_is_copy(c, fty) == false {
+                    let ptid: i32 = list.get(i32, p.mar, (mbase + 4) as usize)
+                    let tn: parser.TypeData = list.get(parser.TypeData, p.ty, ptid as usize)
+                    var sb: String = string_new()
+                    string_push(sb, "`@copy` struct `")
+                    string_push(sb, nm)
+                    string_push(sb, "` carries a non-Copy field `")
+                    string_push(sb, src[fns as usize .. fne as usize])
+                    string_push(sb, "` of type `")
+                    typeck.ty_str(src, c, fty, sb)
+                    string_push(sb, "` — a copy would duplicate a value that may not be duplicated; only Copy fields may ride a `@copy` struct")
+                    ediag(e, tn.start, tn.end, string_view(sb))
+                    string_free(sb)
+                }
+                j = j + 1
+            }
+            i = i + 1
         }
-        i = i + 1
+    }
+
+    if kind == 1 {                                        // enum: variants, 4-tuples in `tch`
+        var v: i32 = 0
+        for v < acount {
+            let vb: i32 = astart + v * 4
+            let vns: i32 = list.get(i32, c.tch, vb as usize)
+            let vne: i32 = list.get(i32, c.tch, (vb + 1) as usize)
+            let pstart: i32 = list.get(i32, c.tch, (vb + 2) as usize)
+            let pcount: i32 = list.get(i32, c.tch, (vb + 3) as usize)
+            // The parser's variant 5-tuples live at (it.b, it.z); slot 2 opens that
+            // variant's own payload run (3-tuples: fname span, parser TypeId).
+            let pvb: i32 = it.b + v * 5
+            let pfs: i32 = list.get(i32, p.ear, (pvb + 2) as usize)
+            var k: i32 = 0
+            for k < pcount {
+                // Payload entries are 3-TUPLES (fname span, lowered TyId), not a flat run
+                // of TyIds -- the tables' header comment says "payload TyIds also in tch",
+                // which reads like the latter. Indexing it that way silently reads a name
+                // span as a type id and the rule never fires.
+                let fty: i32 = list.get(i32, c.tch, (pstart + k * 3 + 2) as usize)
+                if typeck.ty_is_copy(c, fty) == false {
+                    let ptid: i32 = list.get(i32, p.ear, (pfs + k * 3 + 2) as usize)
+                    let tn: parser.TypeData = list.get(parser.TypeData, p.ty, ptid as usize)
+                    var sb: String = string_new()
+                    string_push(sb, "`@copy` enum `")
+                    string_push(sb, nm)
+                    string_push(sb, "` carries a non-Copy payload `")
+                    typeck.ty_str(src, c, fty, sb)
+                    string_push(sb, "` in variant `")
+                    string_push(sb, src[vns as usize .. vne as usize])
+                    string_push(sb, "` — a copy would double-drop it; only Copy payloads may ride a `@copy` enum")
+                    ediag(e, tn.start, tn.end, string_view(sb))
+                    string_free(sb)
+                }
+                k = k + 1
+            }
+            v = v + 1
+        }
     }
 }
 
@@ -1970,6 +2023,7 @@ fn check_items(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read s
         // order in `check_item` -- the P4 golden compares diagnostics in walk order.
         if it.kind == 3 { check_intrinsic_shadowing(e, src, it)  check_fn(e, p, c, src, it) }  // Fn
         else if it.kind == 4 { check_copy_containment(e, p, c, src, it)  walk_methods(e, p, c, src, it.a, it.b) }   // Struct
+        else if it.kind == 5 { check_copy_containment(e, p, c, src, it) }  // Enum: @copy payloads
         else if it.kind == 7 {                                           // Impl method bodies
             // The reference's `Item::Impl` arm in `escape::check_item`. Both sides used
             // to skip these on a comment claiming Stage B checked them; it does not, so

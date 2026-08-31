@@ -19377,34 +19377,78 @@ void jestyr_check_copy_containment(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, 
     {
         return;
     }
-    if ((jestyr_td(j_c, j_row, 2) != 0))
-    {
-        return;
-    }
-    int32_t j_fs = jestyr_td(j_c, j_row, 3);
-    int32_t j_fc = jestyr_td(j_c, j_row, 4);
+    int32_t j_kind = jestyr_td(j_c, j_row, 2);
     JestyrStr j_nm = jestyr_rt_substr(j_src, (size_t)(j_it.j_x), (size_t)(j_it.j_y));
-    int32_t j_i = 0;
-    while ((j_i < j_fc))
+    int32_t j_astart = jestyr_td(j_c, j_row, 3);
+    int32_t j_acount = jestyr_td(j_c, j_row, 4);
+    if ((j_kind == 0))
     {
-        int32_t j_base = (j_fs + (j_i * 3));
-        int32_t j_fns = jestyr_get__list__i32(j_c.j_tch, (size_t)(j_base));
-        int32_t j_fne = jestyr_get__list__i32(j_c.j_tch, (size_t)((j_base + 1)));
-        int32_t j_fty = jestyr_get__list__i32(j_c.j_tch, (size_t)((j_base + 2)));
-        if ((jestyr_ty_is_copy(j_c, j_fty) == false))
+        int32_t j_j = 0;
+        int32_t j_i = 0;
+        while ((j_i < j_it.j_b))
         {
-            JestyrString j_sb = jestyr_rt_str_new();
-            jestyr_rt_str_push(&j_sb, JSTR("`@copy` struct `"));
-            jestyr_rt_str_push(&j_sb, j_nm);
-            jestyr_rt_str_push(&j_sb, JSTR("` carries a non-Copy field `"));
-            jestyr_rt_str_push(&j_sb, jestyr_rt_substr(j_src, (size_t)(j_fns), (size_t)(j_fne)));
-            jestyr_rt_str_push(&j_sb, JSTR("` of type `"));
-            jestyr_ty_str(j_src, j_c, j_fty, &(j_sb));
-            jestyr_rt_str_push(&j_sb, JSTR("` — a copy would duplicate a value that may not be duplicated; only Copy fields may ride a `@copy` struct"));
-            jestyr_ediag(&((*j_e)), (size_t)(j_fns), (size_t)(j_fne), jestyr_rt_str_view(&j_sb));
-            jestyr_rt_str_free(&j_sb);
+            int32_t j_mbase = (j_it.j_a + (j_i * 10));
+            if ((jestyr_get__list__i32(j_p.j_mar, (size_t)(j_mbase)) == 0))
+            {
+                int32_t j_base = (j_astart + (j_j * 3));
+                int32_t j_fns = jestyr_get__list__i32(j_c.j_tch, (size_t)(j_base));
+                int32_t j_fne = jestyr_get__list__i32(j_c.j_tch, (size_t)((j_base + 1)));
+                int32_t j_fty = jestyr_get__list__i32(j_c.j_tch, (size_t)((j_base + 2)));
+                if ((jestyr_ty_is_copy(j_c, j_fty) == false))
+                {
+                    int32_t j_ptid = jestyr_get__list__i32(j_p.j_mar, (size_t)((j_mbase + 4)));
+                    Jestyr_TypeData j_tn = jestyr_get__list__TypeData(j_p.j_ty, (size_t)(j_ptid));
+                    JestyrString j_sb = jestyr_rt_str_new();
+                    jestyr_rt_str_push(&j_sb, JSTR("`@copy` struct `"));
+                    jestyr_rt_str_push(&j_sb, j_nm);
+                    jestyr_rt_str_push(&j_sb, JSTR("` carries a non-Copy field `"));
+                    jestyr_rt_str_push(&j_sb, jestyr_rt_substr(j_src, (size_t)(j_fns), (size_t)(j_fne)));
+                    jestyr_rt_str_push(&j_sb, JSTR("` of type `"));
+                    jestyr_ty_str(j_src, j_c, j_fty, &(j_sb));
+                    jestyr_rt_str_push(&j_sb, JSTR("` — a copy would duplicate a value that may not be duplicated; only Copy fields may ride a `@copy` struct"));
+                    jestyr_ediag(&((*j_e)), j_tn.j_start, j_tn.j_end, jestyr_rt_str_view(&j_sb));
+                    jestyr_rt_str_free(&j_sb);
+                }
+                j_j = (j_j + 1);
+            }
+            j_i = (j_i + 1);
         }
-        j_i = (j_i + 1);
+    }
+    if ((j_kind == 1))
+    {
+        int32_t j_v = 0;
+        while ((j_v < j_acount))
+        {
+            int32_t j_vb = (j_astart + (j_v * 4));
+            int32_t j_vns = jestyr_get__list__i32(j_c.j_tch, (size_t)(j_vb));
+            int32_t j_vne = jestyr_get__list__i32(j_c.j_tch, (size_t)((j_vb + 1)));
+            int32_t j_pstart = jestyr_get__list__i32(j_c.j_tch, (size_t)((j_vb + 2)));
+            int32_t j_pcount = jestyr_get__list__i32(j_c.j_tch, (size_t)((j_vb + 3)));
+            int32_t j_pvb = (j_it.j_b + (j_v * 5));
+            int32_t j_pfs = jestyr_get__list__i32(j_p.j_ear, (size_t)((j_pvb + 2)));
+            int32_t j_k = 0;
+            while ((j_k < j_pcount))
+            {
+                int32_t j_fty = jestyr_get__list__i32(j_c.j_tch, (size_t)(((j_pstart + (j_k * 3)) + 2)));
+                if ((jestyr_ty_is_copy(j_c, j_fty) == false))
+                {
+                    int32_t j_ptid = jestyr_get__list__i32(j_p.j_ear, (size_t)(((j_pfs + (j_k * 3)) + 2)));
+                    Jestyr_TypeData j_tn = jestyr_get__list__TypeData(j_p.j_ty, (size_t)(j_ptid));
+                    JestyrString j_sb = jestyr_rt_str_new();
+                    jestyr_rt_str_push(&j_sb, JSTR("`@copy` enum `"));
+                    jestyr_rt_str_push(&j_sb, j_nm);
+                    jestyr_rt_str_push(&j_sb, JSTR("` carries a non-Copy payload `"));
+                    jestyr_ty_str(j_src, j_c, j_fty, &(j_sb));
+                    jestyr_rt_str_push(&j_sb, JSTR("` in variant `"));
+                    jestyr_rt_str_push(&j_sb, jestyr_rt_substr(j_src, (size_t)(j_vns), (size_t)(j_vne)));
+                    jestyr_rt_str_push(&j_sb, JSTR("` — a copy would double-drop it; only Copy payloads may ride a `@copy` enum"));
+                    jestyr_ediag(&((*j_e)), j_tn.j_start, j_tn.j_end, jestyr_rt_str_view(&j_sb));
+                    jestyr_rt_str_free(&j_sb);
+                }
+                j_k = (j_k + 1);
+            }
+            j_v = (j_v + 1);
+        }
     }
 }
 
@@ -19425,6 +19469,11 @@ void jestyr_check_items(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Chec
         {
             jestyr_check_copy_containment(&((*j_e)), j_p, j_c, j_src, j_it);
             jestyr_walk_methods(&((*j_e)), j_p, j_c, j_src, j_it.j_a, j_it.j_b);
+        }
+        else
+        if ((j_it.j_kind == 5))
+        {
+            jestyr_check_copy_containment(&((*j_e)), j_p, j_c, j_src, j_it);
         }
         else
         if ((j_it.j_kind == 7))

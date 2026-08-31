@@ -528,8 +528,6 @@ impl<'a> TypeChecker<'a> {
                         e.type_params.iter().map(|p| p.name.clone()).collect();
                     let self_idx = self.table.type_index.get(&self.canon_type_cur(&e.name.name)).copied();
                     let mut variants = Vec::new();
-                    let declared_copy =
-                        self_idx.is_some_and(|si| self.table.types[si].is_copy);
                     for v in &e.variants {
                         let mut ftys = Vec::new();
                         for (_, t) in &v.fields {
@@ -537,20 +535,13 @@ impl<'a> TypeChecker<'a> {
                             if let Some(si) = self_idx {
                                 self.check_no_value_recursion(si, self.ast.type_at(*t).span, &fty);
                             }
-                            // The `@copy` contract is checked, not trusted: a copy of a
-                            // droppable payload would drop twice. (Copy-ness of a Named
-                            // payload reads the phase-1 flag, so declaration order does
-                            // not matter.)
-                            if declared_copy && !fty.is_copy(&self.table) {
-                                let shown = fty.display(&self.table);
-                                self.error(
-                                    self.ast.type_at(*t).span,
-                                    format!(
-                                        "`@copy` enum `{}` carries a non-Copy payload `{shown}` in variant `{}` — a copy would double-drop it; only Copy payloads may ride a `@copy` enum",
-                                        e.name.name, v.name.name
-                                    ),
-                                );
-                            }
+                            // The `@copy` contract is checked in `escape.rs`, not here —
+                            // see `escape::Checker::check_copy_containment`. It lived here
+                            // while it was the only half of the rule, and that made it
+                            // UNMIRRORABLE: `typeck.jtr` has no diagnostic channel, so the
+                            // self-hosted compiler silently trusted the flag and built a
+                            // `@copy` enum over a `String` that this compiler refuses. The
+                            // struct half of the same contradiction is checked beside it.
                             ftys.push(fty);
                         }
                         // `variants` keeps field types *positionally*; a struct-variant
@@ -6550,24 +6541,21 @@ mod tests {
         );
     }
 
-    /// The `@copy` enum contract is CHECKED, not trusted (unlike the struct form):
-    /// a copy of a droppable payload would drop twice, so a non-Copy payload under
-    /// `@copy` is refused at the payload's type. All-Copy payloads pass.
+    /// The `@copy` enum contract is checked in **`escape`**, not here — see
+    /// `escape::a_copy_enum_over_a_non_copy_payload_is_refused`, which is this test moved
+    /// rather than deleted. It lived here while it was the only half of the rule, and that
+    /// made it unmirrorable: `typeck.jtr` has no diagnostic channel, so the self-hosted
+    /// compiler trusted the flag and BUILT a `@copy` enum over a `String` that this
+    /// compiler refuses. Nothing a user sees changed — the message is carried over
+    /// verbatim and it is still reported at the payload's type.
     #[test]
-    fn a_copy_enum_requires_copy_payloads() {
+    fn a_copy_enum_contract_is_not_checked_here_anymore() {
         let (_i, d) = analyze(
             "@copy enum Bad { none, own(s: String) }\nfn main() -> i32 { return 0 }",
         );
         assert!(
-            d.iter().any(|m| m.message.contains("non-Copy payload `String`")),
-            "a droppable payload under @copy must be refused: {d:?}"
-        );
-        let (_i2, d2) = analyze(
-            "@copy enum Link { nil, at(n: &i64), idx(i: usize) }\nfn main() -> i32 { return 0 }",
-        );
-        assert!(
-            d2.iter().all(|m| !m.is_error()),
-            "all-Copy payloads (genref, usize) pass: {d2:?}"
+            !d.iter().any(|m| m.message.contains("non-Copy payload")),
+            "typeck must NOT raise this — a rule here cannot be mirrored: {d:?}"
         );
     }
 

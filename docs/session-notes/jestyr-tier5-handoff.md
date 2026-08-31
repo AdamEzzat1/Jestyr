@@ -822,6 +822,51 @@ move surfaced six broken fixtures nobody predicted.
 
 ---
 
+## §3n. The enum half, and the comment that named the bug
+
+A3b was found while closing A3, and the port's own source had been describing the defect
+for as long as it existed. `typeck.jtr`'s `ty_is_copy`:
+
+```
+if kind == 1 { return td(c, d.x, 9) == 1 }   // enum: @copy (validated by the reference)
+```
+
+It TRUSTS the flag. That is true when the reference is in the pipeline and false when `jc`
+is the only compiler — so `jc` built `@copy enum Bad { none, own(s: String) }`, exit 0 and a
+working binary, that `jestyrc` refuses as a double-drop. A second phase-1 comment said the
+same thing (*"the reference validates payload copy-ness — its refusal runs first"*). Both
+now say `escape` validates it, on both toolchains.
+
+**The move, not the rule, was the work.** `escape.rs` grew an `Item::Enum` arm on the
+containment check written for A3; typeck's copy was deleted and its test MOVED rather than
+dropped, with an inverted assertion left behind — typeck must NOT raise this now, and a
+test saying so is what stops it drifting back to the unmirrorable pass.
+
+**The message and span are carried over verbatim**, so a user sees no change at all: same
+sentence, still reported at the payload's TYPE. That mattered for choosing the span — see
+below — because churning an existing diagnostic is a cost the move did not need to pay.
+
+### The span choice, corrected from §3m
+
+§3m recorded the struct rule as reporting at the field NAME's span, with the reason that the
+port's `tch` stores a field's name span and not its type's. **That reason was incomplete.**
+`tch` is typeck's table; the PARSER's arena (`p.ty`) carries `start`/`end` on every type
+node, and the port can read copy-ness from typeck while taking the span from the parser —
+the two are indexed by the same declaration position, so they zip. Both halves now report at
+the field/payload TYPE, which is where the contradiction is and what the enum half already
+did. The struct rule was changed to match rather than the enum bent to fit.
+
+### A tables comment that reads the wrong way
+
+The port's header describes an enum row as *"payload TyIds also in `tch`"*, which reads as a
+flat run of ids. They are **3-tuples** (field-name span, lowered TyId) — the name is kept so
+struct-variant patterns can bind by name. Indexing it as a flat run reads a name span as a
+type id, `ty_is_copy` answers about nonsense, and the rule silently never fires. It cost one
+debug cycle and was found only by reading the code that WRITES the table rather than the
+comment that describes it.
+
+---
+
 ## §4. Comparison suites, rerun at this milestone
 
 Run twice this arc — after §3 and again after §3c, since both changed compiler semantics.
@@ -920,7 +965,18 @@ name span and not the type's, and the P4 golden compares spans.
 Swept clean before landing: 31 `@copy` declarations across 285 corpus files, plus the `.rs`
 test fixtures.
 
-#### A3b. `@copy` ENUM with a non-Copy payload — the reference refuses it, `jc` BUILDS IT
+#### A3b. `@copy` ENUM with a non-Copy payload — **CLOSED (§3n)**
+
+Was: the reference refused it and `jc` built it — exit 0, working binary. The rule moved
+`typeck.rs` → `escape.rs` and is mirrored in `escape.jtr`, so both toolchains now refuse it
+with the same message at the same span. Verified end to end: `jc … build` exits 1 and emits
+no binary. Under `jestyr_copy_containment_matches_reference` alongside the struct half.
+
+The original entry is kept below because its DIAGNOSIS is the reusable part.
+
+<details>
+
+#### A3b (historical). `@copy` ENUM with a non-Copy payload — the reference refuses it, `jc` BUILDS IT
 
 **Found while closing A3, pre-existing, and not fixed here.** The enum form of the same
 contradiction is checked in `typeck.rs` (`` `@copy` enum … carries a non-Copy payload ``) and
@@ -937,10 +993,9 @@ TRUSTS the flag, which is correct when the reference is in the pipeline and fals
 is the only compiler.
 
 The fix is the one A5 established: the rule belongs in `escape` on both sides, not in
-`typeck` (which has no diagnostic channel and therefore cannot mirror anything). `escape.rs`
-already reaches enum variants and `escape.jtr` already has `tdecl`'s variant rows, so it is
-the same shape as A3 — **it was left out only to keep a new rule and a moved rule in separate
-increments**, since the A5 move surfaced six broken fixtures nobody predicted.
+`typeck` (which has no diagnostic channel and therefore cannot mirror anything).
+
+</details>
 
 #### A4. Windows: `capture` + print does not round-trip a child's bytes
 
@@ -1321,3 +1376,20 @@ its own gap, and reading that sentence was worth more than the code around it.
 declaration was already refused in `attrs.rs`. Knowing that reframed A3 from "a new rule" to
 "an existing rule that stops at depth 0", which is a much easier thing to justify, scope, and
 word the diagnostic for.
+
+**Read the code that WRITES a table, not the comment that describes it.** The port's tables
+header calls an enum row's payloads "payload TyIds also in `tch`". They are 3-tuples (name
+span + TyId). Indexing them as a flat run reads a name span as a type id, the copy-ness
+predicate answers about nonsense, and the rule silently never fires — no error, no
+diagnostic, just a mirror that does nothing. The writing code said so plainly.
+
+**A comment that says "validated by the reference" is a divergence with a note attached.**
+`ty_is_copy` in the port carried exactly that, and it was accurate: the flag IS validated by
+the reference, and by nothing at all when `jc` runs alone. Grep the port for phrases of that
+shape — "the reference does X", "X runs first", "checked elsewhere" — because each one is a
+place where the self-hosted compiler is trusting a pass it does not have.
+
+**Move a test, do not delete it, and leave an inverted one behind.** The `@copy` enum check
+moved from typeck to escape. Its typeck test moved with it, and typeck kept a test asserting
+it does NOT raise this any more — which is what stops the rule drifting back into the pass
+that cannot mirror it.
