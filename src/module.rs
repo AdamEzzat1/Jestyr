@@ -699,13 +699,11 @@ mod tests {
         let (info, type_diags) = typeck::check_program(&prog.ast, &prog.modules);
         let mut sema = type_diags;
         sema.extend(crate::escape::check(&prog.ast, &info));
-        // "Clean" means no ERRORS. The one warning the tree carries is the
-        // intrinsic-shadowing notice (`lexer.str_eq`), which is a real hazard reported
-        // deliberately rather than a defect to fix here: renaming it changes emitted C in
-        // a module several goldens compare, so it is recorded as debt instead. Exempted
-        // by MESSAGE rather than by severity, so a future warning of any other kind still
-        // fails this — the exemption names itself.
-        sema.retain(|d| !d.message.contains("shadows a compiler intrinsic"));
+        // "Clean" means no diagnostics AT ALL — no exemption. This used to carry one, for
+        // the intrinsic-shadowing warning that `lexer.str_eq` raised; that is now an error
+        // and the corpus no longer shadows anything, so the exemption is gone rather than
+        // kept "just in case". An exemption that outlives its subject is how the next
+        // warning gets covered silently.
         assert!(sema.is_empty(), "{root}: sema diags: {:?}", sema);
         let (_c, cgen_diags) = crate::cgen::emit(&prog.ast, &info);
         assert!(cgen_diags.is_empty(), "{root}: cgen diags: {:?}", cgen_diags);

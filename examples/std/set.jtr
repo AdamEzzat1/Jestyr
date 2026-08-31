@@ -52,7 +52,11 @@ import "mem"
     return hashmap.remove(T, bool, s, x)
 }
 
-@no_os pub fn contains(comptime T: type, read s: hashmap.HashMap(T, bool), x: T) -> bool {
+// Is `x` a member? Named `has` to match `hashmap.has`, which it forwards to. It was
+// `contains` until that became a compile error: `contains` is a compiler intrinsic, and a
+// function sharing an intrinsic's name means the same call does two different things
+// depending on whether it is written qualified.
+@no_os pub fn has(comptime T: type, read s: hashmap.HashMap(T, bool), x: T) -> bool {
     return hashmap.has(T, bool, s, x)
 }
 

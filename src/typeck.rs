@@ -615,22 +615,33 @@ impl<'a> TypeChecker<'a> {
                     // was a wrong answer at runtime, in a module (`std/cli`) whose whole
                     // job is counting arguments — which is how it got caught at all.
                     //
-                    // **A WARNING, not an error, and the corpus is why.** Two existing
-                    // modules shadow an intrinsic — `lexer.str_eq` and `set.contains` —
-                    // and both work today, because `str_eq`'s semantics happen to match
-                    // the intrinsic's and `contains` is only ever called qualified. An
-                    // error would refuse working code to catch a hazard those two have
-                    // not yet been bitten by; a warning names the hazard and leaves them
-                    // alone. They are still traps: change `lexer.str_eq`'s behaviour and
-                    // the change is silently ignored at every unqualified call.
+                    // **An ERROR, and it used to be a warning.** The warning was the right
+                    // first move — it named the hazard without refusing the two corpus
+                    // modules that already shadowed (`lexer.str_eq`, `set.contains`) and
+                    // worked by coincidence. The reasoning for stopping there was "those
+                    // two have not been bitten yet".
                     //
-                    // **The real fix is in cgen — prefer the user's function when the
-                    // program defines one** — and it is deferred because it is an
-                    // emission change: it would rename `str_eq`'s call sites in a closure
-                    // module, so it owes a port mirror, a reseed and a golden churn. This
-                    // warning is what makes that a known debt rather than a latent one.
+                    // The base rate moved. Since that was written the hazard fired twice
+                    // more (`pub fn ok` in `std/file`, `pub fn find` in `std/metrics`),
+                    // each caught only because a human read the warning — which is not a
+                    // mechanism. And the two grandfathered cases were never as safe as
+                    // recorded: `lexer.str_eq` was DEAD CODE from the day it was written,
+                    // since its only call was unqualified and therefore always reached the
+                    // intrinsic. "It works" was true and "it runs" was not.
+                    //
+                    // Refusing is also the cheaper fix. The recorded plan was to change
+                    // cgen to prefer the user's function, which is an emission change in a
+                    // closure module (port mirror, reseed, golden churn). Refusing costs
+                    // one rename (`set.contains` → `set.has`, matching `bitset.has`, which
+                    // dodged this same collision at authoring time) and one deletion.
+                    //
+                    // The deeper reason to refuse rather than to let the user win: an
+                    // intrinsic and a user function with one name is ambiguous at the CALL
+                    // SITE, not just in cgen. `f(x)` and `mod.f(x)` would still mean
+                    // different things to a reader even if cgen resolved them the same
+                    // way. A name that means two things is worth a rename.
                     if crate::cgen::is_intrinsic(&f.name.name) {
-                        self.warn(
+                        self.error(
                             f.name.span,
                             format!(
                                 "`{}` shadows a compiler intrinsic: an unqualified call emits the intrinsic, not this function",
@@ -640,7 +651,7 @@ impl<'a> TypeChecker<'a> {
                         self.diags.last_mut().unwrap().help = Some(
                             "a qualified call (`mod.name(..)`) reaches this definition and an \
                              unqualified one does not, so the two spellings disagree silently — \
-                             rename it unless the semantics are identical"
+                             rename it (`contains` → `has` is the convention here)"
                                 .to_string(),
                         );
                     }

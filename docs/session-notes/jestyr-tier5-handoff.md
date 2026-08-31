@@ -77,14 +77,24 @@ The three at the top of it:
    already reconciles the two parsers' block-node allocation for six constructs; `select`
    was missing. One `else if`, port-only. §3h's diagnosis and its measurement table were
    both wrong — read §3j before trusting anything §3h says.
-2. **A10 — the WARNING half is DONE (§3i); the SANITIZER half is not.** The item was
+2. **A5's OPEN HALF — the port accepts a program the reference now refuses.** Intrinsic
+   shadowing is a compile error in the reference (§3k) and `typeck.jtr` has no such rule,
+   so `jc` still silently emits the intrinsic. **This is the same class A1 was** — a
+   two-compiler divergence no golden can see, because the corpus no longer contains the
+   shape. Blocked on the port having no `is_intrinsic` list to reuse: cgen.jtr dispatches
+   inline across ~40 sites and typeck.jtr cannot import cgen.jtr. Hoist the list into a
+   shared module first; several things want to ask that question.
+3. **A10 — the WARNING half is DONE (§3i); the SANITIZER half is not.** The item was
    recorded as one gap and was really two: warnings need no runtime library and are now a
    gate (277 emitted programs clean, watched refusing a broken `cgen`). Sanitizers still
-   need a `libasan` this machine lacks, so that half is a CI-only increment and inherits
-   the A2 caveat — nobody in reach can watch it run. **The cheapest real improvement left
-   here is a second C compiler**, not the sanitizer: clang's `-W` set finds shapes gcc's
-   does not, and the gate is only as good as the analysis behind it.
-3. **B3 — the package substrate.** The largest genuinely-absent area, and the one the
+   need a `libasan` this machine lacks.
+   **CORRECTION to an earlier version of this note**, which called a second C compiler the
+   cheapest win here: **there is no clang on this machine** — no `clang`, no `clang-cl`,
+   not even `cc`; only `gcc` resolves, so `find_c_compiler`'s first-match-wins never had a
+   choice to make locally. A clang leg is therefore a CI-only increment inheriting the A2
+   caveat, exactly like the sanitizer, and not the cheap local win it was billed as. MSVC
+   is installed but takes neither `-std=c11` nor `-Werror=`.
+4. **B3 — the package substrate.** The largest genuinely-absent area, and the one the
    tier's own "distribution" theme names.
 
 **Half of the Tier 5 brief already exists on master.** Before building anything in it,
@@ -680,6 +690,51 @@ decision has been given a concrete, countable cost.
 
 ---
 
+## §3k. Intrinsic shadowing is refused, and both grandfathered cases were weaker than recorded
+
+A `pub fn` named for a cgen intrinsic was replaced at every UNQUALIFIED call **with its
+arguments discarded**, while a qualified call reached the user's function. One name, two
+meanings, chosen by spelling. No wrong type, so C is happy; the only signal is a wrong
+answer at runtime. It is now a compile error.
+
+**The recorded plan was the expensive one, and it was aimed slightly wrong.** The note said
+the real fix was an emission change — cgen prefers the user's function — costing a port
+mirror, a reseed and golden churn. But that only resolves the ambiguity *inside cgen*:
+`f(x)` and `mod.f(x)` would still read differently to a human even once they compiled the
+same. Refusing the name resolves it everywhere, and cost one rename and one deletion.
+
+**The two grandfathered cases were the argument for staying advisory, and neither held.**
+
+* `set.contains` — "only ever called qualified", which was true. Renamed `set.has`, matching
+  `bitset.has`, whose own comment records it dodging this exact collision at authoring time
+  *because the warning fired*. The convention already existed; `set` predated it.
+* `lexer.str_eq` — recorded as safe because "its semantics happen to match the intrinsic's".
+  It was **dead code from the day it was written**: its single call site was unqualified and
+  therefore always reached the intrinsic, and nothing ever called it qualified. Deleted, not
+  renamed. "It works" was true. "It runs" was never true, and the two were not distinguished.
+
+The base rate had also moved since the warning was chosen: the hazard fired twice more after
+that decision (`std/file`'s `ok`, `std/metrics`'s `find`), each caught only because a human
+read a warning. A hazard that keeps firing and is caught by attention is not mitigated.
+
+**Watched failing.** The severity assertion was checked by reverting `error` → `warn`: the
+test fails with `severity: Warning`. A message-only assertion — which is what the previous
+test did — passes in that state, so the whole change would have been unpinned.
+
+**Two exemptions deleted, not narrowed.** `module.rs`'s `pipeline_is_clean` and
+`hashmap_compiles_clean` both stripped this warning by message. Both are gone: an exemption
+that outlives its subject is how the next diagnostic gets covered silently.
+
+**No reseed.** The rule says refresh the seed on any `examples/std` change; the drift guard
+says otherwise here, because neither `lexer.jtr` nor `set.jtr` is in the compiler's closure.
+Running the guard rather than refreshing on the heuristic is the recorded trap working in
+the direction it is usually quoted against.
+
+**The port does not mirror this — see §6A5.** It is an acceptance divergence, invisible to
+every golden, and the same class as A1.
+
+---
+
 ## §4. Comparison suites, rerun at this milestone
 
 Run twice this arc — after §3 and again after §3c, since both changed compiler semantics.
@@ -771,13 +826,52 @@ leaving the child's `\r`, so bytes read from a subprocess and printed come out d
 Making stdout binary would change every `\n` the compiler emits on Windows and re-baseline
 many goldens — its own increment and its own decision.
 
-#### A5. Intrinsic shadowing silently replaces a user function
+#### A5. Intrinsic shadowing — **CLOSED in the reference; the port does not mirror it**
 
-Pre-existing (v3). A `pub fn` named for a cgen intrinsic is replaced at every UNQUALIFIED
-call with arguments discarded; a qualified call reaches the user's function, so the two
-spellings disagree. Typeck WARNS. The real fix is an emission change in a closure module →
-mirror + reseed + golden churn. `lexer.str_eq` and `set.contains` are grandfathered.
-**This bit twice this arc** — `pub fn find` in `std/metrics`, caught only by the warning.
+A `pub fn` named for a cgen intrinsic was replaced at every UNQUALIFIED call with arguments
+discarded, while a qualified call reached the user's function — so the two spellings
+disagreed silently, with no wrong type for C to catch. **Now a compile error.**
+
+**The recorded plan was the expensive one.** It said the real fix was an emission change
+(cgen prefers the user's function) costing a port mirror, a reseed and golden churn. But
+"the user wins" only resolves the ambiguity *inside cgen*; `f(x)` and `mod.f(x)` still read
+differently to a human. Refusing the name resolves it everywhere, and cost one rename plus
+one deletion. No emission change, and the seed guard confirmed no reseed was owed.
+
+**Both grandfathered cases were weaker than recorded.** `set.contains` was only ever called
+qualified → renamed `set.has`, matching `bitset.has`, which dodged this same collision at
+authoring time. `lexer.str_eq` was recorded as safe because "its semantics match the
+intrinsic's" — in fact it was **dead code from the day it was written**: its one call site
+was unqualified and therefore always reached the intrinsic. It was deleted, not renamed.
+"It works" was true; "it runs" was not.
+
+**THE OPEN HALF — the port has no such rule, and it MISCOMPILES.** `examples/std/typeck.jtr`
+never had the check, so `jc` still accepts a shadowing program. Verified, not assumed:
+
+```
+fn arg_count(x: i64) -> i64 { return x + 100 }
+fn main() -> i32 { print_int(arg_count(7) as i32)  return 0 }
+```
+
+`jestyrc` refuses this. `jc` accepts it and emits
+
+```c
+int64_t jestyr_arg_count(int64_t j_x)          /* defined … */
+jestyr_rt_print_int((int32_t)(jestyr_rt_arg_count()));   /* … and never called */
+```
+
+— the intrinsic, **with the argument `7` discarded**. The program prints the process's argc
+instead of `107`. This is an ACCEPTANCE divergence, not merely a diagnostic one, and no
+golden catches it: the P3 golden compares types, the cgen golden compares emission between
+two backends *given the same accepted program*, and the corpus now shadows nothing — so
+every gate is vacuous here by construction, exactly as with A1.
+
+It was not mirrored because the port has **no `is_intrinsic` list to reuse** — cgen.jtr
+dispatches intrinsics inline and scattered (`if str_eq(nm, "str_eq")`, ~40 sites), and
+typeck.jtr cannot import cgen.jtr (cgen imports typeck). A mirror therefore means authoring
+a second copy of a list that already exists in fragments, in a module that cannot see the
+original. The honest fix is to hoist the name list into a module both can import — a small
+refactor of cgen.jtr, worth doing before anything else needs to ask "is this an intrinsic".
 
 #### A6. `Self` in a trait parameter — `check` passes, `run` fails
 
@@ -1015,3 +1109,35 @@ probe is indistinguishable from a working gate.
 ignored, like an unknown `-f` often is) and designed around it; measuring took one command
 and made typo-detection free and total. Worth knowing before writing elaborate machinery
 to defend against a failure the tool already forbids.
+
+**"It works" and "it runs" are different claims, and only one of them was checked.**
+`lexer.str_eq` sat on a grandfathered-exception list for two arcs, justified by "its
+semantics match the intrinsic's". Nobody asked whether it *executed*. It never had: its one
+call was unqualified, so every call reached the intrinsic and the function was dead the day
+it was written. An exception justified by behavioural equivalence should be asked which of
+the two implementations is actually running.
+
+**A grandfathered exception is a claim with a timestamp.** "Those two have not been bitten
+yet" was true and reasonable when written. It stayed on the page while the hazard fired
+twice more. Re-derive the cost of an exception before renewing it — the argument for the
+warning was a base-rate argument, and base rates move.
+
+**Assert the SEVERITY, not the message.** The whole of A5 is warning → error. The previous
+test matched on message text, which is identical in both states — so it passed against the
+unfixed compiler, and would have kept passing if the promotion were reverted. Verified by
+reverting: the new test fails with `severity: Warning`, the old one would not have.
+
+**Delete an exemption, do not narrow it.** Two tests stripped this warning by message. Once
+its subject was gone, keeping either "for safety" would have left a message filter sitting
+in the ladder ready to swallow the next diagnostic that happened to share the phrasing.
+
+**Run the drift guard instead of the heuristic — in BOTH directions.** The standing rule is
+"reseed on every `examples/std` change", and the guard said no reseed was owed here because
+neither changed file is in the compiler's closure. The recorded trap warns against skipping
+the guard before refreshing; it is equally worth running before refreshing *unnecessarily*.
+
+**A recorded "next step" can be wrong about the machine it will run on.** An earlier version
+of §0 called a second C compiler the cheapest remaining win in A10. There is no clang on
+this machine at all — checking took one command, and it moved the item from "cheap local
+win" to "CI-only, inherits the A2 caveat". Verify the tool exists before ranking the work
+that needs it.

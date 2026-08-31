@@ -2620,20 +2620,25 @@ mod string_intrinsic_types {
 /// the only signal was a wrong answer at runtime. Qualified calls resolved correctly, so
 /// one name meant two things depending on how it was spelled.
 ///
-/// The rule is a WARNING because two corpus modules already shadow and both work —
-/// `lexer.str_eq` (semantics match the intrinsic's) and `set.contains` (only ever called
-/// qualified). Two tests exempt that warning by message; this test is what stops the
-/// exemption from quietly covering a third name.
+/// The rule is now an ERROR. It was a warning while two corpus modules shadowed and both
+/// appeared to work — but the hazard fired twice more after that decision (`std/file`'s
+/// `ok`, `std/metrics`'s `find`), each caught only because a human read a warning, and
+/// `lexer.str_eq` turned out to have been DEAD CODE the whole time: its only call was
+/// unqualified, so it always reached the intrinsic. Both were retired — `str_eq` deleted,
+/// `set.contains` renamed to `set.has` (matching `bitset.has`, which dodged the same
+/// collision at authoring time).
 #[cfg(test)]
 mod intrinsic_shadowing {
     use super::*;
 
     const NEEDLE: &str = "shadows a compiler intrinsic";
 
-    /// The exact, closed set. A new module that shadows an intrinsic fails here, which is
-    /// the point: the two below are grandfathered, not the start of a pattern.
+    /// **Nothing in the corpus shadows an intrinsic.** This replaces a test that pinned an
+    /// exact two-name allowlist. The allowlist shape was right while the rule was advisory;
+    /// once it refuses, the honest assertion is that the set is EMPTY — an allowlist would
+    /// now be a list of programs the compiler rejects, which cannot exist.
     #[test]
-    fn intrinsic_shadowing_is_confined_to_two_names() {
+    fn no_corpus_module_shadows_an_intrinsic() {
         let mut hits: Vec<String> = Vec::new();
         for dir in ["examples", "examples/std"] {
             let Ok(rd) = std::fs::read_dir(dir) else { continue };
@@ -2645,31 +2650,41 @@ mod intrinsic_shadowing {
                 let prog = crate::module::load(p.to_str().unwrap());
                 let (_info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
                 for d in td.iter().filter(|d| d.message.contains(NEEDLE)) {
-                    // Take the backticked name out of the message so the assertion is
-                    // about WHICH names shadow, not about how many files import them.
-                    if let Some(n) = d.message.split('`').nth(1) {
-                        if !hits.contains(&n.to_string()) {
-                            hits.push(n.to_string());
-                        }
+                    let entry =
+                        format!("{}: {}", p.display(), d.message.split('`').nth(1).unwrap_or("?"));
+                    if !hits.contains(&entry) {
+                        hits.push(entry);
                     }
                 }
             }
         }
         hits.sort();
-        assert_eq!(
-            hits,
-            vec!["contains".to_string(), "str_eq".to_string()],
-            "the set of intrinsic-shadowing names changed — a new one is a latent miscompile, \
-             and a removed one means this exemption can shrink"
+        assert!(
+            hits.is_empty(),
+            "a corpus module shadows a compiler intrinsic, which is now a compile error \
+             (rename it — `contains` → `has` is the convention here):\n  {}",
+            hits.join("\n  ")
         );
     }
 
     /// The shape that started it, kept as an executable record: a user function named for
-    /// an intrinsic is reported, and one that is not is silent.
+    /// an intrinsic is refused, and one that is not is silent.
+    ///
+    /// Asserts the SEVERITY, not just the message. The whole change here is warning → error,
+    /// so a test that only checked the text would pass just as happily if the promotion were
+    /// reverted.
     #[test]
-    fn a_function_named_for_an_intrinsic_is_reported() {
-        let ds = typeck_diags("fn arg_count(x: i64) -> i64 { return x }\nfn main() -> i32 { return 0 }\n");
-        assert!(ds.iter().any(|d| d.contains(NEEDLE)), "shadowing must be reported; got {ds:?}");
+    fn a_function_named_for_an_intrinsic_is_refused() {
+        let src = "fn arg_count(x: i64) -> i64 { return x }\nfn main() -> i32 { return 0 }\n";
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        let (_info, td) = typeck::check(&ast);
+        let hit = td
+            .iter()
+            .find(|d| d.message.contains(NEEDLE))
+            .expect("shadowing must be reported");
+        assert!(hit.is_error(), "shadowing must be an ERROR, not a warning: {hit:?}");
+
         let clean = typeck_diags("fn args_len(x: i64) -> i64 { return x }\nfn main() -> i32 { return 0 }\n");
         assert!(
             !clean.iter().any(|d| d.contains(NEEDLE)),
@@ -4745,12 +4760,10 @@ mod hashmap_props {
     #[test]
     fn hashmap_compiles_clean() {
         for f in ["hashmap.jtr", "hashmap_test.jtr", "set.jtr", "set_test.jtr", "deque.jtr", "deque_test.jtr", "smallvec.jtr", "smallvec_test.jtr"] {
-            let mut d = diags_of(&format!("examples/std/{f}"));
-            // `set.contains` shadows an intrinsic. It is correct today — every call to it
-            // is qualified, and a qualified call reaches the user function — but the name
-            // is a trap, and the warning says so. Exempted by message so any OTHER
-            // diagnostic still fails; see `intrinsic_shadowing_is_confined_to_two_names`.
-            d.retain(|m| !m.contains("shadows a compiler intrinsic"));
+            // No exemption. This used to skip the intrinsic-shadowing warning for
+            // `set.contains`; that name is now `set.has` and the rule is an error, so the
+            // exemption is deleted rather than left behind to cover the next diagnostic.
+            let d = diags_of(&format!("examples/std/{f}"));
             assert!(d.is_empty(), "examples/std/{f}: {d:?}");
         }
     }

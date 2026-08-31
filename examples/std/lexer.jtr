@@ -27,16 +27,10 @@ import "env"
 import "list"
 import "tokens"
 
-// Byte-wise equality of two string views — enough to pick the output mode from argv.
-fn str_eq(read a: str, read b: str) -> bool {
-    if a.len != b.len { return false }
-    var i: usize = 0
-    for i < a.len {
-        if (a[i] as i32) != (b[i] as i32) { return false }
-        i = i + 1
-    }
-    return true
-}
+// `str_eq` is a compiler INTRINSIC, so the call below reaches it directly. This module
+// used to also define a hand-written `fn str_eq` here; it was dead from the day it was
+// written — an unqualified call emits the intrinsic, and nothing ever called this one
+// qualified — and it only looked correct because the two implementations agreed.
 
 // Print the reference `TokenKind::describe()` label for a token's kind — what the kinds
 // dump emits. For keywords and operators the label *is* the source slice, so only the

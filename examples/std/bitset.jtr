@@ -82,9 +82,10 @@ pub fn capacity(read s: BitSet) -> usize {
 }
 
 // Named `has` rather than `contains` because `contains` is a cgen intrinsic, and an
-// unqualified call to a function with an intrinsic's name emits the INTRINSIC. The warning
-// typeck now raises caught this while the module was being written, which is the whole
-// reason that warning exists -- `set.contains` predates it and is grandfathered.
+// unqualified call to a function with an intrinsic's name emits the INTRINSIC. The
+// diagnostic typeck raises caught this while the module was being written, which is the
+// whole reason it exists. It is now an ERROR rather than a warning, and `set.contains`
+// -- which predated it and was grandfathered -- was renamed to `set.has` to match.
 pub fn has(read s: BitSet, i: usize) -> bool {
     if in_range(s, i) == false { return false }
     let w: i64 = list.get(i64, s.words, word_of(i))

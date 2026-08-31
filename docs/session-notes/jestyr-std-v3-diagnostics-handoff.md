@@ -87,7 +87,7 @@ pre-existing mixed test pairs a guarded declaration with an *unguarded* one, whe
 
 | Bug | State |
 |---|---|
-| **Intrinsic shadowing** — a fn named for a cgen intrinsic is silently replaced at every UNQUALIFIED call, arguments discarded | typeck WARNS; the real fix (cgen prefers the user's fn) is an emission change in a closure module → mirror + reseed + golden churn. `lexer.str_eq` and `set.contains` are grandfathered and pinned by `intrinsic_shadowing_is_confined_to_two_names` |
+| **Intrinsic shadowing** — a fn named for a cgen intrinsic is silently replaced at every UNQUALIFIED call, arguments discarded | **SUPERSEDED — now a compile ERROR** (tier-5 note §3k). This row described it as a warning with `lexer.str_eq`/`set.contains` grandfathered, pinned by `intrinsic_shadowing_is_confined_to_two_names`; that test no longer exists (it is now `no_corpus_module_shadows_an_intrinsic`), `str_eq` was deleted as dead code and `contains` renamed `set.has`. The recorded "real fix" (cgen prefers the user's fn) was NOT taken — refusing the name was cheaper and resolves the ambiguity at the call site too. The self-hosted compiler does not mirror the rule; see tier-5 §6A5 |
 | **`Self` in a trait method parameter** | Parses ✓, type-checks ✓ (as `Opaque("Self")`), and **cgen refuses**: *"the C backend cannot lower the external type `Self` yet"*. A diagnostic, not a miscompile — but `check` passes and `run` fails, so it is still the degrades-to-gcc class |
 | **Move-only port mirror** | Not owed today (the corpus trips the rule zero times, so both sides agree). Owed the moment a corpus file trips it |
 | **`.jtr` trap:** a `\u00XX` escape in a string literal passes through to the emitted C verbatim; C rejects a universal character name below 0x20 | Accepted by the front end, fails in gcc. Use a byte-append helper |
@@ -669,9 +669,12 @@ needs to tell them apart.
    text from an Error node; a code would collide with a reference code under a different
    meaning), and diag's gutter prints one leading space more than the reference's — cosmetic,
    and changing it would churn `diag_test.jtr`'s goldens for nothing.
-3. **Intrinsic shadowing, properly** — cgen prefers the user's function over the intrinsic.
-   Emission change in a closure module: mirror, reseed, golden churn. The warning makes
-   this a known debt rather than a latent one, but `lexer.str_eq` is a live trap until then.
+3. ~~**Intrinsic shadowing, properly** — cgen prefers the user's function over the
+   intrinsic.~~ **DONE, but not this way** (tier-5 note §3k). The name is REFUSED instead,
+   which costs a rename rather than an emission change and also fixes the call-site
+   ambiguity that "the user wins" would have left. `lexer.str_eq` was not a live trap after
+   all — it was dead code, never once executed. Remaining: the self-hosted compiler has no
+   mirror of the rule (tier-5 §6A5).
 4. **Pick ONE of §2.4's three gaps** — multi-bounds if Collections v3 is next, `Self`-in-cgen
    if a trait needs typed comparison. Do not do both at once: the first is a parser change
    owing a P2 mirror, the second is a cgen change owing a P5 one.

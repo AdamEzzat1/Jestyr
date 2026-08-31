@@ -5,6 +5,37 @@ versions are snapshots, not stability promises.
 
 ## Unreleased
 
+### Changed
+
+- **Naming a function after a compiler intrinsic is now a compile error.** It was a
+  warning. The hazard: cgen dispatches intrinsics by NAME before it looks at user
+  functions, so an unqualified call to a shadowing function emitted the intrinsic **with
+  the arguments discarded**, while a qualified call reached the real function. One name,
+  two meanings, selected by spelling — and no wrong type, so C accepts it and the only
+  signal is a wrong answer at runtime.
+
+  Two standard-library functions were grandfathered under the warning, and the exception
+  was the reason to stay advisory. Neither held up:
+
+  - `set.contains` was "only ever called qualified", which was true. It is now `set.has`,
+    matching `bitset.has` — whose own comment records it dodging this exact collision at
+    authoring time *because the warning fired*. `set` simply predated the convention.
+  - `lexer.str_eq` was recorded as safe because "its semantics match the intrinsic's". It
+    was in fact **dead code from the day it was written**: its one call site was unqualified
+    and so always reached the intrinsic, and nothing ever called it qualified. Deleted.
+
+  The recorded plan was more expensive and aimed slightly wrong — change cgen to prefer the
+  user's function, at the cost of a port mirror, a reseed and golden churn. That resolves
+  the ambiguity inside cgen, but `f(x)` and `mod.f(x)` still read differently to a human.
+  Refusing the name resolves it everywhere, for one rename and one deletion. No emitted byte
+  moved and the seed drift guard confirmed no reseed was owed.
+
+  **Not mirrored in the self-hosted compiler**, which has no `is_intrinsic` list to reuse
+  (cgen.jtr dispatches inline across ~40 sites; typeck.jtr cannot import cgen.jtr). So `jc`
+  still accepts a shadowing program — an acceptance divergence recorded in the handoff note
+  as the successor to the `select` one, and invisible to every golden now that the corpus
+  contains no such shape.
+
 ### Fixed
 
 - **The two backends agree on a `select` between two `concurrent` blocks.** The last live
