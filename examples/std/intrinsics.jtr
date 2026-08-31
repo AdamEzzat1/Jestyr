@@ -1,0 +1,102 @@
+// examples/std/intrinsics.jtr -- the compiler's intrinsic NAME SET, in one place.
+//
+// cgen dispatches intrinsics by NAME before it looks at user functions, so a program that
+// declares `fn contains(..)` has every UNQUALIFIED call to it emitted as the intrinsic,
+// arguments discarded, while a qualified call reaches the real function. One name, two
+// meanings, chosen by spelling. Refusing the declaration is what closes that, and the
+// refusal has to be made by the same set on both toolchains -- otherwise one compiler
+// accepts what the other rejects, which is the divergence this module exists to prevent.
+//
+// **Why a module of its own.** The reference keeps this list in `cgen.rs`, but the port
+// cannot: `escape.jtr` needs to ask the question, `cgen.jtr` imports `typeck.jtr` which
+// `escape.jtr` also imports, and cgen is the last link in that chain -- so a pass earlier
+// in the pipeline cannot import the one that owns the list. Hoisting it to a leaf module
+// (no imports of its own) lets every pass ask without inverting the dependency.
+//
+// **This list is NOT "every name cgen knows".** It is the set whose SHADOWING is a
+// hazard. cgen also dispatches attribute names, the atomics, and the tier-3 reflection
+// intrinsics; reflection is deliberately excluded, exactly as in the reference, because
+// it is only ever called and never referenced as a value -- listing it would refuse any
+// program with a local named `field_count`, which the self-hosted compiler itself has.
+//
+// Kept byte-for-byte in step with `cgen::is_intrinsic` by
+// `intrinsic_name_set_matches_the_reference`, which asks both implementations about every
+// name in the reference's list and about names that must NOT be in it.
+
+pub fn is_intrinsic(read name: str) -> bool {
+    if str_eq(name, "print_int") { return true }
+    if str_eq(name, "print_float") { return true }
+    if str_eq(name, "print_str") { return true }
+    if str_eq(name, "print_bool") { return true }
+    if str_eq(name, "alloc") { return true }
+    if str_eq(name, "alloc_i32") { return true }
+    if str_eq(name, "realloc") { return true }
+    if str_eq(name, "realloc_i32") { return true }
+    if str_eq(name, "free_ptr") { return true }
+    if str_eq(name, "size_of") { return true }
+    if str_eq(name, "slice") { return true }
+    if str_eq(name, "align_of") { return true }
+    if str_eq(name, "offset_of") { return true }
+    if str_eq(name, "count_codepoints") { return true }
+    if str_eq(name, "codepoints") { return true }
+    if str_eq(name, "from_utf8") { return true }
+    if str_eq(name, "is_utf8") { return true }
+    if str_eq(name, "substr") { return true }
+    if str_eq(name, "str_eq") { return true }
+    if str_eq(name, "starts_with") { return true }
+    if str_eq(name, "ends_with") { return true }
+    if str_eq(name, "contains") { return true }
+    if str_eq(name, "find") { return true }
+    if str_eq(name, "trim") { return true }
+    if str_eq(name, "count_graphemes") { return true }
+    if str_eq(name, "graphemes") { return true }
+    if str_eq(name, "split") { return true }
+    if str_eq(name, "try_from_utf8") { return true }
+    if str_eq(name, "eq_fold") { return true }
+    if str_eq(name, "os_from_bytes") { return true }
+    if str_eq(name, "to_str_lossy") { return true }
+    if str_eq(name, "cow_borrow") { return true }
+    if str_eq(name, "cow_to_mut") { return true }
+    if str_eq(name, "cow_view") { return true }
+    if str_eq(name, "cow_is_owned") { return true }
+    if str_eq(name, "cow_free") { return true }
+    if str_eq(name, "string_new") { return true }
+    if str_eq(name, "string_from") { return true }
+    if str_eq(name, "string_push") { return true }
+    if str_eq(name, "string_view") { return true }
+    if str_eq(name, "string_free") { return true }
+    if str_eq(name, "builder_new") { return true }
+    if str_eq(name, "builder_push") { return true }
+    if str_eq(name, "builder_build") { return true }
+    if str_eq(name, "builder_free") { return true }
+    if str_eq(name, "region_str") { return true }
+    if str_eq(name, "region_concat") { return true }
+    if str_eq(name, "bytes") { return true }
+    if str_eq(name, "gen_new") { return true }
+    if str_eq(name, "gen_free") { return true }
+    if str_eq(name, "region_alloc") { return true }
+    if str_eq(name, "ok") { return true }
+    if str_eq(name, "err") { return true }
+    if str_eq(name, "is_err") { return true }
+    if str_eq(name, "unwrap") { return true }
+    if str_eq(name, "arena_open") { return true }
+    if str_eq(name, "arena_alloc") { return true }
+    if str_eq(name, "arena_close") { return true }
+    if str_eq(name, "read_file") { return true }
+    if str_eq(name, "try_read_file") { return true }
+    if str_eq(name, "write_file") { return true }
+    if str_eq(name, "file_exists") { return true }
+    if str_eq(name, "remove_file") { return true }
+    if str_eq(name, "run_command") { return true }
+    if str_eq(name, "eprint_str") { return true }
+    if str_eq(name, "signal_arm") { return true }
+    if str_eq(name, "signal_caught") { return true }
+    if str_eq(name, "signal_raise") { return true }
+    if str_eq(name, "random_fill") { return true }
+    if str_eq(name, "env_block") { return true }
+    if str_eq(name, "arg_count") { return true }
+    if str_eq(name, "arg") { return true }
+    if str_eq(name, "env_var") { return true }
+    if str_eq(name, "mono_nanos") { return true }
+    return false
+}

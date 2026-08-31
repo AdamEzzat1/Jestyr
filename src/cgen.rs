@@ -10978,32 +10978,43 @@ fn is_scalar_ty(t: &Ty) -> bool {
 
 /// Is `name` a backend intrinsic (a prelude stand-in for the stdlib / C interop)?
 /// Used so a reference to one is not mistaken for a closure capture.
+/// The intrinsic NAME SET, as data rather than a `matches!` pattern.
+///
+/// It is a slice so that it can be **enumerated**, not just queried:
+/// `intrinsic_name_set_matches_the_reference` generates a declaration for every entry and
+/// asserts the self-hosted toolchain refuses exactly the same ones. A `matches!` arm
+/// cannot be iterated, so the port's copy (`examples/std/intrinsics.jtr`) could only ever
+/// have been compared by eye — and a name added on one side and not the other is an
+/// acceptance divergence, which is precisely the failure that mirror exists to prevent.
+///
+/// NOTE: the tier-3 reflection intrinsics are deliberately NOT listed here. This list
+/// keeps a *bare value reference* to an intrinsic from being read as a closure capture;
+/// reflection is only ever **called**, never referenced as a value, so listing it would
+/// buy nothing — and would actively break any program with a local named `field_count`,
+/// which the self-hosted compiler itself has several of. The negative half of that test
+/// pins the exclusion, so a port list built by scraping cgen's dispatch sites fails
+/// loudly instead of quietly refusing the compiler's own sources.
+pub const INTRINSIC_NAMES: &[&str] = &[
+    "print_int", "print_float", "print_str", "print_bool",
+    "alloc", "alloc_i32", "realloc", "realloc_i32", "free_ptr", "size_of", "slice",
+    "align_of", "offset_of", "count_codepoints", "codepoints", "from_utf8", "is_utf8",
+    "substr", "str_eq", "starts_with", "ends_with", "contains", "find", "trim",
+    "count_graphemes", "graphemes", "split", "try_from_utf8", "eq_fold",
+    "os_from_bytes", "to_str_lossy",
+    "cow_borrow", "cow_to_mut", "cow_view", "cow_is_owned", "cow_free",
+    "string_new", "string_from", "string_push", "string_view", "string_free",
+    "builder_new", "builder_push", "builder_build", "builder_free",
+    "region_str", "region_concat", "bytes",
+    "gen_new", "gen_free", "region_alloc", "ok", "err", "is_err", "unwrap",
+    "arena_open", "arena_alloc", "arena_close",
+    "read_file", "try_read_file", "write_file", "file_exists", "remove_file",
+    "run_command", "eprint_str",
+    "signal_arm", "signal_caught", "signal_raise", "random_fill", "env_block",
+    "arg_count", "arg", "env_var", "mono_nanos",
+];
+
 pub fn is_intrinsic(name: &str) -> bool {
-    matches!(
-        name,
-        "print_int" | "print_float" | "print_str" | "print_bool"
-            | "alloc" | "alloc_i32" | "realloc" | "realloc_i32" | "free_ptr" | "size_of" | "slice"
-            // NOTE: the tier-3 reflection intrinsics are deliberately NOT listed here.
-            // This list keeps a *bare value reference* to an intrinsic from being read
-            // as a closure capture; reflection is only ever **called**, never referenced
-            // as a value, so listing it would buy nothing — and would actively break any
-            // program with a local named `field_count`, which the self-hosted compiler
-            // itself has several of.
-            | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8" | "is_utf8"
-            | "substr" | "str_eq" | "starts_with" | "ends_with" | "contains" | "find" | "trim"
-            | "count_graphemes" | "graphemes" | "split" | "try_from_utf8" | "eq_fold"
-            | "os_from_bytes" | "to_str_lossy"
-            | "cow_borrow" | "cow_to_mut" | "cow_view" | "cow_is_owned" | "cow_free"
-            | "string_new" | "string_from" | "string_push" | "string_view" | "string_free"
-            | "builder_new" | "builder_push" | "builder_build" | "builder_free"
-            | "region_str" | "region_concat" | "bytes"
-            | "gen_new" | "gen_free" | "region_alloc" | "ok" | "err" | "is_err" | "unwrap"
-            | "arena_open" | "arena_alloc" | "arena_close"
-            | "read_file" | "try_read_file" | "write_file" | "file_exists" | "remove_file"
-            | "run_command" | "eprint_str"
-            | "signal_arm" | "signal_caught" | "signal_raise" | "random_fill" | "env_block"
-            | "arg_count" | "arg" | "env_var" | "mono_nanos"
-    )
+    INTRINSIC_NAMES.contains(&name)
 }
 
 /// Substitute type parameters (`Ty::Opaque`) throughout a `Ty` — used to push

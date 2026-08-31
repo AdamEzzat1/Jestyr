@@ -634,6 +634,46 @@ mod jc_build_matrix {
         v
     }
 
+    /// **The self-hosted DRIVER refuses a shadowing program, not merely reports it.**
+    ///
+    /// `intrinsic_name_set_matches_the_reference` proves the two escape libraries agree on
+    /// the name set. That is one step short of the property that matters: a diagnostic the
+    /// driver does not act on still compiles. Before the mirror this exact program built
+    /// under `jc` and emitted `jestyr_rt_arg_count()` — the intrinsic, with the argument
+    /// `7` discarded — while defining `jestyr_arg_count` and never calling it, so it
+    /// printed the process's argc instead of `107`.
+    ///
+    /// Asserts the EXIT CODE, because that is what a build system reads. A driver that
+    /// printed the error and exited 0 would satisfy every other gate here.
+    #[test]
+    fn jc_refuses_a_program_that_shadows_an_intrinsic() {
+        let jc = super::c_oracle::build_exe("examples/std/cgen.jtr");
+        let src = std::env::temp_dir().join("jestyr_jc_shadow.jtr");
+        std::fs::write(
+            &src,
+            "fn arg_count(x: i64) -> i64 { return x + 100 }\n\
+             fn main() -> i32 { print_int(arg_count(7) as i32)  return 0 }\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new(&jc)
+            .arg(src.to_str().unwrap())
+            .arg("build")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "the self-hosted driver BUILT a shadowing program — it would emit the intrinsic \
+             with the argument discarded.\nstdout: {}\nstderr: {err}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            err.contains("shadows a compiler intrinsic"),
+            "refused, but not for this reason — the message must survive to the driver: {err}"
+        );
+        let _ = std::fs::remove_file(std::env::temp_dir().join("jestyr_jc_shadow.c"));
+    }
+
     #[test]
     fn jc_build_matrix_matches_expectations() {
         let jc = super::c_oracle::build_exe("examples/std/cgen.jtr");
@@ -2648,8 +2688,12 @@ mod intrinsic_shadowing {
                     continue;
                 }
                 let prog = crate::module::load(p.to_str().unwrap());
-                let (_info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
-                for d in td.iter().filter(|d| d.message.contains(NEEDLE)) {
+                let (info, _td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+                // The rule lives in `escape`, not `typeck` — see
+                // `escape::Checker::check_intrinsic_shadowing` for why that is a port
+                // constraint (typeck.jtr has no diagnostic channel to mirror into).
+                let ed = crate::escape::check(&prog.ast, &info);
+                for d in ed.iter().filter(|d| d.message.contains(NEEDLE)) {
                     let entry =
                         format!("{}: {}", p.display(), d.message.split('`').nth(1).unwrap_or("?"));
                     if !hits.contains(&entry) {
@@ -2678,16 +2722,24 @@ mod intrinsic_shadowing {
         let src = "fn arg_count(x: i64) -> i64 { return x }\nfn main() -> i32 { return 0 }\n";
         let (tokens, _) = Lexer::new(src).tokenize();
         let (ast, _) = Parser::new(src, tokens).parse();
-        let (_info, td) = typeck::check(&ast);
-        let hit = td
+        let (info, _td) = typeck::check(&ast);
+        let ed = crate::escape::check(&ast, &info);
+        let hit = ed
             .iter()
             .find(|d| d.message.contains(NEEDLE))
             .expect("shadowing must be reported");
         assert!(hit.is_error(), "shadowing must be an ERROR, not a warning: {hit:?}");
 
-        let clean = typeck_diags("fn args_len(x: i64) -> i64 { return x }\nfn main() -> i32 { return 0 }\n");
+        // The control, checked through the SAME pass — asking `typeck` here would be
+        // vacuous now that the rule lives in `escape`: that dump can never carry the
+        // message, so the assertion would hold even if every name were being refused.
+        let csrc = "fn args_len(x: i64) -> i64 { return x }\nfn main() -> i32 { return 0 }\n";
+        let (ctok, _) = Lexer::new(csrc).tokenize();
+        let (cast, _) = Parser::new(csrc, ctok).parse();
+        let (cinfo, _) = typeck::check(&cast);
+        let clean = crate::escape::check(&cast, &cinfo);
         assert!(
-            !clean.iter().any(|d| d.contains(NEEDLE)),
+            !clean.iter().any(|d| d.message.contains(NEEDLE)),
             "an ordinary name must be silent; got {clean:?}"
         );
     }
@@ -14702,6 +14754,76 @@ fn g(p: *mut i32) -> i32 {
         );
     }
 
+    /// **The two toolchains refuse the SAME intrinsic name set.**
+    ///
+    /// The rule is only worth having if both compilers apply it: one that refuses what the
+    /// other compiles is an acceptance divergence, and this one was real and measured —
+    /// before the mirror, `jc` accepted `fn arg_count(x: i64)` and emitted
+    /// `jestyr_rt_arg_count()` with the argument discarded, defining the user's function
+    /// and never calling it.
+    ///
+    /// **One program carrying every name**, rather than 74 invocations: the reference's
+    /// `cgen::is_intrinsic` list is the authority, and a declaration is generated for each
+    /// entry, so a name added on one side and not the other fails here. The set is also
+    /// asserted to be non-trivial in both directions — a `is_intrinsic` that always
+    /// returned `true` would pass the positive half alone.
+    ///
+    /// **The negatives are the load-bearing half.** `field_count`/`field_name` are tier-3
+    /// reflection, which cgen dispatches but which is deliberately NOT in the shadowing
+    /// set: it is only ever called, never referenced as a value, so listing it would refuse
+    /// any program with a local of that name — and the self-hosted compiler has several.
+    /// A port list built by grepping cgen's dispatch sites would pick them up and quietly
+    /// refuse the compiler's own sources.
+    #[test]
+    fn intrinsic_name_set_matches_the_reference() {
+        let exe = build_exe("examples/std/escape_cli.jtr");
+
+        // Every name the reference calls an intrinsic, as its own declaration.
+        let names: Vec<&str> = crate::cgen::INTRINSIC_NAMES.to_vec();
+        assert!(names.len() > 50, "the reference list looks truncated: {}", names.len());
+        let src: String =
+            names.iter().map(|n| format!("fn {n}() -> i64 {{ return 0 }}\n")).collect();
+
+        let want = rust_escape_dump(&src);
+        // Anti-vacuity: every one of them must actually be refused, or the "same set"
+        // claim below is comparing two empty dumps.
+        let refused = want.iter().filter(|l| l.contains("shadows a compiler intrinsic")).count();
+        assert_eq!(
+            refused,
+            names.len(),
+            "the reference did not refuse every name in its own list ({refused} of {})",
+            names.len()
+        );
+
+        let f = std::env::temp_dir().join("jestyr_intrinsic_set.jtr");
+        std::fs::write(&f, &src).unwrap();
+        assert_eq!(
+            jestyr_escape_dump(&exe, f.to_str().unwrap()),
+            want,
+            "the toolchains disagree about which names are intrinsics; the port's list is \
+             `examples/std/intrinsics.jtr`"
+        );
+
+        // **The control.** Reflection is dispatched by cgen but deliberately excluded, and
+        // ordinary names must stay legal. A list scraped from cgen's dispatch sites would
+        // fail here rather than silently refusing the compiler's own locals.
+        let ok_names = ["field_count", "field_name", "has", "len", "args_len", "is_intrinsic"];
+        let ok_src: String =
+            ok_names.iter().map(|n| format!("fn {n}() -> i64 {{ return 0 }}\n")).collect();
+        let ok = rust_escape_dump(&ok_src);
+        assert!(
+            !ok.iter().any(|l| l.contains("shadows a compiler intrinsic")),
+            "a non-intrinsic name must stay legal — the set is over-reaching: {ok:?}"
+        );
+        let g = std::env::temp_dir().join("jestyr_intrinsic_set_ok.jtr");
+        std::fs::write(&g, &ok_src).unwrap();
+        assert_eq!(
+            jestyr_escape_dump(&exe, g.to_str().unwrap()),
+            ok,
+            "the toolchains disagree about a name that is NOT an intrinsic"
+        );
+    }
+
     /// **A `spawn` target may not take ANY `mut` parameter, differentially.**
     ///
     /// The rule used to reach only `mut` SLICES, so a `mut` struct crossing `spawn` was
@@ -18668,8 +18790,13 @@ fn main() -> i32 {
     /// exactly the order `module::load` merges their items in).
     /// `sink` and `diag` join at `cgen.jtr`'s `import "diag"`: the DFS visits diag's own
     /// imports first, `list` is already memoized, so `sink` lands immediately before `diag`.
+    /// Deps-first: the flatten concatenates in this order, so a module must follow
+    /// everything it imports. `intrinsics` is a LEAF (it imports nothing — deliberately,
+    /// so that any pass can ask it the shadowing question without inverting the
+    /// dependency) and is used by `escape`, so it sits immediately before it.
     const SELFHOST_MODULES: &[&str] = &[
-        "mem", "intern", "fs", "env", "list", "tokens", "parser", "ctfe", "typeck", "escape",
+        "mem", "intern", "fs", "env", "list", "tokens", "parser", "ctfe", "typeck",
+        "intrinsics", "escape",
         "sha256", "sink", "width", "diag", "cgen",
     ];
 

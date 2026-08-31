@@ -1147,6 +1147,7 @@ Jestyr_Checker jestyr_check_parsed(Jestyr_Parser j_p, JestyrStr j_src, Jestyr_Al
 bool jestyr_ty_is_unknown(Jestyr_Checker j_c, int32_t j_tyid);
 bool jestyr_ty_is_copy(Jestyr_Checker j_c, int32_t j_tyid);
 int32_t jestyr_run__typeck(void);
+bool jestyr_is_intrinsic(JestyrStr j_name);
 void jestyr_e_push(Jestyr_Esc* restrict j_e);
 void jestyr_e_pop(Jestyr_Esc* restrict j_e);
 void jestyr_e_bind(Jestyr_Esc* restrict j_e, int32_t j_ns, int32_t j_ne, int32_t j_isb);
@@ -1209,6 +1210,7 @@ bool jestyr_is_underscore__escape(JestyrStr j_src, size_t j_ns, size_t j_ne);
 void jestyr_walk_methods(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_mem_start, int32_t j_mem_count);
 bool jestyr_fn_has_attr(Jestyr_Parser j_p, JestyrStr j_src, Jestyr_ItemData j_f, JestyrStr j_name);
 void jestyr_check_fn(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_ItemData j_f);
+void jestyr_check_intrinsic_shadowing(Jestyr_Esc* restrict j_e, JestyrStr j_src, Jestyr_ItemData j_it);
 void jestyr_check_items(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src);
 Jestyr_Esc jestyr_check_program(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_Allocator j_a);
 bool jestyr_ub_is_ptr(Jestyr_Checker j_c, int32_t j_t);
@@ -16425,6 +16427,307 @@ int32_t jestyr_run__typeck(void)
     return j_result;
 }
 
+bool jestyr_is_intrinsic(JestyrStr j_name)
+{
+    if (jestyr_rt_str_eq(j_name, JSTR("print_int")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("print_float")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("print_str")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("print_bool")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("alloc")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("alloc_i32")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("realloc")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("realloc_i32")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("free_ptr")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("size_of")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("slice")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("align_of")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("offset_of")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("count_codepoints")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("codepoints")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("from_utf8")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("is_utf8")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("substr")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("str_eq")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("starts_with")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("ends_with")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("contains")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("find")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("trim")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("count_graphemes")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("graphemes")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("split")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("try_from_utf8")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("eq_fold")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("os_from_bytes")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("to_str_lossy")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("cow_borrow")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("cow_to_mut")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("cow_view")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("cow_is_owned")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("cow_free")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("string_new")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("string_from")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("string_push")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("string_view")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("string_free")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("builder_new")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("builder_push")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("builder_build")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("builder_free")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("region_str")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("region_concat")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("bytes")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("gen_new")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("gen_free")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("region_alloc")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("ok")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("err")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("is_err")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("unwrap")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("arena_open")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("arena_alloc")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("arena_close")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("read_file")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("try_read_file")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("write_file")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("file_exists")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("remove_file")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("run_command")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("eprint_str")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("signal_arm")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("signal_caught")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("signal_raise")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("random_fill")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("env_block")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("arg_count")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("arg")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("env_var")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("mono_nanos")))
+    {
+        return true;
+    }
+    return false;
+}
+
 void jestyr_e_push(Jestyr_Esc* restrict j_e)
 {
     jestyr_push__i32(&((*j_e).j_scst), (int32_t)((jestyr_len__i32((*j_e).j_scn) / 3)));
@@ -19047,6 +19350,21 @@ void jestyr_check_fn(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker
     (*j_e).j_self_borrow = j_saved_sb;
 }
 
+void jestyr_check_intrinsic_shadowing(Jestyr_Esc* restrict j_e, JestyrStr j_src, Jestyr_ItemData j_it)
+{
+    JestyrStr j_nm = jestyr_rt_substr(j_src, (size_t)(j_it.j_x), (size_t)(j_it.j_y));
+    if ((jestyr_is_intrinsic(j_nm) == false))
+    {
+        return;
+    }
+    JestyrString j_sb = jestyr_rt_str_new();
+    jestyr_rt_str_push(&j_sb, JSTR("`"));
+    jestyr_rt_str_push(&j_sb, j_nm);
+    jestyr_rt_str_push(&j_sb, JSTR("` shadows a compiler intrinsic: an unqualified call emits the intrinsic, not this function"));
+    jestyr_ediag(&((*j_e)), (size_t)(j_it.j_x), (size_t)(j_it.j_y), jestyr_rt_str_view(&j_sb));
+    jestyr_rt_str_free(&j_sb);
+}
+
 void jestyr_check_items(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src)
 {
     size_t j_r = 0;
@@ -19056,6 +19374,7 @@ void jestyr_check_items(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Chec
         Jestyr_ItemData j_it = jestyr_get__list__ItemData(j_p.j_it, (size_t)(j_iid));
         if ((j_it.j_kind == 3))
         {
+            jestyr_check_intrinsic_shadowing(&((*j_e)), j_src, j_it);
             jestyr_check_fn(&((*j_e)), j_p, j_c, j_src, j_it);
         }
         else

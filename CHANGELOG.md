@@ -30,11 +30,27 @@ versions are snapshots, not stability promises.
   Refusing the name resolves it everywhere, for one rename and one deletion. No emitted byte
   moved and the seed drift guard confirmed no reseed was owed.
 
-  **Not mirrored in the self-hosted compiler**, which has no `is_intrinsic` list to reuse
-  (cgen.jtr dispatches inline across ~40 sites; typeck.jtr cannot import cgen.jtr). So `jc`
-  still accepts a shadowing program — an acceptance divergence recorded in the handoff note
-  as the successor to the `select` one, and invisible to every golden now that the corpus
-  contains no such shape.
+  **Both toolchains refuse it.** Briefly only the reference did, and that gap was a
+  miscompile rather than a missing message: `jc` accepted `fn arg_count(x: i64)` and emitted
+  `jestyr_rt_arg_count()` with the argument discarded, defining the user's function and
+  never calling it, so the program printed the process's argc instead of `107`.
+
+  Closing it moved the rule from `typeck` to `escape` on **both** sides, and that is a port
+  constraint rather than a preference: `examples/std/typeck.jtr` has no diagnostic channel
+  at all — it is a pure resolution pass feeding the P3 type dump — so a rule living there
+  can never be mirrored. `escape.jtr` has one, and the P4 golden compares the two escape
+  passes by span + message, so the rule is now pinned differentially.
+
+  The name set is a new leaf module, `examples/std/intrinsics.jtr`, which imports nothing:
+  `cgen.jtr` owns the dispatch but is the last link in the import chain, so a pass earlier
+  in the pipeline cannot import the owner. On the reference side `cgen::is_intrinsic` became
+  a `const INTRINSIC_NAMES` slice instead of a `matches!` pattern, purely so the set can be
+  ENUMERATED — `intrinsic_name_set_matches_the_reference` generates a declaration for every
+  name and compares both dumps, so one added on a single side fails loudly rather than
+  waiting to be noticed by eye. Its negative half pins the deliberate exclusion of tier-3
+  reflection (`field_count`, `field_name`), which cgen dispatches but which must not be
+  refused — a port list built by scraping cgen's dispatch sites would have quietly refused
+  the self-hosted compiler's own sources.
 
 ### Fixed
 

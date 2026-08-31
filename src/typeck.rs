@@ -615,46 +615,14 @@ impl<'a> TypeChecker<'a> {
                     // was a wrong answer at runtime, in a module (`std/cli`) whose whole
                     // job is counting arguments — which is how it got caught at all.
                     //
-                    // **An ERROR, and it used to be a warning.** The warning was the right
-                    // first move — it named the hazard without refusing the two corpus
-                    // modules that already shadowed (`lexer.str_eq`, `set.contains`) and
-                    // worked by coincidence. The reasoning for stopping there was "those
-                    // two have not been bitten yet".
-                    //
-                    // The base rate moved. Since that was written the hazard fired twice
-                    // more (`pub fn ok` in `std/file`, `pub fn find` in `std/metrics`),
-                    // each caught only because a human read the warning — which is not a
-                    // mechanism. And the two grandfathered cases were never as safe as
-                    // recorded: `lexer.str_eq` was DEAD CODE from the day it was written,
-                    // since its only call was unqualified and therefore always reached the
-                    // intrinsic. "It works" was true and "it runs" was not.
-                    //
-                    // Refusing is also the cheaper fix. The recorded plan was to change
-                    // cgen to prefer the user's function, which is an emission change in a
-                    // closure module (port mirror, reseed, golden churn). Refusing costs
-                    // one rename (`set.contains` → `set.has`, matching `bitset.has`, which
-                    // dodged this same collision at authoring time) and one deletion.
-                    //
-                    // The deeper reason to refuse rather than to let the user win: an
-                    // intrinsic and a user function with one name is ambiguous at the CALL
-                    // SITE, not just in cgen. `f(x)` and `mod.f(x)` would still mean
-                    // different things to a reader even if cgen resolved them the same
-                    // way. A name that means two things is worth a rename.
-                    if crate::cgen::is_intrinsic(&f.name.name) {
-                        self.error(
-                            f.name.span,
-                            format!(
-                                "`{}` shadows a compiler intrinsic: an unqualified call emits the intrinsic, not this function",
-                                f.name.name
-                            ),
-                        );
-                        self.diags.last_mut().unwrap().help = Some(
-                            "a qualified call (`mod.name(..)`) reaches this definition and an \
-                             unqualified one does not, so the two spellings disagree silently — \
-                             rename it (`contains` → `has` is the convention here)"
-                                .to_string(),
-                        );
-                    }
+                    // **Intrinsic shadowing is refused in `escape.rs`, not here.** It was a
+                    // typeck rule while it was a warning, and moving it is not tidying: the
+                    // port has to make the same refusal, `typeck.jtr` has no diagnostic
+                    // channel at all (it is a pure resolution pass feeding the P3 type
+                    // dump), and `escape.jtr` does. The P4 golden compares the two escape
+                    // passes by span + message, so a rule living in escape on both sides is
+                    // pinned differentially; one living in typeck on this side only cannot
+                    // be. See `escape::Checker::check_intrinsic_shadowing`.
                     let key = self.canon_in(item_m, &f.name.name);
                     let cfg = crate::attrs::cfg_of(ast, &f.attrs);
                     if self.table.fns.contains_key(&key)
@@ -6959,7 +6927,7 @@ mod tests {
     /// the escape checker contains the binding by the ordinary frame rule.
     #[test]
     fn with_alive_types_the_binding_and_rejects_non_genrefs() {
-        let src = "struct N { s: String }                    fn ok(read r: &N) { with alive r as read n { print_str(n.s as str) } }                    fn bad(x: i32) { with alive x as read v { print_int(v as i64) } }";
+        let src = "struct N { s: String }                    fn reads(read r: &N) { with alive r as read n { print_str(n.s as str) } }                    fn bad(x: i32) { with alive x as read v { print_int(v as i64) } }";
         let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
         let (ast, _pd) = crate::parser::Parser::new(src, tokens).parse();
         let (info, diags) = check(&ast);

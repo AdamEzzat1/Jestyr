@@ -77,13 +77,12 @@ The three at the top of it:
    already reconciles the two parsers' block-node allocation for six constructs; `select`
    was missing. One `else if`, port-only. §3h's diagnosis and its measurement table were
    both wrong — read §3j before trusting anything §3h says.
-2. **A5's OPEN HALF — the port accepts a program the reference now refuses.** Intrinsic
-   shadowing is a compile error in the reference (§3k) and `typeck.jtr` has no such rule,
-   so `jc` still silently emits the intrinsic. **This is the same class A1 was** — a
-   two-compiler divergence no golden can see, because the corpus no longer contains the
-   shape. Blocked on the port having no `is_intrinsic` list to reuse: cgen.jtr dispatches
-   inline across ~40 sites and typeck.jtr cannot import cgen.jtr. Hoist the list into a
-   shared module first; several things want to ask that question.
+2. ~~**A5's OPEN HALF — the port accepts a program the reference now refuses.**~~ —
+   **CLOSED (§3l).** Both toolchains refuse it, the name set is a shared leaf module
+   (`examples/std/intrinsics.jtr`), and the sets are compared differentially rather than by
+   eye. The transferable part: `typeck.jtr` HAS NO DIAGNOSTIC CHANNEL, so any rule that
+   must be mirrored belongs in `escape` on both sides — which is where the next two-sided
+   static rule should go without rediscovering this.
 3. **A10 — the WARNING half is DONE (§3i); the SANITIZER half is not.** The item was
    recorded as one gap and was really two: warnings need no runtime library and are now a
    gate (277 emitted programs clean, watched refusing a broken `cgen`). Sanitizers still
@@ -730,8 +729,54 @@ says otherwise here, because neither `lexer.jtr` nor `set.jtr` is in the compile
 Running the guard rather than refreshing on the heuristic is the recorded trap working in
 the direction it is usually quoted against.
 
-**The port does not mirror this — see §6A5.** It is an acceptance divergence, invisible to
-every golden, and the same class as A1.
+---
+
+## §3l. The mirror, and where a two-sided rule is allowed to live
+
+§3k left the rule on one side. That is worse than it sounds: an unmirrored REFUSAL is an
+acceptance divergence, and this one miscompiled rather than merely under-reported — `jc`
+built `fn arg_count(x: i64)` into `jestyr_rt_arg_count()` with the argument discarded,
+defining the user's function and never calling it. Closed.
+
+**The rule had to MOVE, and typeck could not host it.** The obvious mirror is
+"add the check to `typeck.jtr`", and it is impossible: that module has no diagnostic
+channel at all. It is a pure resolution pass whose only output is the P3 type dump, and the
+self-hosted driver detects front-end failures by scanning for recovery artifacts rather
+than by reading a diagnostic list. `escape.jtr` has the channel (`dsp` span pairs +
+`dmsg`), and the P4 golden compares the two escape passes **by span + message**. So the
+reference's check moved `typeck.rs` → `escape.rs`, and the rule is now pinned
+differentially rather than existing on one side.
+
+`escape.rs` was already the home for static rules that are not strictly escape analysis —
+`check_spawn_no_shared_mut_slice` is a concurrency rule — so this is the established shape,
+not a new exception.
+
+**Free functions only.** A method is called `x.contains(..)`, never the unqualified shape,
+so it cannot be captured by the intrinsic. The check therefore sits in the `Item::Fn` arm
+of `check_item`, which struct- and impl-methods do not pass through.
+
+**The name set is a leaf module.** `examples/std/intrinsics.jtr` imports nothing, because
+the pass that owns the dispatch (`cgen.jtr`) is the LAST link in the chain — cgen imports
+typeck, which escape imports too — so a pass earlier in the pipeline cannot import the
+owner. Hoisting the set to a leaf lets any pass ask without inverting the dependency.
+
+**`is_intrinsic` became data on the reference side too.** It was a `matches!` pattern, which
+cannot be iterated, so the port's copy could only ever have been compared by eye. It is now
+`const INTRINSIC_NAMES: &[&str]`, and `intrinsic_name_set_matches_the_reference` generates a
+declaration for every entry in one program and compares both escape dumps — so a name added
+on one side and not the other fails. **Watched failing** by deleting a single name
+(`eq_fold`) from the port's list.
+
+**The negative half is the load-bearing one.** Tier-3 reflection (`field_count`,
+`field_name`) is dispatched by cgen but deliberately excluded from the shadowing set: it is
+only ever called, never referenced as a value, and listing it would refuse any program with
+a local of that name — which the self-hosted compiler has several of. A port list built by
+grepping cgen's ~40 dispatch sites would have picked reflection up and quietly refused the
+compiler's own sources. The control pins the exclusion.
+
+**Two gates needed teaching about the new module**: `SELFHOST_MODULES` (deps-first, so
+`intrinsics` sits immediately before `escape`) and the seed, refreshed only after the guard
+was watched reporting `STALE`.
 
 ---
 
@@ -845,26 +890,26 @@ intrinsic's" — in fact it was **dead code from the day it was written**: its o
 was unqualified and therefore always reached the intrinsic. It was deleted, not renamed.
 "It works" was true; "it runs" was not.
 
-**THE OPEN HALF — the port has no such rule, and it MISCOMPILES.** `examples/std/typeck.jtr`
-never had the check, so `jc` still accepts a shadowing program. Verified, not assumed:
+**THE PORT MIRRORS IT — the acceptance divergence is CLOSED (§3l).** Briefly it did not,
+and the gap was a real miscompile rather than a missing message: `jc` accepted
+`fn arg_count(x: i64)` and emitted `jestyr_rt_arg_count()` **with the argument discarded**,
+defining the user's function and never calling it. Both toolchains now refuse it, and
+`jc_refuses_a_program_that_shadows_an_intrinsic` asserts the DRIVER's exit code, not just
+that a diagnostic exists.
 
-```
-fn arg_count(x: i64) -> i64 { return x + 100 }
-fn main() -> i32 { print_int(arg_count(7) as i32)  return 0 }
-```
+**The rule lives in `escape`, not `typeck`, and that is a port constraint.** `typeck.jtr`
+has no diagnostic channel at all — it is a pure resolution pass feeding the P3 type dump —
+so a rule there can never be mirrored. `escape.jtr` has one (`dsp` spans + `dmsg`), and the
+P4 golden compares the two escape passes by span + message, so the rule is now pinned
+differentially instead of living on one side only.
 
-`jestyrc` refuses this. `jc` accepts it and emits
-
-```c
-int64_t jestyr_arg_count(int64_t j_x)          /* defined … */
-jestyr_rt_print_int((int32_t)(jestyr_rt_arg_count()));   /* … and never called */
-```
-
-— the intrinsic, **with the argument `7` discarded**. The program prints the process's argc
-instead of `107`. This is an ACCEPTANCE divergence, not merely a diagnostic one, and no
-golden catches it: the P3 golden compares types, the cgen golden compares emission between
-two backends *given the same accepted program*, and the corpus now shadows nothing — so
-every gate is vacuous here by construction, exactly as with A1.
+**The name set is a leaf module** (`examples/std/intrinsics.jtr`, no imports) because
+`cgen.jtr` owns the dispatch but cannot be imported by a pass earlier in the pipeline —
+cgen imports typeck, which escape also imports. On the reference side `cgen::is_intrinsic`
+became a `const INTRINSIC_NAMES` slice rather than a `matches!`, purely so the set can be
+ENUMERATED: `intrinsic_name_set_matches_the_reference` generates a declaration per name and
+compares both dumps, so a name added on one side and not the other fails loudly. Watched
+failing by deleting one name from the port's list.
 
 It was not mirrored because the port has **no `is_intrinsic` list to reuse** — cgen.jtr
 dispatches intrinsics inline and scattered (`if str_eq(nm, "str_eq")`, ~40 sites), and
@@ -1141,3 +1186,43 @@ of §0 called a second C compiler the cheapest remaining win in A10. There is no
 this machine at all — checking took one command, and it moved the item from "cheap local
 win" to "CI-only, inherits the A2 caveat". Verify the tool exists before ranking the work
 that needs it.
+
+**An unmirrored REFUSAL is worse than an unmirrored warning.** The recorded rule is that
+"diagnostics owe no two-sided tax", and for a warning that is right. The moment a rule
+refuses, it stops being a diagnostic and becomes part of the language: one compiler now
+rejects what the other compiles, and in this case the accepting one MISCOMPILED. Check
+which kind of rule you are adding before invoking the no-tax exemption.
+
+**Ask where the mirror can physically live BEFORE choosing where the rule goes.**
+Intrinsic shadowing went into `typeck` because that is where the reference does name
+resolution. `typeck.jtr` has no diagnostic channel at all, so that choice made the rule
+unmirrorable, and the fix was to move it rather than to build one. For any rule that owes
+a port mirror, `escape` is the side with the channel and the differential golden.
+
+**A `matches!` pattern cannot be compared to anything.** The intrinsic set was a
+`matches!` arm, so the port's copy could only ever be checked by reading both lists. Making
+it a `const` slice cost nothing and turned "two lists that ought to agree" into a test that
+generates a probe per name. If two implementations must agree on a SET, store it as data on
+at least one side.
+
+**A list scraped from dispatch sites is not the same list.** `cgen.jtr` matches ~40
+intrinsic names inline, plus attribute names and the atomics; the shadowing set is 74 and
+deliberately EXCLUDES tier-3 reflection, which the compiler's own sources use as local
+names. Deriving the port's list by grepping the dispatch would have looked reasonable and
+refused the self-hosted compiler. The negative control is what pins that.
+
+**`examples/` is not the whole corpus — inline test fixtures are a second one.** The A5
+refusal was swept against all 285 `.jtr` files and came back clean, and the ladder then
+failed on THREE escape tests whose fixtures declare `fn ok(..)` inside Rust string
+literals. Six such fixtures existed across `escape.rs`, `typeck.rs` and `module.rs`. No
+`examples/` sweep can see them, and no golden covers them. When a new rule refuses a NAME,
+sweep the `.rs` test sources too, not just the corpus.
+
+**Six independent authors reached for `ok`, and that is the rule's real cost.** `ok` is a
+Result constructor intrinsic AND an obvious name for "the function that should be fine" —
+which is exactly why `std/file` was bitten by `pub fn ok` in the first place. The refusal is
+still correct (all six fixtures were dead-calling nothing, the same "works because nothing
+runs it" that `lexer.str_eq` relied on), but the cost is measurable and worth stating rather
+than hiding: this rule will make people rename things they did not expect to rename, and the
+short intrinsic names -- `ok`, `err`, `arg`, `find`, `trim`, `split`, `bytes`, `contains` --
+are where it will happen.

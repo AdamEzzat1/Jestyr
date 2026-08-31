@@ -1131,7 +1131,7 @@ mod tests {
             "qualtype_priv",
             &[
                 ("main.jtr", "import \"lib\"\nfn f(s: lib.Secret) -> i32 { return 0 }\nfn main() -> i32 { return 0 }"),
-                ("lib.jtr", "struct Secret { v: i32 }\npub fn ok() -> i32 { return 0 }"),
+                ("lib.jtr", "struct Secret { v: i32 }\npub fn value() -> i32 { return 0 }"),
             ],
         );
         let prog = load(dir.join("main.jtr").to_str().unwrap());
@@ -1150,7 +1150,7 @@ mod tests {
             "qualtype_unknown",
             &[
                 ("main.jtr", "import \"lib\"\nfn f(s: lib.Nope) -> i32 { return 0 }\nfn main() -> i32 { return 0 }"),
-                ("lib.jtr", "pub fn ok() -> i32 { return 0 }"),
+                ("lib.jtr", "pub fn value() -> i32 { return 0 }"),
             ],
         );
         let prog = load(dir.join("main.jtr").to_str().unwrap());

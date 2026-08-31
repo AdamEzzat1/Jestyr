@@ -23,6 +23,7 @@ import "list"
 import "tokens"
 import "parser"
 import "typeck"
+import "intrinsics"
 
 // Per-run escape state, threaded `mut`. Scopes are flat arenas (like typeck's): `scn` holds
 // binding 3-tuples (name_start, name_end, is_borrow) and `scst` the per-scope start marks; `rgn`
@@ -1895,12 +1896,39 @@ fn check_fn(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src:
     e.self_borrow = saved_sb
 }
 
+// **A free function may not be named for a compiler intrinsic.** cgen dispatches
+// intrinsics by NAME before it looks at user functions, so an unqualified call to a
+// shadowing function emits the intrinsic WITH THE ARGUMENTS DISCARDED while a qualified
+// call reaches the real one -- one name, two meanings, chosen by spelling, and no wrong
+// type for the C compiler to catch. Mirrors `escape::Checker::check_intrinsic_shadowing`.
+//
+// FREE FUNCTIONS ONLY: a method is called `x.contains(..)`, never the unqualified shape,
+// so it cannot be captured. Hence this sits beside the `kind == 3` arm below and not
+// inside `check_fn`, which the struct- and impl-method arms also reach.
+//
+// The name set lives in its own leaf module because BOTH sides must refuse the same set:
+// a rule only one toolchain enforces is an acceptance divergence, which is what this
+// mirror exists to close. `cgen.jtr` owns the dispatch but cannot be imported from here
+// (it imports `typeck.jtr`, which this module also imports), so the set is hoisted.
+fn check_intrinsic_shadowing(mut e: Esc, read src: str, read it: parser.ItemData) {
+    let nm: str = src[it.x as usize .. it.y as usize]
+    if intrinsics.is_intrinsic(nm) == false { return }
+    var sb: String = string_new()
+    string_push(sb, "`")
+    string_push(sb, nm)
+    string_push(sb, "` shadows a compiler intrinsic: an unqualified call emits the intrinsic, not this function")
+    ediag(e, it.x as usize, it.y as usize, string_view(sb))
+    string_free(sb)
+}
+
 fn check_items(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str) {
     var r: usize = 0
     for r < list.len(i32, p.roots) {
         let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
-        if it.kind == 3 { check_fn(e, p, c, src, it) }                    // Fn
+        // The shadowing check runs BEFORE the body walk, matching the reference's push
+        // order in `check_item` -- the P4 golden compares diagnostics in walk order.
+        if it.kind == 3 { check_intrinsic_shadowing(e, src, it)  check_fn(e, p, c, src, it) }  // Fn
         else if it.kind == 4 { walk_methods(e, p, c, src, it.a, it.b) }   // Struct methods
         else if it.kind == 7 {                                           // Impl method bodies
             // The reference's `Item::Impl` arm in `escape::check_item`. Both sides used

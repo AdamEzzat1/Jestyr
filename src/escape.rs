@@ -540,9 +540,46 @@ impl<'a> Checker<'a> {
          be read, reused, or reinitialized; bind the callee's result if you need a value back, \
          or pass a borrow (`read`/`mut`) instead of giving ownership";
 
+    /// **A free function may not be named for a compiler intrinsic.**
+    ///
+    /// cgen dispatches intrinsics by NAME before it looks at user functions, so an
+    /// unqualified call to a shadowing function emits the intrinsic **with the arguments
+    /// discarded**, while a qualified call reaches the real one. One name, two meanings,
+    /// selected by spelling — and no wrong type, so C accepts it and the only signal is a
+    /// wrong answer at runtime. `std/cli` shipped it once (`arg_count`), and after this
+    /// became a warning it fired twice more (`std/file`'s `ok`, `std/metrics`'s `find`).
+    ///
+    /// **Free functions only.** A method is called `x.contains(..)`, which is never the
+    /// unqualified call shape, so it cannot be captured by the intrinsic — hence the check
+    /// sits in the `Item::Fn` arm and not in [`Self::check_fn`], which methods also reach.
+    ///
+    /// **Here rather than in typeck, and that is a port constraint, not taste.** This was a
+    /// typeck rule while it was advisory. `typeck.jtr` has no diagnostic channel — it is a
+    /// pure resolution pass feeding the P3 type dump — so a rule there can never be
+    /// mirrored, and an unmirrored refusal is an ACCEPTANCE divergence: `jc` would compile
+    /// what `jestyrc` refuses. `escape.jtr` has the channel, and the P4 golden compares the
+    /// two escape passes by span + message, so the rule is pinned differentially here.
+    fn check_intrinsic_shadowing(&mut self, f: &FnDecl) {
+        if crate::cgen::is_intrinsic(&f.name.name) {
+            self.error_help(
+                f.name.span,
+                format!(
+                    "`{}` shadows a compiler intrinsic: an unqualified call emits the intrinsic, not this function",
+                    f.name.name
+                ),
+                "a qualified call (`mod.name(..)`) reaches this definition and an \
+                 unqualified one does not, so the two spellings disagree silently — \
+                 rename it (`contains` → `has` is the convention here)",
+            );
+        }
+    }
+
     fn check_item(&mut self, item: &Item) {
         match item {
-            Item::Fn(f) => self.check_fn(f),
+            Item::Fn(f) => {
+                self.check_intrinsic_shadowing(f);
+                self.check_fn(f)
+            }
             Item::Struct { body, .. } => {
                 for m in &body.members {
                     if let StructMember::Method(f) = m {
@@ -3603,7 +3640,7 @@ mod tests {
     #[test]
     fn allows_giving_a_borrow_to_a_borrowing_parameter() {
         let d = escapes(
-            "struct Bin { v: i32 } fn inspect(read x: Bin) {} fn ok(read p: Bin) { inspect(p) }",
+            "struct Bin { v: i32 } fn inspect(read x: Bin) {} fn pass_borrow(read p: Bin) { inspect(p) }",
         );
         assert!(d.is_empty(), "passing a borrow to a `read` param is fine: {:?}", d);
     }
@@ -3620,7 +3657,7 @@ mod tests {
     #[test]
     fn allows_returning_a_closure_capturing_only_owned_values() {
         // `n` is owned (default convention), so capturing it is fine.
-        let d = escapes("fn other(n: i32) {} fn ok(n: i32) -> H { || other(n) }");
+        let d = escapes("fn other(n: i32) {} fn make_closure(n: i32) -> H { || other(n) }");
         assert!(d.is_empty(), "owned capture should be fine: {:?}", d);
     }
 
@@ -3665,7 +3702,7 @@ mod tests {
     #[test]
     fn allows_mutating_the_loop_binding_in_place() {
         // `for mut x` mutates the element via `x`, not via the collection name.
-        let d = escapes("fn ok(mut xs: []i32) { for mut x in xs { x = x * 2 } }");
+        let d = escapes("fn double_in_place(mut xs: []i32) { for mut x in xs { x = x * 2 } }");
         assert!(d.is_empty(), "in-place element mutation is fine: {:?}", d);
     }
 
