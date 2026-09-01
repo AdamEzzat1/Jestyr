@@ -45,14 +45,34 @@ import "fs"
 import "env"
 import "path"
 
-// The OS temp directory: `TMPDIR` (POSIX), else `TEMP` or `TMP` (Windows), else
-// ".". A view into the process environment — OS-owned storage, nothing to free,
-// the same contract as `env.get`.
+// The platform's temp directory when the environment names none.
 //
-// All three spellings are checked because no single one is portable: on this
-// repo's Windows box `TMPDIR` is unset while `TEMP` and `TMP` are both set, and on
-// POSIX it is the other way round. The "." fallback means a caller always gets a
-// usable relative path rather than an empty one.
+// **POSIX does not require `TMPDIR` to be set**, and an unset one does not mean "no
+// temp directory" — it means the implementation-defined default, which is `/tmp`
+// everywhere in practice and is what C spells `P_tmpdir`. A GitHub Ubuntu runner sets
+// none of `TMPDIR`/`TEMP`/`TMP`, which is how this was found.
+//
+// Windows keeps `"."`: `TEMP` and `TMP` are set by the system for every interactive
+// and service account, so reaching the fallback there means something unusual is
+// already true and the current directory is the safer guess than a hardcoded path
+// that may not exist.
+@cfg(posix)  fn temp_default() -> str { return "/tmp" }
+@cfg(windows) fn temp_default() -> str { return "." }
+
+// The OS temp directory: `TMPDIR` (POSIX), else `TEMP` or `TMP` (Windows), else the
+// platform default. A view into the process environment — OS-owned storage, nothing
+// to free, the same contract as `env.get`.
+//
+// All three spellings are checked because no single one is portable: on this repo's
+// Windows box `TMPDIR` is unset while `TEMP` and `TMP` are both set.
+//
+// **The old fallback was `"."` on both platforms, and that was wrong twice over.** It
+// made `temp_path` produce a RELATIVE path, so callers wrote their temp files into
+// whatever the current directory happened to be — a working tree, or something
+// read-only — instead of into a temp directory. And it was reachable: the CI runner
+// sets none of the three, so `test_fixture_demo` asserted `is_abs` of the joined path
+// and got 0. The old comment said POSIX has `TMPDIR` set "the other way round" from
+// Windows; that is true of a login shell and not of a runner.
 pub fn temp_dir() -> str {
     let a: str = env.get("TMPDIR")
     if a.len > 0 { return a }
@@ -60,7 +80,7 @@ pub fn temp_dir() -> str {
     if b.len > 0 { return b }
     let c: str = env.get("TMP")
     if c.len > 0 { return c }
-    return "."
+    return temp_default()
 }
 
 // `<temp_dir()>/<name>` written into `buf`, returning the byte count — the

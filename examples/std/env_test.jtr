@@ -3,12 +3,15 @@
 // A sibling file: `env.jtr` is one of the twelve self-host closure modules, so a
 // `@test` inside it would be compiled into the flattened compiler.
 //
-// SEALING CAN ONLY BE PROVEN AGAINST A VARIABLE THAT IS ACTUALLY SET, and no single
-// variable name is portable. The suite uses the same three-way probe
-// `std/test_fixture.temp_dir` relies on — at least one of `TMPDIR`, `TEMP`, `TMP` is
-// set on any machine that can run a build — so "the host handle sees something the
-// sealed handle does not" is a claim that holds on both platforms without depending
-// on which spelling won.
+// SEALING CAN ONLY BE PROVEN AGAINST A VARIABLE THAT IS ACTUALLY SET, so the choice of
+// variable is load-bearing. This header used to claim that "at least one of `TMPDIR`,
+// `TEMP`, `TMP` is set on any machine that can run a build" and the suite probed all
+// three. **That claim is false**: POSIX does not require `TMPDIR`, and a GitHub Ubuntu
+// runner sets none of the three — the suite failed there against a correct `env`.
+//
+// The host-side probe now asks for `PATH`, which every shell, service manager and CI
+// runner sets on both platforms. The three-way probe is kept for the SEALED handle, where
+// the point is that three lookups were attempted and all came back unset.
 //
 // Run:  jestyrc test examples/std/env_test.jtr
 //   →   5 passed; 0 failed
@@ -19,12 +22,31 @@ import "test_report"
 
 const REPORT_CAP: usize = 512
 
-// True if the host environment names a temp directory under any of the three
-// spellings — the portable "something is definitely set" probe.
+// A THREE-lookup probe, used where the count of attempts is the point: a sealed handle
+// must report three unset reads rather than never asking. Whether any of these is set on
+// the host is deliberately not relied on — see `host_sees_something` for why.
 fn host_sees_a_temp_dir(mut e: env.Env) -> bool {
     if env.present(e, "TMPDIR") { return true }
     if env.present(e, "TEMP") { return true }
     return env.present(e, "TMP")
+}
+
+// The "this handle reads the real environment" probe.
+//
+// **`PATH`, because the temp spellings are not a guarantee.** This used to ask for
+// `TMPDIR`/`TEMP`/`TMP` and assert one was set. POSIX does not require `TMPDIR` — an unset
+// one means the implementation default, not "no temp directory" — and a GitHub Ubuntu
+// runner sets none of the three, so the assertion failed against a perfectly correct `env`.
+//
+// The irony is that `sealed_hides_everything_but_counts_the_attempt` names this machine in
+// its own comment: the control exists so that "sealed sees nothing" cannot pass "on a
+// machine where nothing is set at all". The control was right and the variable was wrong.
+//
+// `PATH` is set by every shell, service manager and CI runner on both platforms, and
+// Windows' `getenv` is case-insensitive so it also finds `Path`. One lookup, so it does not
+// disturb the attempt counts asserted elsewhere.
+fn host_sees_something(mut e: env.Env) -> bool {
+    return env.present(e, "PATH")
 }
 
 @test fn host_reads_the_real_environment() -> bool {
@@ -34,7 +56,7 @@ fn host_sees_a_temp_dir(mut e: env.Env) -> bool {
     var h: env.Env = env.host()
 
     test.is_false(c, rep, "not sealed", env.is_sealed(h))
-    test.is_true(c, rep, "sees a temp dir", host_sees_a_temp_dir(h))
+    test.is_true(c, rep, "reads the real environment", host_sees_something(h))
     test.ne_i64(c, rep, "lookups counted", env.lookups(h), 0)
     // A name nothing sets reads empty rather than faulting.
     test.eq_usize(c, rep, "unset is empty", env.lookup(h, "JESTYR_NO_SUCH_VAR_XYZ").len, 0)
@@ -55,7 +77,7 @@ fn host_sees_a_temp_dir(mut e: env.Env) -> bool {
     var h: env.Env = env.host()
     var s: env.Env = env.sealed()
 
-    test.is_true(c, rep, "control sees it", host_sees_a_temp_dir(h))
+    test.is_true(c, rep, "control sees it", host_sees_something(h))
     test.is_true(c, rep, "is_sealed", env.is_sealed(s))
     test.is_false(c, rep, "sealed sees nothing", host_sees_a_temp_dir(s))
     // Three lookups attempted (the probe tries all three spellings), all reported
@@ -124,7 +146,7 @@ fn host_sees_a_temp_dir(mut e: env.Env) -> bool {
     // ...while a variable read still works, which is the contrast that identifies
     // `main(void)` as the cause rather than a broken environment.
     var h: env.Env = env.host()
-    test.is_true(c, rep, "variables still readable", host_sees_a_temp_dir(h))
+    test.is_true(c, rep, "variables still readable", host_sees_something(h))
 
     let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)

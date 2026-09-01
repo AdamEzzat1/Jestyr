@@ -19458,6 +19458,9 @@ fn main() -> i32 {
     /// The `denied` pair is the controlled half — the same capture through a `host()`
     /// handle writes the file, so the two zeros are about the capability rather than
     /// about a broken command.
+    ///
+    /// See `temp_dir_falls_back_to_an_absolute_path_on_posix` for why this passes on a
+    /// machine with no `TMPDIR` at all.
     #[test]
     fn test_fixture_demo() {
         assert_eq!(
@@ -21376,6 +21379,50 @@ mod cst_props {
         assert!(checked_files > 100, "expected the corpus, saw {checked_files} files");
         eprintln!(
             "stage-2 alignment: {checked_spans} spans across {checked_files} files, all exact"
+        );
+    }
+}
+
+/// **`temp_dir()`'s fallback is ABSOLUTE on POSIX, checked from either host.**
+///
+/// It used to be `"."` on both platforms, which was wrong twice: `temp_path` then produced
+/// a RELATIVE path, so callers wrote temp files into whatever the current directory was
+/// rather than into a temp directory — and the branch was reachable, because a GitHub
+/// Ubuntu runner sets none of `TMPDIR`/`TEMP`/`TMP`. `test_fixture_demo` asserts `is_abs`
+/// of the joined path and got 0 there.
+///
+/// **Asserted on the EMITTED C rather than by running the program**, because `@cfg` selects
+/// with the C preprocessor: both branches are emitted and `_WIN32` is always defined here,
+/// so the POSIX branch cannot be executed on this machine. Emission is the one place both
+/// are visible from either host — and the whole reason this bug survived is that its branch
+/// was unreachable from the machine doing the checking.
+#[cfg(test)]
+mod temp_dir_fallback {
+    #[test]
+    fn temp_dir_falls_back_to_an_absolute_path_on_posix() {
+        let src = std::fs::read_to_string("examples/std/test_fixture.jtr").unwrap();
+        let (tokens, _) = crate::lexer::Lexer::new(&src).tokenize();
+        let (ast, _) = crate::parser::Parser::new(&src, tokens).parse();
+        let (info, _) = crate::typeck::check(&ast);
+        let (c, _) = crate::cgen::emit(&ast, &info);
+
+        // The POSIX arm. `P_tmpdir` is "/tmp" on every Unix in practice, and an unset
+        // TMPDIR means the implementation default, not "no temp directory".
+        assert!(
+            c.contains("JSTR(\"/tmp\")"),
+            "the POSIX fallback must be an absolute temp directory, not the CWD"
+        );
+        // The Windows arm keeps ".", which is only reached when the system did not set
+        // TEMP/TMP — unusual enough that the current directory beats a guessed path.
+        assert!(
+            c.contains("JSTR(\".\")"),
+            "the Windows fallback should still be \".\""
+        );
+        // Both arms exist, so the choice is made by the preprocessor rather than by
+        // whichever host happened to emit this C.
+        assert!(
+            c.contains("#if defined(_WIN32)") || c.contains("#if !defined(_WIN32)"),
+            "temp_default must be @cfg-guarded, or the fallback is host-dependent"
         );
     }
 }
