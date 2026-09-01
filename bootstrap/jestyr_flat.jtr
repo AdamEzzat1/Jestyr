@@ -28378,12 +28378,23 @@ fn driver_build(mut m: Ml, read p: Parser, read c: Checker, read src: str, read 
     }
     string_push(cmd, " -O2 -std=c11 -ffp-contract=off -fno-fast-math")
     if contains(string_view(sb), "pthread") { string_push(cmd, " -pthread") }
-    // **The Windows target baseline**, mirroring `cc_base_flags`: mingw declares `WSAPoll`
-    // only at `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration
-    // returning `int` -- the silent `int`-fallback shape. Set unconditionally on Windows
-    // rather than gated on content, so the same source never compiles differently depending
-    // on which modules a program happened to import.
+    // **The platform's header baseline**, mirroring `cc_platform_defines`. BOTH sides exist
+    // for one reason -- `-std=c11` is strict ISO C, so each libc hides everything that is
+    // not ISO -- and this driver carried only the Windows half until the Linux runner said
+    // so out loud:
+    //
+    //   * mingw declares `WSAPoll` only at `_WIN32_WINNT >= 0x0600`, and below that it is
+    //     an implicit declaration returning `int` -- the silent `int`-fallback shape.
+    //   * glibc: `-std=c11` defines `__STRICT_ANSI__`, which switches `_DEFAULT_SOURCE` OFF,
+    //     so NO POSIX function is declared. `fileno`, `ftruncate`, `usleep`, `clock_gettime`
+    //     and `kill` all fell back to implicit `int`. Not `_POSIX_C_SOURCE=200809L`: `usleep`
+    //     was REMOVED in POSIX.1-2008, so that macro fixes four of the five and hides the
+    //     fifth.
+    //
+    // Set unconditionally rather than gated on content, so the same source never compiles
+    // differently depending on which modules a program happened to import.
     if !posix { string_push(cmd, " -D_WIN32_WINNT=0x0600") }
+    if posix { string_push(cmd, " -D_DEFAULT_SOURCE") }
     string_push(cmd, " -o \"")
     string_push(cmd, string_view(xpath))
     string_push(cmd, "\" \"")

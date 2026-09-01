@@ -918,6 +918,77 @@ to diff against and no evidence those 13 are new. Do not assume this fix closes 
 
 ---
 
+## §3o. The first Linux run, and the flag list assembled in four places
+
+The push was the first time the `-Werror` gate, and four rules landed this arc, ran on a
+second compiler. It refused **35 of 278** corpus programs with one class and nothing else:
+implicit declarations of `fileno` (11), `ftruncate` (11), `usleep` (10), `clock_gettime` (9)
+and `kill` (1). That the other ~20 gate flags stayed silent on a different gcc is its own
+result — no version-specific false positives.
+
+**The includes were never missing.** `#include <unistd.h>` is in the emitted C and the
+source declares its header properly (`@cfg(posix) extern "unistd.h" fn ftruncate`).
+`-std=c11` defines `__STRICT_ANSI__`, which switches glibc's `_DEFAULT_SOURCE` OFF, and all
+five are POSIX rather than ISO. The declarations were not absent; they were switched off.
+Exact mirror of the mingw `__USE_MINGW_ANSI_STDIO` finding — **one `-std=c11` strictness
+consequence per platform, found weeks apart on opposite OSes.**
+
+`_DEFAULT_SOURCE`, deliberately **not** `_POSIX_C_SOURCE=200809L`: `usleep` was REMOVED in
+POSIX.1-2008, so glibc guards it behind `__USE_MISC` and the POSIX macro fixes four of the
+five while hiding the fifth more firmly.
+
+### The defect was DUPLICATION, and it is why nobody saw it
+
+The flag list is assembled in **four** places, and each was supposed to re-add the platform
+baseline by hand:
+
+| site | had Windows half | had POSIX half |
+|---|---|---|
+| `cc_base_flags()` (`main.rs`) | yes | **no** |
+| six helpers in `proptests.rs` | yes | **no** |
+| four more helpers in `proptests.rs` | **no** | **no** |
+| `cgen.jtr`'s `jc build` driver | yes | **no** |
+
+Invisible from here because the half that went missing was the POSIX one and the corpus is
+only ever compiled on Windows locally. All four now route through one definition
+(`cc_platform_defines()` / its `cgen.jtr` mirror).
+
+**Two guards, and the second exists because the first could not have caught the fourth
+site.** `every_cc_invocation_carries_the_platform_defines` scans `proptests.rs` and demands
+the baseline on the line IMMEDIATELY after `CC_FLAGS` — "a few lines later" is where the
+four went wrong. It cannot see a command built in Jestyr, so
+`the_self_hosted_driver_carries_both_platform_defines` checks `cgen.jtr` separately. A
+source-scanning test also finds its OWN needle: the literal is spliced
+(`concat!("args(crate::CC_", "FLAGS)")`) after the scan reported itself twice.
+
+### Result, measured: 14 failures → 5
+
+Nine closed, including the gate itself and `time_demo` — which this note had flagged as
+*unattributable* because it reported gcc FAILING on a runner where implicit declarations are
+warnings. The caution was right to hold and the cause turned out to be the same one; the
+honest lesson is that "I cannot attribute this" was the correct state to record, not a
+reason to guess either way.
+
+**The five that remain are three distinct causes, all diagnosed, none of them the flags:**
+
+1. **`temp_path` returns nothing on POSIX** (`test_fixture_demo`, and half of
+   `capability_suites_pass`). A real portability bug: POSIX says an unset `TMPDIR` means
+   `/tmp`, and Ubuntu runners set none of `TMPDIR`/`TEMP`/`TMP`.
+2. **`env_test.host_sees_a_temp_dir` asserts a non-guarantee** — it requires one of those
+   three variables to be SET. The library is correct; the assertion is wrong. Distinct from
+   (1) and needs the opposite fix: relax the test, do not "fix" `env`.
+3. **The `str` proptest's line-terminator stripper is Windows-only reasoning.** Its own
+   comment documents the failing case and then reasons from text-mode doubling: it pops
+   `
+`, then one ``, because "a payload ending in CR arrives as `…` + `
+`" —
+   true only on Windows. On POSIX the terminator is a bare `
+`, so the `` it pops is
+   PAYLOAD. `~` in the test alphabet decodes to CR, so the generator produces this input by
+   design, and the comment claiming the alphabet "guarantees" no stray CR is wrong.
+
+---
+
 ## §4. Comparison suites, rerun at this milestone
 
 Run twice this arc — after §3 and again after §3c, since both changed compiler semantics.
@@ -1464,3 +1535,29 @@ and a source-text guard requiring it ADJACENT to `CC_FLAGS`.
 
 **A source-scanning test finds its own needle.** Twice. Splice the literal
 (`concat!("args(crate::CC_", "FLAGS)")`) so no line of the file contains it whole.
+
+**Count the places a command is ASSEMBLED before fixing one of them.** The platform baseline
+was built in four places — `cc_base_flags`, six proptest helpers, four more proptest helpers,
+and `cgen.jtr`'s own `jc build` driver. Fixing the first three still left the Linux runner
+reporting `FAIL caps_demo`, because the self-hosted compiler drives gcc itself and no
+Rust-side guard can see a command built in Jestyr. `grep` for the flags, not for the helper.
+
+**A guard written in one language cannot cover a duplicate written in another.** This is why
+there are two tests and not one widened test. Widening the `proptests.rs` scan would have
+looked thorough and still missed `cgen.jtr` entirely.
+
+**A source-scanning test finds its own needle.** The scan reported itself twice — first on a
+bare mention of the constant, then on the narrowed `args(...)` form, because both spellings
+appear in its own body. Splice the literal (`concat!("args(crate::CC_", "FLAGS)")`) so no
+line of the file contains it whole.
+
+**"I cannot attribute this" is a result worth recording, not a gap to fill with a guess.**
+`time_demo` was flagged as unexplained because it reported gcc FAILING where implicit
+declarations are only warnings. It turned out to have the same cause as the rest — but
+recording the uncertainty cost nothing and guessing either way would have been wrong-shaped:
+the honest note is what let the next run settle it as evidence rather than as confirmation.
+
+**A comment that says a test alphabet "guarantees" something is a claim to check.** The `str`
+proptest's alphabet is documented as guaranteeing no stray CR; `~` decodes to CR by design,
+two functions above. The stripper built on that false guarantee is correct on Windows and
+eats payload on POSIX.

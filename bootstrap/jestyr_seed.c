@@ -39741,6 +39741,10 @@ int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_C
     {
         jestyr_rt_str_push(&j_cmd, JSTR(" -D_WIN32_WINNT=0x0600"));
     }
+    if (j_posix)
+    {
+        jestyr_rt_str_push(&j_cmd, JSTR(" -D_DEFAULT_SOURCE"));
+    }
     jestyr_rt_str_push(&j_cmd, JSTR(" -o \""));
     jestyr_rt_str_push(&j_cmd, jestyr_rt_str_view(&j_xpath));
     jestyr_rt_str_push(&j_cmd, JSTR("\" \""));

@@ -21385,6 +21385,31 @@ mod cc_command_assembly {
              (`-std=c11` sets __STRICT_ANSI__), and on mingw it drops the Vista baseline"
         );
     }
+
+    /// **The SELF-HOSTED driver carries both halves of the baseline too.**
+    ///
+    /// `jc <file> build` drives gcc itself, so it assembles a FOURTH cc command — in
+    /// Jestyr, in `cgen.jtr`, where no Rust-side guard can see it. It had the Windows half
+    /// and not the POSIX one, and the fix for the other three sites did not reach it: the
+    /// Linux runner still reported `FAIL caps_demo` in the `jc` build matrix after the
+    /// other three were corrected.
+    ///
+    /// That is the same defect one layer out, and it is why this test exists separately
+    /// rather than the first one being widened — a scan of `proptests.rs` is structurally
+    /// incapable of noticing a command built in another language.
+    #[test]
+    fn the_self_hosted_driver_carries_both_platform_defines() {
+        let src = std::fs::read_to_string("examples/std/cgen.jtr")
+            .expect("the self-hosted backend must be readable");
+        for needle in ["-D_WIN32_WINNT=0x0600", "-D_DEFAULT_SOURCE"] {
+            assert!(
+                src.contains(needle),
+                "`examples/std/cgen.jtr` builds its own gcc command and no longer passes \
+                 `{needle}` — the platform baseline is assembled in FOUR places and this is \
+                 the one no Rust-side check can reach"
+            );
+        }
+    }
 }
 
 /// **The emitted C, put through the C compiler's own analysis.**
