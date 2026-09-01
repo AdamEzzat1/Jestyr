@@ -19866,6 +19866,26 @@ fn main() -> i32 {
 
         // The demo's decoding, applied to the generated argument so the oracle sees the
         // same bytes the module does.
+        /// Remove the ONE line terminator `print_str` appends, and nothing more.
+        ///
+        /// `windows` is a PARAMETER rather than `cfg!` at the use site so both branches are
+        /// reachable from either host — see `strip_one_terminator_keeps_a_payload_cr`. That
+        /// matters here specifically: the bug this fixes is invisible on Windows, so a
+        /// Windows-only check of it is vacuous, and this session has twice been caught by
+        /// exactly that shape.
+        fn strip_one_terminator(mut s: String, windows: bool) -> String {
+            if s.ends_with('\n') {
+                s.pop();
+                // Only where text-mode stdout doubled the terminator into `\r\n` is this
+                // `\r` part of it. On POSIX the terminator is a bare `\n` and any preceding
+                // CR is payload.
+                if windows && s.ends_with('\r') {
+                    s.pop();
+                }
+            }
+            s
+        }
+
         fn decode(s: &str) -> Vec<u8> {
             s.bytes()
                 .map(|c| match c {
@@ -19877,25 +19897,38 @@ fn main() -> i32 {
                 })
                 .collect()
         }
-        // Strip exactly the ONE line terminator `print_str` appends — `\n`, which
-        // Windows renders as `\r\n` — and nothing more. A greedy
-        // `trim_end_matches(['\r','\n'])` was the first version and it was WRONG: it
+        // Strip exactly the ONE line terminator `print_str` appends — and nothing more. A
+        // greedy `trim_end_matches(['\r','\n'])` was the first version and it was WRONG: it
         // also ate a carriage return that legitimately belonged to the result, so
         // `after("\r", "")` (correctly the whole string) compared as empty and failed a
-        // correct module. Popping `\n` then one `\r` is unambiguous, because a payload
-        // ending in CR arrives as `…\r` + `\r\n`.
+        // correct module.
+        //
+        // **The terminator's SHAPE is per-platform, and popping `\r` unconditionally was
+        // the same bug wearing the other hat.** On Windows text-mode stdout renders the
+        // appended `\n` as `\r\n`, so a payload ending in CR arrives as `…\r` + `\r\n` and
+        // the second pop is removing terminator. On POSIX the terminator is a bare `\n`, so
+        // that pop removes PAYLOAD — `after("\r", "")` compared as `""` against `"\r"` and
+        // failed the very case this comment was written to describe, on the first Linux run.
+        //
+        // The generator produces this input deliberately: `~` decodes to CR (see `decode`),
+        // so the note above claiming the alphabet is CR-free was never true.
         let run = |op: &str, a: &str, b: &str| -> String {
             let out = Command::new(exe).args([op, a, b]).output().unwrap();
             assert!(out.status.success(), "str_demo {op} {a:?} {b:?} exited {:?}", out.status);
-            let mut s = String::from_utf8(out.stdout).unwrap();
-            if s.ends_with('\n') {
-                s.pop();
-                if s.ends_with('\r') {
-                    s.pop();
-                }
-            }
-            s
+            strip_one_terminator(String::from_utf8(out.stdout).unwrap(), cfg!(windows))
         };
+
+        // **Both platform branches of the terminator strip, checked from either host.**
+        // The POSIX branch is the one that was wrong, and it is unreachable via `cfg!` on
+        // this machine — so it is asserted explicitly rather than left to CI. The payload
+        // here is exactly the case that failed: `after("\r", "")` is correctly the whole
+        // string, and the old unconditional `\r` pop turned it into "".
+        assert_eq!(strip_one_terminator("\r\r\n".to_string(), true), "\r", "windows: payload CR survives");
+        assert_eq!(strip_one_terminator("\r\n".to_string(), false), "\r", "posix: payload CR survives");
+        assert_eq!(strip_one_terminator("ab\r\n".to_string(), true), "ab", "windows: plain line");
+        assert_eq!(strip_one_terminator("ab\n".to_string(), false), "ab", "posix: plain line");
+        // And nothing is stripped when there is no terminator at all.
+        assert_eq!(strip_one_terminator("ab".to_string(), false), "ab");
 
         // 48 cases, not proptest's default 256: each is twelve process spawns. The
         // toolchain-free properties in `str_props` still run the full default count, so
@@ -19907,9 +19940,14 @@ fn main() -> i32 {
             let sb = decode(&s);
             let tb = decode(&t);
             let as_str = |v: &[u8]| String::from_utf8(v.to_vec()).unwrap();
-            // Only compare when both sides are printable-safe round-trippable text:
-            // the harness compares stdout, and a NUL or a stray CR would test the
-            // pipe rather than the module. The alphabet above guarantees this.
+            // The harness compares stdout, so the alphabet excludes NUL — a value that
+            // would test the pipe rather than the module.
+            //
+            // It does NOT exclude CR: `~` decodes to one, deliberately. An earlier version
+            // of this comment claimed the alphabet guaranteed CR-free text, and the
+            // terminator stripper below was built on that guarantee — correct on Windows,
+            // eating payload on POSIX, until the first Linux run produced exactly the
+            // `after("\r", "")` case the stripper's own comment describes.
             proptest::prop_assert_eq!(run("before", &s, &t), as_str(str_ref_before(&sb, &tb)), "before {:?} {:?}", s, t);
             proptest::prop_assert_eq!(run("after", &s, &t), as_str(str_ref_after(&sb, &tb)), "after {:?} {:?}", s, t);
             proptest::prop_assert_eq!(run("beforelast", &s, &t), as_str(str_ref_before_last(&sb, &tb)), "beforelast {:?} {:?}", s, t);
