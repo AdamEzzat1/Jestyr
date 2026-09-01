@@ -1058,13 +1058,22 @@ means either making the ASTs agree, or deriving spawn symbols from a per-spawn o
 instead of an `ExprId` (small on each side, but churns every spawn-bearing golden and
 attest hash).
 
-#### A2. `environ` on POSIX is unverified — owed to the Linux ladder
+#### A2. `environ` on POSIX is unverified — and NOT for the reason recorded here
 
-`bfcf0f6` makes a POSIX child inherit the parent's full environment. Verified here: the
-emitted C carries `extern char** environ;`, the Windows half is unchanged and still passes,
-both compilers agree byte-for-byte. **NOT verified here: that a POSIX child actually
-inherits it**, because `@cfg(posix)` only runs on the Linux runner. Flagged against this
-tree's own rule about shipping POSIX changes nobody in reach can watch.
+`bfcf0f6` makes a POSIX child inherit the parent's full environment. Verified: the emitted C
+carries `extern char** environ;`, the Windows half is unchanged and still passes, both
+compilers agree byte-for-byte. **Not verified: that a POSIX child actually inherits it.**
+
+**The recorded reason was "owed to the Linux ladder", and that is wrong.** The Linux ladder
+has since run green over this code and still verifies nothing, because **no test anywhere
+asserts that a child sees a variable its parent set** — swept for it. The claim is not
+waiting on a runner; it is waiting on a test nobody has written, which is the same shape as
+the recorded trap about `sysnet`'s cited test that did not exist.
+
+That also makes it cheap and LOCAL, not blocked: `sysproc.capture` can run a child that
+prints one variable, and the assertion works on either platform. Windows would pass it
+today (its half was never in doubt) and Linux would be answering the actual question for
+the first time. Whoever picks this up should write the test before touching anything.
 
 #### A3. `@copy` over a non-Copy field — **CLOSED, both sides (§3m)**
 
@@ -1126,7 +1135,7 @@ leaving the child's `\r`, so bytes read from a subprocess and printed come out d
 Making stdout binary would change every `\n` the compiler emits on Windows and re-baseline
 many goldens — its own increment and its own decision.
 
-#### A5. Intrinsic shadowing — **CLOSED in the reference; the port does not mirror it**
+#### A5. Intrinsic shadowing — **CLOSED, both sides (§3k, §3l)**
 
 A `pub fn` named for a cgen intrinsic was replaced at every UNQUALIFIED call with arguments
 discarded, while a qualified call reached the user's function — so the two spellings
