@@ -1042,20 +1042,30 @@ Both green both times.
 
 ---
 
-## §5. The inventory — half the brief already exists
+## §5. The inventory — WHERE THE TIER ACTUALLY STANDS
 
-| area | state |
-|---|---|
-| 1 service runtime | **core exists.** `runtime.jtr` has the loop, timers, cancellation tokens, IO-readiness poller, and structured exit reasons (`RT_FIRED/IDLE/TIMEOUT/READY`). Missing: signals, graceful shutdown, readiness/liveness, supervision |
-| 2 observability | **half.** `log.jtr` is structured, leveled, logfmt+JSON, injected `Clock`+`Writer`, no globals by design. `time.manual()` is the deterministic clock. Missing: metrics, spans |
-| 3 config | sources exist (`cli`, `env`, `json`, `diag`); the merge does not, and `cli.jtr:38` refuses it pending a precedence decision |
-| 4 sandbox | **mostly.** `sysproc` has real spawn, pipes, `wait_timeout`, kill. Missing env control needs a **language** change (`extern` cannot bind a global; `environ`) |
-| 5 package | content-addressing + DAG ordering exist (`module.rs` manifest, `buildgraph.jtr`, `tar.jtr`, `sha256.jtr`). Missing: semver, resolver, lockfile, cache |
-| 6 HTTP | a hardened `core` parser that refuses request smuggling. Everything above the message is absent |
-| 7 crypto | `sha256` + `crc32` only. No secure random, HMAC, constant-time compare |
-| 8 TLS | absent entirely |
-| 9 storage | `alog.jtr` is a CRC'd crash-recoverable append log. Missing: KV, compaction, batches, migrations |
-| 10 compatibility | **largely built.** `src/attest.rs` emits an ABI manifest and does breaking-vs-compatible diffing as a CI gate |
+**This table was stale for most of the arc** and is now rewritten against the tree. It used
+to read "half the brief already exists"; five areas have moved since, and leaving it as it
+was is how a session rebuilds something that already landed — which this repo has done
+twice.
+
+| # | area | state |
+|---|---|---|
+| 1 | service runtime | **DONE.** `runtime.jtr` (loop, timers, cancellation, IO-readiness, exit reasons) + `sysignal.jtr` (signals via intrinsics) + `service.jtr` (lifecycle, readiness-vs-liveness, computed exit reason). Missing: **supervision / restart policy** |
+| 2 | observability | **mostly.** `log.jtr` (structured, injected `Clock`+`Writer`, no globals) + `metrics.jtr` (counters/gauges/histograms, name-ordered dump, saturating counters). Missing: **trace spans** — and `Span` is taken three times already, so pick another word first |
+| 3 | config | **DONE.** `config.jtr` (precedence is a property of the SOURCE, order-independent) + `ini.jtr` as a file format over it. Missing: live reload, nesting |
+| 4 | sandbox | **mostly.** `sysproc` spawn/pipes/`wait_timeout`/kill, and environment inheritance now matches on both platforms **and is finally tested** (§3p). Missing: **cwd, process groups, fs capability projection** |
+| 5 | package | **the big one, barely started.** Content-addressing + DAG ordering exist (`module.rs` manifest, `buildgraph.jtr`, `tar.jtr`, `sha256.jtr`). Missing: **semver, resolver, lockfile, cache** |
+| 6 | HTTP | **parser only.** `http.jtr` refuses request smuggling. Missing: **routing, middleware, streaming bodies, keep-alive, timeouts, static files, access logs, test client/server** |
+| 7 | crypto | **boundary done.** `sha256`, `crc32`, and `csrand.jtr` (platform CSPRNG + constant-time compare). Missing: **HMAC, signing/verification, a hash interface** — bindings, not algorithms to write |
+| 8 | TLS | **absent**, and wants a DECISION before effort — see §6B4 |
+| 9 | storage | **log only.** `alog.jtr` is CRC'd and crash-recoverable. Missing: **KV, compaction, atomic batches, migrations, backup/export** |
+| 10 | compatibility | **DONE.** `src/attest.rs` emits the ABI manifest and gates breaking-vs-compatible in CI, now including trait/impl records. Missing: `@deprecated` reaches nothing (A8) |
+
+**Scoring it honestly: 4 areas done (1, 3, 7-at-the-boundary, 10), 3 mostly (2, 4, and 10's
+tail), 3 barely or not at all (5, 6, 9), 1 undecided (8).** The tier's own definition of done
+— *"a service can start, report health, run background work, shut down gracefully, and be
+tested deterministically"* — **is met**. What is left is breadth, not the headline claim.
 
 Full detail, with `file:line` citations, is in the research note.
 
