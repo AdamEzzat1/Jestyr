@@ -19475,6 +19475,44 @@ fn main() -> i32 {
         );
     }
 
+    /// **A spawned child inherits its parent's ENVIRONMENT — the A2 claim, finally asked.**
+    ///
+    /// `sysproc`'s header has said "the environment a child inherits is now the SAME on
+    /// both platforms" since `bfcf0f6`, and the register recorded it as "unverified — owed
+    /// to the Linux ladder". The ladder then ran green over that code many times and
+    /// verified nothing: **no test anywhere asked the question.** It was never blocked on a
+    /// machine.
+    ///
+    /// **This test sets the variable, and that is the whole design.** Before the fix a
+    /// POSIX child received `PATH` and nothing else, so a test asserting "the child sees
+    /// `PATH`" passes identically against the broken and the fixed behaviour — the obvious
+    /// test is the vacuous one. Proving the fix needs a variable that is NOT `PATH`, and
+    /// `std/env` reads only, so it has to arrive from the demo's parent: this harness.
+    ///
+    /// `parent-has-probe` is asserted FIRST for the same reason. If the `.env()` below ever
+    /// stops reaching the program, the child inherits nothing, "child saw nothing" looks
+    /// exactly like a regression, and the transcript would agree with a broken build. That
+    /// line fails loudly instead.
+    #[test]
+    fn a_spawned_child_inherits_the_parents_environment() {
+        const PROBE: &str = "JESTYR_ENVIRON_PROBE";
+        const VALUE: &str = "inherited-ok";
+        let exe = build_exe("examples/std/env_inherit_demo.jtr");
+        let out = Command::new(&exe).env(PROBE, VALUE).output().unwrap();
+        assert!(out.status.success(), "env_inherit_demo exited {:?}", out.status);
+        let got: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            got,
+            ["-- environ --", "parent-has-probe", "1", "child-ran", "1", "child-saw", VALUE],
+            "a child did not inherit `{PROBE}` from its parent"
+        );
+    }
+
     /// `std/test_fixture`'s suite through the real harness — it touches the real
     /// filesystem and shell, which is the only honest way to test a module whose job
     /// is fetching bytes from the OS.

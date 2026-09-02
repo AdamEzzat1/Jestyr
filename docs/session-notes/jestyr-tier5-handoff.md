@@ -980,12 +980,49 @@ reason to guess either way.
 3. **The `str` proptest's line-terminator stripper is Windows-only reasoning.** Its own
    comment documents the failing case and then reasons from text-mode doubling: it pops
    `
-`, then one ``, because "a payload ending in CR arrives as `…` + `
+`, then one `
+`, because "a payload ending in CR arrives as `…
+` + `
 `" —
    true only on Windows. On POSIX the terminator is a bare `
-`, so the `` it pops is
+`, so the `
+` it pops is
    PAYLOAD. `~` in the test alphabet decodes to CR, so the generator produces this input by
    design, and the comment claiming the alphabet "guarantees" no stray CR is wrong.
+
+---
+
+## §3p. The A2 claim, and why the ladder could never have found it
+
+`sysproc` has claimed since `bfcf0f6` that a child inherits its parent's whole environment
+on both platforms. The register said that was "unverified -- owed to the Linux ladder". The
+ladder has since run green over that code many times and verified nothing, because **no
+test anywhere asked**. It was never blocked on a machine; it was blocked on a file nobody
+had written. Same shape as the recorded `sysnet` trap: a cited test that did not exist.
+
+**The obvious test is the vacuous one.** Before the fix a POSIX child received `PATH` and
+nothing else, so "the child sees `PATH`" passes identically against the broken and the
+fixed behaviour. Proving the fix needs a variable that is NOT `PATH` -- and `std/env` reads
+only, with no setter anywhere in the tree, so it cannot come from the program. It comes
+from the program's PARENT: the `c-oracle` test sets `JESTYR_ENVIRON_PROBE`.
+
+**The child is the demo re-invoked.** A shell one-liner would need `echo $VAR` on POSIX and
+`echo %VAR%` on Windows -- a `@cfg` split inside the very test whose job is to show the two
+platforms now agree. Self-spawning asks it in one spelling on both.
+
+**`parent-has-probe` is printed FIRST, and that line is the test.** If the harness ever
+stops setting the variable, the child inherits nothing, "child saw nothing" looks exactly
+like a regression, and the transcript would agree with a broken build. Watched failing: the
+run without `.env()` reports `parent-has-probe 0`.
+
+### `cmd.exe` strips the quotes off a command line that begins with one
+
+The first draft quoted the program path, which is the spelling that looks obviously correct:
+`"<path>" child> "<out>" 2>&1`. `cmd.exe /c` re-reads that as `<path>" child> "<out> 2>&1`
+and reports *"The filename, directory name, or volume label syntax is incorrect"*. Unquoted
+works. The cost is that a built path containing a space would break it -- acceptable here
+because the driver builds into the system temp directory, and the alternative is fighting
+cmd's quote-stripping from inside a string `test_fixture.capture` owns.
 
 ---
 
@@ -1058,7 +1095,18 @@ means either making the ASTs agree, or deriving spawn symbols from a per-spawn o
 instead of an `ExprId` (small on each side, but churns every spawn-bearing golden and
 attest hash).
 
-#### A2. `environ` on POSIX is unverified — and NOT for the reason recorded here
+#### A2. `environ` on POSIX — **CLOSED: the test exists now (§3p)**
+
+`examples/std/env_inherit_demo.jtr` + `a_spawned_child_inherits_the_parents_environment`.
+The harness sets `JESTYR_ENVIRON_PROBE`, the demo spawns ITSELF, and the child must print
+the value back. Watched failing without the variable. Windows passes; the Linux runner is
+answering the question for the first time.
+
+The original entry is kept because the diagnosis is the reusable part.
+
+<details>
+
+#### A2 (historical). `environ` on POSIX is unverified — and NOT for the reason recorded here
 
 `bfcf0f6` makes a POSIX child inherit the parent's full environment. Verified: the emitted C
 carries `extern char** environ;`, the Windows half is unchanged and still passes, both
@@ -1074,6 +1122,8 @@ That also makes it cheap and LOCAL, not blocked: `sysproc.capture` can run a chi
 prints one variable, and the assertion works on either platform. Windows would pass it
 today (its half was never in doubt) and Linux would be answering the actual question for
 the first time. Whoever picks this up should write the test before touching anything.
+
+</details>
 
 #### A3. `@copy` over a non-Copy field — **CLOSED, both sides (§3m)**
 
@@ -1570,3 +1620,13 @@ the honest note is what let the next run settle it as evidence rather than as co
 proptest's alphabet is documented as guaranteeing no stray CR; `~` decodes to CR by design,
 two functions above. The stripper built on that false guarantee is correct on Windows and
 eats payload on POSIX.
+
+**"Owed to the Linux ladder" can mean "owed to a test nobody wrote".** A2 sat as blocked-on-
+a-machine for an entire arc. The machine had been running the code green the whole time; no
+test asked the question. Before recording an item as blocked on infrastructure, check
+whether the assertion exists at all — the ladder cannot verify a claim nothing states.
+
+**The obvious test for a portability fix is often the vacuous one.** A POSIX child used to
+get `PATH` alone, so "the child sees `PATH`" passes against both the broken and the fixed
+build. When a fix WIDENS something, the test must use a value outside the old width, or it
+is testing the part that never changed.

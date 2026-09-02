@@ -1,0 +1,94 @@
+// examples/std/env_inherit_demo.jtr — does a spawned child inherit its parent's
+// environment? The claim `std/sysproc` makes, finally asserted.
+//
+// **This existed as a claim with no test for as long as the claim existed.** `sysproc`'s
+// header says "the environment a child inherits is now the SAME on both platforms", and
+// the register recorded that as "unverified — owed to the Linux ladder". The Linux ladder
+// then ran green over it many times and verified nothing, because nothing anywhere asked
+// the question. It was never blocked on a machine; it was blocked on this file.
+//
+// **Why the obvious test would have been vacuous.** Before the fix, a POSIX child got
+// `PATH` and nothing else. So a test asserting "the child sees PATH" passes identically
+// against the broken and the fixed behaviour. Proving the fix needs a variable that is NOT
+// `PATH` — and Jestyr has no way to SET one (`std/env` reads only), so it has to arrive
+// from this program's own parent. The `c-oracle` test sets `JESTYR_ENVIRON_PROBE` when it
+// runs this demo; a child that can read it saw more than `PATH`.
+//
+// **The child is this same program, re-invoked.** A shell one-liner would have to be
+// spelled `echo $VAR` on POSIX and `echo %VAR%` on Windows — a `@cfg` split in the very
+// test whose job is to show the two platforms now agree. Self-spawning asks the question
+// in one spelling on both.
+//
+// Run:  jestyrc run examples/std/env_inherit_demo.jtr
+//   →   -- environ --
+//       parent-has-probe 1        (0 means the harness set nothing — the test is vacuous)
+//       child-ran 1
+//       child-saw <the value>
+import "env"
+import "fs"
+import "process"
+import "test_fixture"
+
+const PROBE: str = "JESTYR_ENVIRON_PROBE"
+const CAP: usize = 1024
+
+fn b2i(b: bool) -> i32 {
+    if b { return 1 }
+    return 0
+}
+
+fn main() -> i32 {
+    // ---- CHILD MODE. Any argument at all means "print the probe and exit"; the parent
+    // passes one. `argc` is 1 for a bare invocation, so the two modes cannot be confused.
+    if env.argc() > 1 {
+        print_str(env.get(PROBE))
+        return 0
+    }
+
+    // ---- PARENT MODE.
+    print_str("-- environ --")
+
+    // The anti-vacuity line, and it is FIRST on purpose. If the harness set nothing, the
+    // child has nothing to inherit and every line below would agree with a broken build.
+    let mine: str = env.get(PROBE)
+    print_str("parent-has-probe")
+    print_int(b2i(mine.len > 0))
+
+    var praw: *mut u8 = alloc(u8, CAP)
+    var pbuf: []u8 = slice(u8, praw, CAP)
+    let n: usize = test_fixture.temp_path("jestyr_environ_probe.out", pbuf)
+    let opath: str = from_utf8(pbuf[0 .. n])
+
+    // `<this program> child`, UNQUOTED, and that is not an oversight.
+    //
+    // `cmd.exe /c` strips the outer quotes of a command line that BEGINS with one, so
+    // `"<path>" child> "<out>" 2>&1` is re-read as `<path>" child> "<out> 2>&1` and cmd
+    // reports "The filename, directory name, or volume label syntax is incorrect". Quoting
+    // the program is the more obviously-correct-looking spelling and it is the broken one.
+    //
+    // The cost is that this breaks if the built binary's path contains a space. It does not
+    // here — the driver builds into the system temp directory — and the alternative is
+    // fighting cmd's quote-stripping rules from inside a string this module does not own.
+    var cmd: String = string_new()
+    string_push(cmd, env.program())
+    string_push(cmd, " child")
+
+    var craw: *mut u8 = alloc(u8, CAP * 2)
+    var cbuf: []u8 = slice(u8, craw, CAP * 2)
+    var h: process.Process = process.host()
+    fs.remove(opath)
+    let rc: i32 = test_fixture.capture(h, string_view(cmd), opath, cbuf)
+    print_str("child-ran")
+    print_int(b2i(rc == 0))
+
+    var text: String = fs.read_text(opath)
+    print_str("child-saw")
+    print_str(trim(string_view(text)))
+
+    string_free(text)
+    fs.remove(opath)
+    string_free(cmd)
+    free_ptr(craw)
+    free_ptr(praw)
+    return 0
+}

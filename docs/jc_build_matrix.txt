@@ -65,6 +65,7 @@ BUILD_OK diag_demo
 BUILD_OK doc_cli
 BUILD_OK drop_named_type_param
 BUILD_OK env_demo
+BUILD_OK env_inherit_demo
 BUILD_OK escape_cli
 BUILD_OK file_demo
 BUILD_OK files
