@@ -22815,6 +22815,19 @@ void jestyr_emit_place(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr
     }
     if ((j_e.j_kind == 6))
     {
+        Jestyr_ExprData j_rix = jestyr_get__list__ExprData(j_p.j_ex, (size_t)(j_e.j_b));
+        if (((j_rix.j_kind == 13) && (jestyr_repr_is_slice(j_c, j_e.j_a) || jestyr_repr_is_str(j_c, j_e.j_a))))
+        {
+            JestyrString j_vb = jestyr_rt_str_new();
+            jestyr_emit_expr(&(j_vb), j_p, j_src, j_c, &((*j_g)), j_eid);
+            jestyr_rt_str_push(&(*j_sb), JSTR("(*("));
+            jestyr_emit_su_tyid(&((*j_sb)), j_p, j_src, j_c, (*j_g), jestyr_repr_tyid(j_c, j_e.j_a));
+            jestyr_rt_str_push(&(*j_sb), JSTR("[1]){ "));
+            jestyr_rt_str_push(&(*j_sb), jestyr_rt_str_view(&j_vb));
+            jestyr_rt_str_push(&(*j_sb), JSTR(" })"));
+            jestyr_rt_str_free(&j_vb);
+            return;
+        }
         int32_t j_bt = jestyr_repr_tyid(j_c, j_e.j_a);
         if ((j_bt >= 0))
         {

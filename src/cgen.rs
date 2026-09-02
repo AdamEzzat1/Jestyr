@@ -10206,6 +10206,33 @@ impl<'a> Cgen<'a> {
             ExprKind::Index { base, index } => {
                 let (base, index) = (*base, *index);
                 let bt = self.repr_of(base);
+                // A RANGE index is not an element access. `xs[a .. b]` computes a
+                // *new* `{ ptr, len }` view, so there is no element whose address
+                // could be taken — the arms below would emit the `Range` node as if
+                // it were a scalar offset and hit the backend's "no ranges yet"
+                // refusal, pointing at the range rather than at anything wrong.
+                //
+                // The sub-view is a value, and `emit_place` owes its callers an
+                // lvalue, so it is parked in a **compound literal of array type**:
+                // `(T[1]){ v }` decays to `T*` and `(*…)` reads back as a place.
+                // Its lifetime is the enclosing block — not the statement expression
+                // that computed it — so `&` of it comfortably outlives the call,
+                // which is the same reason `abi_ref_arg` reaches for this shape.
+                //
+                // The view is a copy of `{ ptr, len }`, but `ptr` still names the
+                // caller's buffer, so a `mut` callee's element writes land where
+                // they should. Only a whole-view reassignment (`xs = …`) would be
+                // lost, and a temporary sub-view has no home to write one back to.
+                //
+                // Restricted to the two bases `emit_expr` actually lowers a range
+                // over; a fixed-size array keeps its existing refusal untouched.
+                if matches!(self.ast.expr_at(index).kind, ExprKind::Range { .. })
+                    && matches!(bt, Ty::Slice(_) | Ty::Prim("str"))
+                {
+                    let sty = self.c_type(&bt);
+                    let v = self.emit_expr(id);
+                    return format!("(*({sty}[1]){{ {v} }})");
+                }
                 if let Ty::Array { len, .. } = &bt {
                     let nlen = *len;
                     let aty = self.c_type(&bt);

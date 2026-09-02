@@ -41,19 +41,72 @@ Every item here touches the compiler's own closure, owes a port mirror, and forc
 reseed. **They cannot run in parallel with each other or with anything else that reseeds**
 (see §3). Do them one at a time, in this order.
 
-### 1.1 — A7: a range expression may not be a call ARGUMENT
+### ~~1.1 — A7: a range expression may not be a call ARGUMENT~~ — **DONE**
 
-`bounds[0 .. 3]` passed to a `read []i64` parameter is refused. The workaround is `alloc` +
-`slice(T, raw, N)` bound to a named local, which every caller currently does by hand.
+Closed both sides. `examples/slice_range_mut.jtr` is the corpus file, allowlisted, and the
+port mirror was **watched failing** without it (the golden named exactly that file).
 
-**Why first:** it is the gap most likely to STOP a parallel session mid-flight. Library work
-in §2 will reach for sub-slices constantly, and today it hits a wall with no diagnostic
-explaining the shape. Closing it removes the most probable cause of a parallel session
-turning serial.
+**Two recorded facts about A7 were wrong, and both cost time — re-measure before designing.**
 
-Recorded too narrowly for a long time as a `mut` sub-slice problem — it is not; the boundary
-is argument position, not mutability. Parser change → the P2 golden has **no allowlist**, so
-the port mirror is mandatory.
+* **It was never about argument position.** `total(b[0 .. 3])` into a `read []i64` has always
+  worked, and `examples/slice_range.jtr` already shipped `from_utf8(b[0 .. 3])`. The Tier 4
+  note's original `mut` diagnosis was the correct one; §6A's "correction" of it was the
+  error. The boundary is **mutability**, i.e. by-address passing.
+* **It was not a parser change**, so the P2-golden argument for the mirror did not apply.
+  The parser builds the `Range` node fine and typeck types the sub-view correctly — `check`
+  passes. It was one arm of **`cgen::emit_place`**.
+
+**The actual mechanism.** `emit_place` is the lvalue-yielding twin of `emit_expr`, used for
+`mut`/`out` arguments because those pass by address. Its `Index` arm assumed the index is a
+*scalar element offset*; a range index is not — `xs[a .. b]` computes a whole new
+`{ ptr, len }` view. The arm emitted the `Range` node as if it were an offset and hit the
+backend's "the C backend does not support ranges yet", **pointing at the range**, which is
+what made the symptom look like a missing range feature rather than a missing place case.
+
+The fix parks the computed sub-view in a **compound literal of array type** — `(T[1]){ v }`
+decays to `T*`, `(*…)` reads back as a place, and its lifetime is the enclosing block rather
+than the statement expression that built it, so `&` of it outlives the call. This is the same
+shape `abi_ref_arg` already uses, for the same reason. `str` takes the same route (a
+`jestyr_rt_substr` call is a value too) and that half is reachable — a `mut str` parameter
+was equally broken, as a raw gcc error rather than the range diagnostic.
+
+The bounds assert survives the wrapping, so a bad sub-range still faults before the callee
+sees it. The fixed-size-array refusal is deliberately untouched: typeck does not extend
+re-slicing to arrays (that needs the borrowed-projection story, safety-mosaic item 2), so
+the guard is restricted to the two bases `emit_expr` actually lowers a range over.
+
+### 1.1b — A11: a **non-place** `mut` argument degrades to a raw gcc error — NEW, needs a decision
+
+Found while fixing A7, and left open deliberately because it is a semantics question, not a
+lowering bug. Same code path, so whoever touches `emit_place` next should see it first.
+
+```
+fn bump(mut xs: []i64) { … }
+fn mk() -> []i64 { … }
+bump(mk())          // error: lvalue required as unary '&' operand   ← raw gcc, no span
+```
+
+`emit_addr_arg` assumes every `mut`/`out` argument lowers to a C lvalue and emits `&(place)`.
+For any argument that is a *value* — a call result, a cast, an arithmetic expression — that is
+"lvalue required". `check` passes; only `run` fails; the message is gcc's, with no Jestyr span.
+The A7 sub-view was one instance of this hole; **this is the rest of it.**
+
+**Why it was NOT folded into the A7 fix.** The tempting one-liner is to route the fall-through
+arms through `is_c_lvalue` and wrap the non-lvalues in the same compound literal. That is a
+**silent-miscompile trap**: `is_c_lvalue` answers "never" for `Index`, but `emit_place`'s
+checked-index arm deliberately renders `(*({ … &elem; }))`, which *is* an lvalue. Wrapping it
+would copy the element and **silently discard the callee's writes**. `abi_ref_arg` can afford
+that predicate because it serves a `read` parameter, where a spurious copy costs a copy; on
+the `mut` path the same wrongness costs a wrong answer. Any fix here needs a predicate that
+tracks `emit_place`'s *rendering*, not the source form — and that predicate must not be able
+to drift from `emit_place`, which is the real design work.
+
+**The decision owed first:** accept it (lower via the compound literal, as A7 now does) or
+**refuse it**. Refusing looks right — a `mut` borrow of a temporary has nowhere to write back
+to, so the mutation is unobservable and the code is almost certainly a bug — but a refusal is
+a rule, so per the standing constraint it must live in **`escape` on both sides** (`typeck.jtr`
+has no diagnostic channel). Note the sub-view case must stay ACCEPTED either way: it aliases
+the caller's buffer, so its element writes are observable and useful.
 
 ### 1.2 — A6: `Self` in a trait parameter — `check` passes, `run` fails
 
@@ -198,9 +251,18 @@ blocked-on-a-machine for an entire arc while the machine ran that code green. Be
 recording an item as infrastructure-blocked, check whether the assertion exists at all.
 
 **A recorded diagnosis is worth less than a recorded symptom, and can be worth less than
-nothing.** Three times this session the note's *conclusion* was right and its *mechanism*
+nothing.** Three times in one session the note's *conclusion* was right and its *mechanism*
 wrong, sending the fix at something far larger than the real one. Re-measure before
 designing around a recorded explanation.
+
+**A7 then made it four, and added a sharper edge: a CORRECTION can be worse than the error it
+replaced.** The entry's original `mut` diagnosis was right; the later "actually the boundary
+is argument position, not mutability" was wrong, and it cost more than the original ever did
+— it pointed at the parser, invoked the no-allowlist P2 golden, and made a two-line `cgen`
+fix look like a mandatory-mirror parser change. **Thirty seconds of running the claim would
+have killed it**: the corpus file the entry sat next to, `examples/slice_range.jtr`, had
+shipped a range sub-view in argument position all along. Before rewriting a defect's
+mechanism, run the sentence you are about to delete.
 
 **A grandfathered exception is a claim with a timestamp.** "Those two have not been bitten
 yet" was reasonable when written and stayed on the page while the hazard fired twice more.

@@ -1247,12 +1247,36 @@ refactor of cgen.jtr, worth doing before anything else needs to ask "is this an 
 Pre-existing. Parses, type-checks as `Opaque("Self")`, and cgen refuses. The degrades-to-gcc
 class the tier has otherwise been closing.
 
-#### A7. A range expression may not be a call ARGUMENT
+#### A7. A range sub-view may not be a `mut` argument — **CLOSED** (both sides)
 
-Pre-existing, and **the recorded description was too narrow**: the Tier 4 note calls it a
-`mut` sub-slice problem, but `bounds[0 .. 3]` into a `read []i64` parameter fails
-identically. The boundary is argument position, not mutability. Workaround: `alloc` +
-`slice(T, raw, N)` bound to a named local.
+**The two descriptions this entry carried were both wrong**, in opposite directions, and the
+correction above was the worse of the two. Kept in full because the failure mode — a recorded
+*diagnosis* outliving the *symptom* it explained — is the one this tree keeps paying for.
+
+* The claim that "`bounds[0 .. 3]` into a `read []i64` parameter fails identically" **does not
+  reproduce**, and could not have: `examples/slice_range.jtr` had shipped
+  `from_utf8(b[0 .. 3])` — a range sub-view in argument position — since the file was written.
+* The Tier 4 note's original `mut` diagnosis was right. The boundary is by-address passing.
+* The inferred consequence — "parser change → the P2 golden has no allowlist" — was therefore
+  also wrong. Nothing in the parser or typeck was involved; `check` passed throughout.
+
+The real defect was one arm of `cgen::emit_place`, which assumed an `Index`'s index is a
+scalar element offset. A range index computes a new `{ ptr, len }` view instead, so the arm
+emitted the `Range` node as if it were an offset and tripped "the C backend does not support
+ranges yet" — a diagnostic pointing at the range, which is precisely what disguised a missing
+*place* case as a missing *range* feature for two tiers.
+
+Fixed by parking the sub-view in a compound literal of array type (`(T[1]){ v }` → `T*` →
+`(*…)` is a place, block lifetime), the same shape `abi_ref_arg` uses. Corpus:
+`examples/slice_range_mut.jtr`, allowlisted in `CGEN_GOLDEN_ALLOWLIST`, so it is covered by
+both `jestyr_cgen_matches_reference` (byte identity) and `selfhost_fixpoint_subset` (gcc-built
+and RUN on both compilers, stdout compared). The port mirror was watched failing without it.
+
+The residual hole is recorded as **A11** in `jestyr-tier5-next-handoff.md` §1.1b: a `mut`
+argument that is a *value* rather than a place (`bump(mk())`) still degrades to a raw gcc
+"lvalue required". That one is a semantics decision, not a lowering bug, and is deliberately
+not folded in here — the obvious shared fix silently discards a callee's writes through a
+checked index.
 
 #### A8. `attest` accepts `@deprecated` and does nothing with it
 

@@ -1,0 +1,69 @@
+// examples/slice_range_mut.jtr — a range sub-view as a `mut` ARGUMENT.
+//
+// `xs[lo .. hi]` builds a fresh `{ ptr, len }` view; examples/slice_range.jtr covers
+// what that view IS. This file is about handing one to a function that MUTATES it.
+//
+// A `mut` parameter is passed by address, so the argument has to be a C lvalue — and a
+// sub-view is computed, never stored, so there is no element to point at. It is parked
+// in a compound literal of array type, `(T[1]){ view }`, which decays to `T*` and whose
+// lifetime is the enclosing block rather than the expression that built it, so the
+// address comfortably outlives the call.
+//
+// What the callee receives is a COPY of `{ ptr, len }` — but `ptr` still names the
+// caller's buffer, so the callee's ELEMENT writes land in the original. That is the
+// whole point, and it is what the first printout checks: only the elements inside the
+// range move, and they move by the right amount. A whole-view reassignment (`xs = …`)
+// is the one thing that is lost, and a temporary sub-view has no home to write one back
+// to — the same bargain Rust strikes for `&mut v[a .. b]`.
+//
+// The bounds assert survives the wrapping, so a bad sub-range still faults before the
+// callee ever sees it.
+//
+//   jestyrc run examples/slice_range_mut.jtr
+//   →  1 102 103 104 5  0 2 4 6 8  6  2
+
+fn bump(mut xs: []i64) {
+    for i in 0..xs.len { xs[i] = xs[i] + 100 }
+}
+
+fn double(mut xs: []i64) {
+    for i in 0..xs.len { xs[i] = xs[i] * 2 }
+}
+
+fn total(read xs: []i64) -> i64 {
+    var s: i64 = 0
+    for i in 0..xs.len { s = s + xs[i] }
+    return s
+}
+
+// A `mut str` parameter takes the same route: `s[a .. b]` lowers to a `jestyr_rt_substr`
+// CALL, which is a value too, so it needs the same lvalue parking.
+fn wipe(mut s: str) -> i64 {
+    s = "zz"
+    return s.len as i64
+}
+
+fn main() -> i32 {
+    var raw: *mut i64 = alloc(i64, 5)
+    var b: []i64 = slice(i64, raw, 5)
+    for i in 0..5 { b[i] = (i + 1) as i64 }
+
+    // The headline: a closed range straight into a `mut` parameter. The view is
+    // elements 1,2,3 — so 1 and 5 must NOT move.
+    bump(b[1 .. 4])
+    for i in 0..5 { print_int(b[i]) }          // 1  102  103  104  5
+
+    // The open-ended form in argument position — the whole buffer.
+    for i in 0..5 { b[i] = i as i64 }
+    double(b[0 ..])
+    for i in 0..5 { print_int(b[i]) }          // 0  2  4  6  8
+
+    // The inclusive form, and a `read` sub-view argument for contrast: both
+    // conventions reach the same buffer.
+    print_int(total(b[1 ..= 2]))               // 2 + 4 = 6
+
+    free_ptr(raw)
+
+    print_int(wipe("ABCDEF"[0 .. 4]))          // 2
+    return 0
+}

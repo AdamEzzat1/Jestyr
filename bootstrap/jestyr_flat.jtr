@@ -14966,6 +14966,34 @@ fn emit_place(mut sb: String, read p: Parser, read src: str, read c: Checker, mu
         return
     }
     if e.kind == 6 {                                  // Index
+        // A RANGE index is not an element access. `xs[a .. b]` computes a *new* `{ ptr, len }`
+        // view, so there is no element whose address could be taken -- the arms below would emit
+        // the Range node as if it were a scalar offset and hit the backend's "no ranges yet"
+        // refusal, pointing at the range rather than at anything wrong.
+        //
+        // The sub-view is a value, and `emit_place` owes its callers an lvalue, so it is parked in
+        // a COMPOUND LITERAL OF ARRAY TYPE: `(T[1]){ v }` decays to `T*` and `(*...)` reads back as
+        // a place. Its lifetime is the enclosing block -- not the statement expression that
+        // computed it -- so `&` of it comfortably outlives the call.
+        //
+        // The view is a copy of `{ ptr, len }`, but `ptr` still names the caller's buffer, so a
+        // `mut` callee's element writes land where they should. Only a whole-view reassignment
+        // would be lost, and a temporary sub-view has no home to write one back to.
+        //
+        // Restricted to the two bases `emit_expr` actually lowers a range over; a fixed-size array
+        // keeps its existing refusal untouched.
+        let rix: ExprData = get__list(ExprData, p.ex, e.b as usize)
+        if rix.kind == 13 and (repr_is_slice(c, e.a) or repr_is_str(c, e.a)) {
+            var vb: String = string_new()
+            emit_expr(vb, p, src, c, g, eid)
+            string_push(sb, "(*(")
+            emit_su_tyid(sb, p, src, c, g, repr_tyid(c, e.a))
+            string_push(sb, "[1]){ ")
+            string_push(sb, string_view(vb))
+            string_push(sb, " })")
+            string_free(vb)
+            return
+        }
         let bt: i32 = repr_tyid(c, e.a)
         if bt >= 0 {
             let bd: TyData = get__list(TyData, c.tys, bt as usize)

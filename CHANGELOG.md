@@ -83,6 +83,37 @@ versions are snapshots, not stability promises.
 
 ### Fixed
 
+- **A range sub-view may now be passed as a `mut` argument** — `sort(xs[0 .. mid])` rather
+  than an `alloc` + `slice(T, raw, N)` bound to a named local at every call site. Fixed on
+  both toolchains; `examples/slice_range_mut.jtr` is the corpus file, and the port mirror was
+  watched failing without it.
+
+  A `mut`/`out` parameter passes by address, so its argument routes through `emit_place`, the
+  lvalue-yielding twin of `emit_expr`. Its `Index` arm assumed the index is a scalar element
+  offset — but a range index is not: `xs[a .. b]` computes a whole new `{ ptr, len }` view,
+  and there is no element whose address could be taken. The arm emitted the `Range` node as
+  though it were an offset and hit "the C backend does not support ranges yet", **pointing at
+  the range**, which is what disguised a missing *place* case as a missing *range* feature.
+
+  The sub-view is a value, and `emit_place` owes its callers an lvalue, so it is parked in a
+  **compound literal of array type**: `(T[1]){ v }` decays to `T*` and `(*…)` reads back as a
+  place, with block lifetime rather than that of the statement expression that computed it —
+  the same shape, for the same reason, that `abi_ref_arg` already uses. The callee receives a
+  copy of `{ ptr, len }` whose `ptr` still names the caller's buffer, so element writes land
+  in the original; only a whole-view reassignment is lost, and a temporary sub-view has no
+  home to write one back to. The bounds assert survives the wrapping, so a bad sub-range still
+  faults before the callee sees it.
+
+  `str` took the same route and was equally broken — a `mut str` parameter given `s[a .. b]`
+  failed as a raw gcc "lvalue required", since `jestyr_rt_substr(…)` is a call. The
+  fixed-size-array case is deliberately unchanged: typeck does not extend re-slicing to
+  arrays, so the guard covers only the two bases the backend actually lowers a range over.
+
+  **Two recorded descriptions of this defect were wrong**, and the more recent one was the
+  worse: it claimed a `read` parameter failed identically and that the fix was a parser
+  change. Neither held — `examples/slice_range.jtr` had shipped `from_utf8(b[0 .. 3])` all
+  along, and `check` passed throughout. Nothing outside `cgen` was involved.
+
 - **The two backends agree on a `select` between two `concurrent` blocks.** The last live
   two-compiler divergence: a `spawn` trampoline's C symbol embeds an `ExprId`, and the
   self-hosted backend numbered select arms one ahead per arm, so the same program emitted
