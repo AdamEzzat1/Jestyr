@@ -15101,6 +15101,64 @@ fn at_guarantee_phrases(mut gb: String, mut gs: List(i32), read p: parser.Parser
 }
 
 // The manifest's rendering of those phrases: one `  guarantee: <phrase>\n` line each.
+// The `@deprecated` marker on fn item `it`, as its manifest line: `  deprecated:` bare, or
+// `  deprecated: <msg>` with the message's OUTER QUOTES stripped (a string literal's source
+// text keeps them, which is exactly what makes it a ready-made C clause in `fn_attr_prefix`).
+//
+// Deliberately NOT a guarantee and NOT part of the sig. The guarantee block is described as
+// machine-checked and a deprecation is proven nothing; and `attest --diff` calls any signature
+// change breaking, which would classify DEPRECATING an API as a breaking change -- backwards,
+// since every existing call still compiles and still works. Mirrors `doc::fn_deprecated`.
+// The `@deprecated` attribute's base index in `p.aar` for item `it`, or -1 when absent.
+fn at_dep_attr(read p: parser.Parser, read src: str, read it: parser.ItemData) -> i32 {
+    var i: i32 = 0
+    for i < it.v {
+        let ab: i32 = it.u + i * 4
+        let ns: i32 = list.get(i32, p.aar, ab as usize)
+        let ne: i32 = list.get(i32, p.aar, (ab + 1) as usize)
+        if str_eq(src[ns as usize .. ne as usize], "deprecated") { return ab }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn at_has_deprecated(read p: parser.Parser, read src: str, read it: parser.ItemData) -> bool {
+    return at_dep_attr(p, src, it) >= 0
+}
+
+// The deprecation MESSAGE, with its outer quotes stripped -- a string literal's source text
+// keeps them, which is exactly what makes it a ready-made C clause in `fn_attr_prefix`.
+// Pushes nothing for a bare `@deprecated`, and nothing for `@deprecated("")`, which lose
+// nothing a caller could act on.
+fn at_dep_msg(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    let ab: i32 = at_dep_attr(p, src, it)
+    if ab < 0 { return }
+    let ac: i32 = list.get(i32, p.aar, (ab + 3) as usize)
+    if ac <= 0 { return }
+    let a0: i32 = list.get(i32, p.aar, list.get(i32, p.aar, (ab + 2) as usize) as usize)
+    let ax: parser.ExprData = list.get(parser.ExprData, p.ex, a0 as usize)
+    if ax.kind != 29 { return }                       // a string literal
+    var s: usize = ax.start
+    var e: usize = ax.end
+    if e > s + 1 { s = s + 1  e = e - 1 }
+    if e > s { string_push(sb, src[s .. e]) }
+}
+
+// The manifest's rendering: `  deprecated:` bare, or `  deprecated: <msg>` with one.
+fn at_deprecated(mut ob: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    if !at_has_deprecated(p, src, it) { return }
+    var mb: String = string_new()
+    at_dep_msg(mb, p, src, it)
+    string_push(ob, "  deprecated:")
+    let mv: str = string_view(mb)
+    if mv.len > 0 {
+        string_push(ob, " ")
+        string_push(ob, mv)
+    }
+    string_push(ob, "\n")
+    string_free(mb)
+}
+
 fn at_guarantees(mut ob: String, read p: parser.Parser, read src: str, read it: parser.ItemData, read a: Allocator) {
     var gb: String = string_new()
     var gs: List(i32) = list.make(i32, a)
@@ -15320,6 +15378,9 @@ fn at_records(mut ob: String, read p: parser.Parser, read src: str, read a: Allo
             string_push(ob, src[it.x as usize .. it.y as usize])
         }
         string_push(ob, "\n")
+        // Ahead of the guarantees, so a reader meets "do not call this" before the proven
+        // facts about what calling it would do.
+        if it.kind == 3 { at_deprecated(ob, p, src, it) }
         if it.kind == 3 { at_guarantees(ob, p, src, it, a) }
         i = i + 1
     }
@@ -15584,7 +15645,11 @@ fn db_group(mut d: Db, read src: str, read docs: List(tokens.RawDoc), want: i32,
 // (-1 for none); `g_*` slice `gsp`, whose pairs span `gbuf`.
 struct Tg { sigbuf: String, gbuf: String, tg: List(i32), gsp: List(i32) }
 
-fn tg_push(mut t: Tg, start: i32, kind: i32, ns: i32, ne: i32, ss: i32, se: i32, ps: i32, pe: i32, g0: i32, gc: i32) {
+// Slots 11/12 are the `@deprecated` message span into `sigbuf`, with 11 == -1 for "absent"
+// and an EMPTY span for a bare `@deprecated`. Only a fn/method target can carry one
+// (`attrs.rs` declares the attribute's targets as Fn and Method), so every other `tg_push`
+// caller passes -1, -1 -- that is the attribute's declared surface, not a hole.
+fn tg_push(mut t: Tg, start: i32, kind: i32, ns: i32, ne: i32, ss: i32, se: i32, ps: i32, pe: i32, g0: i32, gc: i32, ds: i32, de: i32) {
     list.push(i32, t.tg, start)
     list.push(i32, t.tg, kind)
     list.push(i32, t.tg, ns)
@@ -15596,6 +15661,8 @@ fn tg_push(mut t: Tg, start: i32, kind: i32, ns: i32, ne: i32, ss: i32, se: i32,
     list.push(i32, t.tg, 0 - 1)                                // docblk, filled by the attach pass
     list.push(i32, t.tg, g0)
     list.push(i32, t.tg, gc)
+    list.push(i32, t.tg, ds)
+    list.push(i32, t.tg, de)
 }
 
 // A fn or struct-method target: the reconstructed signature plus the proven guarantees.
@@ -15606,7 +15673,17 @@ fn tg_add_fn(mut t: Tg, read p: parser.Parser, read src: str, read it: parser.It
     let g0: i32 = (list.len(i32, t.gsp) / 2) as i32
     at_guarantee_phrases(t.gbuf, t.gsp, p, src, it)
     let g1: i32 = (list.len(i32, t.gsp) / 2) as i32
-    tg_push(t, it.start as i32, kind, it.x, it.y, s0, s1, ps, pe, g0, g1 - g0)
+    // The deprecation message parks in `sigbuf` beside the signature: -1 for absent, an
+    // empty span for a bare `@deprecated`. Shares `at_dep_msg` with the manifest, so the
+    // documented deprecation and the attested one cannot drift.
+    var ds: i32 = 0 - 1
+    var de: i32 = 0 - 1
+    if at_has_deprecated(p, src, it) {
+        ds = sb_len(t.sigbuf)
+        at_dep_msg(t.sigbuf, p, src, it)
+        de = sb_len(t.sigbuf)
+    }
+    tg_push(t, it.start as i32, kind, it.x, it.y, s0, s1, ps, pe, g0, g1 - g0, ds, de)
 }
 
 fn dc_targets(mut t: Tg, read p: parser.Parser, read src: str) {
@@ -15619,19 +15696,19 @@ fn dc_targets(mut t: Tg, read p: parser.Parser, read src: str) {
         } else if it.kind == 8 {
             let s0: i32 = sb_len(t.sigbuf)
             at_extern_sig(t.sigbuf, p, src, it)
-            tg_push(t, it.start as i32, 1, it.x, it.y, s0, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+            tg_push(t, it.start as i32, 1, it.x, it.y, s0, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0, 0 - 1, 0 - 1)
         } else if it.kind == 5 {
             let s1: i32 = sb_len(t.sigbuf)
             at_enum_sig(t.sigbuf, p, src, it)
-            tg_push(t, it.start as i32, 2, it.x, it.y, s1, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+            tg_push(t, it.start as i32, 2, it.x, it.y, s1, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0, 0 - 1, 0 - 1)
         } else if it.kind == 2 {
             let s2: i32 = sb_len(t.sigbuf)
             at_const_sig(t.sigbuf, p, src, it)
-            tg_push(t, it.start as i32, 3, it.x, it.y, s2, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+            tg_push(t, it.start as i32, 3, it.x, it.y, s2, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0, 0 - 1, 0 - 1)
         } else if it.kind == 4 {
             let s3: i32 = sb_len(t.sigbuf)
             at_struct_sig(t.sigbuf, p, src, it)
-            tg_push(t, it.start as i32, 4, it.x, it.y, s3, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+            tg_push(t, it.start as i32, 4, it.x, it.y, s3, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0, 0 - 1, 0 - 1)
             var m: i32 = 0
             for m < it.b {
                 let base: i32 = it.a + m * 10
@@ -15649,13 +15726,13 @@ fn dc_targets(mut t: Tg, read p: parser.Parser, read src: str) {
             string_push(t.sigbuf, src[it.x as usize .. it.y as usize])
             string_push(t.sigbuf, " = ")
             at_ty(t.sigbuf, p, src, it.a)
-            tg_push(t, it.start as i32, 6, it.x, it.y, s4, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+            tg_push(t, it.start as i32, 6, it.x, it.y, s4, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0, 0 - 1, 0 - 1)
         } else if it.kind == 6 {
             let s5: i32 = sb_len(t.sigbuf)
             if it.is_pub != 0 { string_push(t.sigbuf, "pub ") }
             string_push(t.sigbuf, "trait ")
             string_push(t.sigbuf, src[it.x as usize .. it.y as usize])
-            tg_push(t, it.start as i32, 7, it.x, it.y, s5, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+            tg_push(t, it.start as i32, 7, it.x, it.y, s5, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0, 0 - 1, 0 - 1)
         }
         r = r + 1
     }
@@ -15830,6 +15907,19 @@ fn dc_emit_target(mut sb: String, read t: Tg, tb: i32, level: i32, read src: str
     let sv: str = string_view(t.sigbuf)
     string_push(sb, sv[list.get(i32, t.tg, (tb + 4) as usize) as usize .. list.get(i32, t.tg, (tb + 5) as usize) as usize])
     string_push(sb, "\n```\n\n")
+    // Before the prose: a reader deciding whether to CALL this needs the deprecation first,
+    // not after a paragraph explaining what it does.
+    let dps: i32 = list.get(i32, t.tg, (tb + 11) as usize)
+    if dps >= 0 {
+        let dpe: i32 = list.get(i32, t.tg, (tb + 12) as usize)
+        if dpe > dps {
+            string_push(sb, "> **Deprecated** — ")
+            string_push(sb, sv[dps as usize .. dpe as usize])
+            string_push(sb, "\n\n")
+        } else {
+            string_push(sb, "> **Deprecated.**\n\n")
+        }
+    }
     let blk: i32 = list.get(i32, t.tg, (tb + 8) as usize)
     if blk >= 0 {
         var pd: Pd = Pd{ sum: list.make(i32, a), hbuf: string_new(), sec: list.make(i32, a), sln: list.make(i32, a) }
@@ -15864,19 +15954,19 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
 
     var t: Tg = Tg{ sigbuf: string_new(), gbuf: string_new(), tg: list.make(i32, a), gsp: list.make(i32, a) }
     dc_targets(t, p, src)
-    let tn: usize = list.len(i32, t.tg) / 11
+    let tn: usize = list.len(i32, t.tg) / 13
     // Targets in source order (`sort_by_key(span.start)`); collection is already ascending, so
     // this insertion sort is normally a no-op — it keeps the order guaranteed, not assumed.
     var i: usize = 1
     for i < tn {
         var j: usize = i
         for j > 0 {
-            if list.get(i32, t.tg, (j * 11) as usize) >= list.get(i32, t.tg, ((j - 1) * 11) as usize) { break }
+            if list.get(i32, t.tg, (j * 13) as usize) >= list.get(i32, t.tg, ((j - 1) * 13) as usize) { break }
             var f: usize = 0
-            for f < 11 {
-                let tmp: i32 = list.get(i32, t.tg, j * 11 + f)
-                list.set(i32, t.tg, j * 11 + f, list.get(i32, t.tg, (j - 1) * 11 + f))
-                list.set(i32, t.tg, (j - 1) * 11 + f, tmp)
+            for f < 13 {
+                let tmp: i32 = list.get(i32, t.tg, j * 13 + f)
+                list.set(i32, t.tg, j * 13 + f, list.get(i32, t.tg, (j - 1) * 13 + f))
+                list.set(i32, t.tg, (j - 1) * 13 + f, tmp)
                 f = f + 1
             }
             j = j - 1
@@ -15894,7 +15984,7 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
         var hit: i32 = 0 - 1
         var k: usize = 0
         for k < tn {
-            if list.get(i32, t.tg, (k * 11) as usize) >= bend {
+            if list.get(i32, t.tg, (k * 13) as usize) >= bend {
                 hit = k as i32
                 break
             }
@@ -15903,9 +15993,9 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
         if hit < 0 {
             list.push(i32, dangle, bi as i32)
         } else {
-            let prev: i32 = list.get(i32, t.tg, (hit * 11 + 8) as usize)
+            let prev: i32 = list.get(i32, t.tg, (hit * 13 + 8) as usize)
             if prev >= 0 { list.push(i32, dangle, prev) }
-            list.set(i32, t.tg, (hit * 11 + 8) as usize, bi as i32)
+            list.set(i32, t.tg, (hit * 13 + 8) as usize, bi as i32)
         }
         bi = bi + 1
     }
@@ -15944,7 +16034,7 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
     var tops: i32 = 0
     var c0: usize = 0
     for c0 < tn {
-        if list.get(i32, t.tg, (c0 * 11 + 6) as usize) < 0 { tops = tops + 1 }
+        if list.get(i32, t.tg, (c0 * 13 + 6) as usize) < 0 { tops = tops + 1 }
         c0 = c0 + 1
     }
     if tops == 0 {
@@ -15955,7 +16045,7 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
     string_push(sb, "## API\n\n")
     var r: usize = 0
     for r < tn {
-        let tb: i32 = (r * 11) as i32
+        let tb: i32 = (r * 13) as i32
         if list.get(i32, t.tg, (tb + 6) as usize) < 0 {
             dc_emit_target(sb, t, tb, 3, src, outer, a)
             if list.get(i32, t.tg, (tb + 1) as usize) == 4 {   // a struct: gather its methods
@@ -15963,7 +16053,7 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
                 var any: bool = false
                 var m2: usize = 0
                 for m2 < tn {
-                    let mb: i32 = (m2 * 11) as i32
+                    let mb: i32 = (m2 * 13) as i32
                     let ps: i32 = list.get(i32, t.tg, (mb + 6) as usize)
                     if ps >= 0 {
                         if str_eq(src[ps as usize .. list.get(i32, t.tg, (mb + 7) as usize) as usize], nm) { any = true }
@@ -15976,7 +16066,7 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
                     string_push(sb, "`\n\n")
                     var m3: usize = 0
                     for m3 < tn {
-                        let mb2: i32 = (m3 * 11) as i32
+                        let mb2: i32 = (m3 * 13) as i32
                         let ps2: i32 = list.get(i32, t.tg, (mb2 + 6) as usize)
                         if ps2 >= 0 {
                             if str_eq(src[ps2 as usize .. list.get(i32, t.tg, (mb2 + 7) as usize) as usize], nm) {
@@ -16111,6 +16201,14 @@ fn am_parse(read t: str, read a: Allocator) -> Am {
                     list.push(i32, m.gs, (ls + 13) as i32)
                     list.push(i32, m.gs, ce as i32)
                     list.set(i32, m.items, (cur + 6) as usize, list.get(i32, m.items, (cur + 6) as usize) + 1)
+                } else if starts_with(body, "deprecated:") {
+                    // `deprecated:` bare, `deprecated: <msg>` with one. A manifest written
+                    // before this line existed has none, so slot 7 stays -1 and it reads as
+                    // "not deprecated then" -- an old manifest still diffs against a new one.
+                    var ds: usize = ls + 13                // past "  deprecated:"
+                    if ce > ds { ds = ds + 1 }             // the single space the renderer emits
+                    list.set(i32, m.items, (cur + 7) as usize, ds as i32)
+                    list.set(i32, m.items, (cur + 8) as usize, ce as i32)
                 }
             }
         } else {
@@ -16122,6 +16220,8 @@ fn am_parse(read t: str, read a: Allocator) -> Am {
             list.push(i32, m.items, 0)
             list.push(i32, m.items, (list.len(i32, m.gs) / 2) as i32)
             list.push(i32, m.items, 0)                 // guarantee count
+            list.push(i32, m.items, 0 - 1)             // deprecated msg span start (-1 = absent)
+            list.push(i32, m.items, 0 - 1)             // deprecated msg span end
         }
         ls = le + 1
     }
@@ -16133,13 +16233,20 @@ fn am_parse(read t: str, read a: Allocator) -> Am {
 fn am_find(read m: Am, read t: str, read key: str) -> i32 {
     var found: i32 = 0 - 1
     var i: usize = 0
-    for i < list.len(i32, m.items) / 7 {
-        let ib: i32 = (i * 7) as i32
+    for i < list.len(i32, m.items) / 9 {
+        let ib: i32 = (i * 9) as i32
         if str_eq(t[list.get(i32, m.items, ib as usize) as usize .. list.get(i32, m.items, (ib + 1) as usize) as usize], key) { found = ib }
         i = i + 1
     }
     return found
 }
+
+// `@deprecated`: slot 7 is -1 when absent, else the message span (empty for a bare one).
+// Spans, not a `str`: a sub-view of a `read` borrow may not outlive its call, so the caller
+// slices its own buffer -- the same shape `am_g_s`/`am_g_e` use.
+fn am_has_dep(read m: Am, ib: i32) -> bool { return list.get(i32, m.items, (ib + 7) as usize) >= 0 }
+fn am_dep_s(read m: Am, ib: i32) -> usize { return list.get(i32, m.items, (ib + 7) as usize) as usize }
+fn am_dep_e(read m: Am, ib: i32) -> usize { return list.get(i32, m.items, (ib + 8) as usize) as usize }
 
 fn am_g_count(read m: Am, ib: i32) -> i32 { return list.get(i32, m.items, (ib + 6) as usize) }
 fn am_g_s(read m: Am, ib: i32, k: i32) -> usize {
@@ -16498,6 +16605,44 @@ fn am_diff_item(mut cb: String, mut cl: List(i32), read ot: str, read o: Am, ob:
         string_free(d)
     }
 
+    // Deprecation. EVERY verdict here is compatible, and that is the point: a deprecated
+    // function still compiles, still links, and still returns what it always did, so nothing
+    // a caller wrote stops working. Calling it breaking would fire the CI gate on the one
+    // action a library author takes to AVOID breaking people. It still has to be REPORTED --
+    // "this is going away" is exactly what a contract diff is read for.
+    let odep: bool = am_has_dep(o, ob)
+    let ndep: bool = am_has_dep(n, nbs)
+    if !odep and ndep {
+        let nms: usize = am_dep_s(n, nbs)
+        let nme: usize = am_dep_e(n, nbs)
+        if nme <= nms {
+            am_change(cb, cl, key, false, "now `@deprecated`")
+        } else {
+            var d: String = string_new()
+            string_push(d, "now `@deprecated`: ")
+            string_push(d, nt[nms .. nme])
+            am_change(cb, cl, key, false, string_view(d))
+            string_free(d)
+        }
+    }
+    if odep and !ndep { am_change(cb, cl, key, false, "no longer `@deprecated`") }
+    if odep and ndep {
+        let oms: usize = am_dep_s(o, ob)
+        let ome: usize = am_dep_e(o, ob)
+        let nms2: usize = am_dep_s(n, nbs)
+        let nme2: usize = am_dep_e(n, nbs)
+        if !str_eq(ot[oms .. ome], nt[nms2 .. nme2]) {
+            var d2: String = string_new()
+            string_push(d2, "deprecation message changed: `")
+            string_push(d2, ot[oms .. ome])
+            string_push(d2, "` → `")
+            string_push(d2, nt[nms2 .. nme2])
+            string_push(d2, "`")
+            am_change(cb, cl, key, false, string_view(d2))
+            string_free(d2)
+        }
+    }
+
     // `@no_panic` is a postcondition: losing it is breaking, gaining it compatible.
     let onp: bool = am_np(ot, o, ob)
     let nnp: bool = am_np(nt, n, nbs)
@@ -16619,8 +16764,8 @@ fn am_diff(mut rep: String, read ot: str, read o: Am, read nt: str, read n: Am, 
     var cl: List(i32) = list.make(i32, a)
     // Old items: matched (classified) or removed (only a public item's removal breaks).
     var i: usize = 0
-    for i < list.len(i32, o.items) / 7 {
-        let ib: i32 = (i * 7) as i32
+    for i < list.len(i32, o.items) / 9 {
+        let ib: i32 = (i * 9) as i32
         let key: str = ot[list.get(i32, o.items, ib as usize) as usize .. list.get(i32, o.items, (ib + 1) as usize) as usize]
         if am_find(o, ot, key) == ib {
             let mb: i32 = am_find(n, nt, key)
@@ -16638,8 +16783,8 @@ fn am_diff(mut rep: String, read ot: str, read o: Am, read nt: str, read n: Am, 
     }
     // New items with no old counterpart: an addition never breaks an existing caller.
     var j: usize = 0
-    for j < list.len(i32, n.items) / 7 {
-        let jb: i32 = (j * 7) as i32
+    for j < list.len(i32, n.items) / 9 {
+        let jb: i32 = (j * 9) as i32
         let key: str = nt[list.get(i32, n.items, jb as usize) as usize .. list.get(i32, n.items, (jb + 1) as usize) as usize]
         if am_find(n, nt, key) == jb {
             if am_find(o, ot, key) < 0 { am_change(cb, cl, key, false, "added") }

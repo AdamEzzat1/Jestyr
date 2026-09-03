@@ -92,6 +92,14 @@ pub struct Target {
     pub signature: String,
     /// Facts extracted from the AST — the *proven* half of the documentation.
     pub guarantees: Vec<String>,
+    /// `@deprecated`: `None` absent, `Some("")` bare, `Some(msg)` with a message.
+    /// Kept out of `guarantees` on purpose — see [`fn_deprecated`].
+    ///
+    /// Always `None` for a non-callable target. That is not a hole: `attrs.rs` declares
+    /// `@deprecated`'s targets as `Fn` and `Method`, so a `@deprecated struct` is already
+    /// refused at the attribute check. If that surface ever widens, these sites are the
+    /// list of places that have to grow an extractor with it.
+    pub deprecated: Option<String>,
     pub parent: Option<String>,
     pub doc: Option<ParsedDoc>,
 }
@@ -348,6 +356,7 @@ fn collect_targets(ast: &Ast, src: &str) -> Vec<Target> {
                 name: e.name.name.clone(),
                 signature: extern_sig(ast, e),
                 guarantees: Vec::new(),
+                deprecated: None,
                 parent: None,
                 doc: None,
             }),
@@ -357,6 +366,7 @@ fn collect_targets(ast: &Ast, src: &str) -> Vec<Target> {
                 name: e.name.name.clone(),
                 signature: enum_sig(ast, e),
                 guarantees: Vec::new(),
+                deprecated: None,
                 parent: None,
                 doc: None,
             }),
@@ -366,6 +376,7 @@ fn collect_targets(ast: &Ast, src: &str) -> Vec<Target> {
                 name: c.name.name.clone(),
                 signature: const_sig(ast, src, c),
                 guarantees: Vec::new(),
+                deprecated: None,
                 parent: None,
                 doc: None,
             }),
@@ -376,6 +387,7 @@ fn collect_targets(ast: &Ast, src: &str) -> Vec<Target> {
                     name: name.name.clone(),
                     signature: struct_sig(ast, *is_pub, &name.name, body),
                     guarantees: Vec::new(),
+                    deprecated: None,
                     parent: None,
                     doc: None,
                 });
@@ -393,6 +405,7 @@ fn collect_targets(ast: &Ast, src: &str) -> Vec<Target> {
                     name: dd.name.name.clone(),
                     signature: format!("{vis}distinct {} = {}", dd.name.name, ty_str(ast, dd.base)),
                     guarantees: Vec::new(),
+                    deprecated: None,
                     parent: None,
                     doc: None,
                 });
@@ -405,6 +418,7 @@ fn collect_targets(ast: &Ast, src: &str) -> Vec<Target> {
                     name: t.name.name.clone(),
                     signature: format!("{vis}trait {}", t.name.name),
                     guarantees: Vec::new(),
+                    deprecated: None,
                     parent: None,
                     doc: None,
                 });
@@ -425,6 +439,7 @@ fn fn_target(ast: &Ast, src: &str, f: &FnDecl, kind: &'static str, parent: Optio
         name: f.name.name.clone(),
         signature: fn_sig(ast, src, f),
         guarantees: fn_guarantees(ast, src, f),
+        deprecated: fn_deprecated(ast, f),
         parent,
         doc: None,
     }
@@ -464,6 +479,41 @@ pub(crate) fn fn_guarantees(ast: &Ast, src: &str, f: &FnDecl) -> Vec<String> {
         g.push(format!("may fail with `!{{ {} }}`", names.join(", ")));
     }
     g
+}
+
+/// The `@deprecated` marker on `f`: `None` when absent, `Some("")` for a bare
+/// `@deprecated`, and `Some(message)` for `@deprecated("…")`.
+///
+/// ## Why this is not a guarantee
+/// It sits beside [`fn_guarantees`] and is deliberately *not* part of it. That list
+/// feeds a block titled **Guarantees**, described as machine-checked; a deprecation is
+/// proven nothing — it is a status the author asserts. Folding it in would make the
+/// word "checked" false for one entry.
+///
+/// It is equally not part of [`fn_sig`]. `attest --diff` treats any signature change as
+/// **breaking**, so putting it there would classify *deprecating* an API as a breaking
+/// change — backwards, since the API still works, and a gate that fires on a deprecation
+/// is a gate people learn to ignore. It gets its own manifest line and its own verdict.
+///
+/// Shared by the doc generator and the manifest for the same reason the guarantee
+/// extractor is: the documented deprecation and the attested one cannot drift.
+pub(crate) fn fn_deprecated(ast: &Ast, f: &FnDecl) -> Option<String> {
+    let a = f.attr("deprecated")?;
+    let msg = match a.args.first() {
+        // The literal carries its quotes verbatim (the same payload cgen hands to
+        // `__attribute__((deprecated(…)))`), so exactly one pair comes off — not
+        // `trim_matches`, which would also eat an escaped quote at either end.
+        Some(arg) => match &ast.expr_at(*arg).kind {
+            ExprKind::Str(s) => s
+                .strip_prefix('"')
+                .and_then(|r| r.strip_suffix('"'))
+                .unwrap_or(s.as_str())
+                .to_string(),
+            _ => String::new(),
+        },
+        None => String::new(),
+    };
+    Some(msg)
 }
 
 /// Render one error-set name — `Io`, or `Parse(i64)` for a payload carrier.
@@ -726,6 +776,15 @@ fn emit_target_md(out: &mut String, t: &Target, level: usize) {
     out.push_str(&format!("{hashes} `{}`\n\n", t.name));
     out.push_str(&format!("```jestyr\n{}\n```\n\n", t.signature));
 
+    // Before the prose: a reader deciding whether to CALL this needs the deprecation
+    // first, not after a paragraph explaining what it does.
+    if let Some(msg) = &t.deprecated {
+        if msg.is_empty() {
+            out.push_str("> **Deprecated.**\n\n");
+        } else {
+            out.push_str(&format!("> **Deprecated** — {msg}\n\n"));
+        }
+    }
     if let Some(doc) = &t.doc {
         emit_doc_md(out, doc);
     }
@@ -796,6 +855,17 @@ fn render_html(page: &Page) -> String {
 fn emit_target_html(out: &mut String, t: &Target, level: usize) {
     out.push_str(&format!("<h{level}><code>{}</code></h{level}>\n", esc(&t.name)));
     out.push_str(&format!("<pre><code>{}</code></pre>\n", esc(&t.signature)));
+    // Same placement as the Markdown renderer: ahead of the prose.
+    if let Some(msg) = &t.deprecated {
+        if msg.is_empty() {
+            out.push_str("<p class=\"deprecated\"><strong>Deprecated.</strong></p>\n");
+        } else {
+            out.push_str(&format!(
+                "<p class=\"deprecated\"><strong>Deprecated</strong> — {}</p>\n",
+                esc(msg)
+            ));
+        }
+    }
     if let Some(doc) = &t.doc {
         emit_doc_html(out, doc);
     }

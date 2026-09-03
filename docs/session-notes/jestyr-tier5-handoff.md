@@ -1308,11 +1308,40 @@ argument that is a *value* rather than a place (`bump(mk())`) still degrades to 
 not folded in here — the obvious shared fix silently discards a callee's writes through a
 checked index.
 
-#### A8. `attest` accepts `@deprecated` and does nothing with it
+#### A8. `attest` accepts `@deprecated` and does nothing with it — **CLOSED** (both sides)
 
-`src/attrs.rs` marks it Active; it reaches neither `doc::fn_guarantees` nor the manifest, so
-a deprecation is invisible to the breaking-change gate. Smaller than A1 and in the area the
-tier otherwise completed.
+The register's description was accurate this time, with one correction worth keeping: it was
+**not** true that `@deprecated` "did nothing". It reached cgen and emitted
+`__attribute__((deprecated("…")))`, so callers already got a C-level warning. What it did not
+reach was the two places that *describe* the API — `doc` and the manifest.
+
+`@deprecated` now gets its **own manifest line**, `  deprecated:` (bare) or
+`  deprecated: <msg>`, and its own `> **Deprecated**` blockquote ahead of the prose in `doc`.
+
+**The design question this turned on, and it is the whole entry:** a deprecation is neither a
+guarantee nor part of the signature, and putting it in either would have been wrong.
+
+* Not a **guarantee** — that block is titled "checked by the compiler". A deprecation is
+  proven nothing; it is a status the author asserts. Folding it in makes "checked" false for
+  one entry.
+* Not the **signature** — `diff_item` classifies any signature change as `Breaking`. A
+  deprecation in `sig:` would therefore report *deprecating an API* as a breaking change,
+  which is backwards: every existing call still compiles and still works. A gate that fires
+  on the one action an author takes to AVOID breaking people is a gate that gets switched off.
+
+So every deprecation verdict is `Compatible` — added, removed, or message changed — and all
+three are still *reported*, because "this is going away" is exactly what a contract diff is
+read for. Pinned by `deprecating_an_api_is_reported_and_is_never_breaking` and
+`a_deprecation_stays_out_of_the_signature_and_the_guarantees`.
+
+The extractor is shared between `doc` and `attest` on both sides (`doc::fn_deprecated`;
+`at_dep_attr`/`at_dep_msg` in the port), for the same reason `at_guarantee_phrases` is: the
+documented deprecation and the attested one cannot drift. Non-fn records are always `None` —
+`attrs.rs` declares the attribute's targets as `Fn` and `Method`, so that is its declared
+surface, not a hole.
+
+`examples/attributes.jtr` already carried a real `@deprecated("use parse_v2")`, so both
+goldens covered the change from the first run without a new corpus file.
 
 #### A9. Smaller pre-existing language gaps, each recorded elsewhere
 

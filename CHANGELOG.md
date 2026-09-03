@@ -5,6 +5,36 @@ versions are snapshots, not stability promises.
 
 ## Unreleased
 
+### Added
+
+- **`@deprecated` now reaches the attestation manifest and the generated docs.** It gets its
+  own manifest line — `  deprecated:` bare, or `  deprecated: <msg>` — and a
+  `> **Deprecated**` blockquote ahead of the prose in `jestyrc doc`. Both toolchains.
+
+  It was not doing *nothing* before: it already reached cgen as
+  `__attribute__((deprecated("…")))`, so callers got a C-level warning. What it missed were
+  the two places that *describe* the API — which meant the tool whose job is reporting
+  contract changes could not report the one change an author makes specifically to warn
+  callers.
+
+  **It is deliberately neither a guarantee nor part of the signature.** The **Guarantees**
+  block is titled "checked by the compiler", and a deprecation is proven nothing — it is a
+  status the author asserts, so folding it in would make "checked" false for one entry. And
+  `attest --diff` classifies any signature change as **breaking**, so carrying it in `sig:`
+  would report *deprecating* an API as a breaking change — backwards, since every existing
+  call still compiles and still works, and a gate that fires on the one action taken to avoid
+  breaking people is a gate that gets switched off.
+
+  So every deprecation verdict is `Compatible` — added, removed, or message changed — and all
+  three are still reported, because "this is going away" is exactly what a contract diff is
+  read for. An older manifest with no such line parses as "not deprecated", so it still diffs
+  against a new one.
+
+  The extractor is shared between the doc generator and the manifest on both sides, for the
+  same reason the guarantee extractor is: the documented deprecation and the attested one
+  cannot drift. Non-fn records are always absent — `attrs.rs` declares the attribute's targets
+  as `Fn` and `Method`, so that is its declared surface rather than a gap.
+
 ### Changed
 
 - **A `@copy` struct may no longer carry a non-Copy field.** `@copy` says duplicating the

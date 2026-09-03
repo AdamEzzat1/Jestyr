@@ -155,11 +155,30 @@ so where `jestyrc` errored, `jc` alone emitted `int` and `JestyrSlice_Self` sile
 unreachable only because the reference refused first — a divergence that would have become a
 miscompile the moment the reference stopped refusing.
 
-### 1.3 — A8: `attest` accepts `@deprecated` and does nothing with it
+### ~~1.3 — A8: `attest` accepts `@deprecated` and does nothing with it~~ — **DONE**
 
-`src/attrs.rs` marks it Active; it reaches neither `doc::fn_guarantees` nor the manifest, so
-a deprecation is invisible to the breaking-change gate. Small, and it is the last hole in
-area 10, which is otherwise done. `cgen.jtr` implements `jc attest`, so this reseeds.
+Closed both sides; `examples/attributes.jtr` already carried a real `@deprecated`, so both
+goldens covered it without a new corpus file. **Area 10 is now complete.**
+
+One correction to the entry: `@deprecated` was never doing *nothing* — it reached cgen and
+emitted `__attribute__((deprecated("…")))`. What it missed were the two places that
+*describe* the API, `doc` and the manifest.
+
+It now has its own manifest line and its own `> **Deprecated**` blockquote. The design
+question is the whole item: a deprecation is **not a guarantee** (that block says "checked by
+the compiler"; a deprecation is asserted, not proven) and **not part of the signature**
+(`diff_item` calls any signature change `Breaking`, which would classify *deprecating* an API
+as a break — backwards, and a gate that fires on good behaviour gets switched off). So every
+deprecation verdict is `Compatible`, and all of them are still reported.
+
+**Cost note for whoever sizes the next port mirror:** the reference side was ~40 lines. The
+port was four times that, and none of it was the extractor — it was *widening two packed
+tuples*. `jc`'s parsed-manifest item is a flat `List(i32)` of 7-wide records and its doc
+target is 11-wide; adding one optional field to each meant 7→9 and 11→13 plus every stride
+site. **The first sweep missed three of them** (`(r * 11)`, `(m2 * 11)`, `(m3 * 11)`, all in
+one loop a too-specific regex skipped) and the port compiled fine and then died at runtime on
+`Assertion failed!`. A stride change is not done until `grep -n '\* <old>\|/ <old>'` comes
+back empty — check, don't sweep.
 
 ### 1.4 — B1: `select`'s `closed { … }` arm
 

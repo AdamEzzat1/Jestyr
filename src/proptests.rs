@@ -5782,6 +5782,63 @@ mod attest_diff {
         assert_eq!(it.refines.get("n").map(String::as_str), Some("0..10"));
     }
 
+    #[test]
+    fn parse_round_trips_a_deprecation() {
+        // Bare and with a message, plus a control that carries neither — the third is
+        // what makes the first two mean something.
+        let src = "@deprecated pub fn bare() { } \
+                   @deprecated(\"use g\") pub fn msg() { } \
+                   pub fn live() { }";
+        let m = attest::parse_manifest(&attest_src("t", src)).unwrap();
+        assert_eq!(m.items["fn bare"].deprecated.as_deref(), Some(""));
+        assert_eq!(m.items["fn msg"].deprecated.as_deref(), Some("use g"));
+        assert_eq!(m.items["fn live"].deprecated.as_deref(), None);
+    }
+
+    /// **The hole A8 recorded: `@deprecated` was Active in `attrs.rs`, reached cgen as
+    /// `__attribute__((deprecated))`, and was invisible to the manifest — so the tool
+    /// whose whole job is reporting contract changes could not report the one change an
+    /// author makes specifically to warn callers.**
+    #[test]
+    fn deprecating_an_api_is_reported_and_is_never_breaking() {
+        let live = "pub fn f(n: i32) -> i32 { return n }";
+        let gone = "@deprecated(\"use g\") pub fn f(n: i32) -> i32 { return n }";
+
+        let (v, d) = sole(&diff(live, gone));
+        assert_eq!(v, Verdict::Compatible, "deprecating is not a breaking change");
+        assert_eq!(d, "now `@deprecated`: use g");
+
+        // And back: un-deprecating is equally compatible.
+        let (v, d) = sole(&diff(gone, live));
+        assert_eq!(v, Verdict::Compatible);
+        assert_eq!(d, "no longer `@deprecated`");
+
+        // A changed message is a change worth printing, still not a break.
+        let (v, d) = sole(&diff(gone, "@deprecated(\"use h\") pub fn f(n: i32) -> i32 { return n }"));
+        assert_eq!(v, Verdict::Compatible);
+        assert_eq!(d, "deprecation message changed: `use g` → `use h`");
+
+        // A bare `@deprecated` reports without inventing a message.
+        let (v, d) = sole(&diff(live, "@deprecated pub fn f(n: i32) -> i32 { return n }"));
+        assert_eq!(v, Verdict::Compatible);
+        assert_eq!(d, "now `@deprecated`");
+    }
+
+    /// The deprecation must NOT ride in the signature. `diff_item` calls any signature
+    /// change breaking, so a `sig:` line carrying `@deprecated` would classify deprecating
+    /// an API as a break — backwards, and the reason this is its own manifest line.
+    #[test]
+    fn a_deprecation_stays_out_of_the_signature_and_the_guarantees() {
+        let m = attest_src("t", "@deprecated(\"use g\") pub fn f(n: i32) -> i32 { return n }");
+        let sig = m.lines().find(|l| l.starts_with("  sig: ")).expect("a sig line");
+        assert!(!sig.contains("deprecated"), "the signature is unchanged by a deprecation: {sig}");
+        assert!(
+            !m.lines().any(|l| l.starts_with("  guarantee: ") && l.contains("deprecated")),
+            "a deprecation is asserted, not proven — it is not a guarantee:\n{m}"
+        );
+        assert!(m.contains("\n  deprecated: use g\n"), "it has its own line:\n{m}");
+    }
+
     // ── unit: each classification rule, one edit at a time ────────────────────
 
     const BASE: &str = "pub fn f(n: i32) -> i32 { return n }";
