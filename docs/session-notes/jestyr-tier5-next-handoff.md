@@ -108,10 +108,52 @@ a rule, so per the standing constraint it must live in **`escape` on both sides*
 has no diagnostic channel). Note the sub-view case must stay ACCEPTED either way: it aliases
 the caller's buffer, so its element writes are observable and useful.
 
-### 1.2 — A6: `Self` in a trait parameter — `check` passes, `run` fails
+### ~~1.2 — A6: `Self` in a trait parameter — `check` passes, `run` fails~~ — **DONE**
 
-Parses, type-checks as `Opaque("Self")`, and cgen refuses. The degrades-to-gcc class this
-tier has otherwise been closing. A cgen change → mirror + reseed.
+Closed both sides. `examples/trait_self.jtr` is the corpus file, allowlisted, and **each of the
+two mirrors was watched failing on its own**: disabling the `cgen.jtr` half fails the cgen
+golden, disabling the `typeck.jtr` half fails the P3 typeck golden (and only that one).
+
+**The register's description was again narrower than the defect** — third time in two items.
+It was not "a trait parameter", and it was not one failure:
+
+* **A parameter, a return, a local, and nested (`[]Self`) all failed**, and only when the
+  IMPL spells `Self`. A trait declaration's `Self` was always fine (traits are not emitted),
+  and an impl spelling the concrete type was always fine — which is why every corpus file
+  worked and the gap survived.
+* **It was TWO defects wearing two faces.** `check` passes / `run` fails was only the cgen
+  half. `mut o: Self` failed the other way — at `check`, with a message about *escape
+  analysis* — and nothing connected the two.
+
+**cgen.** `Self` reached neither of cgen's two type doors. `c_ty_ast` (a written-down source
+type) refused it: "cannot lower the external type `Self`", fired twice because the impl
+emitter runs once for the prototype and once for the definition. `c_type` (an inferred `Ty`)
+was worse — `Ty::Opaque("Self")` missed the subst and fell through to **`int`, silently, with
+no diagnostic**. Both doors already consult `self.subst`, so the fix is one entry —
+`subst.insert("Self", target)` in `emit_impl_method_decl` — not two special cases. That is
+also what makes nesting work: the emitters recurse through the map.
+
+**typeck.** `check_fn` lowered a body's `Self` to `Opaque("Self")` and left it. The source
+comment called this a deliberate deferral costing nothing, "because `assignable` is lenient on
+`Opaque`". **That justification had expired.** Leniency is not the only consumer: the escape
+checker's `Unknown`-finalization backstop refuses a *borrow* whose type never resolved, so a
+`mut Self` parameter was rejected outright. `read` and `take` slipped through only because
+that backstop is about borrows — which is exactly why the hole looked empty. `register_impls`
+already built the `{Self → target}` map for recorded return types; `check_fn` now applies it
+to parameters and the return too.
+
+**Port shapes differ, and the mirror is not a transcription.** `cgen.jtr`'s `emit_impl_sig`
+took no `Cg`, so it had no substitution to bind into, and its substitution map is keyed by
+source SPAN with a Ty-triple payload rather than by name. The mirror threads `c`/`g` in, swaps
+`emit_c_ty` → `emit_su_ty` (a strict superset — it falls through to `emit_c_ty`), and binds
+`Self` as a kind-0 name-span entry, which renders `Jestyr_P` for a struct target and
+`int32_t` for a primitive one. `su_slot` matches by TEXT, so any occurrence of `Self` serves
+as the key. `typeck.jtr` needed no new machinery — `subst_self` already existed.
+
+**A latent port defect this exposed, now closed with it:** `jc` never refused `Self` at all,
+so where `jestyrc` errored, `jc` alone emitted `int` and `JestyrSlice_Self` silently. It was
+unreachable only because the reference refused first — a divergence that would have become a
+miscompile the moment the reference stopped refusing.
 
 ### 1.3 — A8: `attest` accepts `@deprecated` and does nothing with it
 
@@ -263,6 +305,20 @@ fix look like a mandatory-mirror parser change. **Thirty seconds of running the 
 have killed it**: the corpus file the entry sat next to, `examples/slice_range.jtr`, had
 shipped a range sub-view in argument position all along. Before rewriting a defect's
 mechanism, run the sentence you are about to delete.
+
+**A defect that wears two faces gets recorded as the smaller one.** A7 and A6 were each filed
+by their most visible symptom, and each hid a second failure with a different message, a
+different phase, and sometimes a worse consequence. A6's register line was "check passes, run
+fails" — true of the cgen half, while the typeck half failed AT check, and while the port
+lowered the same construct to a silent `int`. When closing an item, probe every position and
+every convention the construct admits (`read`/`mut`/`take`, parameter/return/local/nested,
+struct receiver and primitive receiver) before believing the recorded shape is the whole of it.
+
+**"It costs nothing today" is a claim about CONSUMERS, and it goes stale when one is added.**
+`check_fn` left `Self` opaque on the reasoning that assignability is lenient on `Opaque`. That
+was true and stayed true — but the escape checker's `Unknown` backstop is a second consumer of
+the same fact, and it refuses rather than shrugs. A deferral justified by "the only thing that
+reads this is lenient" is only as good as the word *only*.
 
 **A grandfathered exception is a claim with a timestamp.** "Those two have not been bitten
 yet" was reasonable when written and stayed on the page while the hazard fired twice more.

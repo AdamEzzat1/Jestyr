@@ -1242,10 +1242,40 @@ a second copy of a list that already exists in fragments, in a module that canno
 original. The honest fix is to hoist the name list into a module both can import — a small
 refactor of cgen.jtr, worth doing before anything else needs to ask "is this an intrinsic".
 
-#### A6. `Self` in a trait parameter — `check` passes, `run` fails
+#### A6. `Self` as a type inside a trait impl — **CLOSED** (both sides)
 
-Pre-existing. Parses, type-checks as `Opaque("Self")`, and cgen refuses. The degrades-to-gcc
-class the tier has otherwise been closing.
+The recorded line — "in a trait parameter; `check` passes, `run` fails" — named one position
+and one of the **two** failures. `Self` failed as a parameter, as a return, as a local's type
+and nested inside `[]Self`; and only when the IMPL spells it (a trait declaration's `Self` was
+always fine, since traits are not emitted, and an impl spelling the concrete type was fine
+too — which is why no corpus file ever tripped it).
+
+**Half 1, cgen — `check` passes, `run` fails.** `Self` reached neither of cgen's two type
+doors. `c_ty_ast` refused it outright ("cannot lower the external type `Self`", emitted twice
+because the impl emitter runs for the prototype and again for the definition); `c_type` was
+worse, missing the subst and falling through to **`int`, silently, with no diagnostic at all**.
+Both doors already consult `self.subst`, so the fix is a single binding —
+`subst.insert("Self", target)` in `emit_impl_method_decl` — rather than two special cases, and
+that is also what makes the nested forms work, since the emitters recurse through the map.
+`impl_ok_ty` (which resolved `Self` by hand for a fallible return, at top level only) survives
+as the vestige of the missing general binding; it stays because its consumer wants a `Ty`.
+
+**Half 2, typeck — `check` FAILS, with a message about escape.** `check_fn` lowered a body's
+`Self` to `Opaque("Self")`. The source comment called that a deliberate deferral costing
+nothing "because `assignable` is lenient on `Opaque`". That justification expired: the escape
+checker's `Unknown`-finalization backstop refuses a *borrow* whose type never resolved, so
+`mut o: Self` was rejected. `read` and `take` slipped through only because the backstop is
+about borrows. `register_impls` already built the `{Self → target}` map for recorded returns;
+`check_fn` now applies it to parameters and the return as well.
+
+Corpus: `examples/trait_self.jtr` (parameter, return, local, `[]Self`, `mut Self`, and a
+PRIMITIVE receiver where `Self` is `i32`), allowlisted. Each mirror was watched failing
+separately — the `cgen.jtr` half against the cgen golden, the `typeck.jtr` half against the P3
+typeck golden.
+
+**A latent port defect closed alongside it:** `jc` had no `Self` refusal of its own, so where
+`jestyrc` errored, `jc` alone emitted `int` and `JestyrSlice_Self`. Unreachable only because
+the reference refused first — it would have become a live miscompile the moment it stopped.
 
 #### A7. A range sub-view may not be a `mut` argument — **CLOSED** (both sides)
 

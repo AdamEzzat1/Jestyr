@@ -2782,6 +2782,17 @@ fn check_fn_item(mut c: Checker, read p: parser.Parser, read src: str, read f: p
     // raise the lookup floor so a nested fn can't see the enclosing fn's bindings.
     let saved_floor: i32 = c.scfloor
     c.scfloor = (list.len(i32, c.scn) / 3) as i32
+    // `Self` in a TYPE position inside a method body's signature is the receiver. A free fn
+    // is checked with `selfty = Unit` and a `Self` there is meaningless, so the substitution
+    // is skipped for it and the name stays Opaque.
+    //
+    // This used to be a deliberate deferral on BOTH sides, justified as costing nothing
+    // because assignability is lenient on an Opaque. That justification expired: leniency is
+    // not the only consumer. A borrow whose type never resolved trips the escape checker's
+    // Unknown-finalization backstop, so `fn f(read self, mut o: Self)` was refused outright.
+    // The `read` and `take` forms slipped through only because that backstop is about
+    // BORROWS, which is why the hole looked empty for as long as it did.
+    let has_self: bool = selfty != t_unknown() and selfty != t_unit()
     var i: i32 = 0
     for i < f.b {
         let base: i32 = f.a + i * 7
@@ -2790,7 +2801,10 @@ fn check_fn_item(mut c: Checker, read p: parser.Parser, read src: str, read f: p
             let ne: i32 = list.get(i32, p.iar, (base + 3) as usize)
             let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
             var t: i32 = t_unknown()
-            if pty >= 0 { t = lower_type(c, p, src, pty) }
+            if pty >= 0 {
+                t = lower_type(c, p, src, pty)
+                if has_self { t = subst_self(c, src, t, selfty) }
+            }
             scope_insert(c, ns, ne, t)
         }
         i = i + 1
@@ -2801,7 +2815,13 @@ fn check_fn_item(mut c: Checker, read p: parser.Parser, read src: str, read f: p
     let saved_ret: i32 = c.curret
     let saved_exp: i32 = c.expected
     var rt: i32 = 0 - 1
-    if f.z >= 0 { rt = lower_type(c, p, src, f.z) }
+    // `-> Self` too: the impl-registration pass already substitutes it into the RECORDED
+    // return every caller is typed by, so leaving the body's own view Opaque made a
+    // method's inside and outside disagree about its return type.
+    if f.z >= 0 {
+        rt = lower_type(c, p, src, f.z)
+        if has_self { rt = subst_self(c, src, rt, selfty) }
+    }
     c.curret = rt
     c.expected = rt
     // The fn's bracket generics `[T: Bound]` (gar 4-tuples at (g,h)) are in force for the

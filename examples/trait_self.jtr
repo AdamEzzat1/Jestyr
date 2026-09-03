@@ -1,0 +1,83 @@
+// examples/trait_self.jtr — `Self` as a TYPE inside a trait impl.
+//
+// `Self` names the impl's target. Inside `impl Trait for P` it is `P`, in every
+// position a type may appear: a parameter, a return, a local binding, and nested
+// (`[]Self`). It works for a primitive receiver too, where `Self` is `i32`.
+//
+// WHY THIS FILE EXISTS
+//
+// `Self` used to resolve in exactly one place — the return type `register_impls`
+// records for callers — and nowhere else. That left two different failures wearing
+// two different faces, which is why the gap was recorded as narrower than it was:
+//
+//   * cgen refused it outright ("cannot lower the external type `Self`") through the
+//     written-type door, and lowered it to a silent `int` through the inferred-type
+//     door. `check` passed; only `run` failed.
+//   * typeck left a body's `Self` as an opaque name, which cost nothing while the
+//     only consumer was a lenient assignability check — but a `mut Self` parameter is
+//     a BORROW, and the escape checker refuses a borrow whose type never resolved.
+//     That one failed at `check` instead, with a message about escape analysis.
+//
+// Both are fixed by binding `Self` to the target once, in the substitution each side
+// already consults, rather than by special-casing the name at each use.
+//
+//   jestyrc run examples/trait_self.jtr
+//   →  21  2  34  31  6  42
+
+trait Combine {
+    fn combine(read self, read other: Self) -> i32   // Self as a READ parameter
+    fn dup(read self) -> Self                        // Self as a RETURN
+    fn blend(read self, read a: Self, read b: Self) -> i32
+    fn total(read self, read xs: []Self) -> i32      // Self NESTED in a slice
+    fn addto(read self, mut o: Self) -> i32          // Self as a MUT parameter
+}
+
+struct P { x: i32, y: i32 }
+
+impl Combine for P {
+    fn combine(read self, read other: Self) -> i32 { return self.x + other.y }
+
+    fn dup(read self) -> Self { return P{ x: self.x, y: self.y } }
+
+    fn blend(read self, read a: Self, read b: Self) -> i32 {
+        let loc: Self = P{ x: a.x + b.x, y: a.y + b.y }   // Self as a LOCAL's type
+        return loc.x + loc.y + self.x
+    }
+
+    fn total(read self, read xs: []Self) -> i32 {
+        var s: i32 = self.x
+        for i in 0..xs.len { s = s + xs[i].x }
+        return s
+    }
+
+    // A `mut Self` is the case the escape checker used to refuse: the parameter is a
+    // borrow, and an unresolved type cannot be judged copied-or-moved soundly.
+    fn addto(read self, mut o: Self) -> i32 { o.x = o.x + self.x return o.x }
+}
+
+// A PRIMITIVE receiver — here `Self` is `i32`, not a struct, so nothing in the
+// lowering may assume `Self` names a `Jestyr_<Name>` typedef.
+trait Mix { fn mix(read self, read o: Self) -> i32 }
+impl Mix for i32 { fn mix(read self, read o: Self) -> i32 { return self + o } }
+
+fn main() -> i32 {
+    let a = P{ x: 1, y: 2 }
+    let b = P{ x: 10, y: 20 }
+
+    print_int(a.combine(b))        // 1 + 20        = 21
+    print_int(a.dup().y)           //                 2
+    print_int(a.blend(a, b))       // 11 + 22 + 1   = 34
+
+    var raw: *mut P = alloc(P, 2)
+    var v: []P = slice(P, raw, 2)
+    v[0] = P{ x: 10, y: 0 }
+    v[1] = P{ x: 20, y: 0 }
+    print_int(a.total(v))          // 1 + 10 + 20   = 31
+    free_ptr(raw)
+
+    var t = P{ x: 5, y: 0 }
+    print_int(a.addto(t))          // 5 + 1         = 6
+
+    print_int((40).mix(2))         //                 42
+    return 0
+}

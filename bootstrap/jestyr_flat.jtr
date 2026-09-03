@@ -9545,6 +9545,17 @@ fn check_fn_item(mut c: Checker, read p: Parser, read src: str, read f: ItemData
     // raise the lookup floor so a nested fn can't see the enclosing fn's bindings.
     let saved_floor: i32 = c.scfloor
     c.scfloor = (len(i32, c.scn) / 3) as i32
+    // `Self` in a TYPE position inside a method body's signature is the receiver. A free fn
+    // is checked with `selfty = Unit` and a `Self` there is meaningless, so the substitution
+    // is skipped for it and the name stays Opaque.
+    //
+    // This used to be a deliberate deferral on BOTH sides, justified as costing nothing
+    // because assignability is lenient on an Opaque. That justification expired: leniency is
+    // not the only consumer. A borrow whose type never resolved trips the escape checker's
+    // Unknown-finalization backstop, so `fn f(read self, mut o: Self)` was refused outright.
+    // The `read` and `take` forms slipped through only because that backstop is about
+    // BORROWS, which is why the hole looked empty for as long as it did.
+    let has_self: bool = selfty != t_unknown() and selfty != t_unit()
     var i: i32 = 0
     for i < f.b {
         let base: i32 = f.a + i * 7
@@ -9553,7 +9564,10 @@ fn check_fn_item(mut c: Checker, read p: Parser, read src: str, read f: ItemData
             let ne: i32 = get__list(i32, p.iar, (base + 3) as usize)
             let pty: i32 = get__list(i32, p.iar, (base + 5) as usize)
             var t: i32 = t_unknown()
-            if pty >= 0 { t = lower_type(c, p, src, pty) }
+            if pty >= 0 {
+                t = lower_type(c, p, src, pty)
+                if has_self { t = subst_self(c, src, t, selfty) }
+            }
             scope_insert(c, ns, ne, t)
         }
         i = i + 1
@@ -9564,7 +9578,13 @@ fn check_fn_item(mut c: Checker, read p: Parser, read src: str, read f: ItemData
     let saved_ret: i32 = c.curret
     let saved_exp: i32 = c.expected
     var rt: i32 = 0 - 1
-    if f.z >= 0 { rt = lower_type(c, p, src, f.z) }
+    // `-> Self` too: the impl-registration pass already substitutes it into the RECORDED
+    // return every caller is typed by, so leaving the body's own view Opaque made a
+    // method's inside and outside disagree about its return type.
+    if f.z >= 0 {
+        rt = lower_type(c, p, src, f.z)
+        if has_self { rt = subst_self(c, src, rt, selfty) }
+    }
     c.curret = rt
     c.expected = rt
     // The fn's bracket generics `[T: Bound]` (gar 4-tuples at (g,h)) are in force for the
@@ -22443,7 +22463,45 @@ fn impl_ok_tid(read p: Parser, read src: str, read im: ItemData, read fd: ItemDa
     return fd.z
 }
 
-fn emit_impl_sig(mut sb: String, read p: Parser, read src: str, read im: ItemData, read fd: ItemData) {
+// A TypeId whose Name text is `Self`, or -1 when the file has none.
+//
+// Used only as the substitution KEY: `su_slot` matches by TEXT, not by span identity, so ANY
+// occurrence of `Self` names every other one. This is how a `Self` binding is expressed in a
+// map whose keys are source spans -- the span is a way to name the string "Self" without
+// allocating one. A file with no `Self` anywhere needs no binding at all.
+fn self_key_tid(read p: Parser, read src: str) -> i32 {
+    var i: usize = 0
+    for i < len(TypeData, p.ty) {
+        let t: TypeData = get__list(TypeData, p.ty, i)
+        if t.kind == 0 {
+            if str_eq(src[t.start .. t.end], "Self") { return i as i32 }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Arm `Self` -> impl target `it.a` in the active substitution, returning the `g.su` length to
+// truncate back to. Binding it in the SUBSTITUTION rather than special-casing the name at each
+// use is what makes `Self` work in every position -- a parameter, a return, and NESTED
+// (`[]Self` -> `JestyrSlice_P`), because the su-aware emitters already recurse through it.
+// The target is stored as a kind-0 (name-span) arg triple, which renders `Jestyr_P` for a
+// struct target and `int32_t` for a primitive one -- the same two cases the type key handles.
+fn arm_self_subst(read p: Parser, read src: str, mut g: Cg, read it: ItemData) -> usize {
+    let n: usize = len(i32, g.su)
+    let skt: i32 = self_key_tid(p, src)
+    if skt < 0 { return n }
+    let st: TypeData = get__list(TypeData, p.ty, skt as usize)
+    let tt: TypeData = get__list(TypeData, p.ty, it.a as usize)
+    push(i32, g.su, st.start as i32)
+    push(i32, g.su, st.end as i32)
+    push(i32, g.su, 0)                           // kind 0 = a name span
+    push(i32, g.su, tt.start as i32)
+    push(i32, g.su, tt.end as i32)
+    return n
+}
+
+fn emit_impl_sig(mut sb: String, read p: Parser, read src: str, read c: Checker, read g: Cg, read im: ItemData, read fd: ItemData) {
     // A fallible impl method returns its tagged result struct (trait-errors T2)
     // -- the trait's signature is the ABI, exactly as a fallible struct method.
     if fn_is_fallible__cgen(p, fd) {
@@ -22451,7 +22509,7 @@ fn emit_impl_sig(mut sb: String, read p: Parser, read src: str, read im: ItemDat
         let iok: i32 = impl_ok_tid(p, src, im, fd)
         if iok < 0 { string_push(sb, "unit") } else { push_ast_mangle(sb, p, src, iok) }
     } else {
-        emit_c_ty(sb, p, src, fd.z)
+        emit_su_ty(sb, p, src, c, g, fd.z)            // `-> Self` resolves through the subst
     }
     string_push(sb, " jestyr_impl_")
     string_push(sb, src[im.x .. im.y])                // trait name
@@ -22473,7 +22531,7 @@ fn emit_impl_sig(mut sb: String, read p: Parser, read src: str, read im: ItemDat
                 if conv == 2 or conv == 4 { string_push(sb, "* restrict") }
                 string_push(sb, " j_self")
             } else {
-                emit_c_ty(sb, p, src, get__list(i32, p.iar, (base + 5) as usize))
+                emit_su_ty(sb, p, src, c, g, get__list(i32, p.iar, (base + 5) as usize))
                 if conv == 2 or conv == 4 { string_push(sb, "* restrict") }
                 string_push(sb, " j_")
                 string_push(sb, src[get__list(i32, p.iar, (base + 2) as usize) as usize .. get__list(i32, p.iar, (base + 3) as usize) as usize])
@@ -22580,15 +22638,17 @@ fn emit_impl_protos(mut sb: String, read p: Parser, read src: str, read c: Check
         let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 7 and it.h <= 0 {
+            let su0: usize = arm_self_subst(p, src, g, it)
             var k: i32 = 0
             for k < it.z {                            // (b,z) = method fn-ItemId slice in mar
                 let mid: i32 = get__list(i32, p.mar, (it.b + k) as usize)
                 let fd: ItemData = get__list(ItemData, p.it, mid as usize)
-                emit_impl_sig(sb, p, src, it, fd)
+                emit_impl_sig(sb, p, src, c, g, it, fd)
                 string_push(sb, ";\n")
                 any = true
                 k = k + 1
             }
+            truncate(i32, g.su, su0)
         }
         r = r + 1
     }
@@ -22619,12 +22679,16 @@ fn emit_impl_defs(mut sb: String, read p: Parser, read src: str, read c: Checker
         let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 7 and it.h <= 0 {
+            // `Self` -> the impl target, for the whole of this impl's methods: the signature
+            // AND the body, since a body's `let x: Self` renders through the same su-aware
+            // emitters. Truncated back at the end of the impl.
+            let su0: usize = arm_self_subst(p, src, g, it)
             var k: i32 = 0
             for k < it.z {
                 let mid: i32 = get__list(i32, p.mar, (it.b + k) as usize)
                 let fd: ItemData = get__list(ItemData, p.it, mid as usize)
                 if true {
-                    emit_impl_sig(sb, p, src, it, fd)
+                    emit_impl_sig(sb, p, src, c, g, it, fd)
                     string_push(sb, "\n")
                     truncate(i32, g.pp, 0)
                     var pi: i32 = 0
@@ -22663,6 +22727,7 @@ fn emit_impl_defs(mut sb: String, read p: Parser, read src: str, read c: Checker
                 }
                 k = k + 1
             }
+            truncate(i32, g.su, su0)
         }
         r = r + 1
     }

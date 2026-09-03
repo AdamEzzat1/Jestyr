@@ -83,6 +83,33 @@ versions are snapshots, not stability promises.
 
 ### Fixed
 
+- **`Self` now works as a type anywhere inside a trait impl** — as a parameter, a return, a
+  local's type, and nested (`[]Self`) — for a struct receiver and a primitive one alike. Fixed
+  on both toolchains; `examples/trait_self.jtr` is the corpus file, and the two mirrors were
+  each watched failing on their own.
+
+  It was **two defects wearing two faces**, which is why it was recorded as narrower than it
+  was. `Self` was only ever resolved in one place: the return type recorded for callers.
+
+  *In cgen*, `Self` reached neither type door. The written-type door refused it outright
+  ("cannot lower the external type `Self`"); the inferred-type door missed the substitution
+  and fell through to **`int`, silently, with no diagnostic**. Both doors already consult the
+  monomorphization substitution, so `Self` is now bound there once, per impl — one entry
+  rather than two special cases, which is also what makes the nested forms resolve, since the
+  emitters recurse through the map.
+
+  *In typeck*, a body's `Self` stayed opaque. That was a documented deferral, justified as
+  costing nothing because assignability is lenient on an opaque name — **but leniency was not
+  the only consumer.** The escape checker refuses a *borrow* whose type never resolved, so
+  `fn f(read self, mut o: Self)` was rejected at `check` with a message about escape analysis.
+  The `read` and `take` forms slipped through only because that backstop is about borrows.
+  The `{Self → target}` map the impl-registration pass already builds is now applied to
+  parameters and the return, not just to the recorded return.
+
+  This also closes a latent divergence: the self-hosted compiler had no `Self` refusal at all,
+  so where the reference errored, `jc` alone silently emitted `int` and `JestyrSlice_Self`. It
+  was unreachable only because the reference refused first.
+
 - **A range sub-view may now be passed as a `mut` argument** — `sort(xs[0 .. mid])` rather
   than an `alloc` + `slice(T, raw, N)` bound to a named local at every call site. Fixed on
   both toolchains; `examples/slice_range_mut.jtr` is the corpus file, and the port mirror was

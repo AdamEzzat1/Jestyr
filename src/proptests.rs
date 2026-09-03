@@ -18295,6 +18295,7 @@ fn main() -> i32 {
         "env.jtr",
         "bound_method.jtr",
         "traits_static.jtr",
+        "trait_self.jtr",
         "operators.jtr",
         "fs.jtr",
         "str_iter.jtr",

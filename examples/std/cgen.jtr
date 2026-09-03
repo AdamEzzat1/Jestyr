@@ -8829,7 +8829,45 @@ fn impl_ok_tid(read p: parser.Parser, read src: str, read im: parser.ItemData, r
     return fd.z
 }
 
-fn emit_impl_sig(mut sb: String, read p: parser.Parser, read src: str, read im: parser.ItemData, read fd: parser.ItemData) {
+// A TypeId whose Name text is `Self`, or -1 when the file has none.
+//
+// Used only as the substitution KEY: `su_slot` matches by TEXT, not by span identity, so ANY
+// occurrence of `Self` names every other one. This is how a `Self` binding is expressed in a
+// map whose keys are source spans -- the span is a way to name the string "Self" without
+// allocating one. A file with no `Self` anywhere needs no binding at all.
+fn self_key_tid(read p: parser.Parser, read src: str) -> i32 {
+    var i: usize = 0
+    for i < list.len(parser.TypeData, p.ty) {
+        let t: parser.TypeData = list.get(parser.TypeData, p.ty, i)
+        if t.kind == 0 {
+            if str_eq(src[t.start .. t.end], "Self") { return i as i32 }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Arm `Self` -> impl target `it.a` in the active substitution, returning the `g.su` length to
+// truncate back to. Binding it in the SUBSTITUTION rather than special-casing the name at each
+// use is what makes `Self` work in every position -- a parameter, a return, and NESTED
+// (`[]Self` -> `JestyrSlice_P`), because the su-aware emitters already recurse through it.
+// The target is stored as a kind-0 (name-span) arg triple, which renders `Jestyr_P` for a
+// struct target and `int32_t` for a primitive one -- the same two cases the type key handles.
+fn arm_self_subst(read p: parser.Parser, read src: str, mut g: Cg, read it: parser.ItemData) -> usize {
+    let n: usize = list.len(i32, g.su)
+    let skt: i32 = self_key_tid(p, src)
+    if skt < 0 { return n }
+    let st: parser.TypeData = list.get(parser.TypeData, p.ty, skt as usize)
+    let tt: parser.TypeData = list.get(parser.TypeData, p.ty, it.a as usize)
+    list.push(i32, g.su, st.start as i32)
+    list.push(i32, g.su, st.end as i32)
+    list.push(i32, g.su, 0)                           // kind 0 = a name span
+    list.push(i32, g.su, tt.start as i32)
+    list.push(i32, g.su, tt.end as i32)
+    return n
+}
+
+fn emit_impl_sig(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, read g: Cg, read im: parser.ItemData, read fd: parser.ItemData) {
     // A fallible impl method returns its tagged result struct (trait-errors T2)
     // -- the trait's signature is the ABI, exactly as a fallible struct method.
     if fn_is_fallible(p, fd) {
@@ -8837,7 +8875,7 @@ fn emit_impl_sig(mut sb: String, read p: parser.Parser, read src: str, read im: 
         let iok: i32 = impl_ok_tid(p, src, im, fd)
         if iok < 0 { string_push(sb, "unit") } else { push_ast_mangle(sb, p, src, iok) }
     } else {
-        emit_c_ty(sb, p, src, fd.z)
+        emit_su_ty(sb, p, src, c, g, fd.z)            // `-> Self` resolves through the subst
     }
     string_push(sb, " jestyr_impl_")
     string_push(sb, src[im.x .. im.y])                // trait name
@@ -8859,7 +8897,7 @@ fn emit_impl_sig(mut sb: String, read p: parser.Parser, read src: str, read im: 
                 if conv == 2 or conv == 4 { string_push(sb, "* restrict") }
                 string_push(sb, " j_self")
             } else {
-                emit_c_ty(sb, p, src, list.get(i32, p.iar, (base + 5) as usize))
+                emit_su_ty(sb, p, src, c, g, list.get(i32, p.iar, (base + 5) as usize))
                 if conv == 2 or conv == 4 { string_push(sb, "* restrict") }
                 string_push(sb, " j_")
                 string_push(sb, src[list.get(i32, p.iar, (base + 2) as usize) as usize .. list.get(i32, p.iar, (base + 3) as usize) as usize])
@@ -8966,15 +9004,17 @@ fn emit_impl_protos(mut sb: String, read p: parser.Parser, read src: str, read c
         let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 7 and it.h <= 0 {
+            let su0: usize = arm_self_subst(p, src, g, it)
             var k: i32 = 0
             for k < it.z {                            // (b,z) = method fn-ItemId slice in mar
                 let mid: i32 = list.get(i32, p.mar, (it.b + k) as usize)
                 let fd: parser.ItemData = list.get(parser.ItemData, p.it, mid as usize)
-                emit_impl_sig(sb, p, src, it, fd)
+                emit_impl_sig(sb, p, src, c, g, it, fd)
                 string_push(sb, ";\n")
                 any = true
                 k = k + 1
             }
+            list.truncate(i32, g.su, su0)
         }
         r = r + 1
     }
@@ -9005,12 +9045,16 @@ fn emit_impl_defs(mut sb: String, read p: parser.Parser, read src: str, read c: 
         let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 7 and it.h <= 0 {
+            // `Self` -> the impl target, for the whole of this impl's methods: the signature
+            // AND the body, since a body's `let x: Self` renders through the same su-aware
+            // emitters. Truncated back at the end of the impl.
+            let su0: usize = arm_self_subst(p, src, g, it)
             var k: i32 = 0
             for k < it.z {
                 let mid: i32 = list.get(i32, p.mar, (it.b + k) as usize)
                 let fd: parser.ItemData = list.get(parser.ItemData, p.it, mid as usize)
                 if true {
-                    emit_impl_sig(sb, p, src, it, fd)
+                    emit_impl_sig(sb, p, src, c, g, it, fd)
                     string_push(sb, "\n")
                     list.truncate(i32, g.pp, 0)
                     var pi: i32 = 0
@@ -9049,6 +9093,7 @@ fn emit_impl_defs(mut sb: String, read p: parser.Parser, read src: str, read c: 
                 }
                 k = k + 1
             }
+            list.truncate(i32, g.su, su0)
         }
         r = r + 1
     }

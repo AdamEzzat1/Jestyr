@@ -2819,12 +2819,30 @@ impl<'a> TypeChecker<'a> {
                 .map(|g| (g.name.name.clone(), g.bound.as_ref().map(|b| b.name.clone())))
                 .collect(),
         );
+        // `Self` in a TYPE position inside a method body's signature is the receiver.
+        // Free functions are checked with `Ty::Unit` as `self_ty`, and a `Self` there is
+        // meaningless, so the substitution is empty for them and the name stays opaque.
+        //
+        // This used to be a deliberate deferral, justified as costing nothing because
+        // `assignable` is lenient on `Opaque`. **That justification expired.** Leniency
+        // is not the only consumer: a borrow whose type never resolved trips the escape
+        // checker's `Unknown`-finalization backstop, so `fn f(read self, mut o: Self)`
+        // was refused outright with "cannot decide whether borrow `o` escapes". The
+        // `take` and `read` forms slipped through only because that backstop is about
+        // borrows, which is why the hole looked empty for as long as it did.
+        let self_subst: HashMap<String, Ty> =
+            if matches!(self_ty, Ty::Unit | Ty::Unknown | Ty::Error) {
+                HashMap::new()
+            } else {
+                std::iter::once(("Self".to_string(), self_ty.clone())).collect()
+            };
         let mut scope: Scope = vec![HashMap::new()];
         for p in &f.params {
             let pty = if p.is_self {
                 self_ty.clone()
             } else if let Some(t) = p.ty {
-                self.lower_type(&typ, t)
+                let t = self.lower_type(&typ, t);
+                subst_ty(&t, &self_subst)
             } else {
                 Ty::Unknown
             };
@@ -2838,7 +2856,13 @@ impl<'a> TypeChecker<'a> {
         // { none => none } }`. Non-tail `let`/`return` statements save/restore
         // `cur_expected`, so by the tail it is back to this seeded value.
         let prev_ret = self.cur_ret.take();
-        self.cur_ret = f.ret_ty.map(|t| self.lower_type(&typ, t));
+        // `-> Self` too, for the same reason: `register_impls` already substitutes it
+        // into the RECORDED return type every caller is typed by, so leaving the body's
+        // own view opaque made a method's inside and outside disagree about its return.
+        self.cur_ret = f.ret_ty.map(|t| {
+            let t = self.lower_type(&typ, t);
+            subst_ty(&t, &self_subst)
+        });
         let prev_errs = self.cur_errs.take();
         self.cur_errs = errs_of(&f.errors);
         let prev_exp = self.cur_expected.take();

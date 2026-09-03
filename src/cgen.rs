@@ -7626,6 +7626,22 @@ impl<'a> Cgen<'a> {
         let type_key = self.info.table.ty_key(&target);
 
         self.subst.clear();
+        // `Self` inside an impl method IS the impl's target, in every position —
+        // a parameter, a return, a local, and nested (`*Self`, `[]Self`, `Self!E`).
+        //
+        // Binding it in the SUBSTITUTION rather than special-casing the name is what
+        // makes that "every position" true, and it is the only shape that covers both
+        // of cgen's type doors: `c_ty_ast` (a written-down source type) consults
+        // `subst` before it looks a name up in `type_index`, and `c_type` (an inferred
+        // `Ty`) resolves `Ty::Opaque` through the same map. Fixing only the first left
+        // the second lowering `Self` to a silent `int` — no diagnostic at all, which is
+        // strictly worse than the refusal it replaced.
+        //
+        // `impl_ok_ty` is the vestige of this: it resolves `Self` by hand, for a
+        // fallible return only, at the top level only. It stays because the mangle it
+        // feeds wants a `Ty` rather than a C spelling, but it is no longer the only
+        // place that knows what `Self` means.
+        self.subst.insert("Self".to_string(), target.clone());
         self.self_cty = self.c_ty_ast(im.ty);
         let self_conv =
             f.params.iter().find(|p| p.is_self).map(|p| p.conv).unwrap_or(Conv::Default);
