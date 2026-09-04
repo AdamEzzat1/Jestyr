@@ -13458,8 +13458,10 @@ mod c_oracle {
                 ref_dump_expr(ast, *reduction, out);
                 ref_dump_expr(ast, *body, out);
             }
-            // Select: arm count, span, then each `(selectarm <chan> <bind span> <body block>)`.
-            ExprKind::Select(arms) => {
+            // Select: arm count, span, each `(selectarm <chan> <bind span> <body block>)`,
+            // then the optional `closed` block (`(none)` when absent, as `withalive`'s
+            // `else` does). Dumping it is what makes the P2 golden able to see it at all.
+            ExprKind::Select { arms, closed } => {
                 out.push("select".to_string());
                 out.push(arms.len().to_string());
                 out.push(s);
@@ -13472,6 +13474,14 @@ mod c_oracle {
                     out.push(arm.bind.span.end.to_string());
                     ref_dump_block(ast, &arm.body, out);
                     out.push(")".to_string());
+                }
+                match closed {
+                    Some(b) => ref_dump_block(ast, b, out),
+                    None => {
+                        out.push("(".to_string());
+                        out.push("none".to_string());
+                        out.push(")".to_string());
+                    }
                 }
             }
             // Region: the region name span, span, then the body block.
@@ -13801,6 +13811,16 @@ mod c_oracle {
             "par for i in 0..n reduce(sum) { i * 2 }", // par-for over a range, mapping body
             "select { recv(c) => v { use(v) } }", // a one-arm select
             "select { recv(a) => x { f(x) }  recv(b) => y { g(y) } }", // two select arms
+            // …and with the `closed` arm, whose block both dumpers must render in the
+            // same place. The two above are the `(none)` control: without them, nothing
+            // would show that the absent case still dumps identically.
+            "select { recv(c) => v { use(v) }  closed { done() } }",
+            "select { recv(a) => x { f(x) }  recv(b) => y { g(y) }  closed { stop() } }",
+            // `closed` is CONTEXTUAL, and this is the probe that it stayed that way:
+            // three corpus modules export a `closed()` and two bind `let closed`, so a
+            // reserved word would have broken them. Outside a select it is an ordinary
+            // name, and both parsers must agree it is a call, not a keyword.
+            "closed(1) + closed(2)",
             // standalone `region r { … }` — an arena scope
             "region r { alloc(r) }",     // a region scope with a body
             "region scratch { let p = make(scratch)  use(p) }", // region with statements
@@ -20589,10 +20609,21 @@ fn main() -> i32 {
         // case; what is under test here is termination, and a producer racing the
         // consumer could end the loop early for the wrong reason and still print a
         // plausible number.
+        //
+        // **Part 3 is Part 2 again with the `closed { … }` arm**, and the assertion is
+        // that the last two numbers EQUAL the middle two. That equality is the whole
+        // check: the arm is sugar over the exit Part 2 detects with a sentinel, so
+        // anything other than the same 146 and 4 means the sugar changed the meaning.
+        //
+        // It is also the guard on the arm's LOWERING, and it fails in the more useful
+        // direction. If the `closed` body were dropped on the floor — emitted as the bare
+        // `_seldone = 1` it replaced — `live` would never be set false and the loop would
+        // never end, so the program hangs rather than printing a wrong number. A dropped
+        // body cannot pass this test quietly.
         for _ in 0..8 {
             assert_eq!(
                 toks("examples/std/select.jtr"),
-                ["66", "146", "4"],
+                ["66", "146", "4", "146", "4"],
                 "select result wrong"
             );
         }

@@ -259,7 +259,7 @@ impl<'src> Parser<'src> {
 
     /// [`error`](Self::error) with a **stable code** — linkable and testable by
     /// identity rather than message substring (roadmap §4 item 4; codes ride
-    /// `check --json` additively). The parser owns `E0001`–`E0023`; codes are
+    /// `check --json` additively). The parser owns `E0001`–`E0025`; codes are
     /// per RULE, not per site, and once assigned never renumber:
     ///
     /// | code  | rule |
@@ -287,6 +287,8 @@ impl<'src> Parser<'src> {
     /// | E0021 | `..` not last in a struct pattern |
     /// | E0022 | range pattern missing its upper bound |
     /// | E0023 | `else` on an infinite `for` |
+    /// | E0024 | more than one `closed` arm in a `select` |
+    /// | E0025 | `closed` not last in a `select` |
     fn error_code(&mut self, span: Span, message: impl Into<String>, code: &'static str) {
         self.diagnostics.push(Diagnostic::new(message, span).with_code(code));
     }
@@ -1824,15 +1826,48 @@ impl<'src> Parser<'src> {
         self.ast.expr(ExprKind::Concurrent(b), span)
     }
 
-    /// `select { recv(<chan>) => <bind> { <body> } … }` — wait on several channels,
-    /// run the arm of whichever has a value ready. `recv` is contextual.
+    /// `select { recv(<chan>) => <bind> { <body> } … closed { <body> } }` — wait on
+    /// several channels, run the arm of whichever has a value ready; the optional
+    /// trailing `closed` block runs when every channel is closed and drained.
+    ///
+    /// Both `recv` and `closed` are **contextual**, and `closed` has to be: the corpus
+    /// already exports `alog.closed()`, `sysnet.closed()` and `syswatch.closed()`, and
+    /// binds `let closed` in two more modules. Reserving the word would have broken five
+    /// files, three of them public API. It is recognised only here, and only when
+    /// followed by `{`, which no other arm can be.
     fn parse_select(&mut self) -> ExprId {
         let start = self.cur().span;
         self.expect(Select, "`select`");
         let open_brace = self.cur().span;
         self.expect(LBrace, "`{`");
         let mut arms = Vec::new();
+        let mut closed: Option<Block> = None;
         while !self.at(RBrace) && !self.at(Eof) {
+            // The `closed { … }` arm. Required LAST, because last is when it runs: the
+            // lowering tests every readiness arm before the closed condition (which is
+            // what stops closing from discarding buffered values), so a `closed` written
+            // first would still run last — source order contradicting evaluation order.
+            if self.at(TokenKind::Ident)
+                && self.text(self.cur().span) == "closed"
+                && self.peek_kind(1) == LBrace
+            {
+                let kw = self.cur().span;
+                self.bump();
+                let b = self.parse_block();
+                if closed.is_some() {
+                    self.error_code(kw, "a `select` may have only one `closed` arm", "E0024");
+                } else {
+                    closed = Some(b);
+                }
+                continue;
+            }
+            if closed.is_some() {
+                self.error_code(
+                    self.cur().span,
+                    "`closed` must be the last arm of a `select` — it runs after every `recv` arm is found not ready".to_string(),
+                    "E0025",
+                );
+            }
             if self.at(TokenKind::Ident) && self.text(self.cur().span) == "recv" {
                 self.bump();
             } else {
@@ -1852,7 +1887,7 @@ impl<'src> Parser<'src> {
         }
         let end = self.cur().span;
         self.expect_close(RBrace, "`}`", open_brace, "select body");
-        self.ast.expr(ExprKind::Select(arms), start.to(end))
+        self.ast.expr(ExprKind::Select { arms, closed }, start.to(end))
     }
 
     /// `spawn <call>` — launch a task. The inner expression is normally a call.
@@ -2997,7 +3032,7 @@ mod tests {
     fn parses_select_with_recv_arms() {
         let ast = parse_ok("fn f() { select { recv(a) => x { g(x) } recv(b) => y { g(y) } } }");
         let arms = ast.exprs.iter().find_map(|e| match &e.kind {
-            ExprKind::Select(arms) => Some(arms.len()),
+            ExprKind::Select { arms, .. } => Some(arms.len()),
             _ => None,
         });
         assert_eq!(arms, Some(2), "select parsed with two recv arms");
@@ -3279,6 +3314,9 @@ mod tests {
             ("fn () {}", "E0003"),                         // missing identifier
             ("@copy import \"x\"", "E0009"),               // attribute not allowed here
             ("fn f() { while true { } }", "E0020"),        // reserved loop keyword
+            // Two `closed` arms, and a `closed` that is not last.
+            ("fn f(a: i64) { select { recv(a) => x { } closed { } closed { } } }", "E0024"),
+            ("fn f(a: i64) { select { closed { } recv(a) => x { } } }", "E0025"),
         ] {
             let (_ast, diags) = parse(src);
             assert!(
@@ -3286,6 +3324,32 @@ mod tests {
                 "`{src}` carries {code}: {diags:?}"
             );
         }
+    }
+
+    /// **`closed` is CONTEXTUAL, and this is what stops it from silently becoming a
+    /// keyword.** The corpus exports `alog.closed()`, `sysnet.closed()` and
+    /// `syswatch.closed()`, and binds `let closed` in two more modules — reserving the
+    /// word would have broken five files, three of them public API. Outside a `select`
+    /// it must stay an ordinary name, and inside one it is only a `closed` arm when a
+    /// `{` follows.
+    #[test]
+    fn closed_is_only_a_keyword_inside_a_select_arm() {
+        // An ordinary program that uses the name every way the corpus does.
+        let src = "fn closed() -> i64 { return 7 }\n\
+                   fn main() -> i32 { let closed: i64 = closed() return closed as i32 }";
+        let (_ast, diags) = parse(src);
+        assert!(diags.is_empty(), "`closed` is an ordinary identifier here: {diags:?}");
+
+        // And a well-formed `closed` arm still parses as one — the anti-vacuity half,
+        // without which the assertion above would pass on a parser that never looked.
+        let (ast, diags) = parse("fn f(a: i64) { select { recv(a) => x { } closed { } } }");
+        assert!(diags.is_empty(), "the arm itself parses: {diags:?}");
+        assert!(
+            ast.exprs
+                .iter()
+                .any(|e| matches!(&e.kind, ExprKind::Select { closed: Some(_), .. })),
+            "the `closed` block reached the AST"
+        );
     }
 
     /// The construct context lives in the `help:` line (the message is the pinned

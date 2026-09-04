@@ -2502,6 +2502,13 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
             pop_scope(c)
             i = i + 1
         }
+        // The `closed` arm binds nothing -- there is no value to receive, which is the
+        // condition it fires on -- so it gets a plain scope.
+        if d.a >= 0 {
+            push_scope(c)
+            infer(c, p, src, d.a)
+            pop_scope(c)
+        }
         r = t_unit()
     }
     // else: a leaf with no children (self/Self/attr/fstring/...) - Unknown for now.
@@ -3003,13 +3010,14 @@ fn dump_types(read src: str, read c: Checker, read p: parser.Parser, read a: All
         } else if d.kind == 46 {                   // with alive: body AND else are Block structs
             if d.b >= 0 { list.set(bool, skip, d.b as usize, true) }
             if d.op >= 0 { list.set(bool, skip, d.op as usize, true) }
-        } else if d.kind == 42 {                   // select: each arm's body block
+        } else if d.kind == 42 {                   // select: each arm's body block, and `closed`
             var ai: i32 = 0
             for ai < d.y {
                 let body: i32 = list.get(i32, p.par, (d.x + ai * 4 + 3) as usize)
                 if body >= 0 { list.set(bool, skip, body as usize, true) }
                 ai = ai + 1
             }
+            if d.a >= 0 { list.set(bool, skip, d.a as usize, true) }
         }
         m = m + 1
     }

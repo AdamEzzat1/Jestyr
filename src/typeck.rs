@@ -4176,7 +4176,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 Ty::Prim("i64")
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 // Each arm waits on a `Channel(i64)` and binds the received `i64`.
                 for arm in arms {
                     let cht = self.infer(scope, typ, self_ty, arm.chan);
@@ -4195,6 +4195,13 @@ impl<'a> TypeChecker<'a> {
                     scope.push(HashMap::new());
                     scope.last_mut().unwrap().insert(arm.bind.name.clone(), Ty::Prim("i64"));
                     self.infer_block(scope, typ, self_ty, &arm.body);
+                    scope.pop();
+                }
+                // The `closed` arm binds nothing — there is no value to receive, which
+                // is the whole condition it fires on — so it gets a plain scope.
+                if let Some(c) = closed {
+                    scope.push(HashMap::new());
+                    self.infer_block(scope, typ, self_ty, c);
                     scope.pop();
                 }
                 Ty::Unit

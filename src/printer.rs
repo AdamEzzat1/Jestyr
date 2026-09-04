@@ -410,11 +410,14 @@ impl<'a> Printer<'a> {
                 self.expr_inline(*reduction),
                 self.expr_inline(*body)
             ),
-            ExprKind::Select(arms) => {
-                let a: Vec<String> = arms
+            ExprKind::Select { arms, closed } => {
+                let mut a: Vec<String> = arms
                     .iter()
                     .map(|arm| format!("recv({}) => {} {{ … }}", self.expr_inline(arm.chan), arm.bind.name))
                     .collect();
+                if closed.is_some() {
+                    a.push("closed { … }".to_string());
+                }
                 format!("select {{ {} }}", a.join(" "))
             }
             ExprKind::Region { name, .. } => format!("region {} {{ ... }}", name.name),

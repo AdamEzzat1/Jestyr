@@ -2184,10 +2184,16 @@ impl<'a> Cgen<'a> {
                 self.collect_structs_in_expr(*reduction, subst, seen, order);
                 self.collect_structs_in_expr(*body, subst, seen, order);
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 for arm in arms {
                     self.collect_structs_in_expr(arm.chan, subst, seen, order);
                     self.collect_structs_in_block(&arm.body, subst, seen, order);
+                }
+                // The `closed` arm holds ordinary code, so it is walked exactly as an
+                // arm body is. Skipping it would hide a call, spawn or closure from the
+                // backend rather than reject it.
+                if let Some(c) = closed {
+                    self.collect_structs_in_block(c, subst, seen, order);
                 }
             }
             _ => {}
@@ -3620,10 +3626,16 @@ impl<'a> Cgen<'a> {
                 self.collect_moved_expr(*reduction, out);
                 self.collect_moved_expr(*body, out);
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 for arm in arms {
                     self.collect_moved_expr(arm.chan, out);
                     self.collect_moved(&arm.body, out);
+                }
+                // The `closed` arm holds ordinary code, so it is walked exactly as an
+                // arm body is. Skipping it would hide a call, spawn or closure from the
+                // backend rather than reject it.
+                if let Some(c) = closed {
+                    self.collect_moved(c, out);
                 }
             }
             ExprKind::For { head, body, els, .. } => {
@@ -4115,7 +4127,7 @@ impl<'a> Cgen<'a> {
                     ExprKind::Block(b) => self.emit_body(b, false),
                     ExprKind::Unsafe(b) => self.emit_body(b, false),
                     ExprKind::Concurrent(b) => self.emit_concurrent(b),
-                    ExprKind::Select(arms) => self.emit_select(arms),
+                    ExprKind::Select { arms, closed } => self.emit_select(arms, closed.as_ref()),
                     ExprKind::Region { name, body } => self.emit_region(&name.name, body),
                     ExprKind::WithAlive { genref, name, body, els } => {
                         self.emit_with_alive(*genref, &name.name, body, els.as_ref())
@@ -6020,7 +6032,7 @@ impl<'a> Cgen<'a> {
             ExprKind::ParFor { var, iter, reduction, body } => {
                 self.emit_par_for(id, var, *iter, *reduction, *body)
             }
-            ExprKind::Select(_) => {
+            ExprKind::Select { .. } => {
                 self.diag(span, "`select` is only supported in statement position");
                 "0".to_string()
             }
@@ -6993,10 +7005,16 @@ impl<'a> Cgen<'a> {
                 self.find_closures_expr(*reduction, found, seen);
                 self.find_closures_expr(*body, found, seen);
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 for arm in arms {
                     self.find_closures_expr(arm.chan, found, seen);
                     self.find_closures_block(&arm.body, found, seen);
+                }
+                // The `closed` arm holds ordinary code, so it is walked exactly as an
+                // arm body is. Skipping it would hide a call, spawn or closure from the
+                // backend rather than reject it.
+                if let Some(c) = closed {
+                    self.find_closures_block(c, found, seen);
                 }
             }
             _ => {}
@@ -7131,10 +7149,16 @@ impl<'a> Cgen<'a> {
                 self.collect_refs(*reduction, out);
                 self.collect_refs(*body, out);
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 for arm in arms {
                     self.collect_refs(arm.chan, out);
                     self.collect_refs_block(&arm.body, out);
+                }
+                // The `closed` arm holds ordinary code, so it is walked exactly as an
+                // arm body is. Skipping it would hide a call, spawn or closure from the
+                // backend rather than reject it.
+                if let Some(c) = closed {
+                    self.collect_refs_block(c, out);
                 }
             }
             _ => {}
@@ -8125,10 +8149,16 @@ impl<'a> Cgen<'a> {
                     self.find_spawns_block(els, out);
                 }
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 for arm in arms {
                     self.find_spawns_expr(arm.chan, out);
                     self.find_spawns_block(&arm.body, out);
+                }
+                // The `closed` arm holds ordinary code, so it is walked exactly as an
+                // arm body is. Skipping it would hide a call, spawn or closure from the
+                // backend rather than reject it.
+                if let Some(c) = closed {
+                    self.find_spawns_block(c, out);
                 }
             }
             _ => {}
@@ -8467,7 +8497,7 @@ impl<'a> Cgen<'a> {
     /// (an `else if` chain so exactly one arm fires per pass). Single-consumer (the
     /// `len > 0` then `recv` is race-free when this is the only receiver). Reuses the
     /// non-generic `channel_len_i64`/`channel_recv_i64` wrappers from `std/sync.jtr`.
-    fn emit_select(&mut self, arms: &[SelectArm]) {
+    fn emit_select(&mut self, arms: &[SelectArm], closed: Option<&Block>) {
         self.line("{");
         self.depth += 1;
         // Hoist each channel to a local so it is evaluated once, not per spin.
@@ -8506,10 +8536,15 @@ impl<'a> Cgen<'a> {
         // it first would discard exactly the work a graceful shutdown is trying to
         // finish — the same ordering rule `channel_recv_open` records.
         //
-        // No arm runs and nothing binds: the `select` simply completes. Distinguishing
-        // "took a value" from "everything closed" is the caller's, via
-        // `channel_is_closed`, and a dedicated `closed { … }` ARM is sugar on top of this
-        // — a syntax change that crosses both parsers, where this is one lowering site.
+        // With no `closed` arm: no arm runs and nothing binds, and the `select` simply
+        // completes — the caller distinguishes "took a value" from "everything closed"
+        // itself, which in practice meant a sentinel read before and after the `select`.
+        //
+        // With one, its body runs here. That is the entire feature: the condition was
+        // already computed and already the exit, so the arm is a place to put a statement,
+        // not a new capability. It stays LAST for the same reason the condition is tested
+        // last — a channel closed but still holding buffered values is served by its own
+        // readiness arm first, so closing never discards work.
         if !arms.is_empty() {
             let all_done: Vec<String> = (0..arms.len())
                 .map(|i| {
@@ -8518,6 +8553,11 @@ impl<'a> Cgen<'a> {
                 .collect();
             self.line(format!("else if ({}) {{", all_done.join(" && ")));
             self.depth += 1;
+            if let Some(c) = closed {
+                for stmt in &c.stmts {
+                    self.emit_stmt(stmt);
+                }
+            }
             self.line("_seldone = 1;");
             self.depth -= 1;
             self.line("}");
@@ -10916,10 +10956,16 @@ impl<'a> Cgen<'a> {
                 self.find_calls_expr(*reduction, subst, work);
                 self.find_calls_expr(*body, subst, work);
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 for arm in arms {
                     self.find_calls_expr(arm.chan, subst, work);
                     self.find_calls_block(&arm.body, subst, work);
+                }
+                // The `closed` arm holds ordinary code, so it is walked exactly as an
+                // arm body is. Skipping it would hide a call, spawn or closure from the
+                // backend rather than reject it.
+                if let Some(c) = closed {
+                    self.find_calls_block(c, subst, work);
                 }
             }
             ExprKind::For { head, body, els, .. } => {

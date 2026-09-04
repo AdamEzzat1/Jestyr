@@ -305,7 +305,13 @@ pub enum ExprKind {
     /// `select { recv(<chan>) => <bind> { <body> } … }` — wait on several channels and
     /// run the arm of whichever has a value ready (Crystal/Go CSP ergonomics over the
     /// move-only `Channel(i64)`). Single-consumer, recv-only for now.
-    Select(Vec<SelectArm>),
+    /// `select { recv(c) => x { … } … closed { … } }`. The optional `closed` block
+    /// runs when every channel is closed AND drained — the point at which the
+    /// `select` would otherwise simply complete having bound nothing. It is sugar
+    /// over that exit, not a new capability, and it must be written last because
+    /// that is when it runs (readiness is tested first, so closing is not
+    /// destructive).
+    Select { arms: Vec<SelectArm>, closed: Option<Block> },
 
     /// `region r { … }` — a named arena scope (design §4.4). `&[r]T` references
     /// into it are zero-cost; the whole arena is freed at the block's end.

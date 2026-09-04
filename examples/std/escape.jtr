@@ -1666,6 +1666,13 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
             e_pop(e)
             i = i + 1
         }
+        // The `closed` arm binds nothing, but its body is ordinary code and owes the same
+        // ownership check as any other block.
+        if d.a >= 0 {
+            e_push(e)
+            check_block(e, p, c, src, d.a, false)
+            e_pop(e)
+        }
         if e.deterministic {
             ediag(e, d.start, d.end, "`select` waits on channels — its choice depends on the schedule; forbidden in a `@deterministic` function.")
         }

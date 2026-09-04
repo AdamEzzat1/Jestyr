@@ -264,7 +264,7 @@ fn classify_expr(ast: &Ast, id: ExprId) -> Result<usize, (Reason, Span)> {
         ExprKind::Concurrent(_) | ExprKind::Spawn(_) | ExprKind::Await(_) => {
             no(Reason::Unsupported("a concurrency form"))
         }
-        ExprKind::Select(_) => no(Reason::Unsupported("a `select`")),
+        ExprKind::Select { .. } => no(Reason::Unsupported("a `select`")),
         ExprKind::Region { .. } => no(Reason::Unsupported("a `region`")),
         ExprKind::Closure { .. } => no(Reason::Unsupported("a closure")),
         ExprKind::FString { .. } => no(Reason::Unsupported("an f-string")),

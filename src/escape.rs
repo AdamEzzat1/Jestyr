@@ -1259,7 +1259,7 @@ impl<'a> Checker<'a> {
                 ctx.loop_floor.pop();
                 return;
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 // Each arm receives an owned `i64` (a fresh value moved out of the
                 // channel), not a borrow — so the binding can't escape. Walk the
                 // channel expression and the arm body.
@@ -1268,6 +1268,13 @@ impl<'a> Checker<'a> {
                     ctx.push();
                     ctx.bind(&arm.bind.name, false);
                     self.check_block(ctx, &arm.body, false);
+                    ctx.pop();
+                }
+                // The `closed` arm binds nothing, but its body is ordinary code and
+                // owes the same ownership check as any other block.
+                if let Some(c) = closed {
+                    ctx.push();
+                    self.check_block(ctx, c, false);
                     ctx.pop();
                 }
                 if self.deterministic {

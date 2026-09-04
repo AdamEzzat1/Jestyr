@@ -130,10 +130,13 @@ pub fn push_children(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
             out.push(*reduction);
             out.push(*body);
         }
-        ExprKind::Select(arms) => {
+        ExprKind::Select { arms, closed } => {
             for arm in arms {
                 out.push(arm.chan);
                 push_block(&arm.body, out);
+            }
+            if let Some(c) = closed {
+                push_block(c, out);
             }
         }
         ExprKind::Region { body, .. } => push_block(body, out),

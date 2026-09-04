@@ -7,6 +7,31 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`select` gains a `closed { … }` arm**, which runs when every channel it waits on is closed
+  and drained. Both toolchains; `examples/std/select.jtr` grew a Part 3 that uses it.
+
+  It is sugar, and deliberately nothing more. A `select` whose channels were all closed and
+  drained already completed rather than spinning — the arm is somewhere to put a statement at
+  a point the lowering was already computing. What it replaces is a sentinel: Part 2 of the
+  example has to read a counter before the `select`, read it again after, and infer from "it
+  did not move" that everything was closed. Part 3 says it directly and prints the same two
+  numbers, which is what makes it a check rather than a demo.
+
+  **`closed` is a CONTEXTUAL keyword**, recognised only inside a `select` body and only when
+  followed by `{`. It had to be: the standard library already exports `alog.closed()`,
+  `sysnet.closed()` and `syswatch.closed()`, and binds a local `closed` in two more modules,
+  so reserving the word would have broken five files, three of them public API. A test pins
+  both halves — that the name still works ordinarily, and that the arm still parses.
+
+  **The arm must be written last** (`E0025`; a second one is `E0024`). Not style: readiness is
+  tested before the closed condition, which is what keeps closing a channel non-destructive,
+  so a `closed` written first would still run last — source order contradicting evaluation
+  order. `ExprKind::Select` became a struct variant carrying `closed: Option<Block>`, and the
+  six cgen walkers that scan arm bodies for calls, spawns, closures, moves, refs and structs
+  now scan the closed block too; missing one would have hidden code from the backend rather
+  than rejected it. The port's `ref_expr_id` shim counts the new block node for the same
+  reason it counts arm bodies — that omission is precisely the A1 divergence shape.
+
 - **`@deprecated` now reaches the attestation manifest and the generated docs.** It gets its
   own manifest line — `  deprecated:` bare, or `  deprecated: <msg>` — and a
   `> **Deprecated**` blockquote ahead of the prose in `jestyrc doc`. Both toolchains.

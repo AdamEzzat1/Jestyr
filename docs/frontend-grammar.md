@@ -182,7 +182,19 @@ ParFor       = 'par' 'for' IDENT 'in' Expr 'reduce' '(' Expr ')' Block
 ```
 
 `par` is a **contextual keyword** — an identifier everywhere except directly
-before `for`. `select` is reserved.
+before `for`. `select` is reserved; `recv` and `closed` are **contextual**,
+recognised only inside a `select` body (and `closed` only when a `{` follows).
+
+`closed` had to be contextual rather than reserved: the standard library already
+exports `alog.closed()`, `sysnet.closed()` and `syswatch.closed()` and binds a
+local `closed` in two more modules, so reserving the word would have broken five
+files, three of them public API.
+
+The `closed` arm must come **last**, and that is a real rule rather than a style
+preference: the lowering tests every `recv` arm's readiness *before* the closed
+condition — which is what stops closing a channel from discarding values still
+buffered in it — so a `closed` written first would still run last. Writing it out
+of order is `E0025`; writing two is `E0024`.
 
 A bare `IDENT {` is a struct literal *except* inside a control-flow header,
 where the parser sets a `no_struct` flag so the `{` opens the body block
@@ -203,7 +215,9 @@ WithAlive = 'with' 'alive' PostfixExpr 'as' 'read' IDENT Block [ 'else' Block ]
 Unsafe    = 'unsafe' Block
 Comptime  = 'comptime' Block
 Concurrent= 'concurrent' Block
-Select    = 'select' '{' { SelectArm } '}'
+Select    = 'select' '{' { SelectArm } [ ClosedArm ] '}'
+SelectArm = 'recv' '(' Expr ')' '=>' IDENT Block
+ClosedArm = 'closed' Block
 ```
 
 Jestyr has one loop keyword. `for` with a `binding in …` head iterates; `for`
@@ -288,7 +302,8 @@ than none:
   subset is meaningful to the obligations pass.
 - **Const-expression positions** (array lengths, attribute arguments) accept the
   full `Expr` grammar syntactically and are narrowed later by CTFE.
-- **`select` arms** and channel syntax are summarised rather than specified.
+- **Channel syntax** is summarised rather than specified (the `select` arms
+  themselves are now spelled out above).
 - **Generic application** in type position (`IDENT '(' Type … ')'`) and generic
   struct literals share a surface that the parser disambiguates with lookahead
   in ways this grammar flattens.

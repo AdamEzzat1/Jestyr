@@ -29,6 +29,19 @@ exists on both sides.
 background work, shut down gracefully, and be tested deterministically."* What remains is
 breadth, not the headline claim.
 
+**The COMPILER-DEFECT queue is now also done.** A7 (a range sub-view as a `mut` argument),
+A6 (`Self` in an impl, in every position), A8 (`@deprecated` reaching attest and doc) and
+B1 (`select`'s `closed` arm) all landed on both toolchains, each with its mirror watched
+failing. Area 10 is complete. The register's remaining entries are a decision (A11), a
+measured deferral (B2), and two CI-only items nobody in reach can watch (A10's sanitizer
+half, a second C compiler) — see §1.
+
+**Three of those four had a WRONG recorded description**, and in two cases the recorded
+"correction" was worse than what it replaced. A7 was not about argument position and not a
+parser change; A6 was not only about parameters and had a second half in typeck the entry
+never mentioned; B1's real risk was six cgen walkers and a shim, not the parser. The §4 rule
+about re-measuring before designing earned its place four more times.
+
 **Four areas done** (service runtime, config, crypto-boundary, compatibility), **three
 mostly** (observability, sandbox, and compatibility's tail), **three barely** (package,
 HTTP, storage), **one undecided** (TLS).
@@ -40,6 +53,15 @@ HTTP, storage), **one undecided** (TLS).
 Every item here touches the compiler's own closure, owes a port mirror, and forces a
 reseed. **They cannot run in parallel with each other or with anything else that reseeds**
 (see §3). Do them one at a time, in this order.
+
+> **THE SERIAL QUEUE IS EMPTY OF ACTIONABLE WORK.** 1.1 (A7), 1.2 (A6), 1.3 (A8) and 1.4 (B1)
+> are all done. What is left here is **1.1b (A11), which needs a DECISION from the owner
+> before any code**, and **1.5 (B2), deferred on measurement** — bigger than everything above
+> it combined. Neither is a "pick it up and go" item.
+>
+> **So the next session should be fanning out on §2**, and §2 parallelises where §1 could not.
+> Read §3 first — the sixteen closure modules are a global lock, and the reseed is the thing
+> two concurrent sessions cannot hand-merge.
 
 ### ~~1.1 — A7: a range expression may not be a call ARGUMENT~~ — **DONE**
 
@@ -180,12 +202,40 @@ one loop a too-specific regex skipped) and the port compiled fine and then died 
 `Assertion failed!`. A stride change is not done until `grep -n '\* <old>\|/ <old>'` comes
 back empty — check, don't sweep.
 
-### 1.4 — B1: `select`'s `closed { … }` arm
+### ~~1.4 — B1: `select`'s `closed { … }` arm~~ — **DONE**
 
-Sugar over the termination that already works. **No longer blocked** — the old note said it
-waited on A1, which turned out to be a shim gap rather than an AST change. Still its own
-increment: `ExprKind::Select` across 22 reference sites, the parser, and the no-allowlist P2
-golden.
+Closed both sides. `examples/std/select.jtr` grew a Part 3 that uses it, and that file is in
+**both** the cgen golden allowlist and the build matrix, so the port mirror is gated
+automatically — no new corpus file was needed. Both mirrors were watched failing.
+
+**It is sugar and nothing more, which was the whole design constraint.** The condition was
+already computed and already the exit; the arm is somewhere to put a statement. Part 2 of the
+example keeps the sentinel it replaces (read a counter before, read it after, infer "nothing
+moved"), and Part 3 prints the same two numbers — the point is that the totals must MATCH, so
+it is a check rather than a demo.
+
+**`closed` is CONTEXTUAL, and this was the finding the register did not have.** The corpus
+already exports `alog.closed()`, `sysnet.closed()` and `syswatch.closed()`, and binds a local
+`closed` in two more modules — reserving the word would have broken five files, three of them
+public API. Recognised only inside a `select` body, only when a `{` follows. A test pins both
+halves (the ordinary name still works; the arm still parses), and a curated P2 snippet pins
+`closed(1) + closed(2)` parsing identically on both sides.
+
+**The arm must be last** — `E0025`, with `E0024` for a second one. Not a style rule: readiness
+is tested before the closed condition (which is what keeps closing non-destructive), so a
+`closed` written first would still run last. The parser owns `E0001`–`E0025` now.
+
+**What the estimate got right and wrong.** "22 reference sites" was about right in spirit —
+`ExprKind::Select` became a struct variant and 14 sites moved — but the *risky* ones were not
+the parser. Six cgen walkers scan arm bodies for calls, spawns, closures, moves, refs and
+structs; each had to learn the closed block, and missing one would have hidden code from the
+backend rather than rejected it. The port's `ref_expr_id` shim needed the new block counted
+for exactly the reason it counts arm bodies — **that omission is the A1 divergence shape**,
+invisible until a select sits between two spawn sites in one function.
+
+The claim about "the no-allowlist P2 golden" was wrong in detail: the corpus-wide P2 coverage
+is the cgen golden and the build matrix; the P2 dump goldens are *curated snippet* lists, so
+the new arm had to be added to one by hand or nothing would have compared it.
 
 ### 1.5 — B2: `extern` binding a C global — MEASURED, then deferred
 
