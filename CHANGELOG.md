@@ -7,6 +7,28 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/cache`** — a **content-addressed** store: the key is the SHA-256 of the value.
+  8 tests. Completes the package substrate (semver → resolve → lockfile → cache).
+
+  A cache keyed by NAME has to answer "is this entry still right", and every answer is a
+  heuristic — an mtime, an etag, a version someone remembered to bump. Keyed by CONTENT it
+  never asks: `abc…` either holds the bytes that hash to `abc…` or it is corrupt, and that is
+  decidable locally without trusting whoever supplied it. So **storing is idempotent** (no
+  invalidation, because nothing can go stale), **an entry verifies without its source**, and
+  two callers racing to store the same content write identical bytes to the same path.
+
+  It also sidesteps a real constraint: `std/sysfs` deliberately exposes no mtime, because
+  `struct stat`’s layout differs per platform and guessing it is how this tree’s silent-`int`
+  miscompiles happened. A name-keyed cache would be stuck; a content-addressed one never
+  wanted one.
+
+  **Writes are atomic** — write beside the entry, `rename_replace` onto it — and that matters
+  more here than usual: a half-written entry’s NAME asserts a hash its contents do not have,
+  so it would be served confidently until something re-verified it. Entries are sharded two
+  hex characters deep, the split git and Nix both use. Every entry point takes an `fs.Fs`, so
+  a component handed `fs.denied()` cannot reach the disk through this API — tested, so the
+  gate is a check rather than a convention.
+
 - **`std/lockfile`** — record a resolution, and prove a later one agrees with it. 10 tests.
 
   **A lockfile here is a WITNESS, not a source of truth**, and that follows from `std/resolve`

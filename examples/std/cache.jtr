@@ -1,0 +1,218 @@
+// std/cache.jtr — a CONTENT-ADDRESSED store: the key is the hash of the value.
+//
+// TIER: `std` + OS. Every entry point takes an `fs.Fs`, so a caller that has not been given
+// the filesystem capability cannot reach the disk through this module — the same gate
+// `std/sysfs` sits behind.
+//
+// ─── The key is the hash, and that is the whole design ──────────────────────────────
+//
+// A cache keyed by NAME has to answer "is this entry still the right one", and every answer
+// is a heuristic: an mtime, an etag, a version string someone remembered to bump. A cache
+// keyed by CONTENT never asks. `abc…` either contains the bytes that hash to `abc…` or it is
+// corrupt, and that is decidable locally, at any time, without trusting whoever supplied it.
+//
+// Three consequences worth naming, because they are what a package cache actually needs:
+//
+//   * **Storing is idempotent.** The same bytes produce the same key, so a second `store` is
+//     a no-op rather than an overwrite. There is no invalidation, because there is nothing
+//     an entry could become stale relative to.
+//   * **An entry can be verified without its source.** `verify` re-hashes what is on disk
+//     and compares it against the name. A filename-keyed cache cannot do this at all: it has
+//     nothing to check the bytes against.
+//   * **Two callers racing to store the same content cannot corrupt each other**, because
+//     they are writing identical bytes to the same path.
+//
+// ─── Why `sysfs` having no mtime is not a limitation here ───────────────────────────
+//
+// `std/sysfs` deliberately exposes no modification time — `struct stat`'s layout differs per
+// platform and guessing it is how the silent-`int` miscompiles in this tree happened. A
+// name-keyed cache would be stuck without one. A content-addressed cache never wanted it:
+// staleness is not a question it can be asked.
+//
+// ─── Writes are atomic, and here that matters more than usual ───────────────────────
+//
+// `store` writes to a temporary path and then `sysfs.rename_replace`s it into place, so a
+// reader never observes a half-written entry. In a content-addressed store a partial write
+// is worse than elsewhere: the file's NAME asserts a hash its contents do not have, so it
+// would be served confidently to everyone who asked for that key until something re-verified
+// it. The rename is what makes the name and the bytes become true together.
+//
+// ─── Sharded two characters deep ────────────────────────────────────────────────────
+//
+//   <root>/ab/cdef0123…
+//
+// A flat directory of a hundred thousand entries is slow to enumerate on several
+// filesystems and unpleasant on all of them. Two hex characters is the split git and Nix
+// both use; it costs one directory level and bounds the fan-out at 256.
+
+import "fs"
+import "sha256"
+import "sysfs"
+
+// A handle to a cache root. The directory need not exist yet — `store` creates what it needs.
+pub struct Cache { root: String }
+
+pub fn open(read a: Allocator, read root: str) -> Cache {
+    var c: Cache = Cache{ root: string_new() }
+    string_push(c.root, root)
+    return c
+}
+
+pub fn root_path(read c: Cache) -> read str { return string_view(c.root) }
+
+// The key for `content`: its lowercase hex SHA-256. Pure — no filesystem, no cache needed,
+// so a caller can compute a key before deciding whether to store.
+pub fn key_of(read a: Allocator, read content: str) -> String {
+    var k: String = string_new()
+    sha256.push_sha256_hex(k, content)
+    return k
+}
+
+// `<root>/ab` — the shard directory for `key`.
+fn shard_path(read c: Cache, read key: str) -> String {
+    var p: String = string_new()
+    string_push(p, string_view(c.root))
+    string_push(p, "/")
+    string_push(p, key[0 .. 2])
+    return p
+}
+
+// `<root>/ab/cdef…` — the full path for `key`.
+fn entry_path(read c: Cache, read key: str) -> String {
+    var p: String = shard_path(c, key)
+    string_push(p, "/")
+    string_push(p, key[2 .. key.len])
+    return p
+}
+
+// A key must be a full hex digest; anything shorter cannot be sharded and anything else did
+// not come from `key_of`. Checked rather than trusted, because a short key would index a
+// path outside the layout.
+@no_alloc @no_os pub fn key_is_wellformed(read key: str) -> bool {
+    if key.len != 64 { return false }
+    var i: usize = 0
+    for i < key.len {
+        let n: i32 = key[i] as i32
+        var ok: bool = false
+        if n >= 48 and n <= 57 { ok = true }
+        if n >= 97 and n <= 102 { ok = true }
+        if !ok { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Is `key` present?
+pub fn has(mut f: fs.Fs, read a: Allocator, read c: Cache, read key: str) -> bool {
+    if !key_is_wellformed(key) { return false }
+    var p: String = entry_path(c, key)
+    let there: bool = fs.present(f, string_view(p))
+    string_free(p)
+    return there
+}
+
+// Store `content`, returning its key. Idempotent: storing bytes already present rewrites
+// nothing and returns the same key. Returns an EMPTY key when the write failed, so a caller
+// that ignores the result cannot mistake a failure for a hit.
+pub fn store(mut f: fs.Fs, read a: Allocator, read c: Cache, read content: str) -> String {
+    var key: String = key_of(a, content)
+    let k: str = string_view(key)
+
+    var p: String = entry_path(c, k)
+    if fs.present(f, string_view(p)) {
+        string_free(p)
+        return key                                  // already there, by content
+    }
+
+    // The root and the shard, in that order. `make_dir` is idempotent, so a concurrent
+    // creator is not an error.
+    let made_root: bool = sysfs.make_dir(f, a, string_view(c.root)) catch false
+    var sh: String = shard_path(c, k)
+    let made_shard: bool = sysfs.make_dir(f, a, string_view(sh)) catch false
+    string_free(sh)
+
+    // Write beside the entry, then rename ONTO it. The temp name carries the key so two
+    // stores of different content never collide on it.
+    var tmp: String = entry_path(c, k)
+    string_push(tmp, ".part")
+    let wrote: bool = fs.put(f, string_view(tmp), content)
+    if !wrote {
+        string_free(tmp)
+        string_free(p)
+        string_free(key)
+        return string_new()
+    }
+    var renamed: bool = true
+    sysfs.rename_replace(f, a, string_view(tmp), string_view(p)) catch { renamed = false }
+    if !renamed {
+        // Leave nothing behind on a failed store: a `.part` that survives is a file whose
+        // name promises nothing and which no key will ever match.
+        let _gone: bool = fs.erase(f, string_view(tmp))
+        string_free(tmp)
+        string_free(p)
+        string_free(key)
+        return string_new()
+    }
+    string_free(tmp)
+    string_free(p)
+    return key
+}
+
+// Read the entry for `key`, or the empty string when it is absent.
+pub fn load(mut f: fs.Fs, read a: Allocator, read c: Cache, read key: str) -> String {
+    if !key_is_wellformed(key) { return string_new() }
+    var p: String = entry_path(c, key)
+    if !fs.present(f, string_view(p)) {
+        string_free(p)
+        return string_new()
+    }
+    var data: String = fs.open_text(f, string_view(p))
+    string_free(p)
+    return data
+}
+
+// Does the entry stored under `key` actually hash to `key`?
+//
+// This is the operation a name-keyed cache cannot offer, and the reason to prefer this
+// shape: it detects a truncated write, a corrupted disk, and a substituted file, using
+// nothing but the entry and its own name. A missing entry is NOT verified — `false` here
+// means "do not trust this", which is the right answer for absent as well as wrong.
+pub fn verify(mut f: fs.Fs, read a: Allocator, read c: Cache, read key: str) -> bool {
+    if !key_is_wellformed(key) { return false }
+    var data: String = load(f, a, c, key)
+    let d: str = string_view(data)
+    if d.len == 0 {
+        // An empty read is either an absent entry or a genuinely empty value; both are
+        // settled by hashing, so no special case is needed beyond not trusting presence.
+        if !has(f, a, c, key) {
+            string_free(data)
+            return false
+        }
+    }
+    var actual: String = string_new()
+    sha256.push_sha256_hex(actual, d)
+    let same: bool = str_eq3(string_view(actual), key)
+    string_free(actual)
+    string_free(data)
+    return same
+}
+
+@no_alloc @no_os fn str_eq3(read a: str, read b: str) -> bool {
+    if a.len != b.len { return false }
+    var i: usize = 0
+    for i < a.len {
+        if (a[i] as i32) != (b[i] as i32) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Remove an entry. Returns false when it was not there — deleting from a content-addressed
+// store is safe by construction, since anything holding the same bytes can restore it.
+pub fn evict(mut f: fs.Fs, read a: Allocator, read c: Cache, read key: str) -> bool {
+    if !key_is_wellformed(key) { return false }
+    var p: String = entry_path(c, key)
+    let gone: bool = fs.erase(f, string_view(p))
+    string_free(p)
+    return gone
+}

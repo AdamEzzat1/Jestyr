@@ -356,15 +356,25 @@ is a corrupt file, not drift — different responses), and `verify` runs in BOTH
 (one-way would let a new transitive dependency enter a build unrecorded and still report
 agreement). Removing either fails exactly the test that names it.
 
-**NEXT in this chain: the content-addressed cache**, and it is the last piece of the
-substrate. `tar.jtr` and `sha256.jtr` already exist; `sysfs`/`sysdir` give it a filesystem.
-The shape to aim for is "key by content hash, so a fetch is idempotent and an entry can be
-verified without trusting where it came from" — which pairs with the lockfile the same way
-`attest` pairs with the module manifest. **Note `sysfs` has no mtime, deliberately** (the
-`struct stat` layout differs per platform), so a cache must not key on one.
+**`std/cache` is DONE, and the package substrate is COMPLETE**: semver → resolve →
+lockfile → cache. 8 tests.
 
-After that the substrate is complete and the remaining §2 items are independent: HTTP V2,
-storage V2, and the second-wave table below.
+Content-addressed: the key is the SHA-256 of the value, so storing is idempotent, an entry
+verifies against its own name without trusting its source, and there is no invalidation
+question to answer. That also sidesteps `sysfs` having no mtime — a name-keyed cache would
+have been stuck there. Writes go through a temp file and `rename_replace`, because a partial
+entry in a content-addressed store is worse than elsewhere: its NAME asserts a hash its bytes
+do not have. Sharded two hex characters deep. Gated on `fs.Fs`, with a test that `fs.denied()`
+really cannot reach the disk through it.
+
+**The substrate is finished. The remaining §2 items are independent and can fan out:** HTTP V2
+(2.2), storage V2 (2.3), and the second-wave table below. TLS is among them and is NOT gated
+— see the correction above.
+
+What the substrate does NOT yet have, recorded so nobody assumes otherwise: a registry
+protocol (nothing fetches), and a package manifest FORMAT (the `Registry` is built by API
+call, not parsed from a file — deliberately, so it is testable without one). Both are the
+obvious next layer if the tier wants an end-to-end `jc add`.
 
 ### 2.2 — HTTP V2 (area 6)
 
