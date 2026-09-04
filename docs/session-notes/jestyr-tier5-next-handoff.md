@@ -8,7 +8,7 @@ defects — one session at a time). §2 is the parallel work (library breadth �
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1350 passed / 0 failed / 3 ignored.** On `master`, pushed. **CI is fully green** — all
+**1354 passed / 0 failed / 3 ignored.** Pushed. **CI is fully green** — all
 four jobs — for the first time in over two weeks.
 
 The long-form history is `docs/session-notes/jestyr-tier5-handoff.md`. Read its §5 for the
@@ -44,7 +44,8 @@ about re-measuring before designing earned its place four more times.
 
 **Four areas done** (service runtime, config, crypto-boundary, compatibility), **three
 mostly** (observability, sandbox, and compatibility's tail), **three barely** (package,
-HTTP, storage), **one undecided** (TLS).
+HTTP, storage), and **TLS, which is no longer 'undecided'** — the coordination cost that
+made it a gate turned out not to exist (see §2). It is now just a large §2 item.
 
 ---
 
@@ -309,11 +310,45 @@ layout differs per platform.
 | Config: live reload, nesting | `std/syswatch` exists; composing them is the caller's job today. |
 | Rewrite `std/plugin` as a server on the pipe transport | Tier 4 leftover. One-process-per-call only because the transport did not exist; it does now (`start_piped`/`capture`). |
 
-### TLS (area 8) — a DECISION, not effort
+### TLS (area 8) — **NOT exclusive of other work.** The recorded blocker was wrong.
 
-Binding OpenSSL or schannel is a link-flag change, and `CC_FLAGS` is attest-hashed, so
-`-lssl` churns **every manifest in the corpus**. That makes it exclusive of all other work.
-Decide whether Tier 5 claims TLS at all, or whether it is its own arc, before anyone starts.
+This entry used to read: *"binding OpenSSL or schannel is a link-flag change, and `CC_FLAGS`
+is attest-hashed, so `-lssl` churns every manifest in the corpus. That makes it exclusive of
+all other work."* **Every step of that is false, and it was blocking the whole area.**
+
+**A per-program link library never goes near `CC_FLAGS`.** The mechanism already exists and
+is *content-triggered*, in `main.rs` at both link sites:
+
+```rust
+if c_src.contains("pthread")      { cmd.arg("-pthread"); }
+if cfg!(windows) && c_src.contains("winsock2.h") { cmd.arg("-lws2_32"); }
+```
+
+TLS would be one more line of the same shape (`openssl/ssl.h` → `-lssl -lcrypto`). Note the
+position rule the winsock comment records: GNU ld resolves left to right against objects seen
+so far, so the library must come **after** the source file.
+
+**Verified, not assumed.** `examples/std/http_demo.jtr` uses `sysnet`, therefore needs
+`-lws2_32` to link, and its manifest is:
+
+```
+cc-flags -O2 -std=c11 -ffp-contract=off -fno-fast-math
+```
+
+The link library is not in it, and cannot be: `attest::manifest` writes
+`crate::CC_FLAGS.join(" ")`, a constant. **Zero manifests move.**
+
+The tree's actual rule is subtler than "link flags are hashed", and `cc_strict_flags` states
+it: a flag that changes no emitted byte "has no business churning the provenance", while one
+that changes *what gets linked* is exactly why `-D__USE_MINGW_ANSI_STDIO` must never reach
+`CC_FLAGS` **in a real build**. Content-triggered link flags sidestep the question entirely by
+never entering the constant.
+
+**What remains is ordinary scope, not a gate.** Binding OpenSSL is real work — handshake,
+certificate verification, an error surface, and a second implementation for schannel if
+Windows is to be served natively rather than through mingw's OpenSSL. Judge it against the
+other §2 items on size, not on a coordination cost it does not have. Nothing needs deciding
+before anyone starts.
 
 ---
 
@@ -378,6 +413,14 @@ fix that WIDENS something needs a value outside the old width.
 **"Owed to the Linux ladder" can mean "owed to a test nobody wrote."** A2 sat as
 blocked-on-a-machine for an entire arc while the machine ran that code green. Before
 recording an item as infrastructure-blocked, check whether the assertion exists at all.
+
+**A recorded COST can be as wrong as a recorded diagnosis, and it blocks more.** TLS sat
+as "exclusive of all other work" on the claim that `-lssl` would churn every attest manifest.
+It would not: per-program link libraries are content-triggered in `main.rs` (`-pthread`,
+`-lws2_32`) and never enter `CC_FLAGS`, which is the constant the manifest prints. One
+`jestyrc attest` on a socket-using corpus file disproved it. **A wrong diagnosis costs the
+session that hits it; a wrong cost estimate costs every session that reads it and moves on.**
+Sanity-check a recorded blocker before treating an area as gated.
 
 **A recorded diagnosis is worth less than a recorded symptom, and can be worth less than
 nothing.** Three times in one session the note's *conclusion* was right and its *mechanism*
