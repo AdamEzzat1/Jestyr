@@ -1,0 +1,87 @@
+// examples/mut_arg_value.jtr — a `mut` argument that is not a PLACE.
+//
+// A `mut`/`out` parameter is passed by address, so its argument routes through the
+// lvalue-yielding half of codegen. Every *place* form already had one: a name, a field,
+// a bounds-checked index, a deref. A value did not — and a value is what you get from a
+// cast, a call, or an arithmetic expression. Those leaked gcc's own "lvalue required as
+// unary '&' operand", with no span and no Jestyr message: `jestyrc check` passed and only
+// the C compiler objected.
+//
+// The value is now parked in a compound literal of array type, `(T[1]){ v }`, which
+// decays to `T*` and reads back as a place. Its lifetime is the enclosing block, so the
+// address outlives the call.
+//
+// WHAT THE CALLEE ACTUALLY GETS, and why this is not a copy that loses your writes:
+// a copy of the value, whose INDIRECTION IS SHARED. A slice is `{ ptr, len }`; copying
+// the descriptor copies the pointer, so element writes land in the caller's buffer. Only
+// a whole-value reassignment (`xs = …`) would be lost, and a temporary has nowhere to
+// write one back to. That is the same bargain `xs[a .. b]` already strikes.
+//
+// The printouts are the check, and they can fail in both directions: if the parking had
+// copied the *buffer*, nothing would move; if it aliased too much, the elements outside a
+// sub-view would move too.
+//
+//   jestyrc run examples/mut_arg_value.jtr
+//   →  101 102 103  1101 1102 103  7  14
+
+distinct Buf = []i64
+
+fn add100(mut xs: Buf) { for i in 0..xs.len { xs[i] = xs[i] + 100 } }
+
+fn add1000(mut xs: []i64) { for i in 0..xs.len { xs[i] = xs[i] + 1000 } }
+
+// A `mut` scalar whose argument is a computed value. Nothing here is observable to the
+// caller — there is no indirection to share — but it must COMPILE rather than fall
+// through to gcc. Whether the language should refuse this shape outright is a separate
+// question from whether the backend can lower it.
+fn twice(mut n: i64) -> i64 { n = n + n  return n }
+
+// A `mut self` method that hands one of its own FIELDS to a `mut` parameter. This is the
+// shape that caught the first version of the parking rule: `self` is a `SelfValue`, not a
+// `Name`, and the lvalue predicate did not list it — so `self.total` resolved to a field of
+// a COPY of `*self`, the callee's write landed in the copy, and the object never changed.
+// It compiled and ran; only the answer was wrong. `bump_field` returning the object's own
+// state afterwards is what makes that visible.
+struct Acc { total: i64 }
+
+fn add_into(mut n: i64, by: i64) { n = n + by }
+
+impl AccOps for Acc {
+    fn bump_field(mut self, by: i64) -> i64 {
+        add_into(self.total, by)
+        return self.total
+    }
+}
+
+trait AccOps { fn bump_field(mut self, by: i64) -> i64 }
+
+fn main() -> i32 {
+    var raw: *mut i64 = alloc(i64, 3)
+    var s: []i64 = slice(i64, raw, 3)
+    for i in 0..3 { s[i] = (i + 1) as i64 }
+
+    // A CAST — a place wearing another type. `Jestyr_Buf` *is* `JestyrSlice_i64`, so the
+    // cast is a type-level no-op and every element must move.
+    add100(s as Buf)
+    for i in 0..3 { print_int(s[i]) }        // 101  102  103
+
+    // A SUB-VIEW temporary. Elements 0 and 1 are in the view; element 2 must NOT move,
+    // which is what separates a correct sub-view from an aliased whole buffer.
+    add1000(s[0 .. 2])
+    for i in 0..3 { print_int(s[i]) }        // 1101  1102  103
+
+    // An ARITHMETIC value in `mut` position: the shape that used to reach gcc.
+    var a: i64 = 3
+    var b: i64 = 4
+    print_int(twice(a + b) / 2)              // (7 + 7) / 2 = 7
+
+    // The `mut self` field case: the callee writes into `self.total`, and the object must
+    // actually change. If `*self` were parked as a copy the write would land there and the
+    // read afterwards would still see the original — printing 5, the untouched value, which
+    // is a far quieter wrong answer than a crash.
+    var acc: Acc = Acc{ total: 5 }
+    print_int(acc.bump_field(9))             // 14
+
+    free_ptr(raw)
+    return 0
+}

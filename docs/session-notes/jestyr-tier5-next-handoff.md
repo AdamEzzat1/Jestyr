@@ -54,9 +54,10 @@ Every item here touches the compiler's own closure, owes a port mirror, and forc
 reseed. **They cannot run in parallel with each other or with anything else that reseeds**
 (see §3). Do them one at a time, in this order.
 
-> **THE SERIAL QUEUE IS EMPTY OF ACTIONABLE WORK.** 1.1 (A7), 1.2 (A6), 1.3 (A8) and 1.4 (B1)
-> are all done. What is left here is **1.1b (A11), which needs a DECISION from the owner
-> before any code**, and **1.5 (B2), deferred on measurement** — bigger than everything above
+> **THE SERIAL QUEUE IS EMPTY OF ACTIONABLE WORK.** 1.1 (A7), 1.2 (A6), 1.3 (A8), 1.4 (B1)
+> and **A11's lowering half** are all done — no `mut` argument leaks a gcc error any more.
+> What is left here is **one language QUESTION** (should a `mut` argument that aliases nothing
+> be refused? — §1.1b) and **1.5 (B2), deferred on measurement**, bigger than everything above
 > it combined. Neither is a "pick it up and go" item.
 >
 > **So the next session should be fanning out on §2**, and §2 parallelises where §1 could not.
@@ -97,38 +98,55 @@ sees it. The fixed-size-array refusal is deliberately untouched: typeck does not
 re-slicing to arrays (that needs the borrowed-projection story, safety-mosaic item 2), so
 the guard is restricted to the two bases `emit_expr` actually lowers a range over.
 
-### 1.1b — A11: a **non-place** `mut` argument degrades to a raw gcc error — NEW, needs a decision
+### 1.1b — A11: the LOWERING half is **DONE**; one language question is still open
 
-Found while fixing A7, and left open deliberately because it is a semantics question, not a
-lowering bug. Same code path, so whoever touches `emit_place` next should see it first.
+**Done:** a `mut` argument no longer has to be a place. `f(mut s as Buf)`, `f(mut mk())` and
+`f(mut a + b)` compile instead of leaking gcc's *"lvalue required as unary `&` operand"*.
+Both sides; `examples/mut_arg_value.jtr` is the corpus file, and the port mirror was watched
+failing.
 
-```
-fn bump(mut xs: []i64) { … }
-fn mk() -> []i64 { … }
-bump(mk())          // error: lvalue required as unary '&' operand   ← raw gcc, no span
-```
+`emit_place` owes its callers an lvalue; its catch-all was handing back whatever `emit_expr`
+produced. Values now park in a compound literal of array type, the shape A7 and `abi_ref_arg`
+already use. The callee gets a copy **whose indirection is shared**, so element writes through
+a slice's `ptr` reach the caller's buffer; only a whole-value reassignment is lost, and a
+temporary has nowhere to put one.
 
-`emit_addr_arg` assumes every `mut`/`out` argument lowers to a C lvalue and emits `&(place)`.
-For any argument that is a *value* — a call result, a cast, an arithmetic expression — that is
-"lvalue required". `check` passes; only `run` fails; the message is gcc's, with no Jestyr span.
-The A7 sub-view was one instance of this hole; **this is the rest of it.**
+The `distinct` cast turned out to be the case that mattered most and the one nobody had
+named: `s as Buf` is not a temporary at all — `Jestyr_Buf` *is* `JestyrSlice_i64` — so the
+ordinary newtype idiom simply did not work in `mut` position.
 
-**Why it was NOT folded into the A7 fix.** The tempting one-liner is to route the fall-through
-arms through `is_c_lvalue` and wrap the non-lvalues in the same compound literal. That is a
-**silent-miscompile trap**: `is_c_lvalue` answers "never" for `Index`, but `emit_place`'s
-checked-index arm deliberately renders `(*({ … &elem; }))`, which *is* an lvalue. Wrapping it
-would copy the element and **silently discard the callee's writes**. `abi_ref_arg` can afford
-that predicate because it serves a `read` parameter, where a spurious copy costs a copy; on
-the `mut` path the same wrongness costs a wrong answer. Any fix here needs a predicate that
-tracks `emit_place`'s *rendering*, not the source form — and that predicate must not be able
-to drift from `emit_place`, which is the real design work.
+**THE MISTAKE THIS ENTRY EXISTS TO RECORD.** The previous version of this note said the guard
+had to track `emit_place`'s *rendering* rather than the source form, and that `is_c_lvalue`
+was unusable because it answers "never" for `Index`. Half right. The fix uses `is_c_lvalue`,
+and the reasoning offered for why that was safe — *"`Field`, `Index` and `Deref` each return
+from their own arm, so the only lvalue reaching the catch-all is a `Name`"* — **was wrong**.
+The `Field` arm RECURSES into `emit_place` on its base, and a method's `self` is a
+`SelfValue`, which `is_c_lvalue` did not list. So `self.seen` in a `mut self` method parked
+`(*j_self)`, and `free(&copy.seen)` freed a copy's list while the caller's was never released.
 
-**The decision owed first:** accept it (lower via the compound literal, as A7 now does) or
-**refuse it**. Refusing looks right — a `mut` borrow of a temporary has nowhere to write back
-to, so the mutation is unobservable and the code is almost certainly a bug — but a refusal is
-a rule, so per the standing constraint it must live in **`escape` on both sides** (`typeck.jtr`
-has no diagnostic channel). Note the sub-view case must stay ACCEPTED either way: it aliases
-the caller's buffer, so its element writes are observable and useful.
+It compiled, it ran, and it produced a wrong answer quietly. **`census_cli` caught it; no
+amount of staring at the arm did.** The corpus file now carries that shape permanently: remove
+`SelfValue` from `is_c_lvalue` and `examples/mut_arg_value.jtr` prints 5 instead of 14 — a
+wrong value, not a crash. `Index` genuinely cannot reach the catch-all; every other kind can,
+and the guard has to be right about all of them.
+
+**Still open — a language question, not a lowering one.** Should a `mut` argument that aliases
+**nothing** be refused? `f(mut a + b)` is unobservable by construction: there is no
+indirection to share, so the callee's write cannot be seen. Refusing it fits the language's
+character (it already refuses `spawn` with `mut` params, and `@copy` with non-Copy fields).
+
+Three things to know before deciding:
+
+* **The old state was not "these are refused".** It was *"they work if they happen to render
+  as a C lvalue"* — `f(mut P{ x: 1 })` compiled all along, because a C compound literal is an
+  lvalue. Refusing category 3 is a NEW refusal, not the restoration of one.
+* **It cannot be a warning.** The port's `jc build` refuses on any escape diagnostic and has
+  no severity model, so a warning would be a program `jestyrc` builds and `jc` will not. Error
+  or nothing.
+* **A refusal is a rule**, so it must live in `escape` on **both** sides (`typeck.jtr` has no
+  diagnostic channel), and the predicate is type-directed and subtle: "not a place, and the
+  type transitively contains no indirection" — a struct with a `*mut T` field is *not* in this
+  category. That is the whole cost, and it is why the lowering was not made to wait on it.
 
 ### ~~1.2 — A6: `Self` in a trait parameter — `check` passes, `run` fails~~ — **DONE**
 

@@ -1485,7 +1485,60 @@ fn emit_place(mut sb: String, read p: parser.Parser, read src: str, read c: type
         emit_expr(sb, p, src, c, g, eid)
         return
     }
-    emit_expr(sb, p, src, c, g, eid)
+    // `Name` -- already an lvalue (`j_x`, or `(*j_x)` for a pointer parameter) -- and every
+    // form that is NOT A PLACE in the source language: a call, a cast, an arithmetic
+    // expression, a struct literal.
+    //
+    // `emit_place` owes its callers an lvalue and C will not give one for a value, so a value
+    // is parked in a COMPOUND LITERAL OF ARRAY TYPE: `(T[1]){ v }` decays to `T*` and `(*…)`
+    // reads back as a place, with the enclosing block's lifetime rather than the expression's.
+    //
+    // Without this, any `mut` argument that is not a place leaked gcc's own "lvalue required"
+    // with no span -- `f(mut mk())`, `f(mut a + b)`, and `f(mut s as Buf)`, which is the
+    // ordinary `distinct` newtype idiom. The callee gets a copy whose INDIRECTION IS SHARED,
+    // so writes through a slice's `ptr` reach the caller's buffer exactly as a sub-view's do.
+    //
+    // THE GUARD MUST BE EXACT, and "conservative" is not a defence. `is_c_lvalue` also serves
+    // the `read` path, where answering "no" to something that IS an lvalue costs one copy. Here
+    // it costs a WRONG ANSWER, because the copy is what a `mut` callee then writes into.
+    //
+    // The first version of this arm reasoned that Field, Index and Deref each return above, so
+    // the only lvalue reaching here is a Name -- and missed that the Field arm RECURSES into
+    // `emit_place` on its base, which for a method's `self` is a SelfValue. `self.seen` in a
+    // `mut self` method then parked `(*j_self)` and freed a copy's list. Index genuinely cannot
+    // reach this arm; every other kind can, and the guard has to be right about all of them.
+    if is_c_lvalue(p, eid) {
+        emit_expr(sb, p, src, c, g, eid)
+        return
+    }
+    var vbuf: String = string_new()                   // value emits BEFORE the type (counter lockstep)
+    emit_expr(vbuf, p, src, c, g, eid)
+    string_push(sb, "(*(")
+    emit_su_tyid(sb, p, src, c, g, list.get(i32, c.et, eid as usize))
+    string_push(sb, "[1]){ ")
+    string_push(sb, string_view(vbuf))
+    string_push(sb, " })")
+    string_free(vbuf)
+}
+
+// Does `eid` lower to a C LVALUE under `emit_expr` -- something `&` may be applied to?
+//
+// A Jestyr place is NOT automatically a C lvalue: `xs[1]` is a place, but cgen lowers a
+// bounds-checked index to a GNU statement expression, which yields a value. So lvalue-ness
+// follows the EMISSION, not the source form: a Name is one, a Deref always is (dereferencing
+// any pointer value produces an lvalue), a Field is one exactly when its base is, and an Index
+// never is. Mirrors the reference's `is_c_lvalue`.
+fn is_c_lvalue(read p: parser.Parser, eid: i32) -> bool {
+    if eid < 0 { return false }
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    if e.kind == 2 { return true }                    // Name
+    // SelfValue renders `j_self`, or `(*j_self)` for a `mut`/`out` receiver -- both lvalues,
+    // exactly as a Name is. Omitting it made `self.seen` in a `mut self` method resolve to a
+    // field of a COPY, so `free(&copy.seen)` freed the wrong list; `census_cli` caught it.
+    if e.kind == 19 { return true }                   // SelfValue
+    if e.kind == 7 { return true }                    // Deref
+    if e.kind == 5 { return is_c_lvalue(p, e.a) }     // Field: iff its base is
+    return false
 }
 
 // Emit `eid` as an argument passed BY ADDRESS — a `mut`/`out` parameter, or a `mut`/`out self`

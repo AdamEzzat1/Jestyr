@@ -1335,6 +1335,7 @@ bool jestyr_is_checked_index(Jestyr_Cg j_g, Jestyr_Parser j_p, JestyrStr j_src, 
 bool jestyr_place_through_checked_index(Jestyr_Cg j_g, Jestyr_Parser j_p, JestyrStr j_src, Jestyr_Checker j_c, int32_t j_eid);
 bool jestyr_place_through_genref_deref(Jestyr_Parser j_p, Jestyr_Checker j_c, int32_t j_eid);
 void jestyr_emit_place(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr j_src, Jestyr_Checker j_c, Jestyr_Cg* restrict j_g, int32_t j_eid, bool j_wr);
+bool jestyr_is_c_lvalue(Jestyr_Parser j_p, int32_t j_eid);
 void jestyr_emit_addr_arg(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr j_src, Jestyr_Checker j_c, Jestyr_Cg* restrict j_g, int32_t j_eid);
 void jestyr_emit_expr(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr j_src, Jestyr_Checker j_c, Jestyr_Cg* restrict j_g, int32_t j_eid);
 JestyrStr jestyr_assign_c(int32_t j_code);
@@ -23041,7 +23042,45 @@ void jestyr_emit_place(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr
         jestyr_emit_expr(&((*j_sb)), j_p, j_src, j_c, &((*j_g)), j_eid);
         return;
     }
-    jestyr_emit_expr(&((*j_sb)), j_p, j_src, j_c, &((*j_g)), j_eid);
+    if (jestyr_is_c_lvalue(j_p, j_eid))
+    {
+        jestyr_emit_expr(&((*j_sb)), j_p, j_src, j_c, &((*j_g)), j_eid);
+        return;
+    }
+    JestyrString j_vbuf = jestyr_rt_str_new();
+    jestyr_emit_expr(&(j_vbuf), j_p, j_src, j_c, &((*j_g)), j_eid);
+    jestyr_rt_str_push(&(*j_sb), JSTR("(*("));
+    jestyr_emit_su_tyid(&((*j_sb)), j_p, j_src, j_c, (*j_g), jestyr_get__list__i32(j_c.j_et, (size_t)(j_eid)));
+    jestyr_rt_str_push(&(*j_sb), JSTR("[1]){ "));
+    jestyr_rt_str_push(&(*j_sb), jestyr_rt_str_view(&j_vbuf));
+    jestyr_rt_str_push(&(*j_sb), JSTR(" })"));
+    jestyr_rt_str_free(&j_vbuf);
+}
+
+bool jestyr_is_c_lvalue(Jestyr_Parser j_p, int32_t j_eid)
+{
+    if ((j_eid < 0))
+    {
+        return false;
+    }
+    Jestyr_ExprData j_e = jestyr_get__list__ExprData(j_p.j_ex, (size_t)(j_eid));
+    if ((j_e.j_kind == 2))
+    {
+        return true;
+    }
+    if ((j_e.j_kind == 19))
+    {
+        return true;
+    }
+    if ((j_e.j_kind == 7))
+    {
+        return true;
+    }
+    if ((j_e.j_kind == 5))
+    {
+        return jestyr_is_c_lvalue(j_p, j_e.j_a);
+    }
+    return false;
 }
 
 void jestyr_emit_addr_arg(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr j_src, Jestyr_Checker j_c, Jestyr_Cg* restrict j_g, int32_t j_eid)

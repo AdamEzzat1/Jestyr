@@ -10336,16 +10336,57 @@ impl<'a> Cgen<'a> {
                 }
                 self.emit_expr(id)
             }
-            _ => self.emit_expr(id),
+            // `Name` — already an lvalue (`j_x`, or `(*j_x)` for a pointer parameter)
+            // — and every form that is **not a place in the source language**: a call,
+            // a cast, an arithmetic expression, a struct literal.
+            //
+            // `emit_place` owes its callers an lvalue and C will not give one for a
+            // value, so a value is parked in a **compound literal of array type**:
+            // `(T[1]){ v }` decays to `T*` and `(*…)` reads back as a place, with the
+            // enclosing block's lifetime rather than the expression's. Same shape, same
+            // reason, as the range sub-view above and as `abi_ref_arg`.
+            //
+            // Without this, any `mut` argument that is not a place leaked gcc's own
+            // "lvalue required as unary '&' operand" — no span, no Jestyr message — for
+            // `f(mut mk())`, `f(mut a + b)` and, importantly, `f(mut s as Buf)`, which
+            // is the ordinary `distinct` newtype idiom. What the callee receives is a
+            // copy whose *indirection is shared*, so writes through a slice's `ptr`
+            // reach the caller's buffer exactly as they do for a sub-view; only a
+            // whole-value reassignment is lost, and a temporary has nowhere to put one.
+            //
+            // ## The guard must be EXACT here, and "conservative" is not a defence
+            // `is_c_lvalue` is shared with `abi_ref_arg`, which serves a `read`
+            // parameter — there, answering "no" to something that *is* an lvalue costs
+            // one copy. **On this path it costs a wrong answer**, because the copy is
+            // what a `mut` callee then writes into.
+            //
+            // That is not hypothetical and it is not confined to the obvious forms. The
+            // first version of this arm reasoned that `Field`, `Index` and `Deref` each
+            // return from their own arm above, so the only lvalue reaching here is a
+            // `Name` — and missed that the `Field` arm *recurses* into `emit_place` on
+            // its base, which for a method's `self` is a `SelfValue`. `is_c_lvalue` did
+            // not list it, so `self.seen` in a `mut self` method parked `(*j_self)` and
+            // `free(&copy.seen)` freed a copy's list. `census_cli` caught it; nothing in
+            // the reasoning did.
+            //
+            // So: `Index` genuinely cannot reach this arm, but the reachable set is
+            // every *other* kind, and the guard has to be right about all of them.
+            _ => {
+                let v = self.emit_expr(id);
+                if is_c_lvalue(self.ast, id) {
+                    return v;
+                }
+                let cty = self.c_type(&self.info.type_of(id).clone());
+                format!("(*({cty}[1]){{ {v} }})")
+            }
         }
     }
 
     /// Emit `id` as an argument passed **by address** — a `mut`/`out` parameter, or
     /// a `mut`/`out self` receiver. Such an argument is a *place*, not a value, so
-    /// it goes through [`Self::emit_place`]: `cs[i].bump()` otherwise takes the
-    /// address of a bounds-checked statement expression and gcc reports "lvalue
-    /// required as unary '&' operand". Every argument that is not reached through a
-    /// checked index emits exactly as `&({expr})` always did.
+    /// it goes through [`Self::emit_place`], whose contract is that it always yields
+    /// a C lvalue: `cs[i].bump()` otherwise takes the address of a bounds-checked
+    /// statement expression and gcc reports "lvalue required as unary '&' operand".
     fn emit_addr_arg(&mut self, id: ExprId) -> String {
         let p = self.emit_place(id, true);
         format!("&({p})")
@@ -11010,7 +11051,13 @@ impl<'a> Cgen<'a> {
 /// worth the few lines.
 fn is_c_lvalue(ast: &Ast, id: ExprId) -> bool {
     match &ast.expr_at(id).kind {
-        ExprKind::Name(_) | ExprKind::Deref { .. } => true,
+        // `SelfValue` renders `j_self`, or `(*j_self)` for a `mut`/`out` receiver — both
+        // lvalues, exactly as `Name` is. **Omitting it was harmless until it wasn't.** On
+        // the `read` path (`abi_ref_arg`) a wrong "no" costs one copy; once `emit_place`'s
+        // catch-all began parking non-lvalues, the same wrong "no" made `self.seen` in a
+        // `mut self` method resolve to a field of a COPY, so `free(&copy.seen)` freed the
+        // wrong list and the caller's was never released. `census_cli` caught it.
+        ExprKind::Name(_) | ExprKind::SelfValue | ExprKind::Deref { .. } => true,
         ExprKind::Field { base, .. } => is_c_lvalue(ast, *base),
         _ => false,
     }

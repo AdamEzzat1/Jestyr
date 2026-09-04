@@ -138,6 +138,44 @@ versions are snapshots, not stability promises.
 
 ### Fixed
 
+- **A `mut` argument no longer has to be a place.** `f(mut s as Buf)`, `f(mut mk())` and
+  `f(mut a + b)` compile; before, each leaked gcc's own *"lvalue required as unary `&`
+  operand"* — no span, no Jestyr message, `jestyrc check` passing and only the C compiler
+  objecting. Both toolchains; `examples/mut_arg_value.jtr` is the corpus file, and the port
+  mirror was watched failing without it.
+
+  A `mut`/`out` parameter passes by address, so its argument routes through `emit_place`,
+  whose contract is that it yields a C lvalue. Every *place* form already did — a name, a
+  field, a checked index, a deref — but its catch-all handed back whatever `emit_expr`
+  produced, and a cast, a call or an arithmetic expression is a value. Those now park in a
+  **compound literal of array type**, the same shape the range sub-view and `abi_ref_arg`
+  already use.
+
+  **The callee gets a copy whose indirection is shared**, which is why this is not a fix that
+  quietly loses your writes: a slice is `{ ptr, len }`, so copying the descriptor copies the
+  pointer and element writes land in the caller's buffer. Only a whole-value reassignment is
+  lost, and a temporary has nowhere to put one. The corpus file checks this in both
+  directions — the elements inside a sub-view move, the one outside it does not.
+
+  **The most useful case is the least obvious one.** `s as Buf` for a `distinct Buf = []i64`
+  is not a temporary at all: `Jestyr_Buf` *is* `JestyrSlice_i64`, so the cast is a type-level
+  no-op and the argument is a place wearing another type. The ordinary newtype idiom simply
+  did not work in `mut` position.
+
+  **Why the guard is `is_c_lvalue` here and must not be anywhere else on this path.** That
+  predicate answers "never" for an index, while `emit_place`'s checked-index arm renders a
+  real lvalue — so using it to decide parking in general would copy an element and *silently
+  discard a `mut` callee's writes*. It cannot do that here: `Field`, `Index` and `Deref` each
+  return from their own arm above, so the only lvalue reaching the catch-all is a `Name`. The
+  hazard is excluded by construction rather than by care. (`abi_ref_arg` can afford the
+  imprecision because it serves a `read` parameter, where a wrong "no" costs a copy.)
+
+  Left open deliberately: whether a `mut` argument that aliases **nothing** — `f(mut a + b)`,
+  where the callee's writes are unobservable by construction — should be *refused*. That is a
+  language question, not a lowering one, and a refusal is a rule owing `escape` on both sides.
+  Note the previous state was not "such arguments are refused" but "they work if they happen
+  to render as a C lvalue": `f(mut P{ x: 1 })` compiled, because a C compound literal is one.
+
 - **`Self` now works as a type anywhere inside a trait impl** — as a parameter, a return, a
   local's type, and nested (`[]Self`) — for a struct receiver and a primitive one alike. Fixed
   on both toolchains; `examples/trait_self.jtr` is the corpus file, and the two mirrors were
