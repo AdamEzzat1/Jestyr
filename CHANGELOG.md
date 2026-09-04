@@ -7,6 +7,41 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/semver`** — semantic versions: parse, validate, and order them. `@no_alloc @no_os`,
+  so a resolver can call it in a loop without an arena and `@no_alloc` code can call it at all.
+  15 tests in `examples/std/semver_test.jtr`; both compilers agree on its emission byte for byte.
+
+  This is the layer directly under a resolver. `std/buildgraph` already answers "what depends
+  on what, in what order, and is it acyclic" over the compiler’s own content-hash manifest,
+  and its header names version solving as what sits below it. That is this.
+
+  **A `Version` stores byte OFFSETS, not borrows, and that is forced rather than chosen.** The
+  obvious shape holds `pre: str` sub-views of the input; Jestyr refuses it, because a `str`
+  field is a borrow and storing one that outlives the call is what the escape checker exists
+  to stop. So a `Version` carries ranges into the source and every function that needs the
+  text takes the source alongside — the same `ExprData`/`src` pairing the compiler itself uses.
+  It is why `compare` takes two sources: the general case is a requirement parsed from one
+  string against a candidate parsed from another.
+
+  **The suite pins the five precedence rules that get implemented wrong**, each chosen so the
+  obvious wrong implementation fails it: a pre-release sorts BEFORE its release (a string
+  compare inverts this); build metadata is ignored entirely, not used as a tiebreaker;
+  numeric identifiers compare numerically (`-2` < `-10`, which lexical order reverses);
+  numeric ranks below alphanumeric; and a longer run wins a tied prefix. **Writing them down
+  was not enough** — the suite caught three real defects on its first run, including a scanner
+  that used the single-identifier character set to scan a whole dotted run and so rejected
+  every `1.0.0-rc.1`, and an empty-run check that accepted `1.0.0-` and `1.0.0+`.
+
+  **`^` on a zero major is not `^`.** Caret means "up to the next change of the leftmost
+  NON-ZERO component", so `^0.2.3` admits `<0.3.0` and `^0.0.3` only `<0.0.4`. Reading `^` as
+  "same major" is the most common range bug, and on 0.x it is the difference between a patch
+  bump and an unreviewed breaking change.
+
+  Two deliberate departures from Cargo, both toward not guessing: **a bare `1.2.3` requirement
+  is EXACT** (if you want a range, spell one), and **a pre-release candidate only satisfies a
+  requirement that names a pre-release on the same release triple** — so `^1.2.3` never
+  installs `2.0.0-rc1`, the rule npm and Cargo both adopted after shipping the permissive one.
+
 - **`select` gains a `closed { … }` arm**, which runs when every channel it waits on is closed
   and drained. Both toolchains; `examples/std/select.jtr` grew a Part 3 that uses it.
 

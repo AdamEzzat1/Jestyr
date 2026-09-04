@@ -281,11 +281,34 @@ independent: different modules, different tests, different areas of the brief.
 
 **Recommended first wave — three sessions:**
 
-### 2.1 — Package substrate (brief area 5) — THE LOAD-BEARING ONE
+### 2.1 — Package substrate (brief area 5) — THE LOAD-BEARING ONE — **STARTED**
 
-semver → resolver → lockfile → content-addressed cache. Content-hashing, `buildgraph.jtr`,
-`tar.jtr` and `sha256.jtr` already exist underneath it. This is the area the tier's own
-"distribution" theme names, so if the tier should mean what its title says, this is the item.
+The chain is semver → resolver → lockfile → content-addressed cache. Content-hashing,
+`buildgraph.jtr`, `tar.jtr` and `sha256.jtr` already exist underneath it.
+
+**`std/semver` is DONE** — parse, validate, order, and requirement ranges. `@no_alloc @no_os`
+(probed: inserting an `alloc` into it is refused), 15 tests, allowlisted so both compilers
+agree on its emission. **It needed no reseed**, which is the §3 property working as designed:
+a new leaf module outside the sixteen is parallel-safe.
+
+Three things a successor should not re-derive:
+
+* **A `Version` cannot hold `str` views.** A `str` field is a borrow and the escape checker
+  refuses storing one that outlives the call. It carries byte OFFSETS and functions take the
+  source alongside — the compiler’s own `ExprData`/`src` idiom. `compare` therefore takes TWO
+  sources, which is the right general shape anyway (a requirement against a candidate).
+* **`@copy` on `Version`/`Req` is load-bearing**, not decoration: without it, reading a
+  `Version` out of a borrowed `Req` is a borrow projection and cannot leave the call.
+* **Writing the hard rules in the header did not make them true.** The suite caught three
+  real defects on its first run — including a scanner that used the single-identifier
+  character set on a whole dotted run, rejecting every `1.0.0-rc.1`. Each test is chosen so
+  the obvious wrong implementation fails it; that is why they failed.
+
+**NEXT in this chain: the resolver.** It has what it needs now — `buildgraph` for the DAG and
+topological order, `semver.matches` for candidate selection. The open design question is what
+to do when two requirements on one package disagree: fail, or pick the highest version
+satisfying both. Then the lockfile (`sha256` + the `attest` manifest shape are the precedent)
+and the content-addressed cache (`tar` already exists).
 
 ### 2.2 — HTTP V2 (area 6)
 

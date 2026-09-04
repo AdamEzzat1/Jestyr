@@ -18476,6 +18476,7 @@ fn main() -> i32 {
         "slice_range.jtr",
         "slice_range_mut.jtr",
         "mut_arg_value.jtr",
+        "semver.jtr",
         "test_fixture.jtr",
         "test_fixture_demo.jtr",
         "test_fixture_test.jtr",

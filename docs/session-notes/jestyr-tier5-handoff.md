@@ -1379,8 +1379,16 @@ goldens covered the change from the first run without a new corpus file.
   caveat A2 carries, and **not** the cheap local win it looks like from the register.
 * `jstatus_serves_a_connection_without_starving_its_timers` is load-sensitive (§3e): a 1ms
   timer with a 500ms budget, so a failure means a half-second deschedule. Failed 1 of ~8
-  full-ladder runs; passes in isolation in 2.8s. **Do not widen the deadline** — a wall-clock
-  test should not run beside a compile farm, which is a harness question.
+  full-ladder runs. **Do not widen the deadline** — a wall-clock test should not run beside a
+  compile farm, which is a harness question.
+
+  **"Passes in isolation" is the WRONG discriminator, and this entry used to give it.** It
+  failed twice for me when run alone — both times immediately after a 12-minute ladder, while
+  the machine was still draining. Run alone on an otherwise IDLE machine it then passed 8/8.
+  So the test that tells you whether a failure is real is *repetition on a quiet box*, not a
+  single isolated run; one isolated failure on a busy one proves nothing either way. Anyone
+  triaging this by the old wording would have concluded it was a genuine regression, which is
+  exactly the wrong call.
 
 ---
 
