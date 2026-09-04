@@ -7,6 +7,33 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/lockfile`** — record a resolution, and prove a later one agrees with it. 10 tests.
+
+  **A lockfile here is a WITNESS, not a source of truth**, and that follows from `std/resolve`
+  selecting minimally. Under maximal selection a lockfile is correctness-critical: resolution
+  consults the registry, the registry changes, so the only reason two builds agree is that one
+  read the lock instead of resolving — delete the file and they diverge. Under minimal
+  selection two builds of the same graph already agree. So this does not *cause* agreement, it
+  **records what was decided so a later build can prove it decided the same thing**.
+
+  That changes what the API is. There is no "install from the lockfile" entry point, because
+  there is nothing it could do that resolving would not: you `render` a solution and `verify`
+  a later one. A disagreement therefore means a REQUIREMENT changed, which is worth being
+  told; the suite pins that publishing a new release leaves the lock verifying.
+
+  Format is `jestyr-lock/v1`, `pkg <name> <version>` sorted by name so the bytes depend on the
+  selection and not on declaration order. **`resolver mvs` is recorded on purpose** — a lock
+  produced under one selection policy means nothing under another, the same reason
+  `jestyr-attest` writes its `cc-flags`; a lock naming another resolver is refused rather than
+  compared. The digest covers the `pkg` lines only, so it survives a header that grows.
+
+  Two design points, each probed by breaking it rather than trusted: **`verify` checks the
+  digest FIRST**, so a hand-edited body reads as a corrupt file rather than as legitimate
+  drift — the two call for completely different responses; and **it checks in BOTH
+  directions**, because "every locked package is still selected" alone would let a new
+  transitive dependency enter a build unrecorded and still report agreement. Removing either
+  fails exactly the test that names it.
+
 - **`std/resolve`** — dependency resolution by **minimal version selection**. 10 tests.
 
   Given `^1.2.0` and a registry holding 1.2.0, 1.5.0 and 1.9.0 it selects **1.2.0**, where

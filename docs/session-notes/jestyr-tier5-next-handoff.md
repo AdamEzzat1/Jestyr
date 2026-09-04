@@ -338,11 +338,33 @@ nothing.** Rewritten so the lift arrives LATE (round 1 selects `b` 1.0.0; a depe
 it in round 2), it now fails under accumulation. A test for a fixpoint’s behaviour has to
 reach the round where the behaviour happens.
 
-**NEXT in this chain: the lockfile**, then the content-addressed cache. `sha256` and the
-`attest` manifest shape are the precedent for the first; `tar` already exists for the second.
-Note that under MVS a lockfile is a *verification* artifact rather than a correctness one,
-which should simplify it — it records what was selected and lets a build prove it got the
-same answer, rather than being the only reason two builds agree.
+**`std/lockfile` is DONE.** `jestyr-lock/v1`, `pkg <name> <version>` sorted by name, with a
+`selection-sha256` over the body only. 10 tests.
+
+**It is a WITNESS, not a source of truth**, and that is the payoff of choosing MVS. Under
+maximal selection a lock is correctness-critical — delete it and two builds diverge. Here two
+builds of the same graph already agree, so the lock records what was decided and lets a later
+build prove it decided the same thing. Hence NO "install from lockfile" entry point: there is
+nothing it could do that resolving would not. A disagreement means a REQUIREMENT changed.
+
+`resolver mvs` is recorded deliberately — a lock produced under one policy means nothing under
+another (the reason `jestyr-attest` writes `cc-flags`), and one naming another resolver is
+refused rather than compared.
+
+Two decisions, each **probed by breaking it**: the digest is checked FIRST (a hand-edited body
+is a corrupt file, not drift — different responses), and `verify` runs in BOTH directions
+(one-way would let a new transitive dependency enter a build unrecorded and still report
+agreement). Removing either fails exactly the test that names it.
+
+**NEXT in this chain: the content-addressed cache**, and it is the last piece of the
+substrate. `tar.jtr` and `sha256.jtr` already exist; `sysfs`/`sysdir` give it a filesystem.
+The shape to aim for is "key by content hash, so a fetch is idempotent and an entry can be
+verified without trusting where it came from" — which pairs with the lockfile the same way
+`attest` pairs with the module manifest. **Note `sysfs` has no mtime, deliberately** (the
+`struct stat` layout differs per platform), so a cache must not key on one.
+
+After that the substrate is complete and the remaining §2 items are independent: HTTP V2,
+storage V2, and the second-wave table below.
 
 ### 2.2 — HTTP V2 (area 6)
 

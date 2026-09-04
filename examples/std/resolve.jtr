@@ -175,6 +175,20 @@ pub fn add_root(mut r: Registry, read name: str, read req: str) {
     list.push(i32, r.root_re, re)
 }
 
+// The name of package `p`, and the version string of version index `v`. Both return views
+// into the registry’s own arena, so a caller may render them without copying.
+pub fn package_name(read r: Registry, p: i32) -> read str {
+    let t: str = string_view(r.text)
+    if p < 0 { return t[0 .. 0] }
+    return t[list.get(i32, r.pkg_ns, p as usize) as usize .. list.get(i32, r.pkg_ne, p as usize) as usize]
+}
+
+pub fn version_string(read r: Registry, v: i32) -> read str {
+    let t: str = string_view(r.text)
+    if v < 0 { return t[0 .. 0] }
+    return t[list.get(i32, r.ver_s, v as usize) as usize .. list.get(i32, r.ver_e, v as usize) as usize]
+}
+
 pub fn package_count(read r: Registry) -> usize { return list.len(i32, r.pkg_ns) }
 pub fn version_count(read r: Registry) -> usize { return list.len(i32, r.ver_pkg) }
 

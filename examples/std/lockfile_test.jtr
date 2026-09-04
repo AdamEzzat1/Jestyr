@@ -1,0 +1,331 @@
+// std/lockfile_test.jtr — round-trip, order-independence, and each way a lock can disagree.
+//
+// Run:  jestyrc test examples/std/lockfile_test.jtr
+import "lockfile"
+import "mem"
+import "resolve"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 4096
+
+// The standing fixture: `app 1.0.0` needs `util >=1.4.0`, and `util` has three releases.
+fn fixture(read a: Allocator) -> resolve.Registry {
+    var r: resolve.Registry = resolve.registry(a)
+    let app: i32 = resolve.add_version(r, "app", "1.0.0")
+    resolve.add_dep(r, app, "util", ">=1.4.0")
+    resolve.add_version(r, "util", "1.0.0")
+    resolve.add_version(r, "util", "1.4.0")
+    resolve.add_version(r, "util", "1.7.0")
+    resolve.add_root(r, "app", "^1.0.0")
+    return r
+}
+
+@test fn renders_a_sorted_deterministic_body() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    var r: resolve.Registry = fixture(a)
+    let s: resolve.Solution = resolve.solve(a, r)
+    test.is_true(c, rep, "solved", resolve.solved(s))
+    var lf: String = lockfile.render(a, r, s)
+
+    // The whole file, byte for byte. Pinning the exact text is the point of a lockfile: if
+    // the format drifts, every checked-in lock silently stops comparing.
+    // Compare the SHAPE rather than the digest here — the digest has its own test below, and
+    // hard-coding it twice would mean a format change had to be edited in two places.
+    let got: str = string_view(lf)
+    test.is_true(c, rep, "header", begins(got, "jestyr-lock/v1\nresolver mvs\nselection-sha256 "))
+    test.is_true(c, rep, "app line", has_line(got, "pkg app 1.0.0"))
+    test.is_true(c, rep, "util line", has_line(got, "pkg util 1.4.0"))
+    // `app` sorts before `util`, and the body must be in that order regardless of how the
+    // registry was built.
+    test.is_true(c, rep, "sorted", index_of(got, "pkg app") < index_of(got, "pkg util"))
+
+    string_free(lf)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_rendered_lock_verifies_against_its_own_resolution() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    var r: resolve.Registry = fixture(a)
+    let s: resolve.Solution = resolve.solve(a, r)
+    var lf: String = lockfile.render(a, r, s)
+    let l: lockfile.Lock = lockfile.parse(a, string_view(lf))
+    test.is_true(c, rep, "parses", lockfile.lock_valid(l))
+    test.eq_usize(c, rep, "two entries", lockfile.entry_count(l), 2)
+
+    let v: lockfile.Verdict = lockfile.verify(a, l, r, s)
+    test.is_true(c, rep, "agrees", lockfile.agrees(v))
+    test.eq_i64(c, rep, "kind ok", lockfile.verdict_kind(v) as i64, lockfile.LOCK_OK as i64)
+
+    string_free(lf)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn publishing_a_newer_version_does_not_break_the_lock() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    // **The property that makes this file a witness rather than a crutch.** Under maximal
+    // selection a new release changes the resolution, so the lock disagrees and someone has
+    // to decide whether that is drift or an upgrade. Under minimal selection nothing moves —
+    // the lock keeps verifying, and a disagreement therefore means a REQUIREMENT changed,
+    // which is a fact worth being told about.
+    var r: resolve.Registry = fixture(a)
+    let s1: resolve.Solution = resolve.solve(a, r)
+    var lf: String = lockfile.render(a, r, s1)
+    let l: lockfile.Lock = lockfile.parse(a, string_view(lf))
+
+    resolve.add_version(r, "util", "1.9.0")           // someone publishes
+    let s2: resolve.Solution = resolve.solve(a, r)
+    let v: lockfile.Verdict = lockfile.verify(a, l, r, s2)
+    test.is_true(c, rep, "still agrees", lockfile.agrees(v))
+
+    string_free(lf)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_changed_requirement_is_reported_as_a_version_difference() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    var r1: resolve.Registry = fixture(a)
+    let s1: resolve.Solution = resolve.solve(a, r1)
+    var lf: String = lockfile.render(a, r1, s1)
+    let l: lockfile.Lock = lockfile.parse(a, string_view(lf))
+
+    // The same graph, but `app` now demands a higher `util`. The lock must NOTICE.
+    var r2: resolve.Registry = resolve.registry(a)
+    let app: i32 = resolve.add_version(r2, "app", "1.0.0")
+    resolve.add_dep(r2, app, "util", ">=1.7.0")
+    resolve.add_version(r2, "util", "1.0.0")
+    resolve.add_version(r2, "util", "1.4.0")
+    resolve.add_version(r2, "util", "1.7.0")
+    resolve.add_root(r2, "app", "^1.0.0")
+    let s2: resolve.Solution = resolve.solve(a, r2)
+    test.eq_str(c, rep, "util moved", resolve.selected_version(r2, s2, "util"), "1.7.0")
+
+    let v: lockfile.Verdict = lockfile.verify(a, l, r2, s2)
+    test.is_false(c, rep, "disagrees", lockfile.agrees(v))
+    test.eq_i64(c, rep, "version differs", lockfile.verdict_kind(v) as i64,
+                lockfile.LOCK_VERSION_DIFFERS as i64)
+
+    string_free(lf)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_new_transitive_dependency_cannot_slip_in_unrecorded() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    // Lock a one-package build, then resolve a graph that pulls in a second package. Without
+    // the "every selected package must be locked" half of `verify`, this AGREES — every
+    // locked entry still checks out — and a dependency enters the build unrecorded. That is
+    // the whole reason the check runs in both directions.
+    var r1: resolve.Registry = resolve.registry(a)
+    resolve.add_version(r1, "app", "1.0.0")
+    resolve.add_root(r1, "app", "^1.0.0")
+    let s1: resolve.Solution = resolve.solve(a, r1)
+    var lf: String = lockfile.render(a, r1, s1)
+    let l: lockfile.Lock = lockfile.parse(a, string_view(lf))
+    test.eq_usize(c, rep, "one entry", lockfile.entry_count(l), 1)
+
+    var r2: resolve.Registry = resolve.registry(a)
+    let app: i32 = resolve.add_version(r2, "app", "1.0.0")
+    resolve.add_dep(r2, app, "extra", "^1.0.0")
+    resolve.add_version(r2, "extra", "1.0.0")
+    resolve.add_root(r2, "app", "^1.0.0")
+    let s2: resolve.Solution = resolve.solve(a, r2)
+
+    let v: lockfile.Verdict = lockfile.verify(a, l, r2, s2)
+    test.is_false(c, rep, "disagrees", lockfile.agrees(v))
+    test.eq_i64(c, rep, "missing from the lock", lockfile.verdict_kind(v) as i64,
+                lockfile.LOCK_MISSING as i64)
+
+    string_free(lf)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_dropped_dependency_is_reported_as_extra() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    var r1: resolve.Registry = fixture(a)
+    let s1: resolve.Solution = resolve.solve(a, r1)
+    var lf: String = lockfile.render(a, r1, s1)
+    let l: lockfile.Lock = lockfile.parse(a, string_view(lf))
+
+    // `app` no longer needs `util`, so `util` leaves the build. The lock still names it.
+    var r2: resolve.Registry = resolve.registry(a)
+    resolve.add_version(r2, "app", "1.0.0")
+    resolve.add_version(r2, "util", "1.4.0")
+    resolve.add_root(r2, "app", "^1.0.0")
+    let s2: resolve.Solution = resolve.solve(a, r2)
+
+    let v: lockfile.Verdict = lockfile.verify(a, l, r2, s2)
+    test.is_false(c, rep, "disagrees", lockfile.agrees(v))
+    test.eq_i64(c, rep, "extra in the lock", lockfile.verdict_kind(v) as i64,
+                lockfile.LOCK_EXTRA as i64)
+
+    string_free(lf)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_hand_edited_body_is_reported_as_corrupt_not_as_drift() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    var r: resolve.Registry = fixture(a)
+    let s: resolve.Solution = resolve.solve(a, r)
+    var lf: String = lockfile.render(a, r, s)
+
+    // Edit a version in the body without touching the digest — what a person does when they
+    // "just bump it in the lockfile". The digest is checked FIRST precisely so this reads as
+    // a corrupt file rather than as a legitimate difference from the resolution: the two
+    // call for completely different responses.
+    let full: str = string_view(lf)
+    let at: isize = index_of(full, "pkg util 1.4.0")
+    test.is_true(c, rep, "found the line to tamper with", at >= 0)
+    var tampered: String = string_new()
+    string_push(tampered, full[0 .. at as usize])
+    string_push(tampered, "pkg util 1.7.0")
+    string_push(tampered, full[(at as usize) + 14 .. full.len])
+    let l: lockfile.Lock = lockfile.parse(a, string_view(tampered))
+    test.is_true(c, rep, "still parses", lockfile.lock_valid(l))
+
+    let v: lockfile.Verdict = lockfile.verify(a, l, r, s)
+    test.is_false(c, rep, "disagrees", lockfile.agrees(v))
+    test.eq_i64(c, rep, "digest, not version", lockfile.verdict_kind(v) as i64,
+                lockfile.LOCK_DIGEST as i64)
+
+    string_free(tampered)
+    string_free(lf)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_malformed_lock_is_refused_rather_than_half_read() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    test.is_false(c, rep, "wrong header",
+        lockfile.lock_valid(lockfile.parse(a, "jestyr-lock/v2\nresolver mvs\nselection-sha256 x\n")))
+    // A lock produced under a DIFFERENT selection policy is not comparable to one produced
+    // under this resolver, so it is refused rather than compared.
+    test.is_false(c, rep, "wrong resolver",
+        lockfile.lock_valid(lockfile.parse(a, "jestyr-lock/v1\nresolver maximal\nselection-sha256 x\n")))
+    test.is_false(c, rep, "no digest",
+        lockfile.lock_valid(lockfile.parse(a, "jestyr-lock/v1\nresolver mvs\npkg a 1.0.0\n")))
+    test.is_false(c, rep, "pkg without a version",
+        lockfile.lock_valid(lockfile.parse(a, "jestyr-lock/v1\nresolver mvs\nselection-sha256 x\npkg a\n")))
+    test.is_false(c, rep, "unknown line",
+        lockfile.lock_valid(lockfile.parse(a, "jestyr-lock/v1\nresolver mvs\nselection-sha256 x\nwat\n")))
+    test.is_false(c, rep, "empty", lockfile.lock_valid(lockfile.parse(a, "")))
+    // …and the well-formed control, without which every line above would pass on a parser
+    // that rejected everything.
+    test.is_true(c, rep, "the valid shape",
+        lockfile.lock_valid(lockfile.parse(a, "jestyr-lock/v1\nresolver mvs\nselection-sha256 x\npkg a 1.0.0\n")))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_malformed_lock_verifies_as_malformed() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    var r: resolve.Registry = fixture(a)
+    let s: resolve.Solution = resolve.solve(a, r)
+    let l: lockfile.Lock = lockfile.parse(a, "not a lockfile at all")
+    let v: lockfile.Verdict = lockfile.verify(a, l, r, s)
+    // Fail CLOSED: an unreadable lock must never come back as agreement.
+    test.is_false(c, rep, "does not agree", lockfile.agrees(v))
+    test.eq_i64(c, rep, "malformed", lockfile.verdict_kind(v) as i64, lockfile.LOCK_MALFORMED as i64)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn crlf_survives_a_round_trip() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    // A lockfile gets checked in, and something will rewrite its line endings. The parser
+    // tolerates CRLF so the digest still matches — otherwise a Windows checkout reports every
+    // lock as corrupt.
+    let l: lockfile.Lock = lockfile.parse(a,
+        "jestyr-lock/v1\r\nresolver mvs\r\nselection-sha256 abc\r\npkg app 1.0.0\r\n")
+    test.is_true(c, rep, "parses", lockfile.lock_valid(l))
+    test.eq_usize(c, rep, "one entry", lockfile.entry_count(l), 1)
+    test.eq_str(c, rep, "name", lockfile.entry_name(l, 0), "app")
+    test.eq_str(c, rep, "version has no CR", lockfile.entry_version(l, 0), "1.0.0")
+    test.eq_str(c, rep, "digest has no CR", lockfile.digest(l), "abc")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// --- small local helpers (kept here rather than in the module: they are test scaffolding) --
+
+@no_alloc @no_os fn begins(read s: str, read p: str) -> bool {
+    if s.len < p.len { return false }
+    var i: usize = 0
+    for i < p.len {
+        if (s[i] as i32) != (p[i] as i32) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+@no_alloc @no_os fn index_of(read s: str, read n: str) -> isize {
+    if n.len > s.len { return 0 - 1 }
+    var i: usize = 0
+    for i <= s.len - n.len {
+        if begins(s[i .. s.len], n) { return i as isize }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+@no_alloc @no_os fn has_line(read s: str, read line: str) -> bool {
+    return index_of(s, line) >= 0
+}
