@@ -7,6 +7,38 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/resolve`** — dependency resolution by **minimal version selection**. 10 tests.
+
+  Given `^1.2.0` and a registry holding 1.2.0, 1.5.0 and 1.9.0 it selects **1.2.0**, where
+  npm and Cargo select the highest. **The reason is reproducibility.** Under maximal
+  selection the answer depends on what the registry contained at the moment you resolved —
+  publishing tonight changes what everyone selects tomorrow — so reproducibility has to be
+  bought back with a lockfile, and that lockfile becomes correctness-critical rather than a
+  cache. Under minimal selection resolution is a pure function of the requirement graph:
+  **adding a release cannot change an existing resolution**, which the suite asserts by
+  resolving, publishing a newer version, and resolving again. You also get the versions your
+  dependencies were tested against. The cost, stated plainly: no automatic patch fixes —
+  upgrading becomes an explicit act rather than a side effect of building on a Tuesday.
+
+  One version per package, which is close to forced: the compiler flattens an import closure
+  into one translation unit, so two versions would collide on symbol names. A conflict is
+  therefore reported, never papered over by duplication.
+
+  `^` and `<` add upper bounds, which is what makes this not pure MVS — Go has only lower
+  bounds and needs no search. It does not backtrack: it iterates a fixpoint with selection
+  pinned **monotone**, which is what makes it terminate, and reports anything it cannot
+  decide. `budget_exhausted` separates a non-convergence from a genuine conflict, because
+  mislabelling one as the other sends someone to debug the wrong thing. The constraint set is
+  **rebuilt** each round rather than accumulated, so a superseded version’s upper bound cannot
+  contradict its successor’s floor and report a conflict in a graph that resolves cleanly.
+
+  **One of these tests was vacuous and a probe caught it.** All ten passed first run, so each
+  claim was checked by breaking the implementation. Flipping to maximal selection failed five
+  — correctly. Making constraints accumulate failed *none*: the phantom-conflict test rooted
+  at `b >=2.0.0`, so `b` was already 2.0.0 in round one and the superseded bound was never
+  contributed under either policy. Rewritten so the lift arrives late, it now fails under
+  accumulation. A test for a fixpoint has to reach the round where the behaviour happens.
+
 - **`std/semver`** — semantic versions: parse, validate, and order them. `@no_alloc @no_os`,
   so a resolver can call it in a loop without an arena and `@no_alloc` code can call it at all.
   15 tests in `examples/std/semver_test.jtr`; both compilers agree on its emission byte for byte.

@@ -1,0 +1,376 @@
+// std/resolve.jtr — dependency resolution by MINIMAL VERSION SELECTION.
+//
+// TIER: `std` (allocates; no OS). Nothing here fetches anything. A `Registry` is built by
+// the caller from data it already has, for the same reason `std/buildgraph` parses a
+// manifest you hand it and `std/cli` parses an `Args` you hand it: a resolver that fetched
+// its own input could not be tested without a network.
+//
+// ─── The choice: MINIMAL version selection, not maximal ─────────────────────────────
+//
+// Given `^1.2.0` and a registry holding 1.2.0, 1.5.0 and 1.9.0, this picks **1.2.0** — the
+// lowest version satisfying every constraint — where npm and Cargo pick the highest.
+//
+// **The reason is reproducibility, and it is the property this tree spends the most effort
+// on everywhere else.** Under maximal selection the answer depends on what the registry
+// contained at the moment you resolved: publishing 1.9.1 tonight silently changes what
+// everyone's build selects tomorrow, so reproducibility has to be bought back with a
+// lockfile, and the lockfile becomes correctness-critical rather than a cache. Under
+// minimal selection the answer is a pure function of the requirement graph. Adding a
+// release to the registry **cannot** change an existing resolution — `resolve_test.jtr`
+// asserts exactly that by resolving, publishing a newer version, and resolving again.
+//
+// It also means you get the versions your dependencies were actually tested against rather
+// than whatever was newest, and that upgrading is an explicit act rather than a side effect
+// of building on a Tuesday. The cost is real and worth stating plainly: **you do not get
+// patch fixes automatically.** Someone must raise a floor to take them. That is a worse
+// default for a casual application and a better one for a compiler toolchain, which is what
+// this is.
+//
+// ─── One version per package, which is close to forced ──────────────────────────────
+//
+// npm allows two versions of one package to coexist by nesting. Jestyr cannot today: the
+// compiler flattens an entire import closure into ONE translation unit, so two versions of
+// one module would collide on symbol names. So a conflict is a conflict, and it is reported
+// rather than papered over by duplication.
+//
+// ─── Upper bounds are what make this not pure MVS, and the honest consequence ───────
+//
+// Go's MVS is a maximum over lower bounds: no upper bounds exist, so selection is a single
+// pass with no search. `^` and `<` introduce upper bounds, which in general makes this a
+// constraint problem that can need backtracking.
+//
+// This does not backtrack. It iterates a fixpoint — select the lowest satisfying version
+// for each constrained package, take that version's dependencies as further constraints,
+// repeat — with **selection pinned monotone**: a package's chosen version never decreases.
+// That guarantees termination (each round either raises some selection or stops, and
+// versions are finite) and it is why the iteration budget below is a safety net rather than
+// the mechanism.
+//
+// A shape this cannot solve is REPORTED, never guessed: `solved` is false and `conflict`
+// names the package. **A resolver that silently picks something when it could not decide is
+// worse than one that stops**, because the wrong answer is a build that works on the
+// machine that produced the lockfile.
+//
+// ─── Where it sits ──────────────────────────────────────────────────────────────────
+//
+// `std/semver` decides whether one version satisfies one requirement. This decides which
+// version each package gets. `std/buildgraph` orders the build once the set is known. The
+// lockfile and the content-addressed cache are the two layers still above this.
+
+import "list"
+import "semver"
+
+// A package universe: names, the versions available for each, and each version's own
+// requirements. Built incrementally by the caller; every string is copied into `text`, so a
+// `Registry` owns its data and the caller's buffers may go away.
+//
+// Parallel lists rather than a list of structs, and spans rather than strings, for the
+// reason `std/semver` records: a struct may not hold a `str` (that is a borrow, and storing
+// one that outlives the call is refused). This is the compiler's own `iar`/`src` idiom.
+pub struct Registry {
+    text: String,
+    pkg_ns: List(i32), pkg_ne: List(i32),
+    ver_pkg: List(i32), ver_s: List(i32), ver_e: List(i32),
+    dep_ver: List(i32), dep_ns: List(i32), dep_ne: List(i32), dep_rs: List(i32), dep_re: List(i32),
+    root_ns: List(i32), root_ne: List(i32), root_rs: List(i32), root_re: List(i32),
+}
+
+pub fn registry(read a: Allocator) -> Registry {
+    return Registry{ text: string_new(),
+        pkg_ns: list.make(i32, a), pkg_ne: list.make(i32, a),
+        ver_pkg: list.make(i32, a), ver_s: list.make(i32, a), ver_e: list.make(i32, a),
+        dep_ver: list.make(i32, a), dep_ns: list.make(i32, a), dep_ne: list.make(i32, a),
+        dep_rs: list.make(i32, a), dep_re: list.make(i32, a),
+        root_ns: list.make(i32, a), root_ne: list.make(i32, a),
+        root_rs: list.make(i32, a), root_re: list.make(i32, a) }
+}
+
+// Copy `s` into the arena, returning its span.
+fn intern(mut r: Registry, read s: str, out st: i32, out en: i32) {
+    let before: str = string_view(r.text)
+    st = before.len as i32
+    string_push(r.text, s)
+    let after: str = string_view(r.text)
+    en = after.len as i32
+}
+
+@no_alloc @no_os fn span_eq(read t: str, a_s: i32, a_e: i32, read b: str) -> bool {
+    let a: str = t[a_s as usize .. a_e as usize]
+    if a.len != b.len { return false }
+    var i: usize = 0
+    for i < a.len {
+        if (a[i] as i32) != (b[i] as i32) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// The index of package `name`, or -1.
+pub fn package_index(read r: Registry, read name: str) -> isize {
+    let t: str = string_view(r.text)
+    var i: usize = 0
+    for i < list.len(i32, r.pkg_ns) {
+        if span_eq(t, list.get(i32, r.pkg_ns, i), list.get(i32, r.pkg_ne, i), name) {
+            return i as isize
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Declare a package, or return the existing index. Idempotent by name.
+pub fn add_package(mut r: Registry, read name: str) -> i32 {
+    let found: isize = package_index(r, name)
+    if found >= 0 { return found as i32 }
+    var st: i32 = 0
+    var en: i32 = 0
+    intern(r, name, st, en)
+    list.push(i32, r.pkg_ns, st)
+    list.push(i32, r.pkg_ne, en)
+    return (list.len(i32, r.pkg_ns) - 1) as i32
+}
+
+// Publish `ver` for package `name`. Returns the VERSION index, which `add_dep` needs.
+// Versions may be added in any order; selection sorts by precedence, not by arrival.
+pub fn add_version(mut r: Registry, read name: str, read ver: str) -> i32 {
+    let p: i32 = add_package(r, name)
+    var st: i32 = 0
+    var en: i32 = 0
+    intern(r, ver, st, en)
+    list.push(i32, r.ver_pkg, p)
+    list.push(i32, r.ver_s, st)
+    list.push(i32, r.ver_e, en)
+    return (list.len(i32, r.ver_pkg) - 1) as i32
+}
+
+// Record that version `v` depends on package `name` at requirement `req`.
+pub fn add_dep(mut r: Registry, v: i32, read name: str, read req: str) {
+    add_package(r, name)
+    var ns: i32 = 0
+    var ne: i32 = 0
+    intern(r, name, ns, ne)
+    var rs: i32 = 0
+    var re: i32 = 0
+    intern(r, req, rs, re)
+    list.push(i32, r.dep_ver, v)
+    list.push(i32, r.dep_ns, ns)
+    list.push(i32, r.dep_ne, ne)
+    list.push(i32, r.dep_rs, rs)
+    list.push(i32, r.dep_re, re)
+}
+
+// A requirement of the thing being built. These are the only constraints that are always
+// in force; every other constraint comes from a version that is currently selected.
+pub fn add_root(mut r: Registry, read name: str, read req: str) {
+    add_package(r, name)
+    var ns: i32 = 0
+    var ne: i32 = 0
+    intern(r, name, ns, ne)
+    var rs: i32 = 0
+    var re: i32 = 0
+    intern(r, req, rs, re)
+    list.push(i32, r.root_ns, ns)
+    list.push(i32, r.root_ne, ne)
+    list.push(i32, r.root_rs, rs)
+    list.push(i32, r.root_re, re)
+}
+
+pub fn package_count(read r: Registry) -> usize { return list.len(i32, r.pkg_ns) }
+pub fn version_count(read r: Registry) -> usize { return list.len(i32, r.ver_pkg) }
+
+// The outcome. `sel[p]` is the chosen VERSION index for package `p`, or -1 when the package
+// was never required. `solved` is false when some required package had no version
+// satisfying its constraints, or when the fixpoint hit its budget.
+pub struct Solution {
+    sel: List(i32),
+    solved: bool,
+    conflict: i32,          // package index, or -1
+    exhausted: bool,        // true when the budget ran out rather than a real conflict
+    rounds: i32,
+}
+
+pub fn solved(read s: Solution) -> bool { return s.solved }
+pub fn conflict_package(read s: Solution) -> i32 { return s.conflict }
+pub fn budget_exhausted(read s: Solution) -> bool { return s.exhausted }
+pub fn rounds(read s: Solution) -> i32 { return s.rounds }
+
+// The chosen version index for package `p`, or -1.
+pub fn selected(read s: Solution, p: i32) -> i32 {
+    if p < 0 { return 0 - 1 }
+    if p as usize >= list.len(i32, s.sel) { return 0 - 1 }
+    return list.get(i32, s.sel, p as usize)
+}
+
+// The chosen version STRING for package `name`, or "" when it was not selected.
+pub fn selected_version(read r: Registry, read s: Solution, read name: str) -> read str {
+    let t: str = string_view(r.text)
+    let p: isize = package_index(r, name)
+    if p < 0 { return t[0 .. 0] }
+    let v: i32 = selected(s, p as i32)
+    if v < 0 { return t[0 .. 0] }
+    return t[list.get(i32, r.ver_s, v as usize) as usize .. list.get(i32, r.ver_e, v as usize) as usize]
+}
+
+// Does version index `v` satisfy the requirement at span `(rs, re)`?
+fn version_meets(read r: Registry, v: i32, rs: i32, re: i32) -> bool {
+    let t: str = string_view(r.text)
+    let req: str = t[rs as usize .. re as usize]
+    let vs: str = t[list.get(i32, r.ver_s, v as usize) as usize .. list.get(i32, r.ver_e, v as usize) as usize]
+    let rq: semver.Req = semver.parse_req(req)
+    if !semver.req_valid(rq) { return false }
+    let sv: semver.Version = semver.parse(vs)
+    if !semver.valid(sv) { return false }
+    return semver.matches(req, rq, vs, sv)
+}
+
+// Compare two version indices by SemVer precedence.
+fn ver_cmp(read r: Registry, a: i32, b: i32) -> i32 {
+    let t: str = string_view(r.text)
+    let sa: str = t[list.get(i32, r.ver_s, a as usize) as usize .. list.get(i32, r.ver_e, a as usize) as usize]
+    let sb: str = t[list.get(i32, r.ver_s, b as usize) as usize .. list.get(i32, r.ver_e, b as usize) as usize]
+    let va: semver.Version = semver.parse(sa)
+    let vb: semver.Version = semver.parse(sb)
+    return semver.compare(sa, va, sb, vb)
+}
+
+// The LOWEST version of package `p` satisfying every active constraint, or -1 when none
+// does. `floor` pins monotonicity: a candidate below the currently selected version is not
+// considered, which is what makes the fixpoint terminate.
+fn lowest_satisfying(read r: Registry, mut cons_pkg: List(i32), mut cons_rs: List(i32), mut cons_re: List(i32), p: i32, floor: i32) -> i32 {
+    var best: i32 = 0 - 1
+    var v: usize = 0
+    for v < list.len(i32, r.ver_pkg) {
+        if list.get(i32, r.ver_pkg, v) == p {
+            let vi: i32 = v as i32
+            var ok: bool = true
+            if floor >= 0 {
+                if ver_cmp(r, vi, floor) < 0 { ok = false }
+            }
+            if ok {
+                var c: usize = 0
+                for c < list.len(i32, cons_pkg) {
+                    if list.get(i32, cons_pkg, c) == p {
+                        if !version_meets(r, vi, list.get(i32, cons_rs, c), list.get(i32, cons_re, c)) {
+                            ok = false
+                            break
+                        }
+                    }
+                    c = c + 1
+                }
+            }
+            if ok {
+                if best < 0 { best = vi }
+                else {
+                    if ver_cmp(r, vi, best) < 0 { best = vi }
+                }
+            }
+        }
+        v = v + 1
+    }
+    return best
+}
+
+// Resolve the registry's root requirements.
+//
+// The fixpoint: each round rebuilds the constraint set from the roots plus the dependencies
+// of every currently-selected version, then re-selects the lowest satisfying version for
+// each constrained package. Rebuilding rather than accumulating is what stops a superseded
+// version's upper bound from producing a phantom conflict — if `B 1.0` required `C <2.0`
+// and `B` has since risen to `2.0` requiring `C >=2.0`, keeping the old bound would refuse
+// a graph that resolves cleanly.
+//
+// Selection is pinned monotone (`floor`), so a round either raises some selection or the
+// fixpoint is reached. The budget is a safety net for that argument being wrong, not the
+// mechanism; `budget_exhausted` distinguishes it from a genuine conflict so a failure is
+// never silently mislabelled.
+pub fn solve(read a: Allocator, read r: Registry) -> Solution {
+    let np: usize = list.len(i32, r.pkg_ns)
+    var sel: List(i32) = list.make(i32, a)
+    var i: usize = 0
+    for i < np {
+        list.push(i32, sel, 0 - 1)
+        i = i + 1
+    }
+
+    var cons_pkg: List(i32) = list.make(i32, a)
+    var cons_rs: List(i32) = list.make(i32, a)
+    var cons_re: List(i32) = list.make(i32, a)
+
+    let budget: i32 = (list.len(i32, r.ver_pkg) + np + 2) as i32
+    var round: i32 = 0
+    var conflict: i32 = 0 - 1
+    var done: bool = false
+    var exhausted: bool = false
+
+    for round < budget {
+        round = round + 1
+        // Rebuild the constraint set: the roots, plus every selected version's deps.
+        list.truncate(i32, cons_pkg, 0)
+        list.truncate(i32, cons_rs, 0)
+        list.truncate(i32, cons_re, 0)
+        let t: str = string_view(r.text)
+        var k: usize = 0
+        for k < list.len(i32, r.root_ns) {
+            let nm: str = t[list.get(i32, r.root_ns, k) as usize .. list.get(i32, r.root_ne, k) as usize]
+            let pi: isize = package_index(r, nm)
+            if pi >= 0 {
+                list.push(i32, cons_pkg, pi as i32)
+                list.push(i32, cons_rs, list.get(i32, r.root_rs, k))
+                list.push(i32, cons_re, list.get(i32, r.root_re, k))
+            }
+            k = k + 1
+        }
+        var q: usize = 0
+        for q < np {
+            let v: i32 = list.get(i32, sel, q)
+            if v >= 0 {
+                var d: usize = 0
+                for d < list.len(i32, r.dep_ver) {
+                    if list.get(i32, r.dep_ver, d) == v {
+                        let dn: str = t[list.get(i32, r.dep_ns, d) as usize .. list.get(i32, r.dep_ne, d) as usize]
+                        let dp: isize = package_index(r, dn)
+                        if dp >= 0 {
+                            list.push(i32, cons_pkg, dp as i32)
+                            list.push(i32, cons_rs, list.get(i32, r.dep_rs, d))
+                            list.push(i32, cons_re, list.get(i32, r.dep_re, d))
+                        }
+                    }
+                    d = d + 1
+                }
+            }
+            q = q + 1
+        }
+
+        // Re-select every constrained package.
+        var changed: bool = false
+        var p: usize = 0
+        for p < np {
+            var constrained: bool = false
+            var c: usize = 0
+            for c < list.len(i32, cons_pkg) {
+                if list.get(i32, cons_pkg, c) == p as i32 { constrained = true  break }
+                c = c + 1
+            }
+            if constrained {
+                let cur: i32 = list.get(i32, sel, p)
+                let pick: i32 = lowest_satisfying(r, cons_pkg, cons_rs, cons_re, p as i32, cur)
+                if pick < 0 {
+                    conflict = p as i32
+                    break
+                }
+                if pick != cur {
+                    list.set(i32, sel, p, pick)
+                    changed = true
+                }
+            }
+            p = p + 1
+        }
+        if conflict >= 0 { break }
+        if !changed { done = true  break }
+    }
+    if !done {
+        if conflict < 0 { exhausted = true }
+    }
+    let ok: bool = done and conflict < 0
+    return Solution{ sel: sel, solved: ok, conflict: conflict, exhausted: exhausted, rounds: round }
+}

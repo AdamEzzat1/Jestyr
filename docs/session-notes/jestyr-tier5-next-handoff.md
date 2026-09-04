@@ -304,11 +304,45 @@ Three things a successor should not re-derive:
   character set on a whole dotted run, rejecting every `1.0.0-rc.1`. Each test is chosen so
   the obvious wrong implementation fails it; that is why they failed.
 
-**NEXT in this chain: the resolver.** It has what it needs now — `buildgraph` for the DAG and
-topological order, `semver.matches` for candidate selection. The open design question is what
-to do when two requirements on one package disagree: fail, or pick the highest version
-satisfying both. Then the lockfile (`sha256` + the `attest` manifest shape are the precedent)
-and the content-addressed cache (`tar` already exists).
+**`std/resolve` is DONE too — by MINIMAL VERSION SELECTION, and that was a decision.**
+
+Given `^1.2.0` and a registry holding 1.2.0/1.5.0/1.9.0 it picks **1.2.0**, where npm and
+Cargo pick the highest. The reason is the property this tree spends its effort on everywhere
+else: under maximal selection the answer depends on what the registry held at resolve time,
+so reproducibility has to be bought back with a lockfile and the lockfile becomes
+correctness-critical rather than a cache. Under minimal selection resolution is a pure
+function of the requirement graph — **publishing a release cannot change an existing build**,
+which `resolve_test.jtr` asserts by resolving, publishing, and resolving again. The cost is
+real: you do not get patch fixes automatically, so upgrading is an explicit act.
+
+One version per package, which is close to forced — the compiler flattens an import closure
+into ONE translation unit, so two versions of a package would collide on symbol names.
+
+`^`/`<` add upper bounds, which is what makes this not pure MVS (Go has only lower bounds and
+needs no search). It does not backtrack: it iterates a fixpoint with **selection pinned
+monotone**, which is what makes it terminate, and REPORTS anything it cannot decide rather
+than guessing — `budget_exhausted` distinguishes a non-convergence from a real conflict so a
+failure is never mislabelled.
+
+**The constraint set is REBUILT each round, not accumulated**, and that is load-bearing: a
+superseded version’s upper bound would otherwise contradict its successor’s floor and report
+a conflict in a graph that resolves cleanly.
+
+**A probe caught one of these tests being vacuous, and it is the lesson worth keeping.** All
+ten passed on the first run, so each claim was probed by breaking the implementation.
+Flipping to maximal selection failed 5 of 10 — correctly, including the reproducibility one.
+But making constraints ACCUMULATE failed nothing: the phantom-conflict test set its root to
+`b >=2.0.0`, so `b` was 2.0.0 from round one, `b 1.0.0` was never selected, and its upper
+bound was never contributed under either policy. **The test asserted the property and pinned
+nothing.** Rewritten so the lift arrives LATE (round 1 selects `b` 1.0.0; a dependency raises
+it in round 2), it now fails under accumulation. A test for a fixpoint’s behaviour has to
+reach the round where the behaviour happens.
+
+**NEXT in this chain: the lockfile**, then the content-addressed cache. `sha256` and the
+`attest` manifest shape are the precedent for the first; `tar` already exists for the second.
+Note that under MVS a lockfile is a *verification* artifact rather than a correctness one,
+which should simplify it — it records what was selected and lets a build prove it got the
+same answer, rather than being the only reason two builds agree.
 
 ### 2.2 — HTTP V2 (area 6)
 

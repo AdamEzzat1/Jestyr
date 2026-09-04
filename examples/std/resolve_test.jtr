@@ -1,0 +1,290 @@
+// std/resolve_test.jtr — the resolver's contract, with the reproducibility property that
+// justifies choosing minimal selection given its own test rather than a comment.
+//
+// Run:  jestyrc test examples/std/resolve_test.jtr
+import "list"
+import "mem"
+import "resolve"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 4096
+
+@test fn picks_the_lowest_version_that_satisfies_the_requirement() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    var r: resolve.Registry = resolve.registry(a)
+    resolve.add_version(r, "left", "1.0.0")
+    resolve.add_version(r, "left", "1.5.0")
+    resolve.add_version(r, "left", "1.9.0")
+    resolve.add_root(r, "left", "^1.0.0")
+
+    let s: resolve.Solution = resolve.solve(a, r)
+    test.is_true(c, rep, "solved", resolve.solved(s))
+    // Maximal selection would answer 1.9.0 here. THIS is the line that distinguishes the
+    // two policies, and it is the whole reason the module exists in this shape.
+    test.eq_str(c, rep, "lowest satisfying", resolve.selected_version(r, s, "left"), "1.0.0")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn publishing_a_newer_version_cannot_change_an_existing_resolution() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    // **The property the whole design choice is FOR.** Resolve, then publish a newer
+    // release into the same range, then resolve again — the answer must be identical.
+    // Under maximal selection the second answer is 2.9.0 and every build in the world
+    // changes the moment someone runs `publish`.
+    var r: resolve.Registry = resolve.registry(a)
+    resolve.add_version(r, "core", "2.0.0")
+    resolve.add_version(r, "core", "2.4.0")
+    resolve.add_root(r, "core", "^2.0.0")
+    let before: resolve.Solution = resolve.solve(a, r)
+    test.is_true(c, rep, "solved before", resolve.solved(before))
+    test.eq_str(c, rep, "before", resolve.selected_version(r, before, "core"), "2.0.0")
+
+    resolve.add_version(r, "core", "2.9.0")          // someone publishes
+    let after: resolve.Solution = resolve.solve(a, r)
+    test.is_true(c, rep, "solved after", resolve.solved(after))
+    test.eq_str(c, rep, "after", resolve.selected_version(r, after, "core"), "2.0.0")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_transitive_requirement_raises_the_floor() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    // root -> app ^1.0.0 ; app 1.0.0 -> util >=1.4.0.
+    // `util` 1.0.0 exists and satisfies nothing else, so the transitive floor must lift the
+    // selection to 1.4.0. Without the fixpoint step this answers 1.0.0.
+    var r: resolve.Registry = resolve.registry(a)
+    let app: i32 = resolve.add_version(r, "app", "1.0.0")
+    resolve.add_dep(r, app, "util", ">=1.4.0")
+    resolve.add_version(r, "util", "1.0.0")
+    resolve.add_version(r, "util", "1.4.0")
+    resolve.add_version(r, "util", "1.7.0")
+    resolve.add_root(r, "app", "^1.0.0")
+
+    let s: resolve.Solution = resolve.solve(a, r)
+    test.is_true(c, rep, "solved", resolve.solved(s))
+    test.eq_str(c, rep, "app", resolve.selected_version(r, s, "app"), "1.0.0")
+    test.eq_str(c, rep, "util lifted by the dep", resolve.selected_version(r, s, "util"), "1.4.0")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn two_requirements_unify_to_the_lowest_satisfying_both() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    // Two dependants disagree about the FLOOR but overlap. Unification, not failure: the
+    // answer is the lowest version satisfying both, not the lowest satisfying either.
+    var r: resolve.Registry = resolve.registry(a)
+    let x: i32 = resolve.add_version(r, "x", "1.0.0")
+    resolve.add_dep(r, x, "shared", ">=1.0.0")
+    let y: i32 = resolve.add_version(r, "y", "1.0.0")
+    resolve.add_dep(r, y, "shared", ">=1.6.0")
+    resolve.add_version(r, "shared", "1.0.0")
+    resolve.add_version(r, "shared", "1.6.0")
+    resolve.add_version(r, "shared", "1.8.0")
+    resolve.add_root(r, "x", "^1.0.0")
+    resolve.add_root(r, "y", "^1.0.0")
+
+    let s: resolve.Solution = resolve.solve(a, r)
+    test.is_true(c, rep, "solved", resolve.solved(s))
+    test.eq_str(c, rep, "unified", resolve.selected_version(r, s, "shared"), "1.6.0")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn an_unsatisfiable_pair_is_reported_not_guessed() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    // `^1` and `^2` share no version. One version per package, so this is a real conflict —
+    // and it must be REPORTED. A resolver that silently picks one produces a build that
+    // works only on the machine that made the lockfile.
+    var r: resolve.Registry = resolve.registry(a)
+    let x: i32 = resolve.add_version(r, "x", "1.0.0")
+    resolve.add_dep(r, x, "shared", "^1.0.0")
+    let y: i32 = resolve.add_version(r, "y", "1.0.0")
+    resolve.add_dep(r, y, "shared", "^2.0.0")
+    resolve.add_version(r, "shared", "1.0.0")
+    resolve.add_version(r, "shared", "2.0.0")
+    resolve.add_root(r, "x", "^1.0.0")
+    resolve.add_root(r, "y", "^1.0.0")
+
+    let s: resolve.Solution = resolve.solve(a, r)
+    test.is_false(c, rep, "not solved", resolve.solved(s))
+    // A conflict, not a budget overrun — mislabelling one as the other sends someone to
+    // debug the wrong thing entirely.
+    test.is_false(c, rep, "not a budget overrun", resolve.budget_exhausted(s))
+    let shared: isize = resolve.package_index(r, "shared")
+    test.eq_i64(c, rep, "names the package", resolve.conflict_package(s) as i64, shared as i64)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_requirement_no_published_version_meets_is_a_conflict() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    var r: resolve.Registry = resolve.registry(a)
+    resolve.add_version(r, "only", "1.0.0")
+    resolve.add_root(r, "only", ">=2.0.0")
+
+    let s: resolve.Solution = resolve.solve(a, r)
+    test.is_false(c, rep, "not solved", resolve.solved(s))
+    test.is_false(c, rep, "not a budget overrun", resolve.budget_exhausted(s))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_dependency_cycle_still_terminates() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    // A depends on B and B on A. `buildgraph` must REJECT a cycle because build order is
+    // undefined; selection does not, because a fixpoint over constraints has an answer
+    // either way. Termination comes from monotone selection, not from cycle detection, and
+    // this is the case that would hang if that were untrue.
+    var r: resolve.Registry = resolve.registry(a)
+    let av: i32 = resolve.add_version(r, "a", "1.0.0")
+    let bv: i32 = resolve.add_version(r, "b", "1.0.0")
+    resolve.add_dep(r, av, "b", "^1.0.0")
+    resolve.add_dep(r, bv, "a", "^1.0.0")
+    resolve.add_root(r, "a", "^1.0.0")
+
+    let s: resolve.Solution = resolve.solve(a, r)
+    test.is_true(c, rep, "solved", resolve.solved(s))
+    test.eq_str(c, rep, "a", resolve.selected_version(r, s, "a"), "1.0.0")
+    test.eq_str(c, rep, "b", resolve.selected_version(r, s, "b"), "1.0.0")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_superseded_upper_bound_does_not_create_a_phantom_conflict() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    // The case that forces the constraint set to be REBUILT each round rather than
+    // accumulated, and it only bites if `b` is genuinely SELECTED at 1.0.0 first and rises
+    // afterwards. The first version of this test asserted the property but pinned nothing:
+    // its root was `b >=2.0.0`, so `b` was 2.0.0 from round one, `b 1.0.0` was never
+    // selected, and its upper bound was never contributed under EITHER policy. Accumulating
+    // passed it unchanged. The lift has to arrive LATE:
+    //
+    //   round 1: roots only          -> a = 1.0.0, b = 1.0.0
+    //   round 2: + a1.0.0 needs b>=2 -> b rises to 2.0.0; b1.0.0 had capped c below 2.0.0
+    //   round 3: + b2.0.0 needs c>=2 -> c = 2.0.0 only if 1.0.0’s cap is GONE
+    //
+    // Accumulating keeps `c <2.0.0` after `b 1.0.0` stops being selected, contradicts it
+    // with `c >=2.0.0`, and reports a conflict in a graph that resolves cleanly.
+    var r: resolve.Registry = resolve.registry(a)
+    let av: i32 = resolve.add_version(r, "a", "1.0.0")
+    resolve.add_dep(r, av, "b", ">=2.0.0")
+    let b1: i32 = resolve.add_version(r, "b", "1.0.0")
+    resolve.add_dep(r, b1, "c", "<2.0.0")
+    let b2: i32 = resolve.add_version(r, "b", "2.0.0")
+    resolve.add_dep(r, b2, "c", ">=2.0.0")
+    resolve.add_version(r, "c", "1.0.0")
+    resolve.add_version(r, "c", "2.0.0")
+    resolve.add_root(r, "a", ">=1.0.0")
+    resolve.add_root(r, "b", ">=1.0.0")
+
+    let s: resolve.Solution = resolve.solve(a, r)
+    test.is_true(c, rep, "solved", resolve.solved(s))
+    test.eq_str(c, rep, "b lifted", resolve.selected_version(r, s, "b"), "2.0.0")
+    test.eq_str(c, rep, "c follows the LIVE bound", resolve.selected_version(r, s, "c"), "2.0.0")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_package_nothing_requires_is_not_selected() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    // Publishing something does not put it in the build. Without this, "resolved" would
+    // silently mean "everything in the registry".
+    var r: resolve.Registry = resolve.registry(a)
+    resolve.add_version(r, "used", "1.0.0")
+    resolve.add_version(r, "unused", "1.0.0")
+    resolve.add_root(r, "used", "^1.0.0")
+
+    let s: resolve.Solution = resolve.solve(a, r)
+    test.is_true(c, rep, "solved", resolve.solved(s))
+    test.eq_str(c, rep, "used", resolve.selected_version(r, s, "used"), "1.0.0")
+    test.eq_str(c, rep, "unused stays out", resolve.selected_version(r, s, "unused"), "")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn resolution_does_not_depend_on_publish_ORDER() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    // Two registries with identical content added in opposite orders must resolve
+    // identically — selection is by version PRECEDENCE, not by arrival. The same
+    // order-independence argument `std/metrics` makes about its dump.
+    var r1: resolve.Registry = resolve.registry(a)
+    resolve.add_version(r1, "p", "1.0.0")
+    resolve.add_version(r1, "p", "1.2.0")
+    resolve.add_version(r1, "p", "1.4.0")
+    resolve.add_root(r1, "p", ">=1.2.0")
+
+    var r2: resolve.Registry = resolve.registry(a)
+    resolve.add_version(r2, "p", "1.4.0")
+    resolve.add_version(r2, "p", "1.0.0")
+    resolve.add_version(r2, "p", "1.2.0")
+    resolve.add_root(r2, "p", ">=1.2.0")
+
+    let s1: resolve.Solution = resolve.solve(a, r1)
+    let s2: resolve.Solution = resolve.solve(a, r2)
+    test.eq_str(c, rep, "ascending", resolve.selected_version(r1, s1, "p"), "1.2.0")
+    test.eq_str(c, rep, "shuffled", resolve.selected_version(r2, s2, "p"), "1.2.0")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
