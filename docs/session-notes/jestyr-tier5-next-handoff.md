@@ -55,11 +55,12 @@ Every item here touches the compiler's own closure, owes a port mirror, and forc
 reseed. **They cannot run in parallel with each other or with anything else that reseeds**
 (see §3). Do them one at a time, in this order.
 
-> **THE SERIAL QUEUE IS EMPTY OF ACTIONABLE WORK.** 1.1 (A7), 1.2 (A6), 1.3 (A8), 1.4 (B1)
-> and **A11's lowering half** are all done — no `mut` argument leaks a gcc error any more.
-> What is left here is **one language QUESTION** (should a `mut` argument that aliases nothing
-> be refused? — §1.1b) and **1.5 (B2), deferred on measurement**, bigger than everything above
-> it combined. Neither is a "pick it up and go" item.
+> **THE SERIAL QUEUE HAS ONE ACTIONABLE ITEM AGAIN: §1.6.** 1.1 (A7), 1.2 (A6), 1.3 (A8),
+> 1.4 (B1) and **A11's lowering half** are all done — no `mut` argument leaks a gcc error any
+> more. What is left here is **1.6 (A12): `return ok(local)` drops the local** — a measured
+> silent miscompile with a three-line probe, routed around by `std/kv` but not fixed — plus
+> **one language QUESTION** (should a `mut` argument that aliases nothing be refused? —
+> §1.1b) and **1.5 (B2), deferred on measurement**, bigger than everything above it combined.
 >
 > **So the next session should be fanning out on §2**, and §2 parallelises where §1 could not.
 > Read §3 first — the sixteen closure modules are a global lock, and the reseed is the thing
@@ -256,6 +257,30 @@ The claim about "the no-allowlist P2 golden" was wrong in detail: the corpus-wid
 is the cgen golden and the build matrix; the P2 dump goldens are *curated snippet* lists, so
 the new arm had to be added to one by hand or nothing would have compared it.
 
+### 1.6 — A12: `return ok(local)` drops the local it carries out — **OPEN, one probe away**
+
+**The one actionable item in this queue.** For a struct with a `Drop` impl or
+`Drop`-bearing fields, `return d` moves and `return ok(D{ … })` moves, but `return ok(d)`
+copies `d` into the result and then emits the local's drops. The caller gets a closed file
+and freed strings. Measured in the emitted C; the probe is three functions:
+
+```
+fn mk_plain() -> D { var d: D = D{ … }  return d }              // moved — fine
+fn mk_ok() -> D !{ Nope } { var d: D = D{ … }  return ok(d) }   // DROPPED, then returned
+fn mk_lit() -> D !{ Nope } { var t = …  return ok(D{ t: t }) }  // moved — fine
+```
+
+Exit code `STATUS_HEAP_CORRUPTION`, stdout lost. Nothing in the corpus tripped it because
+every fallible constructor returns a literal. `std/kv` opens INTO a caller-owned handle to
+route around it, so nothing is waiting on the fix — but it is a silent miscompile of a
+natural shape and it will be written again.
+
+**Cost, honestly guessed rather than measured:** the `return` lowering in `cgen.rs` already
+treats a bare returned local as consumed; `ok(...)`'s argument needs the same treatment,
+plus the mirror in `cgen.jtr`, plus a corpus file returning `ok(local)` so the mirror can
+be watched failing, plus a reseed. Check whether `err(payload)` with an owning payload has
+the same hole while there. **Port unverified**: the probe was run against `jestyrc` only.
+
 ### 1.5 — B2: `extern` binding a C global — MEASURED, then deferred
 
 The principled answer for foreign globals, and no longer needed for anything urgent
@@ -382,11 +407,32 @@ The parser is hardened and refuses request smuggling; **everything above the mes
 absent**. Routing, middleware, streaming bodies, keep-alive, timeouts, static files, access
 logs, a test client/server. `sysproc` timeouts and `syspoll` readiness are in place under it.
 
-### 2.3 — Storage V2 (area 9)
+### ~~2.3 — Storage V2 (area 9)~~ — **DONE: `std/kv`**
 
-KV, compaction, atomic batches, migrations, backup/export on top of `alog.jtr` (which is
-CRC'd and crash-recoverable). Note `sysfs` has **no mtime**, deliberately — `struct stat`'s
-layout differs per platform.
+KV, atomic batches, compaction, migrations and snapshot/backup on `alog.jtr`. Ten tests,
+a pinned demo (`jstate`, `examples/std/kv_demo.jtr`), four mutations watched failing, no
+reseed (the drift guard said so). The long note's §3q has the design; what a successor
+should not re-derive:
+
+* **The log is durability, not capacity.** Values are memory-resident because
+  `file.Reader` has no seek; an offset index could not fetch a value on demand. A store
+  larger than memory needs a `seek` in `std/file` first and is a different structure.
+* **A batch is one record, so it is atomic for free** and bounded by `KV_MAX_RECORD`.
+  There is no begin/commit pair on purpose.
+* **Compaction, migration and snapshot are one `rewrite`** — fresh file beside the store,
+  `rename_replace`, then REPLAY THE NEW FILE into memory. The index has no removal, so a
+  rebuild tombstones every live key by hand first (`forget`); skipping it was one of the
+  four mutations.
+* **Writers apply their own bytes by parsing them** through the one batch parser, so an
+  encoder/parser drift fails at the write.
+* **`open` fills a caller-owned handle** (`kv.closed()` then `kv.open(f, a, path, s)`),
+  because of §1.6.
+* Not built: `[]u8` values, index removal, a text export (values are `str` and may hold
+  newlines; the snapshot is the portable form).
+
+**Four suites were gating nothing.** `semver_test`, `resolve_test`, `lockfile_test` and
+`cache_test` had no `io_suites_pass` entry. Now registered (15/10/10/8). A new suite is not
+done until its count is in that table.
 
 **Available for a second wave, same rules:**
 
@@ -556,7 +602,21 @@ UTF-8 as ANSI, so every em-dash becomes mojibake, and it adds a BOM. Use the edi
 
 **`.jtr` subset traps:** a for-condition cannot start with `(`; a bare `{` after a call-init
 parses as the ctor form; never chain `string_view(x).len`; `out`, `read`, `take`, `error` and
-`spawn` are keywords.
+`spawn` are keywords (a parameter named `out` is thirty-two parse errors, none of which says
+"keyword"); a `catch { … }` block may not contain a `return` — set a flag and test it; a
+fn-pointer argument is spelled `&name`; `else` must follow `}` on the same line.
+
+**`from_utf8` TRAPS; `try_from_utf8` is the checked one.** A `str` is UTF-8 by construction,
+so bytes above 127 cannot pass through a `String` — record framing goes in a `[]u8` buffer.
+The trap is a runtime assertion, not a diagnostic, and the message names the runtime, not
+your line.
+
+**A file size read while a `file.Writer` is open lags the writes.** They sit in the C
+library's buffer until a sync or a close. A test measuring "before" against a live log
+measures the buffer, not the file; sync first.
+
+**A suite is not registered until its count is in `io_suites_pass`.** Four landed green and
+gated nothing.
 
 **`cmd.exe /c` strips the outer quotes off a command line that BEGINS with one**, so quoting
 a program path — the spelling that looks obviously correct — mangles the rest of the line.

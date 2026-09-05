@@ -7,6 +7,46 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/kv`** — a key-value store whose only durable artefact is an `alog`. 10 tests, and
+  `examples/std/kv_demo.jtr` (`jstate`), whose transcript is pinned. Storage V2 (area 9):
+  KV, atomic batches, compaction, migrations, backup.
+
+  **The log is durability, not capacity.** Every live key and value is memory-resident; the
+  log is replayed at open and appended on every write. That is the right shape for what the
+  tier asked for — configuration, service state, a build's bookkeeping — and the wrong one
+  for a dataset larger than memory, which the header says rather than hides (`file.Reader`
+  has no seek, so an offset index could not have fetched a value on demand anyway).
+
+  **A batch is atomic BECAUSE it is one record.** The log already makes one record complete
+  or discarded; a batch rides that directly instead of through a begin/commit pair and the
+  recovery state machine a pair needs. The price is a ceiling (`KV_MAX_RECORD`, 1 MiB), which
+  also bounds the replay buffer. The suite cuts a three-key batch three bytes short and
+  reopens with none of the three and the previous batch untouched.
+
+  **Compaction, migration and snapshot are ONE rewrite**: every live entry into a fresh file
+  beside the store, then `sysfs.rename_replace`. A crash at any point leaves the old file or
+  the new one. After a compaction or migration the in-memory state is rebuilt by REPLAYING
+  THE NEW FILE, so what the caller sees is provably what a reopen would see. The HEAD record
+  carries two numbers of different kinds — the module's `format`, refused when newer, and the
+  caller's `schema`, which `migrate` moves forward only under a rewrite and only upward, so
+  "migrate on every start-up" is safe to write. Deleting an absent key writes nothing; every
+  writer applies its own bytes by parsing them through the ONE batch parser, so an encoder
+  that drifted from the reader would fail at the write rather than at the next reopen.
+
+  **Four mutations watched failing** (skip the reset before reload; frame every batch as a
+  batch of one; accept a newer format; write absent deletes) — each caught by the test that
+  names it.
+
+  **Two things measured on the way, recorded in the tier note:** `return ok(local)` for a
+  `Drop`-bearing struct drops the local at the return that carries it out (the module opens
+  INTO a caller-owned handle to route around it), and `from_utf8` traps on non-UTF-8, so a
+  record's framing must be assembled in a `[]u8` buffer, never a `String`.
+
+- **Registered four suites that were gating nothing.** `semver_test`, `resolve_test`,
+  `lockfile_test` and `cache_test` landed without an entry in the Rust runner: runnable by
+  hand, green for their authors, and checked by nothing on CI. `io_suites_pass` now runs them
+  with their counts pinned (15, 10, 10, 8).
+
 - **`std/cache`** — a **content-addressed** store: the key is the SHA-256 of the value.
   8 tests. Completes the package substrate (semver → resolve → lockfile → cache).
 

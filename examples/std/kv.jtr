@@ -1,0 +1,903 @@
+// std/kv.jtr — a key-value store whose only durable artefact is an append-only log.
+//
+// TIER: `sys`, by dependency: every byte on disk goes through `std/alog`, and every function
+// that reaches the disk takes an `fs.Fs`, so a caller that has not been given the filesystem
+// capability cannot get at a store through this module.
+//
+// ─── The claim, stated so it can be checked ───────────────────────────────────
+//
+// **A store reopened after a crash holds exactly the writes that were completely recorded,
+// and a batch is either entirely there or entirely absent.** Not "usually": the log's frame
+// detects a torn record and discards it, and a batch is ONE record, so a torn batch is a
+// discarded batch — never three of its five puts.
+//
+// **A compaction, a migration and a snapshot never damage the store they read.** Each writes
+// a complete new file beside the old one and renames it into place; a crash at any point
+// leaves either the old file or the new one, never a mixture. The rename is
+// `sysfs.rename_replace`, the same primitive `std/cache` relies on for the same reason.
+//
+// ─── The design in one sentence: the log is DURABILITY, not CAPACITY ──────────
+//
+// Every live key and value is held in memory; the log is replayed at open and appended to on
+// every write. That is a deliberate shape and it has a name — a log-structured store with a
+// memory-resident index and memory-resident values — and it is the right shape for what this
+// tier asked for: configuration, service state, a build's bookkeeping, anything whose working
+// set is megabytes. It is the WRONG shape for a dataset larger than memory, and the honest
+// position is to say so rather than to pretend an index over byte offsets would save it:
+// `file.Reader` has no seek, so a value could not be fetched from the log on demand anyway. A
+// store that must exceed memory is a different structure wearing this one's name.
+//
+// What that buys, and why it is worth the constraint:
+//
+//   * `get` is a hash lookup and a view into memory — no I/O, no allocation, no copy.
+//   * Recovery is the replay the log already does. There is no second index file that can
+//     disagree with the data.
+//   * The on-disk format is ONLY the log's frame plus the record layout below. A store can be
+//     inspected, repaired and reasoned about with `alog`'s reader alone.
+//
+// ─── The record layout ─────────────────────────────────────────────────────────
+//
+// Every record is an `alog` payload. Byte 0 is a tag; integers are LITTLE-ENDIAN, written
+// byte by byte, because a store is a file format and inherits nothing from the host
+// (`alog`'s frame makes the same decision for the same reason).
+//
+//     HEAD   tag=1  'J' 'K' 'V'  format(u8)  schema(u32)          — 9 bytes, record 0, exactly once
+//     BATCH  tag=2  count(u32)  then `count` operations:
+//              PUT  op=1  klen(u32)  vlen(u32)  key  value
+//              DEL  op=2  klen(u32)  vlen(u32)=0  key
+//
+// **The HEAD record carries two numbers that are different kinds of thing.** `format` is
+// this module's: it says how to read the bytes, and a file whose format is newer than
+// `KV_FORMAT` is refused rather than guessed at. `schema` is the CALLER's: it says what the
+// values mean, and this module never interprets it — it stores it, reports it, and lets
+// `migrate` move it forward under a rewrite. Keeping them apart is what lets a program
+// upgrade its own data without the store's format changing, and vice versa.
+//
+// A single `put` is a BATCH of one. There is no separate single-put record, because a second
+// record kind is a second thing recovery has to be right about, and the cost of the four
+// count bytes is nothing next to the frame around them.
+//
+// ─── Batches are atomic BECAUSE they are one record, and that bounds them ─────
+//
+// The log makes one record atomic — complete or discarded — and a batch rides that directly
+// rather than through a begin/commit pair. A pair would need recovery to hold half-applied
+// batches back until it sees the commit, which is exactly the state machine that gets
+// written wrong. The price is a ceiling: a record is at most `KV_MAX_RECORD` bytes, so a
+// batch is too, and a larger one is refused as `KvTooLarge` before anything is written. The
+// ceiling also bounds the replay buffer, which is why it is a constant and not a parameter.
+//
+// ─── Compaction, migration and snapshot are ONE operation ─────────────────────
+//
+// All three are "write every live entry into a fresh store file" and differ only in what
+// happens to each entry on the way (a migration may rewrite or drop it) and what happens to
+// the file afterwards (a snapshot stays beside the store; the other two replace it). So there
+// is one `rewrite` and three thin callers, and a defect in the crash-safety story can only
+// be in one place.
+//
+// After a compaction or migration the in-memory state is REBUILT BY REPLAYING THE NEW FILE,
+// not patched in place. That costs one extra pass and buys the property that matters: the
+// state a caller sees after the operation is provably what a reopen would see, because it is
+// what a reopen did.
+//
+// **Compaction is never automatic.** The garbage figure is a query (`dead_bytes`) and the
+// policy is the caller's — the same position `alog` takes on rotation. A store that compacted
+// itself mid-request would be a latency cliff with no knob.
+//
+// ─── What is deliberately absent ──────────────────────────────────────────────
+//
+// **No concurrent writers**, inherited from `alog` and for its reasons.
+//
+// **No text export.** Keys and values are `str` — UTF-8 by type, and the replay re-checks
+// that so a corrupted byte inside one is damage rather than a trap — but a value may hold any
+// character including newlines, so a line-oriented dump would need an escaping story. The
+// snapshot already IS the portable form: it is a complete store file holding only the live
+// entries, and restoring it is opening it.
+//
+// **No binary values.** The frame around a value is bytes; the value itself is a `str`
+// because that is what the callers this tier has want to store, and a `[]u8` twin of every
+// entry point would double the API for no caller. If one appears, the on-disk layout needs no
+// change — only the replay's checked conversion does.
+//
+// **No range queries and no ordering.** Iteration visits live entries in the order of their
+// most recent write, which is deterministic and is what a replay produces. A sorted view is
+// a caller's sort over that.
+//
+// **The index keeps a tombstone for every deleted key until the store is reopened.** The
+// underlying `strmap` has no removal, so a deleted key costs one slot rather than nothing.
+// A reopen (which `compact` performs) starts from an empty index.
+//
+// Worked example:  examples/std/kv_demo.jtr
+// Run the tests:   jestyrc test examples/std/kv_test.jtr
+
+import "alog"
+import "fs"
+import "list"
+import "mem"
+import "strmap"
+import "sysfs"
+
+// ---- the format ---------------------------------------------------------------------
+
+// The layout version this module writes. A file claiming a higher one is refused.
+pub const KV_FORMAT: i64 = 1
+
+// The largest record this module will write or believe. See the header: it bounds a batch
+// and it bounds the replay buffer, and an oversized record on disk is treated as damage.
+pub const KV_MAX_RECORD: usize = 1048576
+
+const HEAD_LEN: usize = 9
+const TAG_HEAD: u8 = 1
+const TAG_BATCH: u8 = 2
+const OP_PUT: u8 = 1
+const OP_DEL: u8 = 2
+
+// What a migration step may answer for one entry.
+pub const MIGRATE_KEEP: i32 = 0        // write the entry unchanged
+pub const MIGRATE_REPLACE: i32 = 1     // write the value the step pushed into its String
+pub const MIGRATE_DROP: i32 = 2        // omit the entry
+
+// ---- entries -------------------------------------------------------------------------
+//
+// One entry is five `i64`s in a flat list — the concatenation shape `std/buildgraph`'s
+// manifest and `std/cli`'s arguments use, and for the same reason: a `List` of a struct
+// holding a `String` would leak, and a struct holding `str` views is refused.
+
+const E_KOFF: usize = 0
+const E_KLEN: usize = 1
+const E_VOFF: usize = 2
+const E_VLEN: usize = 3
+const E_LIVE: usize = 4
+const E_STRIDE: usize = 5
+
+// ---- little-endian, written explicitly -----------------------------------------------
+
+@no_alloc @no_os fn put_u32(mut b: []u8, at: usize, v: i64) {
+    b[at + 0] = (v & 255) as u8
+    b[at + 1] = ((v >> 8) & 255) as u8
+    b[at + 2] = ((v >> 16) & 255) as u8
+    b[at + 3] = ((v >> 24) & 255) as u8
+}
+
+@no_alloc @no_os fn get_u32(read b: []u8, at: usize) -> i64 {
+    return (b[at + 0] as i64) | ((b[at + 1] as i64) << 8) | ((b[at + 2] as i64) << 16) | ((b[at + 3] as i64) << 24)
+}
+
+// ---- a growable byte buffer -------------------------------------------------------------
+//
+// A record is BYTES — its length fields carry values above 127 — and a `String` cannot hold
+// one: `str` is UTF-8 by construction and `from_utf8` traps on anything else (measured: the
+// first draft assembled records in a `String` and died on the first length over 127). So the
+// encoder builds a record here, in a plain owned buffer, and hands the log a view of it.
+
+struct Buf { p: *mut u8, len: usize, cap: usize }
+
+fn buf_new() -> Buf { return Buf{ p: null, len: 0, cap: 0 } }
+
+fn buf_free(mut b: Buf) {
+    if b.cap != 0 { free_ptr(b.p) }
+    b.p = null
+    b.len = 0
+    b.cap = 0
+}
+
+fn buf_clear(mut b: Buf) { b.len = 0 }
+
+// Make room for `extra` more bytes, doubling from a floor of 64.
+fn buf_reserve(mut b: Buf, extra: usize) {
+    if b.len + extra <= b.cap { return }
+    var newcap: usize = 64
+    if b.cap != 0 { newcap = b.cap * 2 }
+    for newcap < b.len + extra { newcap = newcap * 2 }
+    var np: *mut u8 = alloc(u8, newcap)
+    if b.cap != 0 {
+        var dst: []u8 = slice(u8, np, newcap)
+        var src: []u8 = slice(u8, b.p, b.len)
+        var i: usize = 0
+        for i < b.len {
+            dst[i] = src[i]
+            i = i + 1
+        }
+        free_ptr(b.p)
+    }
+    b.p = np
+    b.cap = newcap
+}
+
+fn buf_push_u8(mut b: Buf, v: u8) {
+    buf_reserve(b, 1)
+    var d: []u8 = slice(u8, b.p, b.cap)
+    d[b.len] = v
+    b.len = b.len + 1
+}
+
+fn buf_push_u32(mut b: Buf, v: i64) {
+    buf_reserve(b, 4)
+    var d: []u8 = slice(u8, b.p, b.cap)
+    put_u32(d, b.len, v)
+    b.len = b.len + 4
+}
+
+fn buf_push_str(mut b: Buf, read s: str) {
+    if s.len == 0 { return }
+    buf_reserve(b, s.len)
+    var d: []u8 = slice(u8, b.p, b.cap)
+    var i: usize = 0
+    for i < s.len {
+        d[b.len + i] = s[i]
+        i = i + 1
+    }
+    b.len = b.len + s.len
+}
+
+// Lay `ops` (`n` encoded operations) into `rb` as one BATCH record. `rb` must be exactly
+// `5 + ops.len` long; the writer and the self-replay both go through here so the frame
+// cannot differ between them.
+fn fill_frame(read ops: Buf, n: i64, mut rb: []u8) {
+    rb[0] = TAG_BATCH
+    put_u32(rb, 1, n)
+    if ops.len == 0 { return }
+    var src: []u8 = slice(u8, ops.p, ops.len)
+    var i: usize = 0
+    for i < ops.len {
+        rb[5 + i] = src[i]
+        i = i + 1
+    }
+}
+
+// ---- the handle ----------------------------------------------------------------------
+
+// One store: a log, and the live state replayed from it.
+//
+// `@move` by containment — `alog.Log` wraps a `file.Writer`, which is one OS handle — and
+// the `Drop` frees the two Strings the field auto-drop cannot (a `String` is a primitive with
+// a manual free; the list, the map and the log release themselves).
+@move pub struct Store {
+    l: alog.Log,
+    a: Allocator,
+    path: String,
+    arena: String,          // every key and value recorded since the last rebuild, back to back
+    used: usize,            // bytes of `arena` in use (a String reports no length of its own)
+    ents: List(i64),        // E_STRIDE per entry
+    index: strmap.StrMap,   // key -> entry index of its latest write, or -1 once deleted
+    live: i64,              // keys present
+    schema: i64,
+    live_bytes: i64,        // key+value bytes of live entries
+    dead_bytes: i64,        // key+value bytes of superseded and deleted entries
+    open: bool,
+}
+
+impl Drop for Store {
+    fn drop(mut self) {
+        string_free(self.path)
+        string_free(self.arena)
+    }
+}
+
+// A closed handle: what `open` fills, and what a caller holds when it has no store yet.
+// Exported because a module-qualified struct literal does not parse.
+pub fn closed() -> Store {
+    let a: Allocator = mem.system_allocator()
+    return Store{ l: alog.closed(), a: a, path: string_new(), arena: string_new(), used: 0,
+                  ents: list.make(i64, a), index: strmap.make(a), live: 0, schema: 0,
+                  live_bytes: 0, dead_bytes: 0, open: false }
+}
+
+@no_alloc @no_os pub fn is_open(read s: Store) -> bool { return s.open }
+@no_alloc @no_os pub fn len(read s: Store) -> i64 { return s.live }
+@no_alloc @no_os pub fn schema(read s: Store) -> i64 { return s.schema }
+@no_alloc @no_os pub fn live_bytes(read s: Store) -> i64 { return s.live_bytes }
+
+// Bytes in the log's records that belong to entries no longer live — what a compaction
+// would reclaim. A query rather than a trigger; see the header.
+@no_alloc @no_os pub fn dead_bytes(read s: Store) -> i64 { return s.dead_bytes }
+
+// How many records the underlying log holds, HEAD included. A caller weighing a compaction
+// wants this alongside `dead_bytes`: a store of one key rewritten a million times has
+// little dead data per record and a very long replay.
+@no_alloc @no_os pub fn records(read s: Store) -> i64 { return alog.next_seq(s.l) }
+
+pub fn path(read s: Store) -> read str { return string_view(s.path) }
+
+// ---- the in-memory state ---------------------------------------------------------------
+
+fn ent(read s: Store, i: usize, col: usize) -> i64 {
+    return list.get(i64, s.ents, i * E_STRIDE + col)
+}
+
+// Record a put in memory: the bytes go to the arena, the entry to the list, and the key's
+// previous entry — if any — becomes dead.
+fn mem_put(mut s: Store, read key: str, read val: str) {
+    let prev: i64 = strmap.get(s.index, key, 0 - 1)
+    if prev >= 0 {
+        let p: usize = prev as usize
+        list.set(i64, s.ents, p * E_STRIDE + E_LIVE, 0)
+        let gone: i64 = ent(s, p, E_KLEN) + ent(s, p, E_VLEN)
+        s.dead_bytes = s.dead_bytes + gone
+        s.live_bytes = s.live_bytes - gone
+    } else {
+        s.live = s.live + 1
+    }
+    let koff: usize = s.used
+    string_push(s.arena, key)
+    s.used = s.used + key.len
+    let voff: usize = s.used
+    string_push(s.arena, val)
+    s.used = s.used + val.len
+    let idx: usize = list.len(i64, s.ents) / E_STRIDE
+    list.push(i64, s.ents, koff as i64)
+    list.push(i64, s.ents, key.len as i64)
+    list.push(i64, s.ents, voff as i64)
+    list.push(i64, s.ents, val.len as i64)
+    list.push(i64, s.ents, 1)
+    strmap.put(s.index, key, idx as i64)
+    s.live_bytes = s.live_bytes + ((key.len + val.len) as i64)
+}
+
+// Record a delete in memory. Deleting an absent key is a no-op here, and the callers make
+// sure such a delete is never WRITTEN either — a log full of deletes of nothing is a replay
+// cost with no information in it.
+fn mem_del(mut s: Store, read key: str) {
+    let prev: i64 = strmap.get(s.index, key, 0 - 1)
+    if prev < 0 { return }
+    let p: usize = prev as usize
+    list.set(i64, s.ents, p * E_STRIDE + E_LIVE, 0)
+    let gone: i64 = ent(s, p, E_KLEN) + ent(s, p, E_VLEN)
+    s.dead_bytes = s.dead_bytes + gone
+    s.live_bytes = s.live_bytes - gone
+    s.live = s.live - 1
+    strmap.put(s.index, key, 0 - 1)
+}
+
+// Apply one BATCH payload to memory. False when the bytes are not a well-formed batch.
+//
+// **This is the ONLY reader of the batch layout, and the writers run their own bytes back
+// through it** — `put`, `del` and `commit` apply their effect by parsing the record they just
+// appended, not by a second code path that agrees with the encoder by inspection. If the
+// encoder and this parser ever disagree, every write fails loudly, today, instead of on the
+// next reopen.
+fn apply_batch(mut s: Store, read p: []u8) -> bool {
+    if p.len < 5 { return false }
+    if p[0] != TAG_BATCH { return false }
+    let count: i64 = get_u32(p, 1)
+    var at: usize = 5
+    var i: i64 = 0
+    for i < count {
+        if at + 9 > p.len { return false }
+        let op: u8 = p[at]
+        let klen: i64 = get_u32(p, at + 1)
+        let vlen: i64 = get_u32(p, at + 5)
+        at = at + 9
+        if klen <= 0 { return false }
+        if (at as i64) + klen + vlen > (p.len as i64) { return false }
+        let kend: usize = at + (klen as usize)
+        let vend: usize = kend + (vlen as usize)
+        // Keys and values are `str`, so they are UTF-8 on disk; the CHECKED conversion is
+        // what makes a corrupted byte inside one read as damage rather than as a trap.
+        let kr = try_from_utf8(p[at .. kend])
+        if is_err(kr) { return false }
+        if op == OP_PUT {
+            let vr = try_from_utf8(p[kend .. vend])
+            if is_err(vr) { return false }
+            mem_put(s, unwrap(kr), unwrap(vr))
+        } else {
+            if op != OP_DEL { return false }
+            if vlen != 0 { return false }
+            mem_del(s, unwrap(kr))
+        }
+        at = vend
+        i = i + 1
+    }
+    return at == p.len
+}
+
+// Forget everything replayed so far, so the file can be replayed again. The index has no
+// removal, so every live key is tombstoned by hand — a stale positive entry there would
+// point past the truncated list on the next `mem_put`.
+fn forget(mut s: Store) {
+    let n: usize = list.len(i64, s.ents) / E_STRIDE
+    var i: usize = 0
+    for i < n {
+        if ent(s, i, E_LIVE) == 1 {
+            // Copied out first: the key is a view into `arena`, and the map is another
+            // field of the same store, so the borrow must end before the mutation starts.
+            var k: String = string_new()
+            string_push(k, slot_key(s, i))
+            strmap.put(s.index, string_view(k), 0 - 1)
+            string_free(k)
+        }
+        i = i + 1
+    }
+    list.truncate(i64, s.ents, 0)
+    string_free(s.arena)
+    s.arena = string_new()
+    s.used = 0
+    s.live = 0
+    s.live_bytes = 0
+    s.dead_bytes = 0
+}
+
+// ---- writing records -----------------------------------------------------------------
+
+// Frame `ops` (already-encoded operations, `n` of them) as one BATCH record and append it.
+fn commit_ops(mut l: alog.Log, read ops: Buf, n: i64) -> bool {
+    let total: usize = 5 + ops.len
+    var raw: *mut u8 = alloc(u8, total)
+    var rb: []u8 = slice(u8, raw, total)
+    fill_frame(ops, n, rb)
+    var good: bool = true
+    alog.append(l, rb) catch { good = false }
+    free_ptr(raw)
+    return good
+}
+
+fn write_head(mut l: alog.Log, schema: i64) -> bool {
+    var raw: *mut u8 = alloc(u8, HEAD_LEN)
+    var hb: []u8 = slice(u8, raw, HEAD_LEN)
+    hb[0] = TAG_HEAD
+    hb[1] = 74 as u8            // 'J'
+    hb[2] = 75 as u8            // 'K'
+    hb[3] = 86 as u8            // 'V'
+    hb[4] = KV_FORMAT as u8
+    put_u32(hb, 5, schema)
+    var good: bool = true
+    alog.append(l, hb) catch { good = false }
+    free_ptr(raw)
+    return good
+}
+
+fn encode_put(mut ops: Buf, read key: str, read val: str) {
+    buf_push_u8(ops, OP_PUT)
+    buf_push_u32(ops, key.len as i64)
+    buf_push_u32(ops, val.len as i64)
+    buf_push_str(ops, key)
+    buf_push_str(ops, val)
+}
+
+fn encode_del(mut ops: Buf, read key: str) {
+    buf_push_u8(ops, OP_DEL)
+    buf_push_u32(ops, key.len as i64)
+    buf_push_u32(ops, 0)
+    buf_push_str(ops, key)
+}
+
+// ---- opening, which is also replay ----------------------------------------------------
+
+// Outcomes of `load`, kept as integers so one function can report all of them and `open`
+// can map each to the error it names.
+const LOAD_OK: i32 = 0
+const LOAD_EMPTY: i32 = 1
+const LOAD_FAILED: i32 = 2
+const LOAD_NOT_A_STORE: i32 = 3
+const LOAD_NEWER: i32 = 4
+const LOAD_DAMAGED: i32 = 5
+
+// Replay the file at `s.path` into `s`, which must be empty (`forget` makes it so).
+fn load(mut f: fs.Fs, mut s: Store) -> i32 {
+    var cu: alog.Cursor = alog.reader(f, s.a, string_view(s.path)) catch alog.no_cursor()
+    if alog.cursor_is_open(cu) == false { return LOAD_FAILED }
+    var raw: *mut u8 = alloc(u8, KV_MAX_RECORD)
+    var buf: []u8 = slice(u8, raw, KV_MAX_RECORD)
+
+    var rc: i32 = LOAD_OK
+    let first: isize = alog.next(cu, buf)
+    if first < 0 {
+        if alog.cursor_damaged(cu) { rc = LOAD_DAMAGED } else { rc = LOAD_EMPTY }
+    } else {
+        // Record 0 must be a HEAD, and it must be ours.
+        var ours: bool = true
+        if (first as usize) != HEAD_LEN { ours = false }
+        if ours {
+            if buf[0] != TAG_HEAD { ours = false }
+        }
+        if ours {
+            if (buf[1] as i32) != 74 or (buf[2] as i32) != 75 or (buf[3] as i32) != 86 { ours = false }
+        }
+        if ours == false {
+            rc = LOAD_NOT_A_STORE
+        } else {
+            if (buf[4] as i64) > KV_FORMAT {
+                rc = LOAD_NEWER
+            } else {
+                s.schema = get_u32(buf, 5)
+            }
+        }
+    }
+
+    for rc == LOAD_OK {
+        let n: isize = alog.next(cu, buf)
+        if n < 0 {
+            if alog.cursor_damaged(cu) { rc = LOAD_DAMAGED }
+            break
+        }
+        if apply_batch(s, buf[0 .. n as usize]) == false { rc = LOAD_DAMAGED }
+    }
+
+    alog.cursor_close(cu)
+    free_ptr(raw)
+    return rc
+}
+
+// Open the store at `path`, creating it if absent, and replay it INTO `s`, which must be a
+// closed handle — `closed()` makes one. On failure `s` stays closed and the file is left as
+// it was.
+//
+// **Why the handle is an argument rather than the result.** A `Store` owns a file handle, a
+// map and a list, and the compiler drops a named local at every return even when that local
+// is what `ok(...)` carries out — so `return ok(s)` hands the caller a store whose file was
+// just closed and whose strings were just freed (measured in the emitted C, recorded in the
+// tier note). Filling a handle the caller already owns never creates a local to drop. The
+// shape is `alog.scan`'s: the callee reports through what it was given.
+//
+// The log is opened FIRST, because `alog.open` is what recovers a torn tail; the replay then
+// reads exactly the records recovery kept. A file that is not a store — anything whose first
+// record is not this module's HEAD — is refused as `KvNotAStore` rather than treated as
+// empty, because appending a HEAD after a stranger's records would make two files claim to
+// be the same store.
+pub fn open(mut f: fs.Fs, read a: Allocator, read path: str, mut s: Store) !{ KvFailed(i32), KvRefused, KvNotAStore, KvNewerFormat, KvDamaged } {
+    if s.open { return err(KvRefused) }
+    if fs.can_write(f) == false { return err(KvRefused) }
+    s.l = alog.open(f, a, path) catch alog.closed()
+    if alog.is_open(s.l) == false { return err(KvFailed(0 - 1)) }
+
+    s.a = a
+    forget(s)
+    string_free(s.path)
+    s.path = string_new()
+    string_push(s.path, path)
+    s.schema = 0
+
+    let rc: i32 = load(f, s)
+    if rc == LOAD_EMPTY {
+        if write_head(s.l, 0) == false {
+            alog.close(s.l) catch nothing()
+            return err(KvFailed(0 - 1))
+        }
+        s.open = true
+        return
+    }
+    if rc == LOAD_OK {
+        s.open = true
+        return
+    }
+    // Refused: release the handle and everything the partial replay built, so a caller's
+    // `catch` sees exactly the closed store it passed in.
+    alog.close(s.l) catch nothing()
+    forget(s)
+    if rc == LOAD_FAILED { return err(KvFailed(0 - 1)) }
+    if rc == LOAD_NOT_A_STORE { return err(KvNotAStore) }
+    if rc == LOAD_NEWER { return err(KvNewerFormat) }
+    return err(KvDamaged)
+}
+
+// Sync and close. Idempotent on the value; the memory is released here rather than at the
+// drop so a closed store is also an empty one.
+pub fn close(mut s: Store) {
+    if s.open == false { return }
+    alog.close(s.l) catch nothing()
+    s.open = false
+    forget(s)
+}
+
+fn nothing() { }
+
+// ---- reading -------------------------------------------------------------------------
+
+pub fn has(read s: Store, read key: str) -> bool {
+    return strmap.get(s.index, key, 0 - 1) >= 0
+}
+
+// The value for `key`, or the empty string when it is absent. An empty VALUE is legitimate,
+// so `has` is the way to tell the two apart. The result is a view into the store and is
+// valid until the next write.
+pub fn get(read s: Store, read key: str) -> read str {
+    let i: i64 = strmap.get(s.index, key, 0 - 1)
+    let v: str = string_view(s.arena)
+    if i < 0 { return v[0 .. 0] }
+    let voff: usize = ent(s, i as usize, E_VOFF) as usize
+    let vlen: usize = ent(s, i as usize, E_VLEN) as usize
+    return v[voff .. voff + vlen]
+}
+
+// ---- iteration ----------------------------------------------------------------------
+//
+// The `std/hashmap` shape: a slot count, a liveness test, and accessors. Slots are entries
+// in write order; a dead slot is one superseded or deleted since the last rebuild.
+
+pub fn slots(read s: Store) -> usize { return list.len(i64, s.ents) / E_STRIDE }
+
+pub fn slot_live(read s: Store, i: usize) -> bool { return ent(s, i, E_LIVE) == 1 }
+
+pub fn slot_key(read s: Store, i: usize) -> read str {
+    let v: str = string_view(s.arena)
+    let koff: usize = ent(s, i, E_KOFF) as usize
+    let klen: usize = ent(s, i, E_KLEN) as usize
+    return v[koff .. koff + klen]
+}
+
+pub fn slot_val(read s: Store, i: usize) -> read str {
+    let v: str = string_view(s.arena)
+    let voff: usize = ent(s, i, E_VOFF) as usize
+    let vlen: usize = ent(s, i, E_VLEN) as usize
+    return v[voff .. voff + vlen]
+}
+
+// ---- writing --------------------------------------------------------------------------
+
+// Store `val` under `key`. An empty key is refused: it is a bug at the call site far more
+// often than a name, and the batch layout uses a zero length as malformed.
+pub fn put(mut s: Store, read key: str, read val: str) !{ KvFailed(i32), KvRefused, KvTooLarge } {
+    if s.open == false { return err(KvRefused) }
+    if key.len == 0 { return err(KvRefused) }
+    var ops: Buf = buf_new()
+    encode_put(ops, key, val)
+    if 5 + ops.len > KV_MAX_RECORD {
+        buf_free(ops)
+        return err(KvTooLarge)
+    }
+    let wrote: bool = commit_ops(s.l, ops, 1)
+    if wrote { replay_own(s, ops, 1) }
+    buf_free(ops)
+    if wrote == false { return err(KvFailed(0 - 1)) }
+}
+
+// Remove `key`. True when it was present. An absent key writes NOTHING and answers false —
+// the log records changes, and this was not one.
+pub fn del(mut s: Store, read key: str) -> bool !{ KvFailed(i32), KvRefused } {
+    if s.open == false { return err(KvRefused) }
+    if has(s, key) == false { return ok(false) }
+    var ops: Buf = buf_new()
+    encode_del(ops, key)
+    let wrote: bool = commit_ops(s.l, ops, 1)
+    if wrote { replay_own(s, ops, 1) }
+    buf_free(ops)
+    if wrote == false { return err(KvFailed(0 - 1)) }
+    return ok(true)
+}
+
+// Apply an operation list this store just wrote, by framing it exactly as `commit_ops` did
+// and handing it to the one parser. See `apply_batch`.
+fn replay_own(mut s: Store, read ops: Buf, n: i64) {
+    let total: usize = 5 + ops.len
+    var raw: *mut u8 = alloc(u8, total)
+    var rb: []u8 = slice(u8, raw, total)
+    fill_frame(ops, n, rb)
+    let fine: bool = apply_batch(s, rb)
+    free_ptr(raw)
+    // Cannot happen unless the encoder and the parser disagree — which is the defect this
+    // path exists to expose at the write rather than at the next reopen.
+    if fine == false { eprint_str("std/kv: a record this store just wrote does not parse") }
+}
+
+// Make everything written so far durable. Separate from the writes for `alog`'s reason: a
+// device flush costs orders of magnitude more than a write, and the choice is the caller's.
+pub fn sync(mut s: Store) !{ KvFailed(i32), KvRefused } {
+    if s.open == false { return err(KvRefused) }
+    var synced: bool = true
+    alog.sync(s.l) catch { synced = false }
+    if synced == false { return err(KvFailed(0 - 1)) }
+}
+
+// ---- batches --------------------------------------------------------------------------
+
+// A set of operations that will land together or not at all. Build it up, `commit` it, and
+// it is empty again — reusable, so a loop that commits a batch per iteration allocates once.
+pub struct Batch {
+    ops: Buf,
+    n: i64,
+}
+
+impl Drop for Batch {
+    fn drop(mut self) {
+        buf_free(self.ops)
+    }
+}
+
+pub fn batch() -> Batch {
+    return Batch{ ops: buf_new(), n: 0 }
+}
+
+@no_alloc @no_os pub fn batch_len(read b: Batch) -> i64 { return b.n }
+
+// Add a put. False for an empty key, which `put` would refuse too.
+pub fn batch_put(mut b: Batch, read key: str, read val: str) -> bool {
+    if key.len == 0 { return false }
+    encode_put(b.ops, key, val)
+    b.n = b.n + 1
+    return true
+}
+
+// Add a delete. Unlike `del`, this cannot know whether the key is present at commit time —
+// an earlier operation in the same batch may create it — so it is always recorded.
+pub fn batch_del(mut b: Batch, read key: str) -> bool {
+    if key.len == 0 { return false }
+    encode_del(b.ops, key)
+    b.n = b.n + 1
+    return true
+}
+
+// Write the batch as ONE record and apply it. Operations apply in the order they were
+// added, so a put and a delete of the same key within one batch resolve to the later one.
+// A batch larger than `KV_MAX_RECORD` is refused before anything is written, and the batch
+// is left intact so the caller can split it. An empty batch writes nothing.
+pub fn commit(mut s: Store, mut b: Batch) !{ KvFailed(i32), KvRefused, KvTooLarge } {
+    if s.open == false { return err(KvRefused) }
+    if b.n == 0 { return }
+    if 5 + b.ops.len > KV_MAX_RECORD { return err(KvTooLarge) }
+    let wrote: bool = commit_ops(s.l, b.ops, b.n)
+    if wrote { replay_own(s, b.ops, b.n) }
+    buf_clear(b.ops)
+    b.n = 0
+    if wrote == false { return err(KvFailed(0 - 1)) }
+}
+
+// ---- the rewrite: compaction, migration and snapshot ------------------------------------
+
+// The step that keeps every entry as it is — what a compaction and a snapshot are.
+fn keep(read key: str, read val: str, mut dst: String) -> i32 {
+    return MIGRATE_KEEP
+}
+
+// Write every live entry of `s` into a FRESH store file at `dest` with the given schema,
+// passing each through `step`. Returns how many entries were written. On any failure the
+// partial file is removed, so a failed rewrite leaves nothing that could be mistaken for a
+// store.
+//
+// `dest` is erased first: `alog.open` appends, and appending a HEAD to a file that already
+// has records would be exactly the two-stores-in-one-file shape `open` refuses.
+fn rewrite(mut f: fs.Fs, read a: Allocator, read s: Store, read dest: str, schema: i64,
+           step: fn(read str, read str, mut String) -> i32) -> i64 !{ KvFailed(i32), KvRefused, KvTooLarge } {
+    let _e: bool = fs.erase(f, dest)
+    var dl: alog.Log = alog.open(f, a, dest) catch alog.closed()
+    if alog.is_open(dl) == false { return err(KvFailed(0 - 1)) }
+    var failed: bool = false
+    var too_large: bool = false
+    if write_head(dl, schema) == false { failed = true }
+
+    var written: i64 = 0
+    let n: usize = slots(s)
+    var i: usize = 0
+    for i < n {
+        if failed or too_large { break }
+        if slot_live(s, i) {
+            var dst: String = string_new()
+            let verdict: i32 = step(slot_key(s, i), slot_val(s, i), dst)
+            if verdict != MIGRATE_DROP {
+                var ops: Buf = buf_new()
+                if verdict == MIGRATE_REPLACE {
+                    encode_put(ops, slot_key(s, i), string_view(dst))
+                } else {
+                    encode_put(ops, slot_key(s, i), slot_val(s, i))
+                }
+                if 5 + ops.len > KV_MAX_RECORD {
+                    too_large = true
+                } else {
+                    if commit_ops(dl, ops, 1) == false { failed = true }
+                    written = written + 1
+                }
+                buf_free(ops)
+            }
+            string_free(dst)
+        }
+        i = i + 1
+    }
+
+    var closed_ok: bool = true
+    alog.close(dl) catch { closed_ok = false }
+    if failed or too_large or closed_ok == false {
+        let _g: bool = fs.erase(f, dest)
+        if too_large { return err(KvTooLarge) }
+        return err(KvFailed(0 - 1))
+    }
+    return ok(written)
+}
+
+// Swap the freshly written `tmp` in for the store's own file and rebuild memory from it.
+// Both halves are here because they must happen in this order and nowhere else: the append
+// handle is closed BEFORE the rename (a Windows rename cannot replace an open file), and a
+// rename that fails reopens the untouched original so the store stays usable.
+fn swap_in(mut f: fs.Fs, read a: Allocator, mut s: Store, read tmp: str) !{ KvFailed(i32), KvDamaged } {
+    alog.close(s.l) catch nothing()
+    var swapped: bool = true
+    sysfs.rename_replace(f, a, tmp, string_view(s.path)) catch { swapped = false }
+    if swapped == false {
+        let _g: bool = fs.erase(f, tmp)
+        s.l = alog.open(f, a, string_view(s.path)) catch alog.closed()
+        if alog.is_open(s.l) == false { s.open = false }
+        return err(KvFailed(0 - 1))
+    }
+    s.l = alog.open(f, a, string_view(s.path)) catch alog.closed()
+    if alog.is_open(s.l) == false {
+        s.open = false
+        return err(KvFailed(0 - 1))
+    }
+    forget(s)
+    let rc: i32 = load(f, s)
+    if rc != LOAD_OK {
+        // The file this module just wrote does not replay. Nothing sensible can be done with
+        // the handle, so the store is closed rather than left claiming a state it cannot read.
+        alog.close(s.l) catch nothing()
+        s.open = false
+        forget(s)
+        return err(KvDamaged)
+    }
+}
+
+// Rewrite the store's file with only its live entries, at the same schema.
+//
+// Returns the number of entries the new file holds. Afterwards `dead_bytes` is 0 and
+// `records` is `len + 1`. The write goes to `<path>.compact` and is renamed over the store,
+// so a crash mid-compaction leaves the old file whole.
+pub fn compact(mut f: fs.Fs, read a: Allocator, mut s: Store) -> i64 !{ KvFailed(i32), KvRefused, KvTooLarge, KvDamaged } {
+    if s.open == false { return err(KvRefused) }
+    var tmp: String = string_new()
+    string_push(tmp, string_view(s.path))
+    string_push(tmp, ".compact")
+    let n: i64 = rewrite(f, a, s, string_view(tmp), s.schema, &keep) catch 0 - 1
+    if n < 0 {
+        string_free(tmp)
+        return err(KvFailed(0 - 1))
+    }
+    var swapped: bool = true
+    swap_in(f, a, s, string_view(tmp)) catch { swapped = false }
+    string_free(tmp)
+    if swapped == false { return err(KvFailed(0 - 1)) }
+    return ok(n)
+}
+
+// Move the store from its current schema to `to`, passing every live entry through `step`.
+//
+// `to` must be GREATER than the current schema: a migration is a step forward, and one that
+// re-ran on a store already at its target would apply its transformation twice. The check is
+// what makes "migrate on every start-up" safe to write.
+//
+// `step` receives the key, the value, and a String to build a replacement in; it answers
+// `MIGRATE_KEEP`, `MIGRATE_REPLACE` or `MIGRATE_DROP`. It runs against the OLD file's
+// entries while the new file is being written, so a crash at any point leaves the old store
+// at the old schema, untouched — the new schema and the new values become visible together,
+// at the rename.
+pub fn migrate(mut f: fs.Fs, read a: Allocator, mut s: Store, to: i64,
+               step: fn(read str, read str, mut String) -> i32) -> i64 !{ KvFailed(i32), KvRefused, KvTooLarge, KvDamaged } {
+    if s.open == false { return err(KvRefused) }
+    if to <= s.schema { return err(KvRefused) }
+    if to > 4294967295 { return err(KvRefused) }
+    var tmp: String = string_new()
+    string_push(tmp, string_view(s.path))
+    string_push(tmp, ".migrate")
+    let n: i64 = rewrite(f, a, s, string_view(tmp), to, step) catch 0 - 1
+    if n < 0 {
+        string_free(tmp)
+        return err(KvFailed(0 - 1))
+    }
+    var swapped: bool = true
+    swap_in(f, a, s, string_view(tmp)) catch { swapped = false }
+    string_free(tmp)
+    if swapped == false { return err(KvFailed(0 - 1)) }
+    return ok(n)
+}
+
+// Write a complete, compacted copy of the store to `dest` — the backup, and the export.
+//
+// The result is itself a store file: opening it yields these entries at this schema. It is
+// written to `<dest>.part` and renamed into place, so a reader of `dest` never sees a
+// half-written backup, and a backup that fails leaves the previous one where it was. The
+// store itself is untouched — this reads through `read s`, which is the type saying so.
+pub fn snapshot(mut f: fs.Fs, read a: Allocator, read s: Store, read dest: str) -> i64 !{ KvFailed(i32), KvRefused, KvTooLarge } {
+    if s.open == false { return err(KvRefused) }
+    var tmp: String = string_new()
+    string_push(tmp, dest)
+    string_push(tmp, ".part")
+    let n: i64 = rewrite(f, a, s, string_view(tmp), s.schema, &keep) catch 0 - 1
+    if n < 0 {
+        string_free(tmp)
+        return err(KvFailed(0 - 1))
+    }
+    var swapped: bool = true
+    sysfs.rename_replace(f, a, string_view(tmp), dest) catch { swapped = false }
+    if swapped == false {
+        let _g: bool = fs.erase(f, string_view(tmp))
+        string_free(tmp)
+        return err(KvFailed(0 - 1))
+    }
+    string_free(tmp)
+    return ok(n)
+}

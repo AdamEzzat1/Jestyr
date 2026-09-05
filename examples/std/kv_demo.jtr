@@ -1,0 +1,159 @@
+// examples/std/kv_demo.jtr — `jstate`, a service's state file, and the crash it survives.
+//
+// Run:  jestyrc run examples/std/kv_demo.jtr
+//
+// ─── What this demonstrates ───────────────────────────────────────────────────
+//
+// A service keeps a handful of settings and a credential that must be rotated as a PAIR: a
+// token and the time it was issued. Writing the two one after the other leaves a window in
+// which a crash records the new token with the old timestamp, and the next start-up expires a
+// credential it just minted — or trusts one it should not. So the rotation is a batch, and
+// the interesting part of this program is not the batch that lands; it is the one that does
+// not.
+//
+// The program **crashes itself on purpose**: it commits a rotation, then commits a second one
+// and cuts the last byte off the file — exactly what a process killed with the record's tail
+// still in a buffer leaves on disk. Reopening shows the first rotation whole and the second
+// absent WHOLE: not a new token with an old timestamp, but the previous pair.
+//
+// It then upgrades its own format (a migration that moves the schema and rewrites a value
+// together), compacts, and takes a snapshot that is itself a store. Every number is
+// deterministic — the same file, the same bytes — so `jstate_survives_a_torn_batch` asserts
+// the transcript to the line.
+
+import "file"
+import "fs"
+import "kv"
+import "mem"
+
+const STATE_PATH: str = "zz_jstate.db"
+const STATE_SNAP: str = "zz_jstate.snapshot.db"
+
+fn nothing() { }
+
+// Print `key = value`, or `key (absent)`.
+fn show(read s: kv.Store, read key: str) {
+    var line: String = string_new()
+    string_push(line, key)
+    if kv.has(s, key) {
+        string_push(line, " = ")
+        string_push(line, kv.get(s, key))
+    } else {
+        string_push(line, " (absent)")
+    }
+    print_str(string_view(line))
+    string_free(line)
+}
+
+// Rotate the credential: both keys, one record.
+fn rotate(mut s: kv.Store, read token: str, read issued: str) {
+    var b: kv.Batch = kv.batch()
+    kv.batch_put(b, "token", token)
+    kv.batch_put(b, "token_issued", issued)
+    kv.commit(s, b) catch nothing()
+}
+
+// Cut one byte off the end of the file — the crash.
+fn cut_last_byte(read a: Allocator) -> bool {
+    var r: file.Reader = file.open_path(a, STATE_PATH)
+    if file.is_open(r) == false { return false }
+    let n: i64 = file.size(r)
+    file.close(r)
+    return file.truncate_path(a, STATE_PATH, n - 1)
+}
+
+// The migration step for schema 1: `mode` gains an explicit suffix; everything else is kept.
+fn to_schema_1(read key: str, read val: str, mut dst: String) -> i32 {
+    if str_eq(key, "mode") {
+        string_push(dst, val)
+        string_push(dst, "-v1")
+        return kv.MIGRATE_REPLACE
+    }
+    return kv.MIGRATE_KEEP
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    fs.erase(h, STATE_PATH)
+    fs.erase(h, STATE_SNAP)
+
+    print_str("-- jstate --")
+    var s: kv.Store = kv.closed()
+    kv.open(h, a, STATE_PATH, s) catch nothing()
+    print_str("opened a fresh state file; keys")
+    print_int(kv.len(s))
+    kv.put(s, "mode", "fast") catch nothing()
+    kv.put(s, "workers", "4") catch nothing()
+    rotate(s, "tok-A", "1000")
+    print_str("settings written; keys, records")
+    print_int(kv.len(s))
+    print_int(kv.records(s))
+    show(s, "token")
+    show(s, "token_issued")
+    kv.sync(s) catch nothing()
+
+    // ---- the crash ----
+    //
+    // A second rotation lands in the log, and then the process dies with the record's last
+    // byte unwritten. The log's frame refuses the torn record; the batch was that record.
+    print_str("-- rotating again, then dying mid-write --")
+    rotate(s, "tok-B", "2000")
+    show(s, "token")
+    kv.close(s)
+    print_bool(cut_last_byte(a))
+
+    // ---- recovery ----
+    var s2: kv.Store = kv.closed()
+    kv.open(h, a, STATE_PATH, s2) catch nothing()
+    print_str("reopened; the pair is the PREVIOUS pair, not a mixture")
+    show(s2, "token")
+    show(s2, "token_issued")
+    print_str("keys")
+    print_int(kv.len(s2))
+    // The property the batch exists for: the two keys agree with EACH OTHER. A store that
+    // applied half the torn rotation would have `tok-B` with `1000`, or `tok-A` with `2000`.
+    let consistent: bool = str_eq(kv.get(s2, "token"), "tok-A") and str_eq(kv.get(s2, "token_issued"), "1000")
+
+    // ---- the upgrade ----
+    //
+    // Schema 0 -> 1: `mode` changes spelling. The new schema and the new value become
+    // visible together, at the rename — a crash during this leaves schema 0 and the old value.
+    print_str("-- migrating to schema 1 --")
+    print_int(kv.migrate(h, a, s2, 1, &to_schema_1) catch 0 - 1)
+    print_str("schema")
+    print_int(kv.schema(s2))
+    show(s2, "mode")
+    show(s2, "workers")
+
+    // ---- compaction and backup ----
+    kv.put(s2, "workers", "8") catch nothing()
+    kv.put(s2, "workers", "16") catch nothing()
+    print_str("-- compacting --")
+    print_str("dead bytes before")
+    print_int(kv.dead_bytes(s2))
+    print_int(kv.compact(h, a, s2) catch 0 - 1)
+    print_str("dead bytes after, records")
+    print_int(kv.dead_bytes(s2))
+    print_int(kv.records(s2))
+    show(s2, "workers")
+
+    print_str("-- snapshot --")
+    print_int(kv.snapshot(h, a, s2, STATE_SNAP) catch 0 - 1)
+    var b: kv.Store = kv.closed()
+    kv.open(h, a, STATE_SNAP, b) catch nothing()
+    print_str("the snapshot opens as a store at the same schema")
+    print_int(kv.schema(b))
+    show(b, "token")
+    show(b, "mode")
+    kv.close(b)
+    kv.close(s2)
+
+    print_str("-- the check --")
+    print_str("no rotation was ever half-applied")
+    print_bool(consistent)
+
+    fs.erase(h, STATE_PATH)
+    fs.erase(h, STATE_SNAP)
+    return 0
+}

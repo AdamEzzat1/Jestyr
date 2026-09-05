@@ -2261,6 +2261,69 @@ mod alog_durable {
     }
 }
 
+/// **`jstate` — a state file that loses a torn batch WHOLE.**
+///
+/// `examples/std/kv_demo.jtr` is `std/kv`'s consumer. A credential is rotated as a pair —
+/// a token and its issue time — in one batch; the program commits one rotation, then commits
+/// a second and cuts the last byte off the file, which is what a process killed with the
+/// record's tail still in a buffer leaves behind. The assertion that matters is the pair
+/// after reopening: the PREVIOUS token with the PREVIOUS time, never one of each.
+///
+/// The rest of the transcript pins the rewrites: a migration that moves the schema and a
+/// value together, a compaction whose dead-byte figure goes to exactly zero, and a snapshot
+/// that opens as a store at the same schema.
+#[cfg(all(test, feature = "c-oracle"))]
+mod kv_durable {
+    use super::*;
+
+    #[test]
+    fn jstate_survives_a_torn_batch() {
+        let exe = super::c_oracle::build_exe("examples/std/kv_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the state demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jstate --\n\
+                    opened a fresh state file; keys\n0\n\
+                    settings written; keys, records\n4\n4\n\
+                    token = tok-A\n\
+                    token_issued = 1000\n\
+                    -- rotating again, then dying mid-write --\n\
+                    token = tok-B\n\
+                    true\n\
+                    reopened; the pair is the PREVIOUS pair, not a mixture\n\
+                    token = tok-A\n\
+                    token_issued = 1000\n\
+                    keys\n4\n\
+                    -- migrating to schema 1 --\n4\n\
+                    schema\n1\n\
+                    mode = fast-v1\n\
+                    workers = 4\n\
+                    -- compacting --\n\
+                    dead bytes before\n16\n\
+                    4\n\
+                    dead bytes after, records\n0\n5\n\
+                    workers = 16\n\
+                    -- snapshot --\n4\n\
+                    the snapshot opens as a store at the same schema\n1\n\
+                    token = tok-A\n\
+                    mode = fast-v1\n\
+                    -- the check --\n\
+                    no rotation was ever half-applied\ntrue";
+        assert_eq!(out.trim_end(), want, "the state demo's transcript changed:\n{out}");
+
+        // Anti-vacuity: the two `true`s are the cut succeeding and the pair agreeing; nothing
+        // may print `false`, and no key may come back absent.
+        assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
+        assert!(!out.contains("(absent)"), "no key the demo wrote may be missing:\n{out}");
+        // `tok-B` must appear exactly once — before the crash — and never after the reopen.
+        assert_eq!(out.matches("tok-B").count(), 1, "the torn rotation must not survive:\n{out}");
+
+        assert!(!std::path::Path::new("zz_jstate.db").exists(), "the demo must clean up after itself");
+        assert!(!std::path::Path::new("zz_jstate.snapshot.db").exists(), "the demo must clean up after itself");
+    }
+}
+
 /// **`jlog` — one logging routine, two renderings, and the log reading itself back.**
 ///
 /// `examples/std/log_demo.jtr` is `std/log`'s consumer. `run_job` is written once and shipped
@@ -18592,6 +18655,7 @@ fn main() -> i32 {
         "sysignal.jtr",
         "csrand.jtr",
         "ini.jtr",
+        "kv.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same
@@ -19819,6 +19883,21 @@ fn main() -> i32 {
             // `time(0)` in the header fails. The checksum test pins the one detail every tar
             // writer gets wrong: the field is summed as eight SPACES, not as zeros.
             ("tar_test", 4),
+            // The package substrate's four suites. They landed with their suites
+            // UNREGISTERED — runnable by hand, gating nothing — which is exactly the shape
+            // this table's docstring warns about, and it went unnoticed because each one
+            // was green when its author ran it.
+            ("semver_test", 15),
+            ("resolve_test", 10),
+            ("lockfile_test", 10),
+            ("cache_test", 8),
+            // **Three of these cut a real store file mid-record**, and one hands the module
+            // a log that is not a store and a HEAD from a future format. The atomicity claim
+            // is checked by the cut: a batch of three keys loses its last three bytes and
+            // must reopen with NONE of them, while the batch before it is untouched. Every
+            // rewrite (compaction, migration, snapshot) is followed by a value-for-value
+            // comparison, because a rewrite that loses a key does so quietly.
+            ("kv_test", 10),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

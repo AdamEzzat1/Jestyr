@@ -1026,6 +1026,68 @@ cmd's quote-stripping from inside a string `test_fixture.capture` owns.
 
 ---
 
+## §3q. Storage V2 — `std/kv`, and two compiler facts measured on the way
+
+Area 9 is no longer "log only". `examples/std/kv.jtr` is a key-value store whose only
+durable artefact is an `alog`: KV, atomic batches, compaction, migrations and backup, on
+`std/alog`, `std/strmap`, `std/list`, `std/fs` and `std/sysfs`. Ten tests, a pinned demo
+(`jstate`), no reseed — the drift guard, not the heuristic, says so. Fourth new leaf module
+in a row to need none, which is the §3 property of the next-steps note working.
+
+**The design decision is that the log is durability, not capacity.** Every live key and
+value is memory-resident and the log is replayed at open. That is the shape the brief's
+consumers want (configuration, service state, a build's bookkeeping) and the wrong shape for
+a dataset larger than memory, which the header says. It was not a free choice:
+`file.Reader` has no seek, so a Bitcask-style offset index could not have fetched a value on
+demand. A store that must exceed memory is a different structure, and needs a seek first.
+
+**A batch is atomic because it is one record.** The log already makes one record complete
+or discarded; a begin/commit pair would need recovery to hold half-applied batches back
+until it sees the commit — the state machine that gets written wrong. The price is a
+ceiling (`KV_MAX_RECORD`, 1 MiB) which also bounds the replay buffer; a larger batch is
+refused before anything is written and left intact so the caller can split it.
+
+**Compaction, migration and snapshot are ONE rewrite** into a fresh file beside the store,
+then `sysfs.rename_replace`. The handle is closed BEFORE the rename (Windows cannot replace
+an open file), and a rename that fails reopens the untouched original. After a compaction
+or migration the memory is rebuilt by REPLAYING THE NEW FILE — which costs a pass and
+means what the caller sees is what a reopen would see, because it is what a reopen did.
+Doing that needed `forget`: the index (`strmap`) has no removal, so every live key is
+tombstoned by hand before the entries list is truncated, or the next `mem_put` would
+index past it. Skipping that step was one of the four mutations watched failing.
+
+**Every writer applies its own bytes by parsing them.** `put`, `del` and `commit` frame an
+operation list, append it, then run the SAME bytes through `apply_batch` — the one reader
+of the layout. An encoder that drifted from the parser fails at the write, not at the next
+reopen. The "frame every batch as a batch of one" mutation showed the shape: the store
+refused to REOPEN, because the self-replay had already rejected its own record.
+
+### Two compiler facts, measured, neither fixed here (§3 rule: report, do not reseed)
+
+**`return ok(local)` drops the local it carries out.** For a struct with a `Drop` impl (or
+`Drop`-bearing fields), `return d` moves and `return ok(D{ … })` moves, but `return ok(d)`
+copies `d` into the result and then emits the local's drops — the file is closed and the
+strings freed before the caller sees them. Measured in the emitted C, exit code
+`STATUS_HEAP_CORRUPTION`, and pinned with a three-function probe (plain / `ok(local)` /
+`ok(literal)`). Reference side only; the port was not run. `std/kv` routes around it by
+opening INTO a caller-owned handle (`kv.closed()` then `kv.open(f, a, path, s)`), the shape
+`alog.scan` uses for its out-parameters. **Every existing fallible constructor in the corpus
+returns a literal** (`alog.open` returns `ok(Log{ w: w, … })`), which is why nothing had
+tripped it. Filed in the next-steps note's §1 with the probe.
+
+**`from_utf8` traps on invalid UTF-8; `try_from_utf8` is the checked one.** A `str` is
+UTF-8 by construction, so a record's length fields — bytes above 127 — cannot pass through a
+`String`. The first draft assembled records in one and died on the first value longer than
+127 bytes, with an assertion in the runtime rather than a diagnostic. The framing now lives
+in a plain owned `[]u8` buffer, and the replay converts keys and values with
+`try_from_utf8` so a corrupted byte reads as damage rather than as an abort. Two traps for
+the §7 list: `out` is a keyword (a parameter named `out` is 32 parse errors), and a
+`catch { … }` block may not contain a `return`.
+
+**Also found: four suites gating nothing.** `semver_test`, `resolve_test`, `lockfile_test`
+and `cache_test` had no entry in `io_suites_pass`. Green for their authors, checked by
+nothing on CI. Registered with their counts pinned, alongside `kv_test`.
+
 ## §4. Comparison suites, rerun at this milestone
 
 Run twice this arc — after §3 and again after §3c, since both changed compiler semantics.
@@ -1055,15 +1117,15 @@ twice.
 | 2 | observability | **mostly.** `log.jtr` (structured, injected `Clock`+`Writer`, no globals) + `metrics.jtr` (counters/gauges/histograms, name-ordered dump, saturating counters). Missing: **trace spans** — and `Span` is taken three times already, so pick another word first |
 | 3 | config | **DONE.** `config.jtr` (precedence is a property of the SOURCE, order-independent) + `ini.jtr` as a file format over it. Missing: live reload, nesting |
 | 4 | sandbox | **mostly.** `sysproc` spawn/pipes/`wait_timeout`/kill, and environment inheritance now matches on both platforms **and is finally tested** (§3p). Missing: **cwd, process groups, fs capability projection** |
-| 5 | package | **the big one, barely started.** Content-addressing + DAG ordering exist (`module.rs` manifest, `buildgraph.jtr`, `tar.jtr`, `sha256.jtr`). Missing: **semver, resolver, lockfile, cache** |
+| 5 | package | **substrate DONE.** `semver` → `resolve` (minimal version selection) → `lockfile` (a witness, not a source of truth) → `cache` (content-addressed), over `module.rs`'s manifest, `buildgraph.jtr`, `tar.jtr`, `sha256.jtr`. Missing: **a registry protocol and a manifest FORMAT** — nothing fetches and nothing is parsed from a file, deliberately |
 | 6 | HTTP | **parser only.** `http.jtr` refuses request smuggling. Missing: **routing, middleware, streaming bodies, keep-alive, timeouts, static files, access logs, test client/server** |
 | 7 | crypto | **boundary done.** `sha256`, `crc32`, and `csrand.jtr` (platform CSPRNG + constant-time compare). Missing: **HMAC, signing/verification, a hash interface** — bindings, not algorithms to write |
-| 8 | TLS | **absent**, and wants a DECISION before effort — see §6B4 |
-| 9 | storage | **log only.** `alog.jtr` is CRC'd and crash-recoverable. Missing: **KV, compaction, atomic batches, migrations, backup/export** |
+| 8 | TLS | **absent**, and NOT gated — the "churns every manifest" claim in §6B4 was measured false (link libraries are content-triggered and never enter `CC_FLAGS`). Ordinary scope: handshake, verification, an error surface, schannel-or-OpenSSL on Windows |
+| 9 | storage | **DONE (§3q).** `kv.jtr` on `alog.jtr`: KV, atomic batches (one record each), compaction, migrations, snapshot/backup — one rewrite primitive under all three. Memory-resident by design; a store larger than memory needs a seek in `file.Reader` first |
 | 10 | compatibility | **DONE.** `src/attest.rs` emits the ABI manifest and gates breaking-vs-compatible in CI, now including trait/impl records. Missing: `@deprecated` reaches nothing (A8) |
 
-**Scoring it honestly: 4 areas done (1, 3, 7-at-the-boundary, 10), 3 mostly (2, 4, and 10's
-tail), 3 barely or not at all (5, 6, 9), 1 undecided (8).** The tier's own definition of done
+**Scoring it honestly: 6 areas done (1, 3, 5-the-substrate, 7-at-the-boundary, 9, 10), 2
+mostly (2, 4), 1 barely (6), 1 absent but no longer gated (8).** The tier's own definition of done
 — *"a service can start, report health, run background work, shut down gracefully, and be
 tested deterministically"* — **is met**. What is left is breadth, not the headline claim.
 
@@ -1104,6 +1166,24 @@ wrong until some program puts the construct between two spawn sites. Removing th
 means either making the ASTs agree, or deriving spawn symbols from a per-spawn ordinal
 instead of an `ExprId` (small on each side, but churns every spawn-bearing golden and
 attest hash).
+
+#### A12. `return ok(local)` drops the local it carries out — OPEN, routed around (§3q)
+
+For a struct that owns something (`Drop` impl, or `Drop`-bearing fields), `return d` moves
+the local and `return ok(D{ … })` moves the literal, but **`return ok(d)` copies `d` into
+the result and then emits the local's drops** — the caller receives a struct whose file has
+been closed and whose strings have been freed. Measured in the emitted C (`JestyrResult_D
+j_result = { .ok = j_d }; jestyr_impl_Drop__D__drop(&j_d); return j_result;`), and pinned
+with a three-function probe. Reference side; the port has not been run against the probe.
+
+**Why the corpus never tripped it:** every fallible constructor returns a literal
+(`alog.open`, `file.finish`, `sysnet`, …). `std/kv` was the first to build a value, work on
+it, and then wrap it — and it now opens INTO a caller-owned handle instead.
+
+**The fix lives in `cgen`** (both sides — `cgen.rs` and `cgen.jtr`) where `ok(...)`'s
+argument should be treated as consumed exactly as a bare `return` treats it. That is a
+closure edit and a reseed, so it belongs in the next-steps note's serial §1, and a corpus
+file that RETURNS `ok(local)` must be added so the port mirror can be watched failing.
 
 #### A2. `environ` on POSIX — **CLOSED: the test exists now (§3p)**
 
@@ -1414,25 +1494,25 @@ reach `attest` (a global is ABI) and `doc`. Larger than the select AST change in
 
 #### B3. The brief's remaining areas — a session each
 
-* **Package substrate** (brief area 5) — semver → resolver → lockfile → content-addressed
-  cache. The largest genuinely-absent area and the one the tier's "distribution" theme
-  names. Content-hashing, `buildgraph`, `tar` and `sha256` are already underneath it.
+* ~~**Package substrate** (brief area 5)~~ — **DONE**: `semver` → `resolve` → `lockfile` →
+  `cache`. What it does not have: a registry protocol and a manifest FORMAT.
 * **HTTP V2** (area 6) — routing, middleware, streaming bodies, keep-alive, timeouts,
   static files, access logs, a test client/server. The parser is hardened and refuses
   request smuggling; everything above the message is absent. `sysproc` timeouts and
   `syspoll` readiness are now in place under it.
-* **Storage V2** (area 9) — KV, compaction, atomic batches, migrations, backup/export on
-  top of `alog`. Note `sysfs` has **no mtime**, deliberately (`struct stat` layout differs
-  per platform).
+* ~~**Storage V2** (area 9)~~ — **DONE** (§3q): `std/kv`. What it does not have: binary
+  (`[]u8`) values, a store larger than memory (needs a seek in `file.Reader` first), and
+  index removal (`strmap` has none, so a deleted key costs a slot until reopen).
 * **Crypto beyond the boundary** (area 7) — HMAC, signing/verification, a hash *interface*.
   `csrand` deliberately invents nothing; these are bindings, not algorithms to write.
 
-#### B4. TLS (area 8) — wants an explicit decision, not just effort
+#### B4. TLS (area 8) — ~~wants an explicit decision~~ — **the blocker below was WRONG**
 
-Absent entirely, and **different in kind**: it means binding OpenSSL or schannel, which is
-a link-flag change — and `cc-flags` is LOCKED and recorded in every attest manifest, so
-adding `-lssl` churns every manifest in the corpus. Worth deciding whether Tier 5 claims
-TLS at all or whether it is its own arc.
+This used to read: *"binding OpenSSL or schannel is a link-flag change — and `cc-flags` is
+LOCKED and recorded in every attest manifest, so adding `-lssl` churns every manifest."*
+Measured false: per-program link libraries are content-triggered in `main.rs` (`-pthread`,
+`-lws2_32`) and never enter `CC_FLAGS`, the constant the manifest prints. The next-steps
+note has the evidence. TLS is ordinary §2 scope, judged on size.
 
 #### B5. Tier 4 leftovers still open
 
