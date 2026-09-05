@@ -8,8 +8,10 @@ defects — one session at a time). §2 is the parallel work (library breadth �
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1354 passed / 0 failed / 3 ignored.** Pushed. **CI is fully green** — all
-four jobs — for the first time in over two weeks.
+**1355 passed / 0 failed / 3 ignored** (full ladder, 785s, after `std/kv`). The `std/kv`
+commit sits on `claude/tier5-compiler-handoff-75c515`, a fast-forward of the package-substrate
+branch; **neither is merged to master and the kv commit is not pushed.** CI was fully green —
+all four jobs — at the substrate branch's head.
 
 The long-form history is `docs/session-notes/jestyr-tier5-handoff.md`. Read its §5 for the
 area inventory (rewritten and current) and §6A for the defect register. Everything below
