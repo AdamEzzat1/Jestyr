@@ -18656,6 +18656,10 @@ fn main() -> i32 {
         "csrand.jtr",
         "ini.jtr",
         "kv.jtr",
+        // A12: `return ok(local)` must MOVE the local. The port mirror was watched
+        // failing on exactly this file — without it the port drops the local and the
+        // emitted C differs by one drop call.
+        "return_ok_local.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same
@@ -19771,6 +19775,26 @@ fn main() -> i32 {
     /// `Cursor` in are shown composing; the `3` is the line count under the
     /// trailing-newline rule. The last two `1`s are a buffer deliberately too small
     /// reporting the loss instead of lying about it.
+    /// **A12: `return ok(local)` moves the local.** Three makers — a bare returned local,
+    /// an `ok(local)`, an `ok(literal)` — and the caller reads each value back. Before the
+    /// fix the middle one printed `drop fired` INSIDE the maker and handed back a freed
+    /// String, and the run ended in `STATUS_HEAP_CORRUPTION`. Exactly three drops, all
+    /// after `-- end of main --`, is the assertion: a drop anywhere earlier is the bug.
+    #[test]
+    fn return_ok_local_moves_the_local() {
+        let got = toks("examples/return_ok_local.jtr");
+        assert_eq!(
+            got,
+            [
+                "--", "plain", "return", "--", "plain", "1",
+                "--", "ok(local)", "return", "--", "ok-wrapped", "2",
+                "--", "ok(literal)", "return", "--", "literal", "3",
+                "--", "end", "of", "main", "--",
+                "drop", "fired", "drop", "fired", "drop", "fired",
+            ]
+        );
+    }
+
     #[test]
     fn writer_demo() {
         assert_eq!(

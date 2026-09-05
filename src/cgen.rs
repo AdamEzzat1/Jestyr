@@ -3394,7 +3394,7 @@ impl<'a> Cgen<'a> {
                 }
                 Stmt::Let { init: None, .. } => {}
                 Stmt::Return { value: Some(e), .. } => {
-                    if let Some(name) = self.as_name(*e) {
+                    if let Some(name) = self.as_returned_name(*e) {
                         out.insert(name);
                     }
                     self.collect_moved_expr(*e, out);
@@ -3403,7 +3403,7 @@ impl<'a> Cgen<'a> {
                 Stmt::Expr(e) => {
                     // The block's tail expression may be an implicit return value.
                     if i + 1 == n {
-                        if let Some(name) = self.as_name(*e) {
+                        if let Some(name) = self.as_returned_name(*e) {
                             out.insert(name);
                         }
                     }
@@ -3419,6 +3419,33 @@ impl<'a> Cgen<'a> {
             ExprKind::Name(n) => Some(n.name.clone()),
             _ => None,
         }
+    }
+
+    /// The bare local a `return` carries out: `return d`, or `return ok(d)` /
+    /// `return err(d)`, whose argument lands in the result struct by value exactly as
+    /// a bare returned local does.
+    ///
+    /// **A12.** Until this existed, `return ok(d)` copied `d` into the result and then
+    /// ran the local's drops — the caller received a closed file and freed strings,
+    /// with no diagnostic. Every fallible constructor in the corpus returned a
+    /// literal (`ok(Log{ w: w, … })`), whose captured locals `collect_moved_expr`
+    /// already marks through the struct-literal arm, which is why it hid. `ok`/`err`
+    /// are intrinsics and cannot be shadowed (that is a hard error), so matching the
+    /// spelling is matching the meaning.
+    fn as_returned_name(&self, id: ExprId) -> Option<String> {
+        if let Some(name) = self.as_name(id) {
+            return Some(name);
+        }
+        if let ExprKind::Call { callee, args } = &self.ast.expr_at(id).kind {
+            if args.len() == 1 {
+                if let ExprKind::Name(n) = &self.ast.expr_at(*callee).kind {
+                    if n.name == "ok" || n.name == "err" {
+                        return self.as_name(args[0]);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// The receiver-parameter convention of a resolved method/impl/operator call,

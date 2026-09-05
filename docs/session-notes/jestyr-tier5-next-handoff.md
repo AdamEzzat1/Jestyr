@@ -57,12 +57,11 @@ Every item here touches the compiler's own closure, owes a port mirror, and forc
 reseed. **They cannot run in parallel with each other or with anything else that reseeds**
 (see §3). Do them one at a time, in this order.
 
-> **THE SERIAL QUEUE HAS ONE ACTIONABLE ITEM AGAIN: §1.6.** 1.1 (A7), 1.2 (A6), 1.3 (A8),
-> 1.4 (B1) and **A11's lowering half** are all done — no `mut` argument leaks a gcc error any
-> more. What is left here is **1.6 (A12): `return ok(local)` drops the local** — a measured
-> silent miscompile with a three-line probe, routed around by `std/kv` but not fixed — plus
-> **one language QUESTION** (should a `mut` argument that aliases nothing be refused? —
-> §1.1b) and **1.5 (B2), deferred on measurement**, bigger than everything above it combined.
+> **THE SERIAL QUEUE IS EMPTY OF ACTIONABLE WORK AGAIN.** 1.1 (A7), 1.2 (A6), 1.3 (A8),
+> 1.4 (B1), **A11's lowering half** and **1.6 (A12, `return ok(local)`)** are all done, each
+> mirror watched failing. What is left here is **one language QUESTION** (should a `mut`
+> argument that aliases nothing be refused? — §1.1b) and **1.5 (B2), deferred on
+> measurement**, bigger than everything above it combined.
 >
 > **So the next session should be fanning out on §2**, and §2 parallelises where §1 could not.
 > Read §3 first — the sixteen closure modules are a global lock, and the reseed is the thing
@@ -259,12 +258,21 @@ The claim about "the no-allowlist P2 golden" was wrong in detail: the corpus-wid
 is the cgen golden and the build matrix; the P2 dump goldens are *curated snippet* lists, so
 the new arm had to be added to one by hand or nothing would have compared it.
 
-### 1.6 — A12: `return ok(local)` drops the local it carries out — **OPEN, one probe away**
+### ~~1.6 — A12: `return ok(local)` drops the local it carries out~~ — **DONE, both sides**
 
-**The one actionable item in this queue.** For a struct with a `Drop` impl or
-`Drop`-bearing fields, `return d` moves and `return ok(D{ … })` moves, but `return ok(d)`
-copies `d` into the result and then emits the local's drops. The caller gets a closed file
-and freed strings. Measured in the emitted C; the probe is three functions:
+Closed. `cgen.rs` gained `as_returned_name` (a `return`'s bare local, or the one argument
+of an `ok(...)`/`err(...)` it returns) and `collect_moved` uses it for both a `return`
+statement and a block's tail; `cgen.jtr` mirrors it as `mv_mark_returned`. Corpus file
+`examples/return_ok_local.jtr`, allowlisted, with a transcript test
+(`return_ok_local_moves_the_local`: three drops, all after `-- end of main --`). **The
+mirror was watched failing** — the golden diverged on exactly that file and no other — and
+the seed moved by 53 lines. `err(local)` is covered by the same arm although no owning
+payload can reach it yet.
+
+What it was: for a struct with a `Drop` impl or `Drop`-bearing fields, `return d` moved
+and `return ok(D{ … })` moved, but `return ok(d)` copied `d` into the result and then
+emitted the local's drops. The caller got a closed file and freed strings. The probe was
+three functions:
 
 ```
 fn mk_plain() -> D { var d: D = D{ … }  return d }              // moved — fine
@@ -273,15 +281,12 @@ fn mk_lit() -> D !{ Nope } { var t = …  return ok(D{ t: t }) }  // moved — f
 ```
 
 Exit code `STATUS_HEAP_CORRUPTION`, stdout lost. Nothing in the corpus tripped it because
-every fallible constructor returns a literal. `std/kv` opens INTO a caller-owned handle to
-route around it, so nothing is waiting on the fix — but it is a silent miscompile of a
-natural shape and it will be written again.
+every fallible constructor returns a literal. `std/kv` still opens INTO a caller-owned
+handle; that shape is fine and stays (changing it now would only churn a green module).
 
-**Cost, honestly guessed rather than measured:** the `return` lowering in `cgen.rs` already
-treats a bare returned local as consumed; `ok(...)`'s argument needs the same treatment,
-plus the mirror in `cgen.jtr`, plus a corpus file returning `ok(local)` so the mirror can
-be watched failing, plus a reseed. Check whether `err(payload)` with an owning payload has
-the same hole while there. **Port unverified**: the probe was run against `jestyrc` only.
+**The cost estimate was right for once**: one predicate on each side, one corpus file, one
+reseed. The fix is in `collect_moved`, the move ANALYSIS, not in the `return` lowering —
+`emit_value_return` was already correct given a right `cur_moved` set.
 
 ### 1.5 — B2: `extern` binding a C global — MEASURED, then deferred
 

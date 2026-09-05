@@ -5,6 +5,17 @@ versions are snapshots, not stability promises.
 
 ## Unreleased
 
+### Fixed
+
+- **`return ok(local)` no longer drops the local it returns (A12).** For a struct that owns
+  something, `return d` and `return ok(D{ … })` moved correctly, but `return ok(d)` copied
+  `d` into the result and then ran the local's drops — the caller received a closed file and
+  freed strings, with no diagnostic, and the run ended in heap corruption. The move analysis
+  (`collect_moved`) now treats the one argument of a returned `ok(...)`/`err(...)` exactly as
+  it treats a bare returned local, on both compilers. Nothing in the corpus had tripped it
+  because every fallible constructor returned a literal. `examples/return_ok_local.jtr` pins
+  it (three drops, all after `main` ends); the port mirror was watched failing on that file.
+
 ### Added
 
 - **`std/kv`** — a key-value store whose only durable artefact is an `alog`. 10 tests, and

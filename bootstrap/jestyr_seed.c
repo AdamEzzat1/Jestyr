@@ -1418,6 +1418,7 @@ void jestyr_fill_take_drops(Jestyr_Cg* restrict j_g, Jestyr_Parser j_p, JestyrSt
 void jestyr_mv_mark(Jestyr_Cg* restrict j_g, Jestyr_Parser j_p, int32_t j_eid);
 void jestyr_mark_take_args(Jestyr_Cg* restrict j_g, Jestyr_Parser j_p, JestyrStr j_src, Jestyr_ExprData j_e);
 void jestyr_collect_moved_expr(Jestyr_Cg* restrict j_g, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_eid);
+void jestyr_mv_mark_returned(Jestyr_Cg* restrict j_g, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_eid);
 void jestyr_collect_moved_block(Jestyr_Cg* restrict j_g, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_beid);
 void jestyr_emit_unit_ok_return(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr j_src, Jestyr_Checker j_c, Jestyr_Cg* restrict j_g, int32_t j_depth);
 void jestyr_emit_return(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr j_src, Jestyr_Checker j_c, Jestyr_Cg* restrict j_g, int32_t j_val, int32_t j_depth);
@@ -28692,6 +28693,29 @@ void jestyr_collect_moved_expr(Jestyr_Cg* restrict j_g, Jestyr_Parser j_p, Jesty
     }
 }
 
+void jestyr_mv_mark_returned(Jestyr_Cg* restrict j_g, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_eid)
+{
+    if ((j_eid < 0))
+    {
+        return;
+    }
+    Jestyr_ExprData j_e = jestyr_get__list__ExprData(j_p.j_ex, (size_t)(j_eid));
+    if (((j_e.j_kind == 10) && (j_e.j_y == 1)))
+    {
+        Jestyr_ExprData j_callee = jestyr_get__list__ExprData(j_p.j_ex, (size_t)(j_e.j_a));
+        if ((j_callee.j_kind == 2))
+        {
+            JestyrStr j_nm = jestyr_rt_substr(j_src, j_callee.j_start, j_callee.j_end);
+            if ((jestyr_rt_str_eq(j_nm, JSTR("ok")) || jestyr_rt_str_eq(j_nm, JSTR("err"))))
+            {
+                jestyr_mv_mark(&((*j_g)), j_p, jestyr_get__list__i32(j_p.j_ar, (size_t)(j_e.j_x)));
+                return;
+            }
+        }
+    }
+    jestyr_mv_mark(&((*j_g)), j_p, j_eid);
+}
+
 void jestyr_collect_moved_block(Jestyr_Cg* restrict j_g, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_beid)
 {
     Jestyr_ExprData j_blk = jestyr_get__list__ExprData(j_p.j_ex, (size_t)(j_beid));
@@ -28708,14 +28732,14 @@ void jestyr_collect_moved_block(Jestyr_Cg* restrict j_g, Jestyr_Parser j_p, Jest
         }
         if (((j_s.j_kind == 1) && (j_s.j_a >= 0)))
         {
-            jestyr_mv_mark(&((*j_g)), j_p, j_s.j_a);
+            jestyr_mv_mark_returned(&((*j_g)), j_p, j_src, j_s.j_a);
             jestyr_collect_moved_expr(&((*j_g)), j_p, j_src, j_s.j_a);
         }
         if ((j_s.j_kind == 2))
         {
             if (((j_i + 1) == j_n))
             {
-                jestyr_mv_mark(&((*j_g)), j_p, j_s.j_a);
+                jestyr_mv_mark_returned(&((*j_g)), j_p, j_src, j_s.j_a);
             }
             jestyr_collect_moved_expr(&((*j_g)), j_p, j_src, j_s.j_a);
         }

@@ -19704,8 +19704,31 @@ fn collect_moved_expr(mut g: Cg, read p: Parser, read src: str, eid: i32) {
     }
 }
 
-// The statement walk: a `let`'s bare-name init, a `return`'s bare-name value, and the block's
-// bare-name tail expression all move; every subexpression is walked for take-args and captures.
+// Mark the bare local a `return` carries out: `return d`, or `return ok(d)` / `return err(d)`,
+// whose one argument lands in the result struct by value exactly as a bare returned local does
+// (mirrors `as_returned_name`). A12: without this the port copied `d` into the result and then
+// ran its drops — the same silent miscompile the reference had, and the cgen golden on
+// `examples/return_ok_local.jtr` is what watched it fail. `ok`/`err` are intrinsics and cannot
+// be shadowed, so matching the spelling is matching the meaning.
+fn mv_mark_returned(mut g: Cg, read p: Parser, read src: str, eid: i32) {
+    if eid < 0 { return }
+    let e: ExprData = get__list(ExprData, p.ex, eid as usize)
+    if e.kind == 10 and e.y == 1 {
+        let callee: ExprData = get__list(ExprData, p.ex, e.a as usize)
+        if callee.kind == 2 {
+            let nm: str = src[callee.start .. callee.end]
+            if str_eq(nm, "ok") or str_eq(nm, "err") {
+                mv_mark(g, p, get__list(i32, p.ar, e.x as usize))
+                return
+            }
+        }
+    }
+    mv_mark(g, p, eid)
+}
+
+// The statement walk: a `let`'s bare-name init, a `return`'s bare-name value (or the local an
+// `ok(...)`/`err(...)` wraps), and the block's bare-name tail expression all move; every
+// subexpression is walked for take-args and captures.
 fn collect_moved_block(mut g: Cg, read p: Parser, read src: str, beid: i32) {
     let blk: ExprData = get__list(ExprData, p.ex, beid as usize)
     let n: i32 = blk.y
@@ -19718,11 +19741,11 @@ fn collect_moved_block(mut g: Cg, read p: Parser, read src: str, beid: i32) {
             collect_moved_expr(g, p, src, s.a)
         }
         if s.kind == 1 and s.a >= 0 {
-            mv_mark(g, p, s.a)
+            mv_mark_returned(g, p, src, s.a)
             collect_moved_expr(g, p, src, s.a)
         }
         if s.kind == 2 {
-            if i + 1 == n { mv_mark(g, p, s.a) }
+            if i + 1 == n { mv_mark_returned(g, p, src, s.a) }
             collect_moved_expr(g, p, src, s.a)
         }
         i = i + 1

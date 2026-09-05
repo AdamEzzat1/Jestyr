@@ -1167,7 +1167,14 @@ means either making the ASTs agree, or deriving spawn symbols from a per-spawn o
 instead of an `ExprId` (small on each side, but churns every spawn-bearing golden and
 attest hash).
 
-#### A12. `return ok(local)` drops the local it carries out — OPEN, routed around (§3q)
+#### A12. ~~`return ok(local)` drops the local it carries out~~ — **CLOSED, both sides**
+
+Closed the same day it was found. `cgen.rs`: `as_returned_name` feeds `collect_moved` for a
+`return` statement and a block tail; `cgen.jtr`: `mv_mark_returned`. Corpus
+`examples/return_ok_local.jtr`, allowlisted, transcript-tested; the golden was watched
+diverging on that one file before the mirror landed; seed refreshed (+53 lines). The fix
+is in the move ANALYSIS — `emit_value_return` was already right given a right `cur_moved`.
+The original entry follows for the record.
 
 For a struct that owns something (`Drop` impl, or `Drop`-bearing fields), `return d` moves
 the local and `return ok(D{ … })` moves the literal, but **`return ok(d)` copies `d` into
