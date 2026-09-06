@@ -1725,11 +1725,13 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             return
         }
         // An `extern … var` GLOBAL (B2): the C symbol, bare — no `j_`, no canon — because
-        // the symbol belongs to the linker, as an extern fn's does (mirrors `extern_globals`).
-        let gx: i32 = find_extern_item(p, src, src[e.start .. e.end])
-        if gx >= 0 {
-            let git: parser.ItemData = list.get(parser.ItemData, p.it, gx as usize)
-            if git.b < 0 {
+        // the symbol belongs to the linker, as an extern fn's does. Decided by the CHECKER's
+        // record (`c.gref`, the reference's `Resolved.global`), never by the spelling: a
+        // local `errno` shadows the global, and this arm has no scope of its own.
+        if is_global_ref(c, eid) {
+            let gx: i32 = find_extern_item(p, src, src[e.start .. e.end])
+            if gx >= 0 {
+                let git: parser.ItemData = list.get(parser.ItemData, p.it, gx as usize)
                 if git.cns >= 0 { string_push(sb, src[git.cns as usize .. git.cne as usize]) }
                 else { string_push(sb, src[e.start .. e.end]) }
                 return
@@ -4188,6 +4190,17 @@ fn emit_extern_protos(mut sb: String, read p: parser.Parser, read src: str) {
         r = r + 1
     }
     if any { string_push(sb, "\n") }
+}
+
+// Did the checker resolve Name `eid` to an `extern … var` global? (`c.gref` membership —
+// the reference's `info.global_ref(id)`.)
+fn is_global_ref(read c: typeck.Checker, eid: i32) -> bool {
+    var i: usize = 0
+    for i < list.len(i32, c.gref) {
+        if list.get(i32, c.gref, i) == eid { return true }
+        i = i + 1
+    }
+    return false
 }
 
 // The item id of an `extern "c"` fn named `src[ns..ne]`… by name, or -1.

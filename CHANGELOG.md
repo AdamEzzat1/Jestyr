@@ -26,6 +26,11 @@ versions are snapshots, not stability promises.
   break) and `doc`, and the P2 item dump prints `var`/`fn` so a global and a nullary fn
   never dump alike. Both port mirrors were watched failing.
 
+  A local that shadows a global is the local: the checker records on the expression that a
+  bare name resolved to the global, and both backends name the C symbol from that record
+  rather than from the spelling (the first cut decided by spelling, and a `var errno` local
+  wrote the real `errno`; the corpus file's `shadow()` pins the fix).
+
 ### Changed
 
 - **A computed value may no longer be passed to a `mut`/`out` parameter of a type with no

@@ -19873,9 +19873,16 @@ fn main() -> i32 {
     /// through `&errno` being visible through the name — the address is the symbol's.
     #[test]
     fn extern_global_is_a_readable_writable_place() {
+        // The last two: a LOCAL named `errno` shadows the global (42, computed through the
+        // local), and the global underneath is still 0. Before the fix the backend named
+        // the symbol for every spelling of the name, so `shadow()` wrote the real `errno`
+        // and printed 42 for BOTH — the checker had resolved the local; cgen had not asked.
         assert_eq!(
             toks("examples/extern_global.jtr"),
-            ["before", "0", "after-open", "true", "2", "cleared", "0", "addr-agrees", "true"]
+            [
+                "before", "0", "after-open", "true", "2", "cleared", "0", "addr-agrees", "true",
+                "shadowed", "42", "0",
+            ]
         );
     }
 

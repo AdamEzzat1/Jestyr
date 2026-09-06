@@ -3139,6 +3139,12 @@ impl<'a> TypeChecker<'a> {
                     if key != n.name {
                         self.record_call_sym(id, key);
                     }
+                    // An `extern … var` global, reached because no local shadowed it:
+                    // say so on the row, which is the only thing the backend may name
+                    // the C symbol from (B2).
+                    if self.table.globals.contains(&n.name) {
+                        self.row(id).global = true;
+                    }
                     t
                 } else if let Some(&i) = self.table.variants.get(&self.canon_variant_in(self.cur_mod, &n.name)) {
                     // A bare nullary variant, e.g. `none` — for a generic enum its

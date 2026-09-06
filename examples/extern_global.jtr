@@ -40,5 +40,18 @@ fn main() -> i32 {
     print_str("addr-agrees")
     print_bool(errno == 7)
     errno = 0
+
+    // A LOCAL of the same name shadows the global, exactly as it shadows a const: the
+    // checker resolves the name to the binding, and the backend must follow the checker
+    // rather than the spelling. The global stays 0 underneath — read again after.
+    print_str("shadowed")
+    print_int(shadow())
+    print_int(errno as i64)
     return 0
+}
+
+fn shadow() -> i64 {
+    var errno: i64 = 40
+    errno = errno + 2
+    return errno
 }

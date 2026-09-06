@@ -1114,8 +1114,14 @@ corpus-wide P2/P3/P4/doc goldens. Two mirrors watched failing: the port's Name a
 the cgen golden diverges on the corpus file; the port's `var` arm off → the item dump
 diverges on the snippets.
 
-**Recorded, not fixed:** a local shadowing a global reads the global in the backend — typeck
-finds the local first, but the cgen Name arm has no scope. No corpus file does it.
+**A gap this first shipped with, closed the same day:** a local shadowing a global read the
+global in the backend — typeck found the local first, but the cgen Name arm decided by
+spelling, so a `var errno` local wrote the real `errno` (watched failing: 2 and 2 for 42 and
+0). The checker now records the resolution on the expression row (`Resolved.global`; the
+port's `c.gref`) and both backends name the symbol from that alone. The corpus file's
+`shadow()` pins it. **A backend that decides by spelling what the checker decided by scope
+is a divergence waiting for the first shadow** — the same shape as `call_sym`, and it was
+fixed the same way.
 
 ## §4. Comparison suites, rerun at this milestone
 

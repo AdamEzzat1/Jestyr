@@ -332,9 +332,14 @@ T`, attest-hashed, so a `fn`↔`var` swap is a break), the P2 printer, the refer
 sizing a feature by its exhaustive matches, ask whether it is a new KIND or a new FLAG on
 one** — the answer is the difference between a session and an afternoon.
 
-Recorded, not fixed: a local shadowing a global reads the global in the backend (typeck
-resolves the local first; the cgen Name arm has no scope). No corpus file does it. `environ`
-still goes through `env_block`; switching it is POSIX-only and owed to the Linux ladder.
+**The shadowing gap this first shipped with is closed.** A local named like a global used to
+read the global in the backend: typeck resolved the local, but the cgen Name arm decided by
+SPELLING, so `var errno: i64 = 40  errno = errno + 2` declared `j_errno` and then wrote the
+real `errno` (watched: 2 and 2 where 42 and 0 were owed). The checker now records on the
+expression row that a bare Name resolved to a global (`Resolved.global`; the port's
+`c.gref` list) and both backends name the symbol from that record and from nothing else.
+`shadow()` in the corpus file pins it. `environ` still goes through `env_block`; switching
+it is POSIX-only and owed to the Linux ladder.
 
 ### Not in this queue, deliberately
 
@@ -665,6 +670,15 @@ measures the buffer, not the file; sync first.
 
 **A suite is not registered until its count is in `io_suites_pass`.** Four landed green and
 gated nothing.
+
+**`jestyrc check` is QUIET on an undeclared bare name.** A `Name` that resolves to nothing
+types as `Unknown` ("a function name or external symbol: stay quiet"), so a typo in a `.jtr`
+source — `eid` for `id` — passes every front-end check and dies in gcc with `'j_eid'
+undeclared`. In the compiler's own modules that means a green `check` on `typeck.jtr` is not
+evidence it builds; run the golden (or `jc build`) before believing an edit to the sixteen.
+The leniency exists for fn-pointer values (`&make`) and extern symbols; a rule that refuses
+a name found in none of scope, consts, variants, fns, externs and globals would close it
+and is a two-sided `escape` item by the usual argument.
 
 **`cmd.exe /c` strips the outer quotes off a command line that BEGINS with one**, so quoting
 a program path — the spelling that looks obviously correct — mangles the rest of the line.

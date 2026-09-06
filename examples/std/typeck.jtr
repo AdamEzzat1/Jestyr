@@ -78,7 +78,10 @@ import "ctfe"
 // row) and `icalls` each impl-dispatched call (5-tuples: call ExprId, trait name span, method
 // name span) — the downstream passes' `method_calls`/`impl_calls` (the escape checker's
 // give-away and manual-drop rules read them).
-pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), pub bcalls: List(i32), pub dcalls: List(i32), pub dcoerce: List(i32), pub epay: List(i32), pub tferr: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, ctsv: i32, alloc: Allocator }
+// `gref` lists the ExprIds of bare Names that resolved to an `extern … var` GLOBAL with no
+// local shadowing them — the reference's `Resolved.global` (B2). The backend names the C
+// symbol from this list and from nothing else.
+pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), pub bcalls: List(i32), pub dcalls: List(i32), pub dcoerce: List(i32), pub epay: List(i32), pub tferr: List(i32), pub gref: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, ctsv: i32, alloc: Allocator }
 
 // One `Ty` arena node - kinds in the header comment. `a`/`b` are child TyIds or slice fields;
 // `x`/`y` are aux ints (prim code, name span, ret TyId/conv).
@@ -106,7 +109,7 @@ fn mk_ty(mut c: Checker, kind: i32, a: i32, b: i32, x: i32, y: i32) -> i32 {
 // The checker with the well-known instances pre-created (ids 0..7) and `et` sized to the
 // expression arena, all-Unknown.
 fn make_checker(read p: parser.Parser, read a: Allocator) -> Checker {
-    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), tra: list.make(i32, a), imp: list.make(i32, a), mcalls: list.make(i32, a), icalls: list.make(i32, a), bcalls: list.make(i32, a), dcalls: list.make(i32, a), dcoerce: list.make(i32, a), epay: list.make(i32, a), tferr: list.make(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, ctsv: 0 - 1, alloc: a }
+    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), tra: list.make(i32, a), imp: list.make(i32, a), mcalls: list.make(i32, a), icalls: list.make(i32, a), bcalls: list.make(i32, a), dcalls: list.make(i32, a), dcoerce: list.make(i32, a), epay: list.make(i32, a), tferr: list.make(i32, a), gref: list.make(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, ctsv: 0 - 1, alloc: a }
     mk_ty(c, 0, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 0 Unknown
     mk_ty(c, 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 1 Unit
     mk_ty(c, 2, 0 - 1, 0 - 1, 2, 0 - 1)            // 2 Prim i32   (code 2)
@@ -410,6 +413,21 @@ fn find_fn(read c: Checker, read src: str, ns: usize, ne: usize) -> i32 {
         i = i + 1
     }
     return 0 - 1
+}
+
+// Is `src[ns..ne]` the name of an `extern … var` GLOBAL (an extern item with `b == -1`)? The
+// reference's `globals` set, answered by a scan since the port keeps no such set.
+fn is_global_name(read p: parser.Parser, read src: str, ns: usize, ne: usize) -> bool {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r as usize)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 8 and it.b < 0 {
+            if str_eq(src[it.x as usize .. it.y as usize], src[ns .. ne]) { return true }
+        }
+        r = r + 1
+    }
+    return false
 }
 
 // The const's declared type for `src[ns..ne]`, or -1 (the reference's `consts` map).
@@ -2089,7 +2107,12 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         if hit >= 0 { r = hit }
         else {
             let ct: i32 = find_const(c, src, d.start, d.end)
-            if ct >= 0 { r = ct }
+            if ct >= 0 {
+                r = ct
+                // Reached the const table with no local in the way: if the name is an
+                // `extern … var` global, record the ExprId (mirrors `Resolved.global`).
+                if is_global_name(p, src, d.start, d.end) { list.push(i32, c.gref, id) }
+            }
             else {
                 let erow: i32 = find_variant(c, src, d.start, d.end)
                 if erow >= 0 {                     // a bare nullary variant, e.g. `none`

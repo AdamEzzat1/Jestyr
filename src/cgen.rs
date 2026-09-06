@@ -5428,12 +5428,12 @@ impl<'a> Cgen<'a> {
                 } else if self.no_mangle_consts.contains(&n.name) {
                     // A `@no_mangle` const is referenced by its bare exported name.
                     n.name.clone()
-                } else if let Some(sym) = self.extern_globals.get(&n.name) {
-                    // An `extern … var` global (B2): the C symbol, bare. A local of the
-                    // same name would have been found by `scope_lookup` first in typeck,
-                    // but the backend has no scope here — so a program shadowing a global
-                    // with a local reads the global. Recorded; no corpus file does it.
-                    sym.clone()
+                } else if self.info.global_ref(id) {
+                    // An `extern … var` global (B2): the C symbol, bare — but only when
+                    // the CHECKER resolved this name to the global. The backend has no
+                    // scope at this arm, and deciding by the spelling made a local
+                    // `errno` write the real one (`examples/extern_global.jtr`, `shadow`).
+                    self.extern_globals.get(&n.name).cloned().unwrap_or_else(|| n.name.clone())
                 } else {
                     // `call_sym` carries typeck's resolution for a bare name that
                     // COLLIDES across modules — set only for a const or function the
@@ -5475,9 +5475,12 @@ impl<'a> Cgen<'a> {
                         if let Some(sym) = self.extern_fns.get(&n.name) {
                             return format!("(&{sym})");
                         }
-                        // The address of an `extern … var` global is the symbol's (B2).
-                        if let Some(sym) = self.extern_globals.get(&n.name) {
-                            return format!("(&{sym})");
+                        // The address of an `extern … var` global is the symbol's (B2) —
+                        // by the checker's resolution, not the spelling (see the Name arm).
+                        if self.info.global_ref(*rhs) {
+                            if let Some(sym) = self.extern_globals.get(&n.name) {
+                                return format!("(&{sym})");
+                            }
                         }
                         // Canonical name for a colliding function referenced by
                         // address (the checker recorded it on the name expr);
