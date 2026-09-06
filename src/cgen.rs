@@ -292,7 +292,18 @@ fn emit_program(
                 // (`fn sys_read = "read"(…)`) separates the two; without one they are
                 // the same string, which is every extern written before the alias existed
                 // and is why nothing else in this file had to care.
-                Item::Extern(e) => Some((
+                Item::Extern(e) if !e.is_global => Some((
+                    e.name.name.clone(),
+                    e.c_name.clone().unwrap_or_else(|| e.name.name.clone()),
+                )),
+                _ => None,
+            })
+            .collect(),
+        extern_globals: ast
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Extern(e) if e.is_global => Some((
                     e.name.name.clone(),
                     e.c_name.clone().unwrap_or_else(|| e.name.name.clone()),
                 )),
@@ -792,6 +803,10 @@ struct Cgen<'a> {
     /// declared alias; different for `extern "unistd.h" fn sys_read = "read"(…)`, which
     /// exists because `read` is a Jestyr KEYWORD and cannot be an extern's name at all.
     extern_fns: HashMap<String, String>,
+    /// `extern … var` globals (B2): Jestyr name → C symbol. A read or a write of one
+    /// names the symbol bare — no `j_` prefix, no module canon — because the symbol
+    /// belongs to the linker, exactly as an extern fn's does.
+    extern_globals: HashMap<String, String>,
     /// trait names used as `dyn Trait` anywhere — each gets a synthesized vtable
     /// struct + fat-pointer typedef, and a static vtable per `impl` (Stage F).
     dyn_traits: HashSet<String>,
@@ -2785,6 +2800,18 @@ impl<'a> Cgen<'a> {
                     Some(t) => self.c_ty_ast(t),
                     None => "void".to_string(),
                 };
+                if e.is_global {
+                    // A global under `extern "c"` is declared, not defined: the symbol
+                    // lives in whatever the program links against. A `.h` abi was
+                    // `continue`d above, for the same reason a header-declared fn gets
+                    // no prototype — and for `errno` it is the only thing that works,
+                    // since a macro cannot be redeclared.
+                    let key = e.c_name.clone().unwrap_or_else(|| e.name.name.clone());
+                    let g = self.cfg_open(cfg, &key);
+                    self.raw(format!("extern {ret} {key};\n"));
+                    self.cfg_close(g);
+                    continue;
+                }
                 let params = self.extern_params_str(e);
                 // The prototype declares the C SYMBOL. Under a declared alias the Jestyr
                 // name never reaches the emitted C at all — it exists so the source can
@@ -5401,6 +5428,12 @@ impl<'a> Cgen<'a> {
                 } else if self.no_mangle_consts.contains(&n.name) {
                     // A `@no_mangle` const is referenced by its bare exported name.
                     n.name.clone()
+                } else if let Some(sym) = self.extern_globals.get(&n.name) {
+                    // An `extern … var` global (B2): the C symbol, bare. A local of the
+                    // same name would have been found by `scope_lookup` first in typeck,
+                    // but the backend has no scope here — so a program shadowing a global
+                    // with a local reads the global. Recorded; no corpus file does it.
+                    sym.clone()
                 } else {
                     // `call_sym` carries typeck's resolution for a bare name that
                     // COLLIDES across modules — set only for a const or function the
@@ -5440,6 +5473,10 @@ impl<'a> Cgen<'a> {
                 if matches!(op, UnOp::Ref) {
                     if let ExprKind::Name(n) = &self.ast.expr_at(*rhs).kind {
                         if let Some(sym) = self.extern_fns.get(&n.name) {
+                            return format!("(&{sym})");
+                        }
+                        // The address of an `extern … var` global is the symbol's (B2).
+                        if let Some(sym) = self.extern_globals.get(&n.name) {
                             return format!("(&{sym})");
                         }
                         // Canonical name for a colliding function referenced by

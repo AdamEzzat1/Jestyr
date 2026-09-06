@@ -70,7 +70,8 @@ Variant   = IDENT [ '(' [ Field { ',' Field } ] ')' ]
 
 Const     = 'const' IDENT [ ':' Type ] '=' Expr
 Distinct  = 'distinct' IDENT '=' Type
-Extern    = 'extern' STR 'fn' IDENT Params [ '->' Type ]
+Extern    = 'extern' [ STR ] 'fn' IDENT [ '=' STR ] Params [ '->' Type ]
+          | 'extern' [ STR ] 'var' IDENT [ '=' STR ] ':' Type
 Import    = 'import' STR [ '=' STR ]
 Trait     = 'trait' IDENT '{' { TraitMethod } '}'
 Impl      = 'impl' [ Generics ] IDENT 'for' Type '{' { Fn } '}'

@@ -572,6 +572,20 @@ pub(crate) fn extern_sig(ast: &Ast, e: &ExternFn) -> String {
     // `fn sys_read = "_read"` — the POSIX and Windows halves of one binding — must not
     // render identically. They bind different C symbols, which is exactly the kind of
     // drift the manifest exists to catch.
+    if e.is_global {
+        // A global's contract is its symbol and its type — there is nothing else to
+        // render, and the `var` keyword is what separates it from a nullary function
+        // in the manifest (a change between the two IS an ABI break).
+        match &e.c_name {
+            Some(sym) => s.push_str(&format!("extern \"{}\" var {} = \"{sym}\"", e.abi, e.name.name)),
+            None => s.push_str(&format!("extern \"{}\" var {}", e.abi, e.name.name)),
+        }
+        if let Some(t) = e.ret_ty {
+            s.push_str(": ");
+            s.push_str(&ty_str(ast, t));
+        }
+        return s;
+    }
     match &e.c_name {
         Some(sym) => s.push_str(&format!("extern \"{}\" fn {} = \"{sym}\"(", e.abi, e.name.name)),
         None => s.push_str(&format!("extern \"{}\" fn {}(", e.abi, e.name.name)),

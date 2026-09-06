@@ -12970,6 +12970,10 @@ mod c_oracle {
                 // the port) and the text is the thing that has to agree. `-` for absent,
                 // which no C symbol can be.
                 out.push(e.c_name.clone().unwrap_or_else(|| "-".to_string()));
+                // `var` or `fn` (B2): a global and a nullary fn returning `T` would
+                // otherwise dump alike, and the port marks the difference by a
+                // sentinel param count (-1) that this atom is the readable form of.
+                out.push(if e.is_global { "var" } else { "fn" }.to_string());
                 out.push(e.params.len().to_string());
                 ref_dump_params(ast, &e.params, out);
                 out.push(ref_conv_code(e.ret_conv).to_string());
@@ -14287,6 +14291,10 @@ mod c_oracle {
             "impl[T] Drop for Vec(T) { fn drop(mut self) { } }", // a blanket impl generic
             "pub fn map[T: Show](x: T) { }",             // pub + a bounded generic
             "extern \"stdcall\" fn WinApi(h: i32) -> i32", // a non-default extern abi
+            // extern GLOBALS (B2): header-declared, aliased, public, guarded
+            "extern \"errno.h\" var errno: i32",          // a header-declared global
+            "pub extern \"c\" var counter = \"g_counter\": i64", // public, with a declared alias
+            "@cfg(posix) extern \"unistd.h\" var environ: *mut cstr", // a `@cfg`-guarded global
             // fn error sets + contracts
             "fn load() -> i32 !{ NotFound, Timeout } { 0 }", // an error set
             "fn div(a: i32, b: i32) -> i32 requires b != 0 ensures result > 0 { a }", // contracts
@@ -15616,6 +15624,8 @@ fn g(p: *mut i32) -> i32 {
             "examples/loops_advanced.jtr",
             "examples/shapes.jtr",
             "examples/array_lit.jtr",
+            // B2: an `extern … var` record — `var NAME: T` in the manifest, never `fn`.
+            "examples/extern_global.jtr",
         ] {
             let out = Command::new(&jc).args([file, "attest"]).output().unwrap();
             assert!(
@@ -18732,6 +18742,9 @@ fn main() -> i32 {
         // failing on exactly this file — without it the port drops the local and the
         // emitted C differs by one drop call.
         "return_ok_local.jtr",
+        // B2: an `extern … var` global — the declaration-free `.h` form, a read, a write,
+        // and `&global`. The port mirror was watched failing on this file.
+        "extern_global.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same
@@ -19852,6 +19865,20 @@ fn main() -> i32 {
     /// fix the middle one printed `drop fired` INSIDE the maker and handed back a freed
     /// String, and the run ended in `STATUS_HEAP_CORRUPTION`. Exactly three drops, all
     /// after `-- end of main --`, is the assertion: a drop anywhere earlier is the bug.
+    /// **B2: `extern … var` binds a foreign GLOBAL, as a place.** `errno` is the probe
+    /// because it is a MACRO on every libc this backend meets, so it works only if the
+    /// binding emits no declaration and names the symbol at each use. The three numbers
+    /// are a read (0 after clearing), the value a failed `fopen` leaves (ENOENT is 2 on
+    /// every platform here), and a read after an assignment; the final `true` is a write
+    /// through `&errno` being visible through the name — the address is the symbol's.
+    #[test]
+    fn extern_global_is_a_readable_writable_place() {
+        assert_eq!(
+            toks("examples/extern_global.jtr"),
+            ["before", "0", "after-open", "true", "2", "cleared", "0", "addr-agrees", "true"]
+        );
+    }
+
     #[test]
     fn return_ok_local_moves_the_local() {
         let got = toks("examples/return_ok_local.jtr");

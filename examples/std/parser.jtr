@@ -2282,6 +2282,24 @@ fn parse_extern(mut p: Parser, is_pub: i32, attr_start: i32, attr_count: i32) ->
     bump(p)                                        // consume `extern`
     var abis: i32 = 0 - 1  var abie: i32 = 0 - 1   // abi inner span (-1 => default "c")
     if cur_kind(p) == 3 { let at: tokens.Token = cur_tok(p)  abis = (at.start + 1) as i32  abie = (at.end - 1) as i32  bump(p) }
+    // `extern "hdr" var NAME [= "sym"]: T` — a foreign GLOBAL (B2). Marked by param_count
+    // `b == -1` (a fn always has `b >= 0`); its type rides in `z` where a fn's return would.
+    // Mirrors the `Var` arm of `parse_extern`.
+    if cur_kind(p) == 9 {
+        bump(p)                                    // `var`
+        let gt: tokens.Token = cur_tok(p)
+        var gns: usize = gt.start
+        var gne: usize = gt.end
+        if cur_kind(p) == 0 { bump(p) }
+        var gsyms: i32 = 0 - 1  var gsyme: i32 = 0 - 1
+        if cur_kind(p) == 84 {                     // `=`
+            bump(p)
+            if cur_kind(p) == 3 { let gs: tokens.Token = cur_tok(p)  gsyms = (gs.start + 1) as i32  gsyme = (gs.end - 1) as i32  bump(p) }
+        }
+        if cur_kind(p) == 71 { bump(p) }           // `:`
+        let gty: i32 = parse_type(p)
+        return mk_item_extern(p, start, prev_end(p), is_pub, gns, gne, 0 - 1, 0 - 1, 0, gty, abis, abie, attr_start, attr_count, gsyms, gsyme)
+    }
     if cur_kind(p) == 7 { bump(p) }                // `fn`
     // `eat_ident`: the offending token's span when the name is absent.
     let idn14: tokens.Token = cur_tok(p)
@@ -3448,8 +3466,10 @@ fn dump_item(read src: str, read p: Parser, iid: i32) {
         // The declared alias, as TEXT — the reference stores a String and this stores a
         // span, so the text is the thing that has to agree. `-` for absent.
         if d.cns < 0 { print_str("-") } else { print_str(src[d.cns as usize .. d.cne as usize]) }
-        print_int(d.b as i64)
-        dump_params(src, p, d.a, d.b)
+        // `var` or `fn` (B2): a global is marked by `b == -1` (a fn always has b >= 0),
+        // and the reference dumps a `0` param count for it, so the count is printed as 0.
+        if d.b < 0 { print_str("var") print_int(0) } else { print_str("fn") print_int(d.b as i64) }
+        if d.b > 0 { dump_params(src, p, d.a, d.b) }
         print_int(d.op as i64)
         if d.z < 0 { print_str("(") print_str("none") print_str(")") } else { dump_type(src, p, d.z) }
     } else {

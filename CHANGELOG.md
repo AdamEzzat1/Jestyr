@@ -5,6 +5,27 @@ versions are snapshots, not stability promises.
 
 ## Unreleased
 
+### Added
+
+- **`extern … var` binds a foreign GLOBAL** (B2), on both compilers. `extern "errno.h" var
+  errno: i32` is a readable, assignable place named by its C symbol; `extern "c" var x: T`
+  emits `extern T x;`, a `.h` abi emits nothing (the header's declaration is the truth, and
+  `errno` is a macro on every libc this backend meets, so nothing else could have worked).
+  The declared alias (`var counter = "g_counter": i64`) and `@cfg` work as for functions.
+  `examples/extern_global.jtr` reads `errno`, has a failed `fopen` set it, clears it, and
+  writes through `&errno`; its transcript is pinned and both cgen backends agree on its C.
+
+  **The recorded cost was wrong by an order of magnitude, and the reason is the lesson.** The
+  register sized this as a NEW item kind: 257 exhaustive `Item::` matches across seventeen
+  files, plus 42 in the port, plus attest and doc. A global IS an extern symbol with a type —
+  the same header, alias, `@cfg` and ABI story — that happens to have no parameter list, so
+  it is carried on the existing extern item under an `is_global` flag (the port marks it
+  with a `-1` parameter count, the one slot every reader already bounds-checks). Every
+  exhaustive match kept compiling; nine sites branch, and each is one the change genuinely
+  concerns. It reaches `attest` (`var NAME: T`, never `fn`, so a swap between the two is a
+  break) and `doc`, and the P2 item dump prints `var`/`fn` so a global and a nullary fn
+  never dump alike. Both port mirrors were watched failing.
+
 ### Changed
 
 - **A computed value may no longer be passed to a `mut`/`out` parameter of a type with no

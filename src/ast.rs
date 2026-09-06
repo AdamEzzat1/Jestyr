@@ -596,6 +596,21 @@ pub struct ExternFn {
     pub params: Vec<Param>,
     pub ret_conv: Conv,
     pub ret_ty: Option<TypeId>,
+    /// `extern "errno.h" var errno: i32` — a foreign GLOBAL rather than a function
+    /// (B2). Carried on this item rather than as an `Item` kind of its own, and that
+    /// was a measured decision: a new kind is 257 exhaustive-match sites across
+    /// seventeen files, every one of them a compile error until visited, while a
+    /// global IS an extern symbol with a type — the same header, alias, `@cfg` and
+    /// ABI story — that happens to have no parameter list. So `params` is empty,
+    /// `ret_ty` holds the variable's type, and only the sites that CARE branch on
+    /// this flag: the parser, name resolution, the declaration and name emission,
+    /// the attest record, the doc signature and the P2 printer.
+    ///
+    /// A global is a PLACE: readable and assignable, by its C symbol. A `.h` abi emits
+    /// no declaration of its own (the header's is the truth — and `errno` is a macro
+    /// on every libc that matters, which only works because nothing redeclares it);
+    /// `extern "c"` emits `extern T sym;`.
+    pub is_global: bool,
     pub span: Span,
 }
 

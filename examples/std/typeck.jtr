@@ -657,6 +657,12 @@ fn build_table(mut c: Checker, read p: parser.Parser, read src: str) {
             list.push(i32, c.cst, it.x)
             list.push(i32, c.cst, it.y)
             list.push(i32, c.cst, t)
+        } else if it.kind == 8 and it.b < 0 {      // extern GLOBAL (B2): a typed name, registered
+            var t: i32 = t_unknown()               // as a const so a bare read types through the
+            if it.z >= 0 { t = lower_type(c, p, src, it.z) }   // ordinary Name path (mirrors the
+            list.push(i32, c.cst, it.x)            // `is_global` arm of `build_table`)
+            list.push(i32, c.cst, it.y)
+            list.push(i32, c.cst, t)
         } else if it.kind == 8 {                   // extern fn signature
             var ret: i32 = t_unit()
             if it.z >= 0 { ret = lower_type(c, p, src, it.z) }

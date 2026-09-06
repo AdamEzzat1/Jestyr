@@ -1088,6 +1088,35 @@ the §7 list: `out` is a keyword (a parameter named `out` is 32 parse errors), a
 and `cache_test` had no entry in `io_suites_pass`. Green for their authors, checked by
 nothing on CI. Registered with their counts pinned, alongside `kv_test`.
 
+## §3r. B2 — `extern … var`, and a cost estimate that priced the wrong design
+
+`extern "errno.h" var errno: i32` binds a foreign global as a place: read, assigned and
+`&`-taken by its C symbol. `extern "c" var x: T` declares `extern T x;`; a `.h` abi emits
+nothing, which for `errno` — a macro on glibc and msvcrt alike — is the only thing that can
+work. The alias and `@cfg` forms are the function ones.
+
+**The register said 257 `Item::` sites. The number was right; the design was wrong.** That
+is the price of a new item KIND, and every one of those sites is a compile error until
+visited (a silent fall-through in the port). A global is an extern symbol with a type that
+has no parameter list — same header, alias, `@cfg` and ABI story — so it is a FLAG on the
+existing extern item. `is_global` on the reference; on the port, param count `b == -1`,
+because every reader of an extern already bounds its loops by `b` and the other free-looking
+slots (`(g,h)`, `v`, `e`) are read kind-blind — the alias work found that by segfaulting.
+Nine sites branch: parser, typeck (registers as a const and in a new `globals` set), cgen's
+symbol map, declaration, Name arm and `&name`, `doc::extern_sig` (`var NAME: T`, which
+attest hashes — a swap between `fn` and `var` is a break), the P2 printer, and the reference
+item dump (an explicit `var`/`fn` atom, since a global and a nullary fn otherwise dump
+alike). Every exhaustive match kept compiling untouched.
+
+**Verification.** `examples/extern_global.jtr` (transcript pinned; in the cgen allowlist and
+the attest list), three P2 item snippets (header-declared, aliased+pub, `@cfg`), and the
+corpus-wide P2/P3/P4/doc goldens. Two mirrors watched failing: the port's Name arm off →
+the cgen golden diverges on the corpus file; the port's `var` arm off → the item dump
+diverges on the snippets.
+
+**Recorded, not fixed:** a local shadowing a global reads the global in the backend — typeck
+finds the local first, but the cgen Name arm has no scope. No corpus file does it.
+
 ## §4. Comparison suites, rerun at this milestone
 
 Run twice this arc — after §3 and again after §3c, since both changed compiler semantics.
@@ -1508,12 +1537,11 @@ goldens covered the change from the first run without a new corpus file.
 | Sandbox: cwd, process groups, fs capability projection | medium | `sysproc.jtr:113` names all three. `fs.Fs` gates the parent; nothing projects it onto a child. |
 | attest: corpus minimizer, benchmark history | medium | `@bench` emits timings; nothing records them across runs. |
 
-#### B2. `extern` binding a C global — the language feature, SIZED
+#### ~~B2. `extern` binding a C global~~ — **DONE (§3r)**, as a flag on the extern item
 
-Still the principled answer for foreign globals, and no longer needed for anything urgent
-(`environ` went through an intrinsic). **Measured before deferring**: a new item kind means
-252 `Item::` match sites across nine reference files plus 42 in the port, and it must also
-reach `attest` (a global is ABI) and `doc`. Larger than the select AST change in A1.
+The 257-site measurement priced a NEW item kind; a global is an extern symbol with a type
+and no parameters, so it rides `ExternFn` under `is_global` and nine sites branch. Both
+sides, both mirrors watched failing, `examples/extern_global.jtr` pinned.
 
 #### B3. The brief's remaining areas — a session each
 

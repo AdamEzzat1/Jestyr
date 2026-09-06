@@ -644,6 +644,35 @@ impl<'src> Parser<'src> {
         } else {
             "c".to_string()
         };
+        // `extern "hdr" var NAME [= "sym"]: T` — a foreign GLOBAL (B2). Same header,
+        // alias and `@cfg` story as a function; the `var` is what says "a place, not a
+        // call", and the type sits where a function's return type would.
+        if self.at(Var) {
+            self.bump();
+            let name = self.eat_ident("global name");
+            let c_name = if self.eat(Eq) {
+                let sp = self.cur().span;
+                self.expect(Str, "the C symbol as a string");
+                Some(self.text(sp).trim_matches('"').to_string())
+            } else {
+                None
+            };
+            self.expect(Colon, "`:` and the global's type");
+            let ty = self.parse_type();
+            let span = start.to(self.prev_span());
+            return ExternFn {
+                is_pub: false,
+                abi,
+                attrs: Vec::new(),
+                name,
+                c_name,
+                params: Vec::new(),
+                ret_conv: Conv::Default,
+                ret_ty: Some(ty),
+                is_global: true,
+                span,
+            };
+        }
         self.expect(Fn, "`fn`");
         let name = self.eat_ident("function name");
         // `= "<c symbol>"` — the declared alias. The same `= "<string>"` shape
@@ -667,7 +696,18 @@ impl<'src> Parser<'src> {
             ret_ty = Some(self.parse_type());
         }
         let span = start.to(self.prev_span());
-        ExternFn { is_pub: false, abi, attrs: Vec::new(), name, c_name, params, ret_conv, ret_ty, span }
+        ExternFn {
+            is_pub: false,
+            abi,
+            attrs: Vec::new(),
+            name,
+            c_name,
+            params,
+            ret_conv,
+            ret_ty,
+            is_global: false,
+            span,
+        }
     }
 
     fn parse_conv(&mut self) -> Conv {

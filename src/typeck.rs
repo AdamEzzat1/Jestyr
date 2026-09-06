@@ -640,6 +640,28 @@ impl<'a> TypeChecker<'a> {
                     let t = c.ty.map(|t| self.lower_type(&empty, t)).unwrap_or(Ty::Unknown);
                     self.table.consts.insert(self.canon_in(item_m, &c.name.name), t);
                 }
+                Item::Extern(e) if e.is_global => {
+                    // A foreign GLOBAL is a typed NAME, not a callable: it registers as a
+                    // const so a bare read resolves to its type through the ordinary
+                    // `Name` arm, and in `globals` so the backend and the assignment rule
+                    // know it is a symbol rather than a `static const`. Keyed by the bare
+                    // name, never canonicalized — an extern's name IS a C symbol (the
+                    // owners pass puts it in `extern_owned` for the same reason).
+                    let t = e.ret_ty.map(|t| self.lower_type(&empty, t)).unwrap_or(Ty::Unknown);
+                    let cfg = crate::attrs::cfg_of(ast, &e.attrs);
+                    if (self.table.consts.contains_key(&e.name.name)
+                        || self.table.fns.contains_key(&e.name.name))
+                        && !crate::attrs::cfgs_may_share_a_name(
+                            fn_cfg.get(&e.name.name).unwrap_or(&None),
+                            &cfg,
+                        )
+                    {
+                        self.error(e.name.span, format!("duplicate definition of `{}`", e.name.name));
+                    }
+                    fn_cfg.insert(e.name.name.clone(), cfg);
+                    self.table.consts.insert(e.name.name.clone(), t);
+                    self.table.globals.insert(e.name.name.clone());
+                }
                 Item::Extern(e) => {
                     let params: Vec<ParamSig> = e
                         .params

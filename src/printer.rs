@@ -80,12 +80,21 @@ impl<'a> Printer<'a> {
                 // The declared alias is part of what was parsed, so it belongs in the
                 // dump — this is the P2 golden's view of the AST, and a form the port
                 // parsed but did not print would be a divergence nothing could see.
+                let kw = if e.is_global { "var" } else { "fn" };
                 match &e.c_name {
                     Some(sym) => self.line(
                         d,
-                        &format!("extern \"{}\" fn {} = \"{sym}\"", e.abi, e.name.name),
+                        &format!("extern \"{}\" {kw} {} = \"{sym}\"", e.abi, e.name.name),
                     ),
-                    None => self.line(d, &format!("extern \"{}\" fn {}", e.abi, e.name.name)),
+                    None => self.line(d, &format!("extern \"{}\" {kw} {}", e.abi, e.name.name)),
+                }
+                if e.is_global {
+                    // A global's type rides in `ret_ty`; dumped under its own label so a
+                    // global and a nullary fn returning `T` never print alike.
+                    if let Some(t) = e.ret_ty {
+                        self.line(d + 1, &format!("type: {}", self.type_str(t)));
+                    }
+                    return;
                 }
                 for p in &e.params {
                     let ts = p.ty.map(|t| self.type_str(t)).unwrap_or_else(|| "_".to_string());

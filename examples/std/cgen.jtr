@@ -1724,6 +1724,17 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, ")")
             return
         }
+        // An `extern … var` GLOBAL (B2): the C symbol, bare — no `j_`, no canon — because
+        // the symbol belongs to the linker, as an extern fn's does (mirrors `extern_globals`).
+        let gx: i32 = find_extern_item(p, src, src[e.start .. e.end])
+        if gx >= 0 {
+            let git: parser.ItemData = list.get(parser.ItemData, p.it, gx as usize)
+            if git.b < 0 {
+                if git.cns >= 0 { string_push(sb, src[git.cns as usize .. git.cne as usize]) }
+                else { string_push(sb, src[e.start .. e.end]) }
+                return
+            }
+        }
         string_push(sb, "j_")
         string_push(sb, src[e.start .. e.end])
         return
@@ -4137,6 +4148,19 @@ fn emit_extern_protos(mut sb: String, read p: parser.Parser, read src: str) {
                 var xns: i32 = it.x  var xne: i32 = it.y
                 if it.cns >= 0 { xns = it.cns  xne = it.cne }
                 let eg: bool = cfg_open_for(sb, p, src, xns, xne, cfg_word(p, src, it.xat, it.xac))
+                if it.b < 0 {
+                    // An `extern "c"` GLOBAL (B2) is declared, not defined: `extern T sym;`.
+                    // A `.h` abi was skipped above, as for a header-declared fn — and for
+                    // `errno` that is the only thing that works, a macro being undeclarable.
+                    string_push(sb, "extern ")
+                    emit_c_ty(sb, p, src, it.z)
+                    string_push(sb, " ")
+                    string_push(sb, src[xns as usize .. xne as usize])
+                    string_push(sb, ";\n")
+                    cfg_close(sb, eg)
+                    r = r + 1
+                    continue
+                }
                 emit_c_ty(sb, p, src, it.z)               // ret type (-1 = void)
                 string_push(sb, " ")
                 string_push(sb, src[xns as usize .. xne as usize])
@@ -15094,7 +15118,9 @@ fn at_extern_sig(mut sb: String, read p: parser.Parser, read src: str, read it: 
     if it.is_pub != 0 { string_push(sb, "pub ") }
     string_push(sb, "extern \"")
     if it.w >= 0 { string_push(sb, src[it.w as usize .. it.u as usize]) } else { string_push(sb, "c") }
-    string_push(sb, "\" fn ")
+    // A GLOBAL (B2, `b == -1`) renders `var NAME[ = "sym"]: T` — its contract is the symbol
+    // and the type, and the keyword is what keeps it apart from a nullary fn in the manifest.
+    if it.b < 0 { string_push(sb, "\" var ") } else { string_push(sb, "\" fn ") }
     string_push(sb, src[it.x as usize .. it.y as usize])
     // The declared alias is part of the ABI contract attest hashes: `fn sys_read = "read"`
     // and `fn sys_read = "_read"` bind different C symbols and must not render alike.
@@ -15102,6 +15128,10 @@ fn at_extern_sig(mut sb: String, read p: parser.Parser, read src: str, read it: 
         string_push(sb, " = \"")
         string_push(sb, src[it.cns as usize .. it.cne as usize])
         string_push(sb, "\"")
+    }
+    if it.b < 0 {
+        if it.z >= 0 { string_push(sb, ": ")  at_ty(sb, p, src, it.z) }
+        return
     }
     string_push(sb, "(")
     at_params(sb, p, src, it.a, it.b)

@@ -348,6 +348,11 @@ pub struct GlobalTable {
     pub type_index: HashMap<String, usize>,
     pub fns: HashMap<String, FnSig>,
     pub consts: HashMap<String, Ty>,
+    /// The names that are `extern … var` GLOBALS (B2). Each is also in `consts`
+    /// under the same key, which is what makes a bare read of it type-check; this set
+    /// is what tells the backend to name the C SYMBOL rather than a `j_`-prefixed
+    /// static, and what lets an assignment to one through.
+    pub globals: HashSet<String>,
     /// enum-variant name → its enum's index in `types`.
     pub variants: HashMap<String, usize>,
     /// trait name → its method set (for coherence + method resolution).

@@ -8,8 +8,9 @@ defects — one session at a time). §2 is the parallel work (library breadth �
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1357 passed / 0 failed / 3 ignored** (full ladder after `std/kv`, A12 and A11; the two new
-tests are `return_ok_local_moves_the_local` and `jestyr_mut_value_arg_matches_reference`).
+**1358 passed / 0 failed / 3 ignored** (full ladder after `std/kv`, A12, A11 and B2; the new
+tests are `return_ok_local_moves_the_local`, `jestyr_mut_value_arg_matches_reference` and
+`extern_global_is_a_readable_writable_place`).
 Those commits sit on `claude/tier5-compiler-handoff-75c515`, a fast-forward of the
 package-substrate branch; **neither is merged to master and the new commits are not
 pushed.** CI was fully green — all four jobs — at the substrate branch's head.
@@ -35,9 +36,9 @@ breadth, not the headline claim.
 **The COMPILER-DEFECT queue is now also done.** A7 (a range sub-view as a `mut` argument),
 A6 (`Self` in an impl, in every position), A8 (`@deprecated` reaching attest and doc) and
 B1 (`select`'s `closed` arm) all landed on both toolchains, each with its mirror watched
-failing. Area 10 is complete. The register's remaining entries are a decision (A11), a
-measured deferral (B2), and two CI-only items nobody in reach can watch (A10's sanitizer
-half, a second C compiler) — see §1.
+failing. Area 10 is complete. A11 has since been decided and enforced, A12 found and closed,
+and B2 (`extern … var`) built — so the register's remaining entries are two CI-only items
+nobody in reach can watch (A10's sanitizer half, a second C compiler) — see §1.
 
 **Three of those four had a WRONG recorded description**, and in two cases the recorded
 "correction" was worse than what it replaced. A7 was not about argument position and not a
@@ -58,12 +59,11 @@ Every item here touches the compiler's own closure, owes a port mirror, and forc
 reseed. **They cannot run in parallel with each other or with anything else that reseeds**
 (see §3). Do them one at a time, in this order.
 
-> **THE SERIAL QUEUE HAS ONE ENTRY LEFT, AND IT IS THE MEASURED DEFERRAL.** 1.1 (A7), 1.2
-> (A6), 1.3 (A8), 1.4 (B1), **1.6 (A12, `return ok(local)`)** and **both halves of A11** (the
-> lowering, and the language decision — a computed value into a `mut` param of an
-> indirection-free type is now REFUSED, both sides) are done, each mirror watched failing.
-> What is left is **1.5 (B2)**, `extern` binding a C global, deferred on measurement and
-> bigger than everything above it combined.
+> **THE SERIAL QUEUE IS EMPTY.** 1.1 (A7), 1.2 (A6), 1.3 (A8), 1.4 (B1), **1.6 (A12,
+> `return ok(local)`)**, **both halves of A11** (the lowering, and the language decision — a
+> computed value into a `mut` param of an indirection-free type is now REFUSED, both sides)
+> and **1.5 (B2, `extern … var`)** are all done, each mirror watched failing. B2 did not
+> cost what it was measured at — see §1.5 for why, because the reason generalises.
 >
 > **So the next session should be fanning out on §2**, and §2 parallelises where §1 could not.
 > Read §3 first — the sixteen closure modules are a global lock, and the reseed is the thing
@@ -309,18 +309,32 @@ handle; that shape is fine and stays (changing it now would only churn a green m
 reseed. The fix is in `collect_moved`, the move ANALYSIS, not in the `return` lowering —
 `emit_value_return` was already correct given a right `cur_moved` set.
 
-### 1.5 — B2: `extern` binding a C global — MEASURED, then deferred
+### ~~1.5 — B2: `extern` binding a C global~~ — **DONE, both sides; the measurement priced the wrong design**
 
-The principled answer for foreign globals, and no longer needed for anything urgent
-(`environ` went through an intrinsic instead). **Measured before deferring, and re-measured
-2026-09-05:** a new item kind means **257** `Item::` match sites across **seventeen**
-reference files (the old "252 across nine" undercounted the files: `cgen` 65, `typeck` 48,
-`parser` 42, `proptests` 23, `escape` 13, `module` 12, `doc` 10, `printer` 9, `attest` 8,
-and eight more) plus 42 in the port, and it must also reach `attest` (a global is ABI) and
-`doc`. Larger than everything above it combined, and — the reason it stays deferred rather
-than started — a HALF-DONE item kind is worse than none: every unmatched site is a compile
-error on the reference and a silent fall-through in the port. It is one session's work with
-nothing else in it, started with the `Item::` sweep, not a thing to fit beside other work.
+`extern "errno.h" var errno: i32`, `pub extern "c" var counter = "g_counter": i64`,
+`@cfg(posix) extern "unistd.h" var environ: *mut cstr`. A global is a PLACE — read,
+assigned, and `&`-taken by its C symbol. `extern "c"` declares `extern T sym;`; a `.h` abi
+declares nothing, which for `errno` (a macro on glibc and msvcrt) is the only thing that
+works. Corpus file `examples/extern_global.jtr` (cgen allowlist, attest list, transcript
+pinned), three P2 item snippets; both port mirrors watched failing (the cgen Name arm →
+cgen golden diverges on the corpus file; the parser `var` arm → item dump diverges).
+
+**The 257-site count was right, and it was the price of a design nobody had to choose.** 257
+is what a NEW item kind costs. A global is an extern symbol with a type and no parameter
+list — the same header, alias, `@cfg` and ABI story as a function — so it rides the EXISTING
+`ExternFn` item under an `is_global` flag. On the port it is param count `b == -1`, the one
+slot every reader of an extern already bounds its loops by; `(g,h)`, `v` and `e` are read
+kind-blind and were NOT usable, which the alias work had found by segfaulting. Nine sites
+branch, each one the change concerns: parser, typeck registration (a const plus a `globals`
+set), cgen's symbol map + declaration + Name arm + `&name`, `doc::extern_sig` (`var NAME:
+T`, attest-hashed, so a `fn`↔`var` swap is a break), the P2 printer, the reference item dump
+(an explicit `var`/`fn` atom). Every exhaustive match kept compiling untouched. **Before
+sizing a feature by its exhaustive matches, ask whether it is a new KIND or a new FLAG on
+one** — the answer is the difference between a session and an afternoon.
+
+Recorded, not fixed: a local shadowing a global reads the global in the backend (typeck
+resolves the local first; the cgen Name arm has no scope). No corpus file does it. `environ`
+still goes through `env_block`; switching it is POSIX-only and owed to the Linux ladder.
 
 ### Not in this queue, deliberately
 
