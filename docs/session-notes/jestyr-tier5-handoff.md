@@ -1330,7 +1330,44 @@ argument should be treated as consumed exactly as a bare `return` treats it. Tha
 closure edit and a reseed, so it belongs in the next-steps note's serial §1, and a corpus
 file that RETURNS `ok(local)` must be added so the port mirror can be watched failing.
 
-#### A13. Drop glue under COLLIDING type names calls a function that does not exist — OPEN
+#### A13. Drop glue under COLLIDING type names calls a function that does not exist — **CLOSED 2026-09-06**
+
+**What it was, measured.** One defect, not two: `typeck::register_impls` iterated the items
+WITHOUT setting `cur_mod` — the only item pass that did not — so `impl Drop for Writer` in
+`file` lowered `Writer` in whatever module the previous pass left behind, missed
+`Writer__m<file>`, degraded to `Opaque("Writer")` and was keyed `("Drop", "Writer")`. From
+that one key: (1) a `file.Writer` local's own key `Writer__m<file>` found no impl, so **it
+was never dropped** — the probe printed `1 2 3` and no `drop`; a leaked handle with no
+diagnostic; (2) `escape`'s `droppable_ty` answered "no" for it, so the consuming rule was
+off for such a program; (3) a `json.Writer` FIELD lowered from the emitting module — which
+had no `json` import to resolve the path through — degraded to the same `Opaque("Writer")`,
+FOUND the bare key, and called the symbol nothing emits. cgen's `aggregate_drop_fields` /
+`enum_drop_variants` were the second site: they matched the decl by BARE spelling (first
+struct named `Writer` wins) and lowered fields via `ast_type_to_ty`, i.e. from `cur_mod`.
+
+**The fix, reference-only.** `register_impls` sets `cur_mod` per item; `ast_type_to_ty`
+gained an explicit-module form `ast_type_to_ty_in(id, subst, m)` (with `path_target_in`),
+and the two drop-field helpers match by `canon_type_in(decl_mod, name) == decl.name` and
+lower from `decl_mod`; `generic_drop_impl`/`has_concrete_drop_impl` lower each impl's target
+from the impl's module. **The port needed nothing**: `ml_rewrite` renames colliding types in
+the token stream, so its typeck/cgen never see a bare `Writer` — it built and ran the probe
+correctly BEFORE the fix, which is what made this a two-compiler divergence. After the fix
+the two agree byte-for-byte (2,938 lines sans `#line`); the drift guard reported no reseed.
+
+**Pinned by:** `examples/std/drop_collide_demo.jtr` (`jdropcollide` — a scope-dropped
+`file.Writer` proven by the file's size read back, `3`, beside a `log.Logger` held from a
+module that never imports `json`; transcript test + the port-vs-reference run comparison +
+`jc_build_matrix`), and `module.rs::drop_glue_under_colliding_type_names_finds_the_right_impl_and_only_that_one`
+(the three-module `Res` fixture: impl keyed `Res__m<a>`, exactly one drop call, none on the
+holder). Both watched failing on the pre-fix binary: the demo with the undefined reference,
+the fixture with `1 2 3` and no drop.
+
+**Lesson, added to §3j's family:** "every spelling-based rule eventually meets a scope" —
+and every per-pass module context is a rule someone can forget to set. The item passes in
+`typeck.rs` and `cgen.rs` each set `cur_mod` themselves; there is no guard that a pass did.
+
+<details>
+<summary>Original entry</summary>
 
 Three modules in one closure each define a `Writer` (`file`, `writer`, one more); only
 `file.Writer` has a `Drop` impl, emitted canonically as `jestyr_impl_Drop__Writer__m21__drop`.
@@ -1350,6 +1387,8 @@ Routed around in `httpd_test` (no `sysfs` import). Needs: a probe program with t
 same-named types, one `Drop`, a field of the other; the fix in typeck's field-type lowering
 and/or `drop_key_of`; both sides; a reseed. **Any program importing `file` and `writer`
 together is exposed today.**
+
+</details>
 
 #### A14. The port's loader renamed LOCALS that share a colliding fn name — **CLOSED**
 

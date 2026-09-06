@@ -84,6 +84,23 @@ versions are snapshots, not stability promises.
 
 ### Fixed
 
+- **Drop glue under colliding type names finds the right `Drop`, and only it (A13).** When
+  two modules define one type name and one of them has a `Drop` — `file.Writer` beside
+  `json.Writer` and `writer.Writer` — the reference keyed the impl under the BARE name:
+  `register_impls` was the one item pass that never set the current module, so the impl's
+  target lowered in a stale module, missed the colliding `Writer__m<file>` and degraded to
+  an opaque `Writer`. Two consequences from that one key. A `file.Writer` local was NEVER
+  dropped (its canonical key found no impl — a leaked handle with no diagnostic), and a
+  struct holding another module's `Writer` field, dropped from a module that did not import
+  that field's module, called `jestyr_impl_Drop__Writer__drop` — a symbol nothing emits —
+  and failed to link. Had the names lined up, that field would have been handed to
+  `file.Writer`'s `fclose`. The drop walker now matches a decl by its canonical name and
+  lowers its field types from the DECLARING module (`ast_type_to_ty_in`), and the impl pass
+  sets its module like every other. The self-hosted compiler was already right — its loader
+  renames colliding types in the token stream — and the two agree byte-for-byte on the new
+  probe `examples/std/drop_collide_demo.jtr` (`jdropcollide`), which proves the drop by the
+  file size read back. No port change, no reseed.
+
 - **The self-hosted loader no longer renames a LOCAL that shares a colliding function's
   name (A14).** `jc` flattens an import closure at the token level and rewrites a module's
   own colliding top-level names at bare uses; a parameter or `let` of the same name was

@@ -742,7 +742,11 @@ mod jc_build_matrix {
     #[test]
     fn jc_built_generics_run_the_same_as_the_reference() {
         let jc = super::c_oracle::build_exe("examples/std/cgen.jtr");
-        for stem in ["combinators", "mutex", "slice_algos", "try_read", "log_demo", "str_demo"] {
+        // `drop_collide_demo` is A13's program: three modules spell `Writer`, one has a
+        // `Drop`. The reference used to link-fail on it; the port always built it. This
+        // is where the two are held to the same BEHAVIOUR — the file size read back after
+        // a scope-dropped `file.Writer` — not just to both producing a binary.
+        for stem in ["combinators", "mutex", "slice_algos", "try_read", "log_demo", "str_demo", "drop_collide_demo"] {
             let src = format!("examples/std/{stem}.jtr");
             let built = std::process::Command::new(&jc).arg(&src).arg("build").output().unwrap();
             assert!(built.status.success(), "jc must build {stem}:\n{}", String::from_utf8_lossy(&built.stderr));
@@ -2294,6 +2298,36 @@ mod httpd_service {
         assert_eq!(out.trim_end(), want, "the httpd demo's transcript changed:\n{out}");
         assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
         assert!(!out.contains("could not"), "the demo must bind its socket:\n{out}");
+    }
+}
+
+/// **`jdropcollide` — three modules spell `Writer`; the right one is dropped, and only it.**
+///
+/// `examples/std/drop_collide_demo.jtr` is A13's program. `file`, `writer` and `json` each
+/// define a `Writer`; only `file.Writer` has a `Drop`. A `file.Writer` leaves a scope
+/// without `finish`, and the file's size read back afterwards is the proof its drop ran
+/// (`3`; a leaked handle reads `0`). Beside it a `log.Logger` — which holds a `json.Writer`
+/// FIELD — is held by a module that imports `file` and `log` but never `json`: the shape
+/// whose scope-exit glue used to name `jestyr_impl_Drop__Writer__drop`, a symbol no module
+/// emits, and fail to link. The transcript is exact; the port is held to the same bytes in
+/// `jc_built_generics_run_the_same_as_the_reference`.
+#[cfg(all(test, feature = "c-oracle"))]
+mod drop_collide {
+    use super::*;
+
+    #[test]
+    fn jdropcollide_drops_the_right_writer_and_only_that_one() {
+        let exe = super::c_oracle::build_exe("examples/std/drop_collide_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+        let want = "-- jdropcollide --\n\
+                    bytes on disk after the writer was dropped\n3\n\
+                    scratch file removed\ntrue\n\
+                    records emitted by the logger\n1\n\
+                    ts=1000 level=info msg=\"held beside a file writer\" writers=three";
+        assert_eq!(out.trim_end(), want, "the drop-collide demo's transcript changed:\n{out}");
+        assert!(!std::path::Path::new("zz_drop_collide.tmp").exists(), "the demo must clean up after itself");
     }
 }
 

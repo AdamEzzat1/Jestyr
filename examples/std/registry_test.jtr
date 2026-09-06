@@ -9,8 +9,10 @@
 //
 // The HTTP half serves the same directory through `std/httpd`'s static route on a spawned
 // thread and fetches through `std/httpc`. The server there is kept in raw memory rather
-// than a local because a `Server` holds a `writer.Writer`, and this program also links
-// `std/file` — the drop-glue defect the handoff records as A13 fires on exactly that pair.
+// than a local: a `Server` holds a `writer.Writer`, this program also links `std/file`,
+// and that pair used to trip the drop-glue defect A13. A13 is CLOSED (`drop_collide_demo`
+// pins the pair); a local `Server` would work now, and the raw-memory shape is kept only
+// because the thread hands the server's lifetime around by pointer anyway.
 //
 // Run:  jestyrc test examples/std/registry_test.jtr
 
@@ -146,7 +148,7 @@ fn h_reg(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
 }
 
 // The registry server, on its own thread. Publishes the port through `port_out`, serves for
-// `budget_ms`, then stops. Its `Server` lives in raw memory (see the header: A13).
+// `budget_ms`, then stops. Its `Server` lives in raw memory (see the header).
 fn serve_registry(port_out: *mut i64, budget_ms: i64) -> i64 {
     let a: Allocator = mem.system_allocator()
     var net: sysnet.Net = sysnet.host()

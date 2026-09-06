@@ -357,9 +357,10 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
     var net: sysnet.Net = sysnet.host()
     var h: fs.Fs = fs.host()
     // The static root is the repository's own `examples/` directory, and the "secret" one
-    // level above it is a file that really exists there. No scratch tree: `std/sysfs` would
-    // bring `std/file` into the closure, and a second type named `Writer` next to
-    // `writer.Writer` trips the drop-glue defect the handoff records (A13).
+    // level above it is a file that really exists there. No scratch tree — originally
+    // because `std/sysfs` would bring `std/file` into the closure, and a second type named
+    // `Writer` next to `writer.Writer` tripped the drop-glue defect A13. That defect is
+    // CLOSED (`drop_collide_demo` pins the pair); the shape is kept because it is simpler.
     fs.put(h, "examples/zz_httpd_asset.css", "body{}")
     var sv: httpd.Server = boot(a, net, false)
 

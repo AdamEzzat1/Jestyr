@@ -8,12 +8,13 @@ defects — one session at a time). §2 is the parallel work (library breadth �
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1358 passed / 0 failed / 3 ignored** (full ladder after `std/kv`, A12, A11 and B2; the new
-tests are `return_ok_local_moves_the_local`, `jestyr_mut_value_arg_matches_reference` and
-`extern_global_is_a_readable_writable_place`).
+**1361 passed / 0 failed / 3 ignored** (full ladder after A13, 717 s; the new tests are
+`drop_glue_under_colliding_type_names_finds_the_right_impl_and_only_that_one` and
+`jdropcollide_drops_the_right_writer_and_only_that_one`; before them 1359 after HTTP V2, TLS
+and the registry layer).
 Those commits sit on `claude/tier5-compiler-handoff-75c515`, a fast-forward of the
-package-substrate branch; **neither is merged to master and the new commits are not
-pushed.** CI was fully green — all four jobs — at the substrate branch's head.
+package-substrate branch; **not merged to master.** CI was fully green — all four jobs — at
+the substrate branch's head; the Linux ladder has not run since `std/kv`.
 
 The long-form history is `docs/session-notes/jestyr-tier5-handoff.md`. Read its §5 for the
 area inventory (rewritten and current) and §6A for the defect register. Everything below
@@ -471,9 +472,10 @@ What a successor should not re-derive:
 * **`connect`/`close`/`listen` are `sysnet`'s C symbols in every module that links it**;
   the checker says "duplicate definition" one module away from the cause. Hence `dial`/
   `hangup`/`start`/`stop`.
-* **A13** (drop glue under colliding type names) fires the moment `sysfs` (→ `file`) and
-  `log` (→ `writer`) share a closure with a struct holding a `writer.Writer`. `httpd_test`
-  avoids the import; nothing else does.
+* **A13** (drop glue under colliding type names) fired the moment `sysfs` (→ `file`) and
+  `log` (→ `json`/`writer`) shared a closure with a struct holding a `json.Writer`.
+  **CLOSED 2026-09-06** (reference-only; the port was already right — see the register).
+  `httpd_test`'s dropped `sysfs` import may go back.
 * Not built: request-body streaming (a request must fit the connection buffer; 431 and a
   close otherwise), TLS, compression, ranges, ETags.
 
@@ -606,7 +608,7 @@ must fit the connection buffer today).
 
 | id | what | status |
 |---|---|---|
-| **A13** | **Drop glue under COLLIDING type names.** Three `Writer` types in one closure; a struct holding `writer.Writer` emits `jestyr_impl_Drop__Writer__drop` (bare name, no such fn) → link error; had the names lined up it would `fclose` the wrong struct. Fires on `sysfs`(→`file`) + `log`(→`writer`) in one program with a dropped `httpd.Server` local. | Found this pass, in `httpd_test`. Routed around twice (no `sysfs` import; a `Server` kept in raw memory in `registry_test`). Needs a probe file, the fix in field-type lowering and/or `drop_key_of` (impl index keyed by the canonical name), both sides, a reseed. **Any program importing `file` and `writer` together is exposed.** |
+| **A13** | **Drop glue under COLLIDING type names.** Three `Writer` types in one closure; a struct holding `json.Writer` emitted `jestyr_impl_Drop__Writer__drop` (bare name, no such fn) → link error; had the names lined up it would have `fclose`d the wrong struct. AND the quiet half, found by the probe: a `file.Writer` local was never dropped at all in such a program (its canonical key found no impl), and `escape`'s consuming rule answered "no Drop" for it. | **CLOSED 2026-09-06, reference-only.** One defect, two sites: `typeck::register_impls` was the one item pass that never set `cur_mod`, so the impl target lowered in a stale module, degraded to `Opaque("Writer")` and was keyed under the BARE name; cgen's `aggregate_drop_fields`/`enum_drop_variants` matched the decl by bare spelling and lowered field types from the EMITTING module (`ast_type_to_ty_in(.., decl_mod)` now). The port was already correct — its loader renames colliding types in the token stream, so its typeck and cgen never see a bare `Writer` — and the two compilers agree byte-for-byte on the probe; **no port change, no reseed** (the drift guard said so). Probe: `examples/std/drop_collide_demo.jtr` (`jdropcollide`: a scope-dropped `file.Writer` proven by the file size read back, a `log.Logger` held from a module that never imports `json`) + `drop_glue_under_colliding_type_names_finds_the_right_impl_and_only_that_one` in `module.rs` + the demo in the port-vs-reference run comparison. `httpd_test`'s route-around (the dropped `sysfs` import) is no longer needed. |
 | **A14** | The port's loader renamed a LOCAL sharing a colliding fn's name (`body`, `now`) — token-level rename by spelling. | **CLOSED this pass** (loader tracks the current fn's binders). Residual: a block-local binder is kept until the fn ends, so a fn-valued use of that name after the block would go unrenamed; no corpus program does it. |
 | **Link rules in three places** | `-pthread`/`-lws2_32`/`-lssl -lcrypto` are content-triggered in `main.rs` twice and in `proptests::link_and_finish` once; `tls_test` linked under the driver and failed under the harness until the third copy learned OpenSSL. | The §3o hazard, now with a third site. Fold into one function. |
 | **A4** | Windows: `capture` + print does not round-trip a child's bytes (text-mode stdout). | Recorded decision, not a bug to fix blind: binary stdout re-baselines many goldens. |

@@ -1415,6 +1415,58 @@ mod tests {
         assert!(!c.contains("struct Jestyr_Slot "), "the bare `Jestyr_Slot` symbol must not appear:\n{c}");
     }
 
+    /// **A13.** Two modules define `Res`; only `a.Res` has a `Drop`. `c.Holder` owns a
+    /// `b.Res` FIELD, and `main` — which imports `a` and `c` but not `b` — drops one of
+    /// each. Before the fix `register_impls` lowered the impl target without setting the
+    /// module, keyed `a`'s impl under the bare `Res`, and the drop walker lowered
+    /// `Holder`'s field from `main`'s view: the `a.Res` local was never dropped (its
+    /// canonical key found no impl) and the holder's field — degraded to `Opaque("Res")`
+    /// — called `jestyr_impl_Drop__Res__drop`, which nothing emits. Both from one program.
+    #[test]
+    fn drop_glue_under_colliding_type_names_finds_the_right_impl_and_only_that_one() {
+        let dir = fixture(
+            "collide_drop",
+            &[
+                (
+                    "main.jtr",
+                    "import \"a\"\nimport \"c\"\nfn main() -> i32 {\n    let x: a.Res = a.mk(1)\n    let h: c.Holder = c.hold(2)\n    return x.h + h.r.v + h.n\n}",
+                ),
+                (
+                    "a.jtr",
+                    "trait Drop { fn drop(mut self) }\npub struct Res { pub h: i32 }\npub fn mk(h: i32) -> Res { return Res{ h: h } }\nimpl Drop for Res { fn drop(mut self) { print_str(\"drop a.Res\") } }",
+                ),
+                ("b.jtr", "pub struct Res { pub v: i32 }\npub fn mk(v: i32) -> Res { return Res{ v: v } }"),
+                (
+                    "c.jtr",
+                    "import \"b\"\npub struct Holder { pub r: b.Res, pub n: i32 }\npub fn hold(v: i32) -> Holder { return Holder{ r: b.mk(v), n: v + 1 } }",
+                ),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(diags.is_empty(), "typeck: {:?}", diags);
+        // The impl is keyed under the CANONICAL name of `a`'s `Res`, never the bare one.
+        let drop_keys: Vec<&String> =
+            info.table.impl_index.keys().filter(|(t, _)| t == "Drop").map(|(_, k)| k).collect();
+        assert!(
+            drop_keys.iter().all(|k| k.starts_with("Res__m")),
+            "a colliding type's Drop impl must be keyed by its canonical name, got {drop_keys:?}"
+        );
+        let (c, cd) = crate::cgen::emit(&prog.ast, &info);
+        assert!(cd.is_empty(), "cgen diags: {:?}", cd);
+        assert!(
+            !c.contains("jestyr_impl_Drop__Res__drop"),
+            "the bare-named drop — a function nothing emits — must never be called:\n{c}"
+        );
+        assert!(c.contains("__drop(&j_x);"), "the `a.Res` local must be dropped:\n{c}");
+        assert!(
+            !c.contains("__drop(&j_h"),
+            "`c.Holder` owns a `b.Res`, which has no Drop — nothing of `h` may be dropped:\n{c}"
+        );
+        assert_eq!(c.matches("__drop(&").count(), 1, "exactly one scope-exit drop call:\n{c}");
+    }
+
     /// Two modules each defining `enum Color { red, green }` compile together with
     /// distinct enum + variant symbols, and each module's variant construction /
     /// `match` dispatches against its own enum.

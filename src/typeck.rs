@@ -773,8 +773,17 @@ impl<'a> TypeChecker<'a> {
     fn register_impls(&mut self) {
         let ast = self.ast;
         let empty = HashSet::new();
-        for item in &ast.items {
+        for (i, item) in ast.items.iter().enumerate() {
             let Item::Impl(im) = item else { continue };
+            // Lower the target FROM THE IMPL'S OWN MODULE. Every other item pass
+            // sets `cur_mod` per item; this one did not, so `impl Drop for Writer`
+            // in `file` lowered `Writer` in whatever module the previous pass left
+            // behind, missed the colliding `Writer__m<file>`, degraded to
+            // `Opaque("Writer")` and was keyed under the BARE name. Its own type
+            // then found no impl (a `file.Writer` local was never dropped), while a
+            // field of ANOTHER module's `Writer` that degraded the same way found it
+            // and called `jestyr_impl_Drop__Writer__drop` — a symbol no one emits (A13).
+            self.cur_mod = *self.modules.item_mod.get(i).unwrap_or(&0);
             if !self.table.traits.contains_key(&im.trait_name.name) {
                 self.error(
                     im.trait_name.span,

@@ -63,6 +63,7 @@ BUILD_OK deque_demo
 BUILD_OK deterministic
 BUILD_OK diag_demo
 BUILD_OK doc_cli
+BUILD_OK drop_collide_demo
 BUILD_OK drop_named_type_param
 BUILD_OK env_demo
 BUILD_OK env_inherit_demo

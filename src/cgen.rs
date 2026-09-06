@@ -1055,7 +1055,13 @@ impl<'a> Cgen<'a> {
     /// The module an import `binding` refers to, from the module being emitted —
     /// so a `mod.Type` path resolves to that module's (possibly colliding) type.
     fn path_target(&self, binding: &str) -> Option<ModId> {
-        self.info.imports.get(self.cur_mod).and_then(|m| m.get(binding)).copied()
+        self.path_target_in(self.cur_mod, binding)
+    }
+
+    /// [`path_target`] from an explicit module — the import map of the module
+    /// that WROTE a type annotation, when it is not the one being emitted.
+    fn path_target_in(&self, m: ModId, binding: &str) -> Option<ModId> {
+        self.info.imports.get(m).and_then(|im| im.get(binding)).copied()
     }
 
     fn raw(&mut self, s: impl AsRef<str>) {
@@ -1870,24 +1876,35 @@ impl<'a> Cgen<'a> {
 
     /// Lower an AST type to a `Ty`, applying the given type-parameter substitution.
     fn ast_type_to_ty(&self, id: TypeId, subst: &HashMap<String, Ty>) -> Ty {
+        self.ast_type_to_ty_in(id, subst, self.cur_mod)
+    }
+
+    /// [`ast_type_to_ty`] resolved from an explicit module `m` — the module that
+    /// WROTE the annotation. The emitted item's module (`cur_mod`) is the right
+    /// context for its own signatures and bodies; it is the wrong one for a
+    /// struct's field types read while walking a value declared elsewhere (the
+    /// drop walker), where a bare `Writer` must canon to the declaring module's
+    /// `Writer__m<decl>` and a `json.Writer` path must go through the DECLARING
+    /// module's import map — the emitting module may not import `json` at all.
+    fn ast_type_to_ty_in(&self, id: TypeId, subst: &HashMap<String, Ty>, m: ModId) -> Ty {
         match &self.ast.type_at(id).kind {
             TypeKind::Name(n) => {
                 if let Some(t) = subst.get(&n.name) {
                     t.clone()
                 } else if let Some(p) = prim_ty(&n.name) {
                     Ty::Prim(p)
-                } else if let Some(&i) = self.info.table.type_index.get(&self.canon_type(&n.name)) {
+                } else if let Some(&i) = self.info.table.type_index.get(&self.canon_type_in(m, &n.name)) {
                     Ty::Named(i)
                 } else {
                     Ty::Opaque(n.name.clone())
                 }
             }
             TypeKind::Ptr { mutbl, inner } => {
-                Ty::Ptr { mutbl: *mutbl, inner: Box::new(self.ast_type_to_ty(*inner, subst)) }
+                Ty::Ptr { mutbl: *mutbl, inner: Box::new(self.ast_type_to_ty_in(*inner, subst, m)) }
             }
             TypeKind::App { ctor, args } => {
-                let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty(*a, subst)).collect();
-                let key = self.canon_type(&ctor.name);
+                let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty_in(*a, subst, m)).collect();
+                let key = self.canon_type_in(m, &ctor.name);
                 if self.enum_is_generic(&key) {
                     Ty::GenEnum { ctor: key, args: aty }
                 } else {
@@ -1895,25 +1912,25 @@ impl<'a> Cgen<'a> {
                     // namespace — two modules' `Box(T)` instances stay distinct
                     // (`Jestyr_Box__m<a>__i32` vs `__m<b>__i32`), mirroring
                     // typeck's resolution. Bare unless the name collides.
-                    Ty::GenStruct { ctor: self.canon_fn(&ctor.name), args: aty }
+                    Ty::GenStruct { ctor: self.canon_fn_in(m, &ctor.name), args: aty }
                 }
             }
-            TypeKind::Slice(inner) => Ty::Slice(Box::new(self.ast_type_to_ty(*inner, subst))),
+            TypeKind::Slice(inner) => Ty::Slice(Box::new(self.ast_type_to_ty_in(*inner, subst, m))),
             TypeKind::Array { len, elem } => Ty::Array {
-                elem: Box::new(self.ast_type_to_ty(*elem, subst)),
+                elem: Box::new(self.ast_type_to_ty_in(*elem, subst, m)),
                 len: self.array_len(*len),
             },
-            TypeKind::GenRef(inner) => Ty::GenRef(Box::new(self.ast_type_to_ty(*inner, subst))),
+            TypeKind::GenRef(inner) => Ty::GenRef(Box::new(self.ast_type_to_ty_in(*inner, subst, m))),
             TypeKind::RegionRef { inner, .. } => {
-                Ty::RegionRef(Box::new(self.ast_type_to_ty(*inner, subst)))
+                Ty::RegionRef(Box::new(self.ast_type_to_ty_in(*inner, subst, m)))
             }
             TypeKind::Fn { params, ret_conv, ret } => {
                 let ps: Vec<(Conv, Box<Ty>)> = params
                     .iter()
-                    .map(|p| (p.conv, Box::new(self.ast_type_to_ty(p.ty, subst))))
+                    .map(|p| (p.conv, Box::new(self.ast_type_to_ty_in(p.ty, subst, m))))
                     .collect();
                 let r = match ret {
-                    Some(t) => self.ast_type_to_ty(*t, subst),
+                    Some(t) => self.ast_type_to_ty_in(*t, subst, m),
                     None => Ty::Unit,
                 };
                 Ty::Fn { params: ps, ret: Box::new(r), ret_conv: *ret_conv }
@@ -1929,9 +1946,9 @@ impl<'a> Cgen<'a> {
                     } else if let Some(p) = prim_ty(&name.name) {
                         Ty::Prim(p)
                     } else {
-                        let key = match self.path_target(&module.name) {
+                        let key = match self.path_target_in(m, &module.name) {
                             Some(t) => self.canon_type_in(t, &name.name),
-                            None => self.canon_type(&name.name),
+                            None => self.canon_type_in(m, &name.name),
                         };
                         match self.info.table.type_index.get(&key) {
                             Some(&i) => Ty::Named(i),
@@ -1939,17 +1956,17 @@ impl<'a> Cgen<'a> {
                         }
                     }
                 } else {
-                    let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty(*a, subst)).collect();
-                    let key = match self.path_target(&module.name) {
+                    let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty_in(*a, subst, m)).collect();
+                    let key = match self.path_target_in(m, &module.name) {
                         Some(t) => self.canon_type_in(t, &name.name),
-                        None => self.canon_type(&name.name),
+                        None => self.canon_type_in(m, &name.name),
                     };
                     if self.enum_is_generic(&key) {
                         Ty::GenEnum { ctor: key, args: aty }
                     } else {
-                        let fkey = match self.path_target(&module.name) {
+                        let fkey = match self.path_target_in(m, &module.name) {
                             Some(t) => self.canon_fn_in(t, &name.name),
-                            None => self.canon_fn(&name.name),
+                            None => self.canon_fn_in(m, &name.name),
                         };
                         Ty::GenStruct { ctor: fkey, args: aty }
                     }
@@ -3196,10 +3213,20 @@ impl<'a> Cgen<'a> {
         // Read field names + types from the AST decl (the type table's struct
         // fields carry the same data, but the AST is the source of truth for the
         // `j_<name>` C accessor and is what the enum path must use anyway).
+        //
+        // The decl is matched by its CANONICAL name (the table's `Writer__m<decl>`
+        // for a colliding type, the bare spelling otherwise), and its field types
+        // are lowered FROM THE DECLARING MODULE: a bare `Writer` field canons to
+        // that module's `Writer`, and a `json.Writer` path goes through that
+        // module's import map. Lowering them from `cur_mod` — the module whose
+        // function is being emitted — matched the first struct spelled `Writer`
+        // and degraded any field type the emitting module could not see to an
+        // `Opaque` keyed by its bare name (A13).
         let name = &decl.name;
-        for item in &self.ast.items {
+        for (i, item) in self.ast.items.iter().enumerate() {
             if let Item::Struct { name: sname, body, is_union, .. } = item {
-                if &sname.name != name {
+                let decl_mod = self.item_module(i);
+                if self.canon_type_in(decl_mod, &sname.name) != *name {
                     continue;
                 }
                 // An untagged `union` has no single live field — never auto-drop it.
@@ -3212,7 +3239,7 @@ impl<'a> Cgen<'a> {
                     .iter()
                     .filter_map(|m| match m {
                         StructMember::Field { name: fname, ty: fty, .. } => {
-                            Some((fname.name.clone(), self.ast_type_to_ty(*fty, &empty)))
+                            Some((fname.name.clone(), self.ast_type_to_ty_in(*fty, &empty, decl_mod)))
                         }
                         _ => None,
                     })
@@ -3239,10 +3266,13 @@ impl<'a> Cgen<'a> {
         if self.niche_enum_at(*i).is_some() {
             return Some(Vec::new());
         }
+        // Matched by canonical name and lowered from the declaring module, for the
+        // same reason as `aggregate_drop_fields` (A13).
         let name = decl.name.clone();
-        for item in &self.ast.items {
+        for (i, item) in self.ast.items.iter().enumerate() {
             if let Item::Enum(e) = item {
-                if e.name.name != name || e.is_generic() {
+                let decl_mod = self.item_module(i);
+                if e.is_generic() || self.canon_type_in(decl_mod, &e.name.name) != name {
                     continue;
                 }
                 let empty = HashMap::new();
@@ -3253,7 +3283,7 @@ impl<'a> Cgen<'a> {
                         let payload = v
                             .fields
                             .iter()
-                            .map(|(fname, fty)| (fname.name.clone(), self.ast_type_to_ty(*fty, &empty)))
+                            .map(|(fname, fty)| (fname.name.clone(), self.ast_type_to_ty_in(*fty, &empty, decl_mod)))
                             .filter(|(_, t)| !Self::is_indirect_ty(t))
                             .collect();
                         (v.name.name.clone(), payload)
@@ -7948,12 +7978,15 @@ impl<'a> Cgen<'a> {
     /// parameter, so a concrete instance can substitute it.
     fn generic_drop_impl(&self, ctor: &str) -> Option<(&'a ImplDecl, String)> {
         let empty = HashMap::new();
-        for item in &self.ast.items {
+        for (i, item) in self.ast.items.iter().enumerate() {
             let Item::Impl(im) = item else { continue };
             if im.generics.is_empty() || im.trait_name.name != "Drop" {
                 continue;
             }
-            if let Ty::GenStruct { ctor: c, .. } = self.ast_type_to_ty(im.ty, &empty) {
+            // The impl's target is lowered from the impl's OWN module, so a
+            // colliding ctor canons to the right `Box__m<impl>` (A13's family).
+            let im_mod = self.item_module(i);
+            if let Ty::GenStruct { ctor: c, .. } = self.ast_type_to_ty_in(im.ty, &empty, im_mod) {
                 if c == ctor {
                     let g = im.generics.first().map(|g| g.name.name.clone()).unwrap_or_default();
                     return Some((im, g));
@@ -7972,11 +8005,11 @@ impl<'a> Cgen<'a> {
         let empty = HashMap::new();
         let key = self.info.table.ty_key(ty);
         let ast = self.ast;
-        ast.items.iter().any(|it| {
+        ast.items.iter().enumerate().any(|(i, it)| {
             matches!(it, Item::Impl(im)
                 if im.generics.is_empty()
                     && im.trait_name.name == "Drop"
-                    && self.info.table.ty_key(&self.ast_type_to_ty(im.ty, &empty)) == key)
+                    && self.info.table.ty_key(&self.ast_type_to_ty_in(im.ty, &empty, self.item_module(i))) == key)
         })
     }
 
