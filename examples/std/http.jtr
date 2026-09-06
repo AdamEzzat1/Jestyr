@@ -108,6 +108,12 @@ pub const HTTP_MAX_HEADERS: usize = 100
     pub len: usize,
 }
 
+// A `Span` for another module: a module-qualified struct literal does not parse, so this is
+// the only way `std/httpd` can name one.
+@no_alloc @no_os pub fn span(off: usize, len: usize) -> Span {
+    return Span{ off: off, len: len }
+}
+
 @no_alloc @no_os pub fn span_str(read s: Span, read buf: []u8) -> str {
     if s.len == 0 { return "" }
     if s.off + s.len > buf.len { return "" }
@@ -120,8 +126,9 @@ pub const HTTP_MAX_HEADERS: usize = 100
 }
 
 // A parsed request. Every field is a view; `body` is what followed the headers, already
-// framed by `Content-Length` or by chunked decoding.
-pub struct Request {
+// framed by `Content-Length` or by chunked decoding. `@copy`: offsets and flags, nothing
+// owned — which is what lets a server keep one inside its per-request state.
+@copy pub struct Request {
     pub method: Span,
     pub target: Span,
     pub minor: i32,               // the `1` in HTTP/1.1
@@ -259,8 +266,24 @@ pub struct Request {
     req.minor = vd - 48
 
     // ---- headers ----
-    var at: usize = eol + 2
     var n: usize = 0
+    var after: usize = 0
+    let ho: i32 = parse_headers(buf, hs, eol + 2, n, after)
+    if ho != HTTP_OK { return ho }
+    req.headers = n
+
+    // ---- framing, which is where the danger is ----
+    return frame_body(buf, hs, n, after, req)
+}
+
+// The header section, from `start` to the empty line. Fills `hs`, reports the count through
+// `n` and the offset just past the empty line through `after`. **One loop for requests and
+// responses**, because the obs-fold and space-before-colon refusals are framing decisions
+// and a framing decision made in two places is the disagreement this module exists to
+// refuse.
+@no_alloc @no_os fn parse_headers(read buf: []u8, mut hs: []Header, start: usize, mut n: usize, mut after: usize) -> i32 {
+    var at: usize = start
+    var count: usize = 0
     for true {
         let e: isize = line_end(buf, at)
         if e == 0 - 1 { return HTTP_INCOMPLETE }
@@ -271,7 +294,7 @@ pub struct Request {
             at = at + 2
             break                                    // the empty line: headers are done
         }
-        if n >= hs.len or n >= HTTP_MAX_HEADERS { return HTTP_TOO_LARGE }
+        if count >= hs.len or count >= HTTP_MAX_HEADERS { return HTTP_TOO_LARGE }
 
         // **A leading space is an obs-fold** (a header continued onto the next line). RFC 9112
         // says a recipient must reject it in a request: it is the other historical framing
@@ -305,23 +328,23 @@ pub struct Request {
             if is_value_byte(buf[vi] as i32) == false { return HTTP_BAD }
             vi = vi + 1
         }
-        hs[n] = Header{ name: name, value: Span{ off: v, len: ve - v } }
-        n = n + 1
+        hs[count] = Header{ name: name, value: Span{ off: v, len: ve - v } }
+        count = count + 1
         at = he + 2
     }
-    req.headers = n
-
-    // ---- framing, which is where the danger is ----
-    return frame_body(buf, hs, n, at, req)
+    n = count
+    after = at
+    return HTTP_OK
 }
 
-// Decide how long the body is, refusing every arrangement that two implementations could read
-// differently. See the header.
-@no_alloc @no_os fn frame_body(read buf: []u8, read hs: []Header, n: usize, at: usize, mut req: Request) -> i32 {
+// Read the framing headers, refusing every arrangement that two implementations could read
+// differently. Reports the `Content-Length` (-1 when absent) and whether the body is chunked;
+// the caller applies them, because a request and a response apply "neither" differently.
+@no_alloc @no_os fn scan_framing(read buf: []u8, read hs: []Header, n: usize, mut cl: i64, mut chunked: bool) -> i32 {
     var seen_cl: i32 = 0
-    var cl: i64 = 0 - 1
-    var chunked: bool = false
     var seen_te: i32 = 0
+    var got_cl: i64 = 0 - 1
+    var got_te: bool = false
     var i: usize = 0
     for i < n {
         if header_is(hs[i], buf, "content-length") {
@@ -332,28 +355,46 @@ pub struct Request {
             // redundant.** RFC 9112 allows collapsing identical values, and refusing them
             // would reject messages no attacker sent.
             if seen_cl > 1 {
-                if v != cl { return HTTP_AMBIGUOUS }
+                if v != got_cl { return HTTP_AMBIGUOUS }
             }
-            cl = v
+            got_cl = v
         }
         if header_is(hs[i], buf, "transfer-encoding") {
             seen_te = seen_te + 1
             // Only `chunked` is understood, and it must be the whole value: `gzip, chunked`
             // means a body this module cannot frame, and guessing is the failure mode.
             if eq_ci(buf, hs[i].value, "chunked") == false { return HTTP_BAD }
-            chunked = true
+            got_te = true
         }
         i = i + 1
     }
 
     // **The smuggling case.** A message with both is read one way by a proxy and another way
     // by an origin server, which turns one request into two.
-    if chunked and cl >= 0 { return HTTP_AMBIGUOUS }
+    if got_te and got_cl >= 0 { return HTTP_AMBIGUOUS }
     if seen_te > 1 { return HTTP_AMBIGUOUS }
+    cl = got_cl
+    chunked = got_te
+    return HTTP_OK
+}
+
+// Decide how long a REQUEST body is. See the header.
+@no_alloc @no_os fn frame_body(read buf: []u8, read hs: []Header, n: usize, at: usize, mut req: Request) -> i32 {
+    var cl: i64 = 0 - 1
+    var chunked: bool = false
+    let fo: i32 = scan_framing(buf, hs, n, cl, chunked)
+    if fo != HTTP_OK { return fo }
 
     if chunked {
         req.chunked = true
-        return frame_chunked(buf, at, req)
+        var b: Span = Span{ off: 0, len: 0 }
+        var t: usize = 0
+        let co: i32 = frame_chunked(buf, at, b, t)
+        if co == HTTP_OK {
+            req.body = b
+            req.total = t
+        }
+        return co
     }
     if cl < 0 {
         // No framing headers: the body is empty. For a REQUEST that is the only safe reading —
@@ -370,9 +411,9 @@ pub struct Request {
     return HTTP_OK
 }
 
-// Walk a chunked body to its terminating zero chunk. The body span covers the ENCODED bytes;
-// `decode_chunked` produces the decoded ones.
-@no_alloc @no_os fn frame_chunked(read buf: []u8, at: usize, mut req: Request) -> i32 {
+// Walk a chunked body to its terminating zero chunk. `body` covers the ENCODED bytes and
+// `total` is the offset just past the message; `decode_chunked` produces the decoded ones.
+@no_alloc @no_os fn frame_chunked(read buf: []u8, at: usize, mut body: Span, mut total: usize) -> i32 {
     let start: usize = at
     var p: usize = at
     for true {
@@ -409,8 +450,8 @@ pub struct Request {
                 }
                 p = tee + 2
             }
-            req.body = Span{ off: start, len: (p - start) }
-            req.total = p
+            body = Span{ off: start, len: (p - start) }
+            total = p
             return HTTP_OK
         }
         if p + (size as usize) + 2 > buf.len { return HTTP_INCOMPLETE }
@@ -419,6 +460,101 @@ pub struct Request {
         p = p + 2
     }
     return HTTP_BAD
+}
+
+// ---- responses ------------------------------------------------------------------------------
+
+// A parsed response. `until_close` is the response-only framing: no `Content-Length` and no
+// chunking means the body runs until the peer closes, so `body` and `total` then cover
+// whatever has ARRIVED and the caller keeps reading until a read returns zero.
+@copy pub struct Response {
+    pub minor: i32,
+    pub status: i32,
+    pub reason: Span,
+    pub headers: usize,
+    pub body: Span,
+    pub chunked: bool,
+    pub until_close: bool,
+    pub total: usize,
+}
+
+@no_alloc @no_os pub fn empty_response() -> Response {
+    return Response{ minor: 1, status: 0, reason: Span{ off: 0, len: 0 }, headers: 0,
+                     body: Span{ off: 0, len: 0 }, chunked: false, until_close: false, total: 0 }
+}
+
+// Parse a response out of `buf`: `HTTP/1.N SP 3DIGIT SP reason CRLF`, headers, body. The same
+// header loop and the same framing scan as a request — a client is the other end of the
+// smuggling conversation, and a response it frames differently from the server is the same
+// hole seen from the other side. A `204`, a `304` and every `1xx` carry no body regardless
+// of headers; anything else without framing headers is `until_close`.
+@no_alloc @no_os pub fn parse_response(read buf: []u8, mut hs: []Header, mut resp: Response) -> i32 {
+    resp = empty_response()
+    if buf.len == 0 { return HTTP_INCOMPLETE }
+    let e0: isize = line_end(buf, 0)
+    if e0 == 0 - 1 { return HTTP_INCOMPLETE }
+    if e0 == 0 - 3 { return HTTP_TOO_LARGE }
+    if e0 < 0 { return HTTP_BAD }
+    let eol: usize = e0 as usize
+
+    // `HTTP/1.N` then a space, three digits, a space, the reason (which may be empty).
+    if eol < 12 { return HTTP_BAD }
+    if match_at(buf, 0, "HTTP/1.") == false { return HTTP_BAD }
+    let vd: i32 = buf[7] as i32
+    if is_digit(vd) == false { return HTTP_BAD }
+    resp.minor = vd - 48
+    if (buf[8] as i32) != 32 { return HTTP_BAD }
+    var st: i32 = 0
+    for i in 0..3 {
+        let c: i32 = buf[9 + i] as i32
+        if is_digit(c) == false { return HTTP_BAD }
+        st = st * 10 + (c - 48)
+    }
+    if st < 100 { return HTTP_BAD }
+    resp.status = st
+    if eol > 12 {
+        if (buf[12] as i32) != 32 { return HTTP_BAD }
+        resp.reason = Span{ off: 13, len: eol - 13 }
+    }
+
+    var n: usize = 0
+    var after: usize = 0
+    let ho: i32 = parse_headers(buf, hs, eol + 2, n, after)
+    if ho != HTTP_OK { return ho }
+    resp.headers = n
+
+    var cl: i64 = 0 - 1
+    var chunked: bool = false
+    let fo: i32 = scan_framing(buf, hs, n, cl, chunked)
+    if fo != HTTP_OK { return fo }
+
+    if st == 204 or st == 304 or st < 200 {
+        resp.body = Span{ off: after, len: 0 }
+        resp.total = after
+        return HTTP_OK
+    }
+    if chunked {
+        resp.chunked = true
+        var b: Span = Span{ off: 0, len: 0 }
+        var t: usize = 0
+        let co: i32 = frame_chunked(buf, after, b, t)
+        if co == HTTP_OK {
+            resp.body = b
+            resp.total = t
+        }
+        return co
+    }
+    if cl < 0 {
+        resp.until_close = true
+        resp.body = Span{ off: after, len: buf.len - after }
+        resp.total = buf.len
+        return HTTP_OK
+    }
+    let want: usize = cl as usize
+    if after + want > buf.len { return HTTP_INCOMPLETE }
+    resp.body = Span{ off: after, len: want }
+    resp.total = after + want
+    return HTTP_OK
 }
 
 // A `Content-Length` value: DIGITS ONLY, no sign, no space, no hex, no leading `+`.

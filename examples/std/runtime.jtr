@@ -129,6 +129,13 @@ fn never_ready(ctx: *mut u8, fds: *mut i64, ready: *mut u8, n: usize, timeout_na
     return Poller{ ctx: null, wait_fn: &never_ready }
 }
 
+// Ask `p` directly which of `n` handles are readable, waiting up to `timeout_nanos`. The
+// same call `fire_ready` makes, exported for a loop that owns its own handle table and
+// wants readiness without a `Runtime` in between (`std/httpd` is the first).
+pub fn ask(read p: Poller, fds: *mut i64, ready: *mut u8, n: usize, timeout_nanos: i64) -> i64 {
+    return p.wait_fn(p.ctx, fds, ready, n, timeout_nanos)
+}
+
 // ---- cancellation ------------------------------------------------------------
 //
 // **A token, not a flag, and not an id.** `cancel(rt, id)` already existed and cancels one

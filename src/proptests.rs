@@ -2261,6 +2261,42 @@ mod alog_durable {
     }
 }
 
+/// **`jhttpd` — a service on one connection, in one thread.**
+///
+/// `examples/std/httpd_demo.jtr` is `std/httpd`'s consumer: a router with a bound parameter,
+/// a middleware that gates one path, three requests on ONE kept-alive connection (the `1`
+/// after "connections accepted"), a streamed body that decodes whole, and the access log.
+/// Client and server take turns in one thread, so the transcript is exact.
+#[cfg(all(test, feature = "c-oracle"))]
+mod httpd_service {
+    use super::*;
+
+    #[test]
+    fn jhttpd_serves_a_session_on_one_connection() {
+        let exe = super::c_oracle::build_exe("examples/std/httpd_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the httpd demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jhttpd --\n\
+                    GET /hello -> hello\n\
+                    GET /greet/jestyr -> hello, jestyr\n\
+                    GET /count (streamed) -> one two three\n\
+                    chunked\ntrue\n\
+                    connections accepted for three requests\n1\n\
+                    -- the middleware --\n\
+                    401\n\
+                    GET /admin without a token -> token required\n\
+                    200\n\
+                    GET /admin with the token -> welcome, admin\n\
+                    -- the access log's last record names the status --\ntrue\n\
+                    requests served\n5";
+        assert_eq!(out.trim_end(), want, "the httpd demo's transcript changed:\n{out}");
+        assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
+        assert!(!out.contains("could not"), "the demo must bind its socket:\n{out}");
+    }
+}
+
 /// **`jstate` — a state file that loses a torn batch WHOLE.**
 ///
 /// `examples/std/kv_demo.jtr` is `std/kv`'s consumer. A credential is rotated as a pair —
@@ -12196,6 +12232,13 @@ mod c_oracle {
     /// where `-lws2_32` does not exist.
     fn link_and_finish(cmd: &mut Command, exe: &std::path::Path, cfile: &std::path::Path, c_src: &str) {
         cmd.arg("-o").arg(exe).arg(cfile);
+        // The same content-triggered rules as `main.rs`'s two link sites. **This is a
+        // third copy of the rule**, the hazard §3o of the handoff records — `tls_test`
+        // linked under the driver and failed under this harness until the line below
+        // existed. Folding the three into one function is the fix owed.
+        if c_src.contains("openssl/ssl.h") {
+            cmd.arg("-lssl").arg("-lcrypto");
+        }
         if cfg!(windows) && c_src.contains("winsock2.h") {
             cmd.arg("-lws2_32");
         }
@@ -18745,6 +18788,14 @@ fn main() -> i32 {
         // B2: an `extern … var` global — the declaration-free `.h` form, a read, a write,
         // and `&global`. The port mirror was watched failing on this file.
         "extern_global.jtr",
+        // `httpd.jtr` and `httpc.jtr` are deliberately ABSENT, and it was measured: both
+        // diverge with imports unresolved — they hold `sysnet.Socket`/`http.Request` as
+        // fields and take `mut Exchange` through fn-pointer types, the shapes that degrade
+        // to `?`. Their agreement is gated by `jc_build_matrix` (the demo) and the suites.
+        // TLS: header-declared externs only, so the port's gated prelude for `openssl/*.h`
+        // is under byte-identity. The manifest format is pure text.
+        "tls.jtr",
+        "manifest.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same
@@ -20028,6 +20079,25 @@ fn main() -> i32 {
             // rewrite (compaction, migration, snapshot) is followed by a value-for-value
             // comparison, because a rewrite that loses a key does so quietly.
             ("kv_test", 10),
+            // **Real loopback sockets, one thread, client and server taking turns**, so every
+            // case but the timeout one is an exact transcript: routing with bound params,
+            // middleware order and `DONE`, keep-alive with PIPELINED requests, a streamed
+            // body decoded whole, static files with traversal refused as a 404, the access
+            // log record, a smuggling attempt refused and the connection dropped. The
+            // timeout case asserts a lower bound only.
+            ("httpd_test", 8),
+            // **A real TLS handshake over loopback, the client on a spawned thread.** The
+            // verifying case chains to the fixture CA AND checks the hostname; the wrong-
+            // hostname case is right CA, wrong name, and must fail; the trust-nothing case
+            // completes and SAYS it did not verify. Links OpenSSL (`-lssl -lcrypto`, content-
+            // triggered); the Linux runner has libssl-dev, and a host without it fails here.
+            ("tls_test", 4),
+            // The package manifest format: render(parse(x)) == x, and every refusal by name.
+            ("manifest_test", 2),
+            // Publish → load → resolve (minimally) → fetch through the cache, with a tampered
+            // archive refused before it is stored; then the same fetch over HTTP against
+            // `std/httpd`'s static route on a spawned thread — the `jc add` shape, end to end.
+            ("registry_test", 2),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

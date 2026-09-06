@@ -1,0 +1,288 @@
+// std/manifest.jtr — the package manifest FORMAT: what a package says about itself.
+//
+// TIER: `core`. Text in, a checked structure out; no filesystem, no allocation beyond the
+// owned copy of the text. The package substrate (`semver` → `resolve` → `lockfile` →
+// `cache`) deliberately had no file format — a `resolve.Registry` is built by API call so it
+// stays testable — and this module is that format, kept as small as the lockfile's:
+//
+//     jestyr-package/v1
+//     name <name>
+//     version <semver>
+//     dep <name> <requirement>
+//     dep <name> <requirement>
+//
+// One record per line, the first line the format tag, `dep` zero or more times. Names are
+// `[a-z0-9_-]+`; versions and requirements are `std/semver`'s, checked at parse time so a
+// manifest that parses is one the resolver can consume without a second validation.
+//
+// ─── Why not INI, JSON or TOML ────────────────────────────────────────────────────────
+//
+// The tree has `std/ini` and `std/json`. Neither is used here for the reason `std/lockfile`
+// gave: a manifest is hashed, diffed and rendered by tools, and a format with optional
+// whitespace, quoting and key order has a dozen renderings of one meaning. This one has
+// exactly one — `render` of a `parse` is byte-identical to the input when the input was
+// itself rendered — so two manifests that mean the same thing ARE the same bytes.
+//
+// Run the tests:  jestyrc test examples/std/manifest_test.jtr
+
+import "list"
+import "semver"
+
+pub const MANIFEST_TAG: str = "jestyr-package/v1"
+
+pub const MANIFEST_OK: i32 = 0
+pub const MANIFEST_NO_TAG: i32 = 1
+pub const MANIFEST_NO_NAME: i32 = 2
+pub const MANIFEST_BAD_NAME: i32 = 3
+pub const MANIFEST_NO_VERSION: i32 = 4
+pub const MANIFEST_BAD_VERSION: i32 = 5
+pub const MANIFEST_BAD_DEP: i32 = 6
+pub const MANIFEST_BAD_LINE: i32 = 7
+pub const MANIFEST_DUP_DEP: i32 = 8
+
+@no_alloc @no_os pub fn problem_name(p: i32) -> str {
+    if p == MANIFEST_OK { return "ok" }
+    if p == MANIFEST_NO_TAG { return "missing or wrong format tag" }
+    if p == MANIFEST_NO_NAME { return "no name" }
+    if p == MANIFEST_BAD_NAME { return "invalid name" }
+    if p == MANIFEST_NO_VERSION { return "no version" }
+    if p == MANIFEST_BAD_VERSION { return "invalid version" }
+    if p == MANIFEST_BAD_DEP { return "invalid dependency" }
+    if p == MANIFEST_DUP_DEP { return "dependency named twice" }
+    return "unrecognised line"
+}
+
+// A parsed manifest. Names, the version and every requirement are byte ranges into `text`
+// (a struct may not hold a `str` view), so the accessors take nothing but the manifest.
+pub struct Manifest {
+    text: String,
+    ok: bool,
+    problem: i32,
+    problem_line: i32,
+    name_s: usize,
+    name_e: usize,
+    ver_s: usize,
+    ver_e: usize,
+    deps: List(i32),        // 4 per dep: name s/e, req s/e
+}
+
+impl Drop for Manifest {
+    fn drop(mut self) {
+        string_free(self.text)
+    }
+}
+
+@no_alloc @no_os pub fn parsed(read m: Manifest) -> bool { return m.ok }
+@no_alloc @no_os pub fn problem(read m: Manifest) -> i32 { return m.problem }
+@no_alloc @no_os pub fn problem_line(read m: Manifest) -> i32 { return m.problem_line }
+
+pub fn name(read m: Manifest) -> read str {
+    let v: str = string_view(m.text)
+    return v[m.name_s .. m.name_e]
+}
+
+pub fn version(read m: Manifest) -> read str {
+    let v: str = string_view(m.text)
+    return v[m.ver_s .. m.ver_e]
+}
+
+@no_alloc @no_os pub fn dep_count(read m: Manifest) -> usize { return list.len(i32, m.deps) / 4 }
+
+pub fn dep_name(read m: Manifest, i: usize) -> read str {
+    let v: str = string_view(m.text)
+    return v[list.get(i32, m.deps, i * 4) as usize .. list.get(i32, m.deps, i * 4 + 1) as usize]
+}
+
+pub fn dep_req(read m: Manifest, i: usize) -> read str {
+    let v: str = string_view(m.text)
+    return v[list.get(i32, m.deps, i * 4 + 2) as usize .. list.get(i32, m.deps, i * 4 + 3) as usize]
+}
+
+// Is `n` a package name: `[a-z0-9_-]+`, starting with a letter?
+@no_alloc @no_os pub fn valid_name(read n: str) -> bool {
+    if n.len == 0 { return false }
+    for i in 0..n.len {
+        let c: i32 = n[i] as i32
+        var fine: bool = false
+        if c >= 97 and c <= 122 { fine = true }
+        if c >= 48 and c <= 57 { if i > 0 { fine = true } }
+        if c == 95 or c == 45 { if i > 0 { fine = true } }
+        if fine == false { return false }
+    }
+    return true
+}
+
+fn failed(mut m: Manifest, p: i32, line: i32) -> bool {
+    m.ok = false
+    m.problem = p
+    m.problem_line = line
+    return false
+}
+
+// The end of the line starting at `at` (the offset of its `\n`, or `text.len`).
+@no_alloc @no_os fn line_end(read t: str, at: usize) -> usize {
+    var i: usize = at
+    for i < t.len {
+        if (t[i] as i32) == 10 { return i }
+        i = i + 1
+    }
+    return t.len
+}
+
+// A line's words: `w1s..w1e`, `w2s..w2e`, `w3s..w3e` (each empty when absent). Single
+// spaces only — two spaces is a fourth, empty word, and the line is malformed.
+@no_alloc @no_os fn word_end(read t: str, from: usize, to: usize) -> usize {
+    var i: usize = from
+    for i < to {
+        if (t[i] as i32) == 32 { return i }
+        i = i + 1
+    }
+    return to
+}
+
+// Parse `text`. The result owns a copy; check `parsed`, then `problem`/`problem_line`.
+pub fn parse(read a: Allocator, read text: str) -> Manifest {
+    var m: Manifest = Manifest{ text: string_new(), ok: true, problem: MANIFEST_OK, problem_line: 0,
+                                name_s: 0, name_e: 0, ver_s: 0, ver_e: 0, deps: list.make(i32, a) }
+    string_push(m.text, text)
+    let t: str = string_view(m.text)
+    var at: usize = 0
+    var lineno: i32 = 0
+    var have_name: bool = false
+    var have_ver: bool = false
+    for at < t.len {
+        lineno = lineno + 1
+        var e: usize = line_end(t, at)
+        var le: usize = e
+        if le > at {
+            if (t[le - 1] as i32) == 13 { le = le - 1 }      // a CRLF file reads as LF
+        }
+        if lineno == 1 {
+            if str_eq(t[at .. le], MANIFEST_TAG) == false { failed(m, MANIFEST_NO_TAG, lineno)  return m }
+        } else {
+            if le > at {
+                let w1e: usize = word_end(t, at, le)
+                let key: str = t[at .. w1e]
+                if w1e >= le { failed(m, MANIFEST_BAD_LINE, lineno)  return m }
+                let w2s: usize = w1e + 1
+                let w2e: usize = word_end(t, w2s, le)
+                if str_eq(key, "name") {
+                    if w2e != le or have_name { failed(m, MANIFEST_BAD_LINE, lineno)  return m }
+                    if valid_name(t[w2s .. w2e]) == false { failed(m, MANIFEST_BAD_NAME, lineno)  return m }
+                    m.name_s = w2s
+                    m.name_e = w2e
+                    have_name = true
+                } else {
+                    if str_eq(key, "version") {
+                        if w2e != le or have_ver { failed(m, MANIFEST_BAD_LINE, lineno)  return m }
+                        let v: semver.Version = semver.parse(t[w2s .. w2e])
+                        if semver.valid(v) == false { failed(m, MANIFEST_BAD_VERSION, lineno)  return m }
+                        m.ver_s = w2s
+                        m.ver_e = w2e
+                        have_ver = true
+                    } else {
+                        if str_eq(key, "dep") == false { failed(m, MANIFEST_BAD_LINE, lineno)  return m }
+                        if w2e >= le { failed(m, MANIFEST_BAD_DEP, lineno)  return m }
+                        let w3s: usize = w2e + 1
+                        let w3e: usize = word_end(t, w3s, le)
+                        if w3e != le { failed(m, MANIFEST_BAD_LINE, lineno)  return m }
+                        if valid_name(t[w2s .. w2e]) == false { failed(m, MANIFEST_BAD_DEP, lineno)  return m }
+                        let r: semver.Req = semver.parse_req(t[w3s .. w3e])
+                        if semver.req_valid(r) == false { failed(m, MANIFEST_BAD_DEP, lineno)  return m }
+                        // A dependency named twice has two requirements, and a resolver
+                        // given both would silently take one of them.
+                        let n: usize = list.len(i32, m.deps) / 4
+                        var k: usize = 0
+                        for k < n {
+                            let ds: usize = list.get(i32, m.deps, k * 4) as usize
+                            let de: usize = list.get(i32, m.deps, k * 4 + 1) as usize
+                            if str_eq(t[ds .. de], t[w2s .. w2e]) { failed(m, MANIFEST_DUP_DEP, lineno)  return m }
+                            k = k + 1
+                        }
+                        list.push(i32, m.deps, w2s as i32)
+                        list.push(i32, m.deps, w2e as i32)
+                        list.push(i32, m.deps, w3s as i32)
+                        list.push(i32, m.deps, w3e as i32)
+                    }
+                }
+            }
+        }
+        at = e + 1
+    }
+    if lineno == 0 { failed(m, MANIFEST_NO_TAG, 0)  return m }
+    if have_name == false { failed(m, MANIFEST_NO_NAME, lineno)  return m }
+    if have_ver == false { failed(m, MANIFEST_NO_VERSION, lineno)  return m }
+    return m
+}
+
+// Render a manifest in the ONE canonical form: tag, name, version, then deps in the order
+// given. `render(parse(x)) == x` for any `x` that was itself rendered.
+pub fn render(read a: Allocator, read name: str, read version: str, read deps: List(i32), read dep_text: str) -> String {
+    var s: String = string_new()
+    string_push(s, MANIFEST_TAG)
+    string_push(s, "\nname ")
+    string_push(s, name)
+    string_push(s, "\nversion ")
+    string_push(s, version)
+    string_push(s, "\n")
+    let n: usize = list.len(i32, deps) / 4
+    var i: usize = 0
+    for i < n {
+        string_push(s, "dep ")
+        string_push(s, dep_text[list.get(i32, deps, i * 4) as usize .. list.get(i32, deps, i * 4 + 1) as usize])
+        string_push(s, " ")
+        string_push(s, dep_text[list.get(i32, deps, i * 4 + 2) as usize .. list.get(i32, deps, i * 4 + 3) as usize])
+        string_push(s, "\n")
+        i = i + 1
+    }
+    return s
+}
+
+// Re-render a parsed manifest canonically.
+pub fn render_of(read a: Allocator, read m: Manifest) -> String {
+    return render(a, name(m), version(m), m.deps, string_view(m.text))
+}
+
+// A builder for the common case — a program assembling a manifest from parts.
+pub struct Draft {
+    buf: String,
+    used: usize,
+    deps: List(i32),
+    name_s: usize,
+    name_e: usize,
+    ver_s: usize,
+    ver_e: usize,
+}
+
+impl Drop for Draft {
+    fn drop(mut self) {
+        string_free(self.buf)
+    }
+}
+
+pub fn draft(read a: Allocator, read name: str, read version: str) -> Draft {
+    var d: Draft = Draft{ buf: string_new(), used: 0, deps: list.make(i32, a), name_s: 0, name_e: 0, ver_s: 0, ver_e: 0 }
+    string_push(d.buf, name)
+    d.name_e = name.len
+    d.ver_s = name.len
+    string_push(d.buf, version)
+    d.used = name.len + version.len
+    d.ver_e = d.used
+    return d
+}
+
+pub fn draft_dep(mut d: Draft, read name: str, read req: str) {
+    list.push(i32, d.deps, d.used as i32)
+    string_push(d.buf, name)
+    d.used = d.used + name.len
+    list.push(i32, d.deps, d.used as i32)
+    list.push(i32, d.deps, d.used as i32)
+    string_push(d.buf, req)
+    d.used = d.used + req.len
+    list.push(i32, d.deps, d.used as i32)
+}
+
+pub fn draft_render(read a: Allocator, read d: Draft) -> String {
+    let v: str = string_view(d.buf)
+    return render(a, v[d.name_s .. d.name_e], v[d.ver_s .. d.ver_e], d.deps, v)
+}

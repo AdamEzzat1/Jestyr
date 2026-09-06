@@ -1,0 +1,207 @@
+// std/httpc.jtr — an HTTP/1.1 client: one connection, many requests, and the response parsed
+// by the same module that parses requests.
+//
+// TIER: `sys`, by dependency on `std/sysnet`. Built as the TEST client for `std/httpd` and
+// shaped like one: it is blocking, it holds one connection, and it reads a response until
+// `std/http` says the message is complete — which for a response without framing headers
+// means until the peer closes. That is the client half of the smuggling conversation, and it
+// is the parser's decision, not this module's.
+//
+// `fetch` is the one-shot form: connect, ask, read, close. `Client` is the kept-alive form,
+// for the test that must prove two requests travelled on one socket.
+//
+// Not here: redirects, cookies, TLS, a connection pool, anything asynchronous.
+
+import "http"
+import "mem"
+import "sysnet"
+
+const HTTPC_HEADERS: usize = 100
+
+@move pub struct Client {
+    sock: sysnet.Socket,
+    buf: *mut u8,
+    cap: usize,
+    have: usize,
+    hs: *mut http.Header,
+    resp: http.Response,
+    open: bool,
+    sent: i64,
+    received: i64,
+}
+
+// Connect to `addr` with a `cap`-byte receive buffer. Check `is_open`. (`dial`, not
+// `connect`: an extern's name is a C symbol in every module that links it, and `sysnet`
+// binds `connect(2)` and `close(2)` — a Jestyr fn may not shadow either.)
+pub fn dial(mut net: sysnet.Net, read addr: sysnet.SocketAddr, cap: usize) -> Client {
+    var s: sysnet.Socket = sysnet.connect_to(net, addr) catch sysnet.closed()
+    let ok: bool = sysnet.is_open(s)
+    return Client{ sock: s, buf: alloc(u8, cap), cap: cap, have: 0, hs: alloc(http.Header, HTTPC_HEADERS),
+                   resp: http.empty_response(), open: ok, sent: 0, received: 0 }
+}
+
+@no_alloc @no_os pub fn is_open(read c: Client) -> bool { return c.open }
+@no_alloc @no_os pub fn requests_sent(read c: Client) -> i64 { return c.sent }
+@no_alloc @no_os pub fn responses_read(read c: Client) -> i64 { return c.received }
+
+pub fn hangup(mut c: Client) {
+    if c.open {
+        sysnet.close_socket(c.sock) catch nothing()
+        c.open = false
+    }
+    if c.buf != null { free_ptr(c.buf)  c.buf = null }
+    if c.hs != null { free_ptr(c.hs as *mut u8)  c.hs = null }
+}
+
+fn nothing() { }
+
+// Send exactly `text`. The escape hatch for a test that wants to send something no
+// well-formed client would.
+pub fn send_raw(mut c: Client, read text: str) -> bool {
+    if c.open == false { return false }
+    let b: []u8 = slice(u8, text.ptr as *mut u8, text.len)
+    let n: usize = sysnet.send_all(c.sock, b) catch 0
+    if n == text.len { c.sent = c.sent + 1 }
+    return n == text.len
+}
+
+// Send a request. `extra` is zero or more already-rendered header lines (`Name: v\r\n`); a
+// `Content-Length` is added when `body` is non-empty, and `Host` always.
+pub fn request(mut c: Client, read method: str, read path: str, read extra: str, read body: str) -> bool {
+    var m: String = string_new()
+    string_push(m, method)
+    string_push(m, " ")
+    string_push(m, path)
+    string_push(m, " HTTP/1.1\r\nHost: localhost\r\n")
+    string_push(m, extra)
+    if body.len > 0 {
+        string_push(m, "Content-Length: ")
+        push_usize(m, body.len)
+        string_push(m, "\r\n")
+    }
+    string_push(m, "\r\n")
+    string_push(m, body)
+    let sent: bool = send_raw(c, string_view(m))
+    string_free(m)
+    return sent
+}
+
+fn push_usize(mut s: String, v: usize) {
+    if v == 0 {
+        string_push(s, "0")
+        return
+    }
+    var raw: *mut u8 = alloc(u8, 24)
+    var b: []u8 = slice(u8, raw, 24)
+    var n: usize = 0
+    var t: usize = v
+    for t > 0 {
+        b[n] = (48 + (t % 10)) as u8
+        t = t / 10
+        n = n + 1
+    }
+    var i: usize = 0
+    for i < n / 2 {
+        let tmp: u8 = b[i]
+        b[i] = b[n - 1 - i]
+        b[n - 1 - i] = tmp
+        i = i + 1
+    }
+    string_push(s, from_utf8(b[0 .. n]))
+    free_ptr(raw)
+}
+
+// Read the next response. Returns an `http` outcome; on `HTTP_OK` the response is complete
+// and `status`/`body`/`header` describe it. A response framed "until close" is read to the
+// close. A peer that closes before a complete message is `HTTP_BAD` unless nothing at all
+// had arrived, which is reported as `HTTP_INCOMPLETE` — the answer to "did the server hang
+// up on me" that the timeout tests ask.
+pub fn read_response(mut c: Client) -> i32 {
+    if c.open == false { return http.HTTP_BAD }
+    // Drop the previous response's bytes; what follows them is this one.
+    let prev: usize = c.resp.total
+    if prev > 0 and prev <= c.have {
+        var cb: []u8 = slice(u8, c.buf, c.cap)
+        var j: usize = 0
+        for j < c.have - prev {
+            cb[j] = cb[prev + j]
+            j = j + 1
+        }
+        c.have = c.have - prev
+    }
+    c.resp = http.empty_response()
+    var hs: []http.Header = slice(http.Header, c.hs, HTTPC_HEADERS)
+    var eof: bool = false
+    for true {
+        let b: []u8 = slice(u8, c.buf, c.have)
+        var r: http.Response = http.empty_response()
+        let o: i32 = http.parse_response(b, hs, r)
+        if o == http.HTTP_OK {
+            if r.until_close and eof == false {
+                // Keep reading: the body is everything until the peer closes.
+            } else {
+                c.resp = r
+                c.received = c.received + 1
+                return http.HTTP_OK
+            }
+        } else {
+            if o != http.HTTP_INCOMPLETE { return o }
+            if eof {
+                if c.have == 0 { return http.HTTP_INCOMPLETE }
+                return http.HTTP_BAD
+            }
+        }
+        if c.have >= c.cap { return http.HTTP_TOO_LARGE }
+        var cb2: []u8 = slice(u8, c.buf, c.cap)
+        var win: []u8 = cb2[c.have .. c.cap]
+        // A read error reads as a close: either way no more bytes are coming.
+        let n: usize = sysnet.recv_bytes(c.sock, win) catch 0
+        if n == 0 { eof = true } else { c.have = c.have + n }
+    }
+    return http.HTTP_BAD
+}
+
+@no_alloc @no_os pub fn status(read c: Client) -> i32 { return c.resp.status }
+@no_alloc @no_os pub fn is_chunked(read c: Client) -> bool { return c.resp.chunked }
+
+// The first header named `name` (lower-case) of the last response, or "".
+pub fn header(read c: Client, read name: str) -> str {
+    let b: []u8 = slice(u8, c.buf, c.have)
+    let hs: []http.Header = slice(http.Header, c.hs, c.resp.headers)
+    return http.header_value(hs, c.resp.headers, b, name)
+}
+
+// Append the last response's DECODED body to `dst`. False if a chunked body was malformed.
+pub fn body(read c: Client, mut dst: String) -> bool {
+    let b: []u8 = slice(u8, c.buf, c.have)
+    if c.resp.chunked {
+        var raw: *mut u8 = alloc(u8, c.resp.body.len + 1)
+        var db: []u8 = slice(u8, raw, c.resp.body.len + 1)
+        let n: isize = http.decode_chunked(b, c.resp.body, db)
+        var fine: bool = false
+        if n >= 0 {
+            string_push(dst, from_utf8(db[0 .. n as usize]))
+            fine = true
+        }
+        free_ptr(raw)
+        return fine
+    }
+    string_push(dst, from_utf8(b[c.resp.body.off .. c.resp.body.off + c.resp.body.len]))
+    return true
+}
+
+// Connect, send one request, read the response, close. Returns the status, or -1 when no
+// response arrived; the body lands in `dst`.
+pub fn fetch(mut net: sysnet.Net, read addr: sysnet.SocketAddr, read method: str, read path: str, read extra: str, read reqbody: str, mut dst: String) -> i32 {
+    var c: Client = dial(net, addr, 65536)
+    if is_open(c) == false { return 0 - 1 }
+    var st: i32 = 0 - 1
+    if request(c, method, path, extra, reqbody) {
+        if read_response(c) == http.HTTP_OK {
+            st = status(c)
+            body(c, dst)
+        }
+    }
+    hangup(c)
+    return st
+}

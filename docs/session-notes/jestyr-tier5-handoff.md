@@ -1123,6 +1123,93 @@ port's `c.gref`) and both backends name the symbol from that alone. The corpus f
 is a divergence waiting for the first shadow** — the same shape as `call_sym`, and it was
 fixed the same way.
 
+## §3s. HTTP V2 — `std/httpd` and `std/httpc`
+
+Everything above the message, in one loop. `httpd.jtr`: a router (`:name` segments, a
+trailing `*`, method `*`, first match wins), middleware as a `List(Handler)` run before
+routing (`HTTPD_DONE` skips it), keep-alive with PIPELINING (the parser's `req.total` is the
+boundary; every complete request in a buffer is answered before the kernel is asked for
+more), a READ timeout (408 + close: Slowloris) and an IDLE timeout (silent close) as separate
+knobs because they are separate failures, chunked streaming out, static files under a root
+with `..`/backslash/NUL refused as a 404 (a probing client learns nothing), an access log
+record per exchange through `std/log`. `httpc.jtr`: a blocking client, `fetch` one-shot and
+`Client` kept-alive, reading a response until `std/http` says it is complete.
+
+**Single-threaded, readiness-driven, by design.** `spawn` refuses a `mut` parameter, so a
+worker per connection would be a channel architecture; one poll over `runtime.ask` (the
+poller exposed to a loop with its own fd table) is smaller and is what makes the suite a
+transcript: client and server take turns in one process. Handlers are the `runtime.Task`
+shape — fn pointer plus context — because that is what a `List` can hold.
+
+**`std/http` grew the response half**, sharing the request parser's header loop and
+framing scan (one framing decision, both directions), a `span` constructor (a
+module-qualified struct literal does not parse), and `@copy` on `Request`/`Response` (all
+offsets and flags; without it a borrowed `Request` cannot sit in the exchange). `sysnet`
+grew `adopt(fd)` for a table that stores descriptors.
+
+**Three names moved because an extern's name is a C symbol in every module that links
+it**: `connect`, `close` and `listen` are `sysnet`'s, so the client `dial`s and `hangup`s
+and the server `start`s and `stop`s. The checker's message is "duplicate definition", one
+module away from the cause.
+
+**Found on the way: A13** (§6A) — drop glue under colliding type names, a link error here
+and a wrong-type `fclose` in the case that links.
+
+Eight tests, five mutations watched failing (keep-alive never kept, middleware `DONE`
+ignored, traversal check removed, timeouts never expiring, the pipelined remainder
+discarded), the `jhttpd` demo pinned. **Two of the five FAIL BY HANGING** — a client blocks
+on a response the mutated server never sends — and a probe harness must treat a hang as a
+failure and kill the grandchild, or it waits forever on the pipe. **One probe passed the
+first suite**: with `DONE` ignored the client still saw the middleware's 401, because the
+handler that ran afterwards had its response refused as a duplicate. The status could not
+tell; only a handler that RECORDS that it ran could, and the suite now has one. A test
+that asserts through the wire alone cannot see what happened behind it.
+
+## §3t. TLS — `std/tls`, by binding OpenSSL
+
+Bindings through `extern "openssl/ssl.h"`/`"openssl/err.h"` — header-declared, so no
+prototype is emitted and the library's own signatures are used. A `Context` (client, or
+server loaded with a certificate and its key, checked against each other at load), a
+`Session` over a `sysnet` descriptor (`client_session` with SNI and — whenever the context
+trusts a CA — `SSL_set1_host`, so the hostname is checked; `server_session`), `write_all`,
+`read_into` (0 is a clean close-notify, -1 is everything else, including a peer that
+vanished — the truncation-attack distinction TLS adds over TCP), `shutdown`, and
+`last_error` in OpenSSL's words. Verification has no "continue on failure" mode.
+
+**A handshake needs both ends running at once**, and `sysnet` is blocking, so the suite
+spawns the client (`concurrent { let h = spawn client_roundtrip(port, verify, wrong_host) }`)
+and serves on the main thread. The spawn target takes integers and returns one — the shape
+`spawn` accepts — and encodes what it saw. Four cases: verified (chain AND hostname), wrong
+hostname with the right CA (must fail), trust-nothing (completes, reports unverified),
+refusals at load with the library's reason.
+
+**Linking:** `openssl/ssl.h` in the emitted C → `-lssl -lcrypto` after the source, at both
+of `main.rs`'s link sites and in the port's `jc build` driver (a reseed). Measured first:
+Strawberry's mingw ships OpenSSL 1.1.1i headers and both static libraries. The test
+certificate is a checked-in self-signed `localhost` pair (`examples/std/fixtures/`), minted
+with `openssl req -config …` because that `openssl.exe` cannot find its default config.
+
+Not built: schannel, non-blocking sessions (`sysnet` has none), resumption, client
+certificates, ALPN, a `protocol` accessor (a `cstr` has no view helper in `std/cstring`).
+
+## §3u. The registry layer — `std/manifest` and `std/registry`
+
+The two absences the substrate recorded. `manifest.jtr`: `jestyr-package/v1`, `name`,
+`version`, `dep <name> <req>`, validated with `semver` at parse, refusing what a resolver
+could not consume (a dependency named twice, a name with a capital), rendering in ONE form
+so `render(parse(x)) == x`. `registry.jtr`: a directory — `index` of `pkg <name> <version>
+<sha256>` lines, `<name>-<version>.manifest`, `<name>-<version>.tar` — and the same paths
+under a base URL over HTTP, which is what `httpd`'s static route serves without knowing.
+`load` builds `resolve.Registry` from text alone; `fetch`/`fetch_http` share one admission
+rule (hash, compare to the index's promise, then `cache.store`); `publish` refuses a bad
+manifest and an existing version.
+
+The end-to-end test is the `jc add` shape: publish three versions, load, `resolve` picks
+minimally, fetch the selection through the cache, refuse a tampered archive, then fetch
+the same package over HTTP from `httpd` on a spawned thread. **That thread keeps its
+`Server` in raw memory** (`alloc` + `unsafe { p.* = … }`) because a dropped `Server` local
+in a program that also links `std/file` trips A13.
+
 ## §4. Comparison suites, rerun at this milestone
 
 Run twice this arc — after §3 and again after §3c, since both changed compiler semantics.
@@ -1152,10 +1239,10 @@ twice.
 | 2 | observability | **mostly.** `log.jtr` (structured, injected `Clock`+`Writer`, no globals) + `metrics.jtr` (counters/gauges/histograms, name-ordered dump, saturating counters). Missing: **trace spans** — and `Span` is taken three times already, so pick another word first |
 | 3 | config | **DONE.** `config.jtr` (precedence is a property of the SOURCE, order-independent) + `ini.jtr` as a file format over it. Missing: live reload, nesting |
 | 4 | sandbox | **mostly.** `sysproc` spawn/pipes/`wait_timeout`/kill, and environment inheritance now matches on both platforms **and is finally tested** (§3p). Missing: **cwd, process groups, fs capability projection** |
-| 5 | package | **substrate DONE.** `semver` → `resolve` (minimal version selection) → `lockfile` (a witness, not a source of truth) → `cache` (content-addressed), over `module.rs`'s manifest, `buildgraph.jtr`, `tar.jtr`, `sha256.jtr`. Missing: **a registry protocol and a manifest FORMAT** — nothing fetches and nothing is parsed from a file, deliberately |
-| 6 | HTTP | **parser only.** `http.jtr` refuses request smuggling. Missing: **routing, middleware, streaming bodies, keep-alive, timeouts, static files, access logs, test client/server** |
+| 5 | package | **DONE through the registry layer (§3u).** `semver` → `resolve` → `lockfile` → `cache`, then `manifest.jtr` (the package FORMAT, one canonical rendering) and `registry.jtr` (a directory layout, the same over HTTP; `load` feeds the solver, `fetch` verifies against the index's digest before the cache). Missing: **signatures, yanking, mirrors, publishing over HTTP**, and the `jc add` command itself over these pieces |
+| 6 | HTTP | **DONE (§3s).** `httpd.jtr` (router, middleware, keep-alive + pipelining, read/idle timeouts, chunked streaming, static files, access log) + `httpc.jtr` (test client) above `http.jtr`, which now parses responses too. Missing: request-BODY streaming (a request must fit the connection buffer), TLS |
 | 7 | crypto | **boundary done.** `sha256`, `crc32`, and `csrand.jtr` (platform CSPRNG + constant-time compare). Missing: **HMAC, signing/verification, a hash interface** — bindings, not algorithms to write |
-| 8 | TLS | **absent**, and NOT gated — the "churns every manifest" claim in §6B4 was measured false (link libraries are content-triggered and never enter `CC_FLAGS`). Ordinary scope: handshake, verification, an error surface, schannel-or-OpenSSL on Windows |
+| 8 | TLS | **DONE (§3t).** `tls.jtr` binds OpenSSL: contexts, blocking sessions over a `sysnet` descriptor, verification that includes the hostname, an error surface. Content-triggered `-lssl -lcrypto` on both drivers. Missing: **schannel** (Windows goes through mingw's OpenSSL), non-blocking sessions, resumption, client certs, ALPN |
 | 9 | storage | **DONE (§3q).** `kv.jtr` on `alog.jtr`: KV, atomic batches (one record each), compaction, migrations, snapshot/backup — one rewrite primitive under all three. Memory-resident by design; a store larger than memory needs a seek in `file.Reader` first |
 | 10 | compatibility | **DONE.** `src/attest.rs` emits the ABI manifest and gates breaking-vs-compatible in CI, now including trait/impl records. Missing: `@deprecated` reaches nothing (A8) |
 
@@ -1242,6 +1329,49 @@ it, and then wrap it — and it now opens INTO a caller-owned handle instead.
 argument should be treated as consumed exactly as a bare `return` treats it. That is a
 closure edit and a reseed, so it belongs in the next-steps note's serial §1, and a corpus
 file that RETURNS `ok(local)` must be added so the port mirror can be watched failing.
+
+#### A13. Drop glue under COLLIDING type names calls a function that does not exist — OPEN
+
+Three modules in one closure each define a `Writer` (`file`, `writer`, one more); only
+`file.Writer` has a `Drop` impl, emitted canonically as `jestyr_impl_Drop__Writer__m21__drop`.
+A scope-exit drop of a struct holding a `writer.Writer` FIELD (`log.Logger.jw`, reached
+through `httpd.Server`) emitted `jestyr_impl_Drop__Writer__drop` — the BARE name, for a
+type that has no `Drop` at all — and the link failed. Found by `httpd_test` importing
+`sysfs` (→ `file`) beside `log` (→ `writer`).
+
+Two things are wrong at once: the field type reached `needs_drop` under its bare name
+(`ty_key` of an `Opaque("Writer")`, so the module-qualified field type did not resolve to
+its index), and the impl index answered that bare name (the impl is registered under the
+bare key while the type's canonical name is suffixed). The visible failure is a link
+error. **The invisible one is worse:** had the names lined up, a `writer.Writer` would have
+been handed to `file.Writer`'s drop — `fclose` on a struct that holds no `FILE*`.
+
+Routed around in `httpd_test` (no `sysfs` import). Needs: a probe program with two
+same-named types, one `Drop`, a field of the other; the fix in typeck's field-type lowering
+and/or `drop_key_of`; both sides; a reseed. **Any program importing `file` and `writer`
+together is exposed today.**
+
+#### A14. The port's loader renamed LOCALS that share a colliding fn name — **CLOSED**
+
+`ml_rewrite` flattens modules at the TOKEN level and renames a module's own colliding
+top-level names at every bare, non-`.`-preceded, non-binder use. A local's USE is exactly
+that shape: `body.len` inside `httpc.request(…, read body: str)` became `j_body__m4`
+(`httpc` exports `fn body`, and so does `httpd`), and `runtime`'s `let now` + `now + …`
+became `j_now__m16` because `log`, `runtime` and `time` all export a `now`. gcc:
+"`j_body__m4` undeclared". `jestyrc` resolves scope first and was right. Surfaced by
+`jc_build_matrix` moving `httpd_demo` to `FAIL` — the first corpus program whose closure
+holds two exports of one name AND a local spelled like it.
+
+Fixed in the loader: it now collects the current function's binders (parameters via the
+`ident :` shape inside the parens, `let`/`var` names, `for x in` variables), resets at
+each `fn`, and skips the rename for any of them. Over-approximates in one direction: a
+block-local binder is kept until the function ends, so a fn-valued use of that name AFTER
+the block would go unrenamed — no corpus program does it. Port-only, so no reference
+change; a reseed. The port-built demo prints the pinned transcript.
+
+**The lesson is the one §3j already carries:** the loader is a compensation layer that
+works by spelling, and every spelling-based rule eventually meets a scope. `A13`
+(drop glue by bare name) is the same family on the reference side.
 
 #### A2. `environ` on POSIX — **CLOSED: the test exists now (§3p)**
 

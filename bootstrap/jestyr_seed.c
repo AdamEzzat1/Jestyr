@@ -1651,6 +1651,8 @@ void jestyr_ml_register(Jestyr_Ml* restrict j_m, JestyrStr j_name, JestyrStr j_s
 bool jestyr_ml_ident_head(JestyrStr j_s);
 void jestyr_ml_scan_decls(Jestyr_Ml* restrict j_m, size_t j_mi, Jestyr_Interner* restrict j_it, int64_t j_kwcount, Jestyr_Allocator j_a);
 void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restrict j_sb2, Jestyr_Interner* restrict j_it, int64_t j_kwcount, Jestyr_Allocator j_a);
+void jestyr_ml_add_local(JestyrString* restrict j_set, JestyrStr j_name);
+bool jestyr_ml_is_local(JestyrStr j_set, JestyrStr j_name);
 JestyrString jestyr_ml_flatten(Jestyr_Ml* restrict j_m, JestyrStr j_root, Jestyr_Interner* restrict j_it, int64_t j_kwcount, Jestyr_Allocator j_a);
 Jestyr_SourceMap jestyr_driver_map(Jestyr_Ml* restrict j_m, Jestyr_Allocator j_a);
 int64_t jestyr_driver_orig(Jestyr_Ml* restrict j_m, size_t j_start);
@@ -39846,6 +39848,7 @@ void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restr
     }
     JestyrStr j_stem = jestyr_rt_str_view(&j_stemb);
     size_t j_src_s = (size_t)(jestyr_get__list__i32((*j_m).j_mods, (j_b + 4)));
+    JestyrString j_locals = jestyr_rt_str_new();
     size_t j_cur = 0;
     jestyr_push__i32(&((*j_m).j_map), jestyr_sb_len(&((*j_sb2))));
     jestyr_push__i32(&((*j_m).j_map), (int32_t)(j_src_s));
@@ -39899,6 +39902,72 @@ void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restr
             jestyr_push__i32(&((*j_m).j_map), (int32_t)((j_src_s + j_cur)));
             j_i = (j_last + 1);
             continue;
+        }
+        if (jestyr_rt_str_eq(j_tx, JSTR("fn")))
+        {
+            jestyr_rt_str_free(&j_locals);
+            j_locals = jestyr_rt_str_new();
+            size_t j_q = (j_i + 1);
+            int32_t j_depth = 0;
+            bool j_seen_open = false;
+            while ((j_q < j_n))
+            {
+                Jestyr_Token j_qt = jestyr_get__list__Token(j_tk, j_q);
+                JestyrStr j_qx = jestyr_rt_substr(j_src, j_qt.j_start, j_qt.j_end);
+                if (jestyr_rt_str_eq(j_qx, JSTR("{")))
+                {
+                    break;
+                }
+                if (jestyr_rt_str_eq(j_qx, JSTR("(")))
+                {
+                    j_depth = (j_depth + 1);
+                    j_seen_open = true;
+                }
+                if (jestyr_rt_str_eq(j_qx, JSTR(")")))
+                {
+                    j_depth = (j_depth - 1);
+                    if (((j_depth == 0) && j_seen_open))
+                    {
+                        break;
+                    }
+                }
+                if (((j_seen_open && (j_depth > 0)) && ((j_q + 1) < j_n)))
+                {
+                    Jestyr_Token j_nq = jestyr_get__list__Token(j_tk, (j_q + 1));
+                    if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_nq.j_start, j_nq.j_end), JSTR(":")))
+                    {
+                        if (jestyr_ml_ident_head(j_qx))
+                        {
+                            jestyr_ml_add_local(&(j_locals), j_qx);
+                        }
+                    }
+                }
+                j_q = (j_q + 1);
+            }
+        }
+        if ((jestyr_rt_str_eq(j_tx, JSTR("let")) || jestyr_rt_str_eq(j_tx, JSTR("var"))))
+        {
+            if (((j_i + 1) < j_n))
+            {
+                Jestyr_Token j_bt = jestyr_get__list__Token(j_tk, (j_i + 1));
+                JestyrStr j_bx = jestyr_rt_substr(j_src, j_bt.j_start, j_bt.j_end);
+                if (jestyr_ml_ident_head(j_bx))
+                {
+                    jestyr_ml_add_local(&(j_locals), j_bx);
+                }
+            }
+        }
+        if (jestyr_rt_str_eq(j_tx, JSTR("for")))
+        {
+            if (((j_i + 2) < j_n))
+            {
+                Jestyr_Token j_ft = jestyr_get__list__Token(j_tk, (j_i + 1));
+                Jestyr_Token j_it2 = jestyr_get__list__Token(j_tk, (j_i + 2));
+                if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_it2.j_start, j_it2.j_end), JSTR("in")))
+                {
+                    jestyr_ml_add_local(&(j_locals), jestyr_rt_substr(j_src, j_ft.j_start, j_ft.j_end));
+                }
+            }
         }
         if (jestyr_ml_ident_head(j_tx))
         {
@@ -39959,7 +40028,7 @@ void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restr
                     continue;
                 }
             }
-            if (((!j_prev_dot) && ((!j_next_colon) || j_prev_const)))
+            if ((((!j_prev_dot) && ((!j_next_colon) || j_prev_const)) && (!jestyr_ml_is_local(jestyr_rt_str_view(&j_locals), j_tx))))
             {
                 if (jestyr_ml_is_collision(j_ren, j_stem, j_tx))
                 {
@@ -39978,11 +40047,30 @@ void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restr
     jestyr_rt_str_push(&(*j_sb2), jestyr_rt_substr(j_src, j_cur, j_src.len));
     jestyr_rt_str_push(&(*j_sb2), JSTR("\n"));
     jestyr_free__Token(&(j_tk));
+    jestyr_rt_str_free(&j_locals);
     jestyr_rt_str_free(&j_binds);
     jestyr_rt_str_free(&j_stemb);
     jestyr_rt_str_free(&j_srcb);
     jestyr_rt_str_free(&j_renb);
     jestyr_impl_Drop__List_Token___drop(&j_tk);
+}
+
+void jestyr_ml_add_local(JestyrString* restrict j_set, JestyrStr j_name)
+{
+    jestyr_rt_str_push(&(*j_set), JSTR("|"));
+    jestyr_rt_str_push(&(*j_set), j_name);
+    jestyr_rt_str_push(&(*j_set), JSTR("|"));
+}
+
+bool jestyr_ml_is_local(JestyrStr j_set, JestyrStr j_name)
+{
+    JestyrString j_probe = jestyr_rt_str_new();
+    jestyr_rt_str_push(&j_probe, JSTR("|"));
+    jestyr_rt_str_push(&j_probe, j_name);
+    jestyr_rt_str_push(&j_probe, JSTR("|"));
+    intptr_t j_at = jestyr_rt_find(j_set, jestyr_rt_str_view(&j_probe));
+    jestyr_rt_str_free(&j_probe);
+    return (j_at >= 0);
 }
 
 JestyrString jestyr_ml_flatten(Jestyr_Ml* restrict j_m, JestyrStr j_root, Jestyr_Interner* restrict j_it, int64_t j_kwcount, Jestyr_Allocator j_a)
@@ -40319,6 +40407,10 @@ int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_C
     jestyr_rt_str_push(&j_cmd, JSTR("\" \""));
     jestyr_rt_str_push(&j_cmd, jestyr_rt_str_view(&j_cpath));
     jestyr_rt_str_push(&j_cmd, JSTR("\""));
+    if (jestyr_rt_contains(jestyr_rt_str_view(&j_sb), JSTR("openssl/ssl.h")))
+    {
+        jestyr_rt_str_push(&j_cmd, JSTR(" -lssl -lcrypto"));
+    }
     if ((!j_posix))
     {
         if (jestyr_rt_contains(jestyr_rt_str_view(&j_sb), JSTR("winsock2.h")))

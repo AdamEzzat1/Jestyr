@@ -7,6 +7,57 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/tls`** — TLS over a `sysnet` socket by binding OpenSSL (area 8). A client context
+  that trusts nothing until `trust` gives it a CA, a server context that checks its key
+  against its certificate at load, blocking `client_session`/`server_session` handshakes
+  with SNI, `write_all`/`read_into`/`shutdown`, and an error surface (`TLS_*` plus
+  `last_error` in OpenSSL's own words). **A client that trusts a CA also checks the
+  hostname**, and a session that does not verify on a verifying context is a FAILED
+  handshake, not a warning — there is no "verify but continue" mode. 4 tests over a real
+  loopback handshake with the client on a spawned thread: verified, wrong hostname (right
+  CA, must fail), trust-nothing (completes and says so), refusals at load.
+
+  Bindings, not an implementation — `std/csrand`'s rule. Linking is the content-triggered
+  shape `-pthread` and `-lws2_32` use: a program whose C names `openssl/ssl.h` gets
+  `-lssl -lcrypto` after its source, on both drivers; `CC_FLAGS` and every attest manifest
+  are untouched. No schannel: Windows is served through mingw's OpenSSL.
+
+- **`std/manifest` and `std/registry`** — the layer above the package substrate. A package
+  manifest FORMAT (`jestyr-package/v1`, `name`, `version`, `dep <name> <req>`; one canonical
+  rendering, so `render(parse(x)) == x`), and a registry that is a DIRECTORY LAYOUT —
+  `index`, `<name>-<version>.manifest`, `<name>-<version>.tar` — or the same directory
+  served over HTTP through `std/httpd`'s static route and fetched with `std/httpc`. `load`
+  builds the solver's `resolve.Registry` from the index and the manifests; `fetch` re-hashes
+  an archive against the digest the index promised BEFORE it reaches the cache, and a
+  tampered archive is refused, not stored; a published version is immutable. 2 + 2 tests:
+  publish → load → resolve minimally → fetch through the cache, then the same fetch over
+  HTTP — the `jc add` shape, end to end.
+
+- **`std/httpd` and `std/httpc`** — HTTP V2 (area 6): everything above the message. A
+  router (`/users/:id`, a trailing `*`), middleware in a list (`HTTPD_NEXT`/`HTTPD_DONE`),
+  keep-alive with PIPELINING, a read timeout (408, Slowloris) and an idle timeout (silent
+  close), streamed chunked responses, static files with traversal refused as a 404, an
+  access log through `std/log`, and a blocking test client with `fetch` and a kept-alive
+  `Client`. 8 tests on real loopback sockets, the `jhttpd` demo transcript pinned, five
+  mutations watched failing.
+
+  **One thread, one poll, a table of connections.** `spawn` refuses a `mut` parameter, so a
+  worker per connection would have to be built from channels; a readiness-driven loop over
+  `std/syspoll` is smaller, and it is what makes the suite EXACT — client and server take
+  turns in one process, so every case but the timeout is a transcript. Handlers are the
+  `runtime.Task` shape (a fn pointer plus a context pointer), which is what a `List` can hold.
+
+  `std/http` gained `parse_response` sharing the request parser's header loop and framing
+  scan — the client is the other end of the smuggling conversation, and a response framed
+  differently from the server would be the same hole from the other side — plus a `span`
+  constructor (a module-qualified struct literal does not parse) and `@copy` on `Request`.
+  `runtime.ask` exposes the poller to a loop that owns its own handle table; `sysnet.adopt`
+  gives a stored descriptor its typed operations back.
+
+  Three names moved on the way and the reason is recorded in each: `connect`, `close` and
+  `listen` are `sysnet`'s C symbols, and an extern's name is taken in every module that
+  links it — so the client dials and hangs up, and the server starts and stops.
+
 - **`extern … var` binds a foreign GLOBAL** (B2), on both compilers. `extern "errno.h" var
   errno: i32` is a readable, assignable place named by its C symbol; `extern "c" var x: T`
   emits `extern T x;`, a `.h` abi emits nothing (the header's declaration is the truth, and
@@ -30,6 +81,19 @@ versions are snapshots, not stability promises.
   bare name resolved to the global, and both backends name the C symbol from that record
   rather than from the spelling (the first cut decided by spelling, and a `var errno` local
   wrote the real `errno`; the corpus file's `shadow()` pins the fix).
+
+### Fixed
+
+- **The self-hosted loader no longer renames a LOCAL that shares a colliding function's
+  name (A14).** `jc` flattens an import closure at the token level and rewrites a module's
+  own colliding top-level names at bare uses; a parameter or `let` of the same name was
+  rewritten too, so `httpc.request(…, read body: str)` emitted `j_body__m4` for the local
+  (`httpc` also exports `fn body`) and `runtime`'s `let now` became `j_now__m16` beside
+  three modules' `fn now`. `jestyrc` resolves scope before it canonicalizes and built the
+  same programs. The loader now tracks the current function's binders — parameters, `let`/
+  `var`, `for x in` — and leaves their uses alone. Found by `jc_build_matrix` recording
+  `FAIL httpd_demo`, which is that file doing its job; the port-built demo now prints the
+  pinned transcript.
 
 ### Changed
 

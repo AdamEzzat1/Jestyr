@@ -955,6 +955,12 @@ fn build_one(source: &str, output: &str) -> ExitCode {
     // the whole design -- so the source names `winsock2.h` on Linux too, where `-lws2_32`
     // does not exist and would fail a link that was about to succeed.
     cmd.arg("-o").arg(&exe).arg(&c_file);
+    // OpenSSL, the same content-triggered shape, after the source for the same reason.
+    // `-lssl` names `-lcrypto` symbols, so crypto comes last. Not host-gated: the header
+    // is the same name on every platform and only a program that binds it pays for it.
+    if c_src.contains("openssl/ssl.h") {
+        cmd.arg("-lssl").arg("-lcrypto");
+    }
     if cfg!(windows) && c_src.contains("winsock2.h") {
         cmd.arg("-lws2_32");
     }
@@ -1256,6 +1262,9 @@ fn build_and_maybe_run(path: &str, c_src: &str, run: bool) -> ExitCode {
     }
     // See the note at the other link site: `-lws2_32` must follow the source file.
     cmd.arg("-o").arg(&exe).arg(&c_file);
+    if c_src.contains("openssl/ssl.h") {
+        cmd.arg("-lssl").arg("-lcrypto");
+    }
     if cfg!(windows) && c_src.contains("winsock2.h") {
         cmd.arg("-lws2_32");
     }

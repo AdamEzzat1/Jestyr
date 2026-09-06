@@ -14499,6 +14499,16 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
     }
     let stem: str = string_view(stemb)
     let src_s: usize = list.get(i32, m.mods, b + 4) as usize
+    // The names bound LOCALLY in the function being rewritten: its parameters, its `let`/
+    // `var` binders, its `for x in` variables. A bare use of one of these is the local, not
+    // the module-level name it happens to share, and must not be renamed — `std/httpc`'s
+    // `request(…, read body: str)` reads `body.len` while `httpc` also exports `fn body`,
+    // and `std/runtime`'s `let now` sits beside `pub fn now` in three modules of one
+    // closure. Both emitted `j_body__m4`/`j_now__m16` for a LOCAL and died in gcc, while
+    // `jestyrc` (which resolves scope before it canonicalizes) built the same programs.
+    // Reset at every `fn`; a binder in an inner block is kept until the function ends,
+    // which over-approximates only where a fn-valued use follows a same-named block local.
+    var locals: String = string_new()
     var cur: usize = 0                                // source cursor: copy gaps, apply edits
     // (merged_pos, allsrc_pos) checkpoints: between edits the text is copied verbatim, so a
     // merged span maps back EXACTLY to its original file offset — the `#line` analogue.
@@ -14534,6 +14544,45 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
             list.push(i32, m.map, (src_s + cur) as i32)
             i = last + 1
             continue
+        }
+        if str_eq(tx, "fn") {
+            // A new function: collect its parameter names (`ident :` inside the parens).
+            string_free(locals)
+            locals = string_new()
+            var q: usize = i + 1
+            var depth: i32 = 0
+            var seen_open: bool = false
+            for q < n {
+                let qt: tokens.Token = list.get(tokens.Token, tk, q)
+                let qx: str = src[qt.start .. qt.end]
+                if str_eq(qx, "{") { break }
+                if str_eq(qx, "(") { depth = depth + 1  seen_open = true }
+                if str_eq(qx, ")") {
+                    depth = depth - 1
+                    if depth == 0 and seen_open { break }
+                }
+                if seen_open and depth > 0 and q + 1 < n {
+                    let nq: tokens.Token = list.get(tokens.Token, tk, q + 1)
+                    if str_eq(src[nq.start .. nq.end], ":") {
+                        if ml_ident_head(qx) { ml_add_local(locals, qx) }
+                    }
+                }
+                q = q + 1
+            }
+        }
+        if str_eq(tx, "let") or str_eq(tx, "var") {
+            if i + 1 < n {
+                let bt: tokens.Token = list.get(tokens.Token, tk, i + 1)
+                let bx: str = src[bt.start .. bt.end]
+                if ml_ident_head(bx) { ml_add_local(locals, bx) }
+            }
+        }
+        if str_eq(tx, "for") {
+            if i + 2 < n {
+                let ft: tokens.Token = list.get(tokens.Token, tk, i + 1)
+                let it2: tokens.Token = list.get(tokens.Token, tk, i + 2)
+                if str_eq(src[it2.start .. it2.end], "in") { ml_add_local(locals, src[ft.start .. ft.end]) }
+            }
         }
         if ml_ident_head(tx) {
             var prev_dot: bool = false
@@ -14618,7 +14667,7 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
             // before, 46 after -- and `test_demo` moved from BUILD_OK to FAIL in the same
             // run, which is why `jc_build_matrix` is a two-directional expectations file
             // rather than a count.
-            if !prev_dot and (!next_colon or prev_const) {
+            if !prev_dot and (!next_colon or prev_const) and !ml_is_local(string_view(locals), tx) {
                 if ml_is_collision(ren, stem, tx) {   // an own colliding name at a bare use
                     string_push(sb2, src[cur .. t.start])
                     string_push(sb2, tx)
@@ -14635,10 +14684,28 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
     string_push(sb2, src[cur .. src.len])
     string_push(sb2, "\n")
     list.free(tokens.Token, tk)
+    string_free(locals)
     string_free(binds)
     string_free(stemb)
     string_free(srcb)
     string_free(renb)
+}
+
+// The local-name set of `ml_rewrite`: `|name|` entries, probed with `find`.
+fn ml_add_local(mut set: String, read name: str) {
+    string_push(set, "|")
+    string_push(set, name)
+    string_push(set, "|")
+}
+
+fn ml_is_local(read set: str, read name: str) -> bool {
+    var probe: String = string_new()
+    string_push(probe, "|")
+    string_push(probe, name)
+    string_push(probe, "|")
+    let at: isize = find(set, string_view(probe))
+    string_free(probe)
+    return at >= 0
 }
 
 // Load + flatten the import closure rooted at `root` into one single-file program. Returns
@@ -14995,6 +15062,9 @@ fn driver_build(mut m: Ml, read p: parser.Parser, read c: typeck.Checker, read s
     // before the source resolves nothing and the link fails exactly as if the flag were
     // absent. Content-triggered like `-pthread`, and host-gated because both `@cfg` branches
     // are always emitted -- the source names `winsock2.h` on Linux too.
+    // OpenSSL, the same content-triggered shape, not host-gated (mirrors the reference's
+    // `openssl/ssl.h` rule at both of its link sites).
+    if contains(string_view(sb), "openssl/ssl.h") { string_push(cmd, " -lssl -lcrypto") }
     if !posix {
         if contains(string_view(sb), "winsock2.h") { string_push(cmd, " -lws2_32") }
     }

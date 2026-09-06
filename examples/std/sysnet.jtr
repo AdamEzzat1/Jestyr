@@ -349,6 +349,16 @@ pub fn wire_bytes(read a: SocketAddr, mut buf: []u8) -> usize {
     return Socket{ fd: NET_INVALID }
 }
 
+// A `Socket` over a descriptor the caller already holds as a number — the way a server that
+// keeps a TABLE of connections (a plain array of fds, polled together) gets back to the
+// typed operations for one of them. **This is the raw constructor, and its contract is the
+// caller's:** the descriptor stays owned by whoever stored it, so the handle this returns is
+// a second name for it, and closing through both is the double close `@move` exists to
+// prevent. `std/httpd` is the consumer, and it closes exactly once, from the table.
+@no_alloc @no_os pub fn adopt(fd: i64) -> Socket {
+    return Socket{ fd: fd }
+}
+
 // ---- opening ---------------------------------------------------------------------
 
 // The one wrapper that survives unification: two different functions, one name.

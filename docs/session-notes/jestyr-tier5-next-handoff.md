@@ -454,11 +454,28 @@ protocol (nothing fetches), and a package manifest FORMAT (the `Registry` is bui
 call, not parsed from a file — deliberately, so it is testable without one). Both are the
 obvious next layer if the tier wants an end-to-end `jc add`.
 
-### 2.2 — HTTP V2 (area 6)
+### ~~2.2 — HTTP V2 (area 6)~~ — **DONE: `std/httpd` + `std/httpc`**
 
-The parser is hardened and refuses request smuggling; **everything above the message is
-absent**. Routing, middleware, streaming bodies, keep-alive, timeouts, static files, access
-logs, a test client/server. `sysproc` timeouts and `syspoll` readiness are in place under it.
+Routing, middleware, keep-alive with pipelining, read and idle timeouts, chunked streaming
+out, static files, an access log, a test client. Eight tests on real loopback sockets, five
+mutations watched failing, the `jhttpd` demo pinned. The long note's §3s has the design.
+What a successor should not re-derive:
+
+* **One thread, one poll.** `spawn` refuses `mut` params, so a per-connection worker is a
+  channel architecture; the readiness loop over `runtime.ask` is smaller and makes the
+  suite a transcript. A handler is `fn(*mut u8, mut Exchange) -> i32` plus its context —
+  the `runtime.Task` shape, the one a `List` can hold.
+* **`httpc.fetch` cannot be used against an in-process server** — it blocks on the answer
+  and the caller is the only thread that could produce it. The demo hung on exactly this;
+  every in-process exchange is dial → request → `serve_for` → read.
+* **`connect`/`close`/`listen` are `sysnet`'s C symbols in every module that links it**;
+  the checker says "duplicate definition" one module away from the cause. Hence `dial`/
+  `hangup`/`start`/`stop`.
+* **A13** (drop glue under colliding type names) fires the moment `sysfs` (→ `file`) and
+  `log` (→ `writer`) share a closure with a struct holding a `writer.Writer`. `httpd_test`
+  avoids the import; nothing else does.
+* Not built: request-body streaming (a request must fit the connection buffer; 431 and a
+  close otherwise), TLS, compression, ranges, ETags.
 
 ### ~~2.3 — Storage V2 (area 9)~~ — **DONE: `std/kv`**
 
@@ -498,7 +515,29 @@ done until its count is in that table.
 | Config: live reload, nesting | `std/syswatch` exists; composing them is the caller's job today. |
 | Rewrite `std/plugin` as a server on the pipe transport | Tier 4 leftover. One-process-per-call only because the transport did not exist; it does now (`start_piped`/`capture`). |
 
-### TLS (area 8) — **NOT exclusive of other work.** The recorded blocker was wrong.
+### ~~The registry layer~~ — **DONE: `std/manifest` + `std/registry`**
+
+The two things the substrate note said were absent — a manifest FORMAT and a registry
+PROTOCOL — are a one-rendering text format and a directory layout (`index`, `.manifest`,
+`.tar`) that is the same over HTTP through `httpd`'s static route. `load` builds the
+solver's table from text alone; `fetch` re-hashes against the index's promise before the
+cache sees a byte. The end-to-end `jc add` shape is now a test: publish, load, resolve
+minimally, fetch through the cache, and fetch the same package over HTTP. Not built:
+signatures (a hash is not authentication), yanking, mirrors, publishing over HTTP.
+
+### ~~TLS (area 8)~~ — **DONE: `std/tls`, by binding OpenSSL**
+
+Contexts, blocking sessions over a `sysnet` descriptor, verification that includes the
+HOSTNAME whenever a CA is trusted, an error surface. Four tests over a real handshake with
+the client on a spawned thread (`concurrent { spawn … }` is how a handshake gets both ends).
+Linking is content-triggered (`openssl/ssl.h` → `-lssl -lcrypto`, both drivers, after the
+source); `CC_FLAGS` untouched. The test certificate is a checked-in self-signed
+`localhost` pair under `examples/std/fixtures/` (minted with `openssl req -config`, since
+Strawberry's `openssl.exe` cannot find its own default config). Not built: schannel,
+non-blocking sessions (`sysnet` has no non-blocking mode), resumption, client certs, ALPN.
+**The Linux runner needs `libssl-dev`; a host without it fails `tls_test` at link.**
+
+### TLS (area 8) — the original entry, kept for its correction
 
 This entry used to read: *"binding OpenSSL or schannel is a link-flag change, and `CC_FLAGS`
 is attest-hashed, so `-lssl` churns every manifest in the corpus. That makes it exclusive of
@@ -539,6 +578,61 @@ other §2 items on size, not on a coordination cost it does not have. Nothing ne
 before anyone starts.
 
 ---
+
+## §2b. WHAT IS LEFT — the consolidated register after the breadth pass (2026-09-06)
+
+Everything in §1 and §2's first wave is done: A7, A6, A8, B1, A11, A12, B2; the package
+substrate and its registry layer; storage V2; HTTP V2; TLS. **This section is the whole of
+what remains**, so nobody has to reconcile §1, §2, the long note's §6A/§6B and the
+CHANGELOG to find it.
+
+### Unbuilt — the six second-wave modules (parallel-safe, none reseeds)
+
+| module | what | the one thing to know first |
+|---|---|---|
+| **Crypto bindings** | HMAC, signing/verification, a hash interface | Bindings over `sha256`/OpenSSL, not algorithms; `std/tls` shows the `extern "openssl/*.h"` shape and the link rule is already in place |
+| **Trace spans** | a span per unit of work, parent ids, a dump | `Span` is taken three times (`http`, `diag`, `@span`) — pick another word; fn-pointer vtable, not a trait (`@no_alloc` passes vacuously through a trait) |
+| **Service supervision** | restart policy over `std/sysproc`, backoff, a supervision tree | the lifecycle (`std/service`) is complete; this is a supervisor OVER children, its own module |
+| **Sandbox** | cwd, process groups, fs capability projection onto a child | `sysproc.jtr:113` names all three; `fs.Fs` gates the parent and nothing projects it |
+| **Config live reload + nesting** | re-read on change, nested sections | `std/syswatch` + `std/config` exist; composing them is the module |
+| **`std/plugin` on the pipe transport** | a plugin as a server on `sysproc.start_piped` | Tier 4 leftover; one-process-per-call only because the transport did not exist |
+
+Plus the layer the breadth pass stopped short of: **the `jc add` command** over
+`manifest` + `registry` + `resolve` + `lockfile` + `cache` (every piece exists and is tested
+end to end; the command is the glue), and **request-body streaming** in `httpd` (a request
+must fit the connection buffer today).
+
+### Compiler defects and gaps — OPEN
+
+| id | what | status |
+|---|---|---|
+| **A13** | **Drop glue under COLLIDING type names.** Three `Writer` types in one closure; a struct holding `writer.Writer` emits `jestyr_impl_Drop__Writer__drop` (bare name, no such fn) → link error; had the names lined up it would `fclose` the wrong struct. Fires on `sysfs`(→`file`) + `log`(→`writer`) in one program with a dropped `httpd.Server` local. | Found this pass, in `httpd_test`. Routed around twice (no `sysfs` import; a `Server` kept in raw memory in `registry_test`). Needs a probe file, the fix in field-type lowering and/or `drop_key_of` (impl index keyed by the canonical name), both sides, a reseed. **Any program importing `file` and `writer` together is exposed.** |
+| **A14** | The port's loader renamed a LOCAL sharing a colliding fn's name (`body`, `now`) — token-level rename by spelling. | **CLOSED this pass** (loader tracks the current fn's binders). Residual: a block-local binder is kept until the fn ends, so a fn-valued use of that name after the block would go unrenamed; no corpus program does it. |
+| **Link rules in three places** | `-pthread`/`-lws2_32`/`-lssl -lcrypto` are content-triggered in `main.rs` twice and in `proptests::link_and_finish` once; `tls_test` linked under the driver and failed under the harness until the third copy learned OpenSSL. | The §3o hazard, now with a third site. Fold into one function. |
+| **A4** | Windows: `capture` + print does not round-trip a child's bytes (text-mode stdout). | Recorded decision, not a bug to fix blind: binary stdout re-baselines many goldens. |
+| **A10 / sanitizers** | No sanitizer has ever run over the emitted C. | CI-only: no `libasan` here. `selfhost_fixpoint_subset` is the harness. |
+| **Second C compiler** | Only gcc has ever compiled the output. | CI-only: no clang here; MSVC takes neither `-std=c11` nor `-Werror=`. |
+| **`#line` gap** | The port emits no `#line`; `jestyrc attest` and `jc attest` disagree on `c-sha256` for a module-path build. | Invisible to every golden (they strip `#line`). Needs a module-path C golden first. |
+| **Multi-bound generics** | `fn f[T: Hash + Eq]` does not parse. | Why `hashmap` stores fn-pointer hash/eq. P2 dump goldens are curated snippet lists — add the snippet by hand. |
+| **Generic aliases** | refused; no way to newtype a container. | Why `std/set` is free functions over `HashMap(T, bool)`. |
+| **Uninitialized memory** | no facility; containers carry fake defaults (`smallvec.jtr:77`). | The hard part is the destructor rule for partially initialised aggregates. |
+| **`\u00XX` below 0x20** | passes through to the emitted C verbatim; C rejects it. | Small; lexer, both sides. |
+| **`check` is quiet on an undeclared bare name** | a typo (`eid` for `id`) passes every front-end check and dies in gcc. | Leniency exists for fn-pointer values and extern symbols; a rule refusing a name found in none of scope/consts/variants/fns/externs/globals is a two-sided `escape` item. |
+| **`alog.jtr` header debt** | `alog.Cursor` is move-only by containment; the header does not say so. | A comment, owed on the next change to that file. |
+| **`std/cstring` has no `cstr` view** | a C string cannot be read back as `str`; `tls.protocol` was dropped for it. | Bind `strlen`, build a slice; small. |
+
+### Known flake
+
+`jstatus_serves_a_connection_without_starving_its_timers`: 1ms timer, 500ms budget. Use
+repetition on a quiet machine; "passes in isolation" is the wrong discriminator; do not
+widen the deadline.
+
+### Verification owed to a machine not in reach
+
+The Linux ladder has not run since `std/kv`. **New this pass:** `tls_test` links
+`-lssl -lcrypto` (the runner has `libssl-dev`; a host without it fails at link), and every
+socket suite (`httpd_test`, `tls_test`, `registry_test`) is a loopback transcript that has
+only ever run on Windows.
 
 ## §3. COORDINATION — what makes §2 safe
 
@@ -670,6 +764,18 @@ measures the buffer, not the file; sync first.
 
 **A suite is not registered until its count is in `io_suites_pass`.** Four landed green and
 gated nothing.
+
+**A mutation probe over a SOCKET suite can hang, and the hang is the verdict.** Two of
+`httpd`'s five mutations left a client blocked on a response the broken server never sent.
+A probe harness needs a per-run timeout that counts as FAILED, and on Windows it must kill
+the test binary itself — `subprocess.run(timeout=…)` kills the compiler it launched, then
+blocks on the pipe the grandchild still holds. Watched twice before it was understood.
+
+**A test that asserts only through the wire cannot see what happened behind it.** Ignoring
+middleware `DONE` passed the first `httpd` suite: the client still saw the 401, because the
+handler that ran afterwards had its response refused as a duplicate. Only a handler that
+records that it RAN (through its context pointer) made the mutation visible. When a probe
+passes, ask what the assertion could not observe.
 
 **`jestyrc check` is QUIET on an undeclared bare name.** A `Name` that resolves to nothing
 types as `Unknown` ("a function name or external symbol: stay quiet"), so a typo in a `.jtr`

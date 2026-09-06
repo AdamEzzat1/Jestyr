@@ -1,0 +1,216 @@
+// std/tls_test.jtr — a real handshake over loopback, and the two ways it must fail.
+//
+// A TLS handshake needs both ends running at once, so each round trip here SPAWNS the client
+// on its own thread (`concurrent { let h = spawn … }`) while the server side runs on this
+// one. The spawned task takes plain integers and returns one — the shape `spawn` accepts —
+// and encodes what it saw: `1` for "the server answered pong", `+10` for "and the peer
+// verified", `100 + outcome` for a handshake that did not complete.
+//
+// The certificate under `fixtures/` is self-signed for `localhost` with a matching SAN, and
+// it is its own CA: the client trusts THAT file, which is what makes the verifying case a
+// real chain check rather than a `VERIFY_NONE` that happens to succeed. The hostname case
+// dials the same server as `example.com` — right CA, wrong name — and must fail, because a
+// client that trusts a CA and skips the name check accepts every certificate that CA ever
+// issued.
+//
+// Run:  jestyrc test examples/std/tls_test.jtr
+
+import "mem"
+import "sysnet"
+import "test"
+import "test_report"
+import "tls"
+
+const TLS_T_CAP: usize = 8192
+const TLS_T_CERT: str = "examples/std/fixtures/tls_test_cert.pem"
+const TLS_T_KEY: str = "examples/std/fixtures/tls_test_key.pem"
+
+fn nothing() { }
+
+// The CLIENT, on its own thread. `verify` 1 trusts the fixture CA; `wrong_host` 1 dials as
+// `example.com`. Returns the code described in the header.
+fn client_roundtrip(port: i64, verify: i64, wrong_host: i64) -> i64 {
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var sock: sysnet.Socket = sysnet.connect_to(net, sysnet.loopback(port as u16)) catch sysnet.closed()
+    if sysnet.is_open(sock) == false { return 0 - 1 }
+    var ctx: tls.Context = tls.client_context()
+    if verify == 1 {
+        if tls.trust(ctx, a, TLS_T_CERT) == false { return 0 - 2 }
+    }
+    var host: str = "localhost"
+    if wrong_host == 1 { host = "example.com" }
+    var s: tls.Session = tls.client_session(ctx, a, sock.fd, host)
+    var code: i64 = 0
+    if tls.is_established(s) == false {
+        code = 100 + (tls.outcome(s) as i64)
+    } else {
+        tls.write_all(s, "ping")
+        var raw: *mut u8 = alloc(u8, TLS_T_CAP)
+        var buf: []u8 = slice(u8, raw, TLS_T_CAP)
+        let n: isize = tls.read_into(s, buf)
+        if n == 4 {
+            if str_eq(from_utf8(buf[0 .. 4]), "pong") { code = 1 }
+        }
+        if tls.peer_verified(s) { code = code + 10 }
+        free_ptr(raw)
+        tls.shutdown(s)
+    }
+    tls.free_context(ctx)
+    sysnet.close_socket(sock) catch nothing()
+    sysnet.shutdown(net)
+    return code
+}
+
+// The SERVER side of one connection, on this thread: accept, handshake, read, answer.
+// Returns the server's view: 1 if the handshake completed and "ping" arrived, else 0.
+fn serve_one(mut net: sysnet.Net, read lis: sysnet.Socket, read sctx: tls.Context) -> i64 {
+    var conn: sysnet.Socket = sysnet.accept_one(net, lis) catch sysnet.closed()
+    if sysnet.is_open(conn) == false { return 0 }
+    var s: tls.Session = tls.server_session(sctx, conn.fd)
+    var seen: i64 = 0
+    if tls.is_established(s) {
+        var raw: *mut u8 = alloc(u8, TLS_T_CAP)
+        var buf: []u8 = slice(u8, raw, TLS_T_CAP)
+        let n: isize = tls.read_into(s, buf)
+        if n == 4 {
+            if str_eq(from_utf8(buf[0 .. 4]), "ping") { seen = 1 }
+        }
+        tls.write_all(s, "pong")
+        free_ptr(raw)
+        tls.shutdown(s)
+    }
+    sysnet.close_socket(conn) catch nothing()
+    return seen
+}
+
+@test fn a_verified_handshake_carries_bytes_both_ways() -> bool {
+    var raw: *mut u8 = alloc(u8, TLS_T_CAP)
+    var rep: []u8 = slice(u8, raw, TLS_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var lis: sysnet.Socket = sysnet.listen_on(net, sysnet.loopback(0), 4) catch sysnet.closed()
+    test.is_true(c, rep, "listening", sysnet.is_open(lis))
+    let bound: sysnet.SocketAddr = sysnet.local_addr(lis) catch sysnet.addr(0, 0)
+    var sctx: tls.Context = tls.server_context(a, TLS_T_CERT, TLS_T_KEY)
+    test.is_true(c, rep, "the server context loaded its certificate and key", tls.context_is_open(sctx))
+
+    var client: i64 = 0
+    var server: i64 = 0
+    concurrent {
+        let h = spawn client_roundtrip(bound.port as i64, 1, 0)
+        server = serve_one(net, lis, sctx)
+        client = await h
+    }
+    test.eq_i64(c, rep, "the server saw ping over TLS", server, 1)
+    // 1 for pong, +10 for a verified peer: the chain to the fixture CA AND the hostname.
+    test.eq_i64(c, rep, "the client got pong and verified the peer", client, 11)
+
+    tls.free_context(sctx)
+    sysnet.close_socket(lis) catch nothing()
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_trusted_ca_with_the_wrong_hostname_fails_the_handshake() -> bool {
+    var raw: *mut u8 = alloc(u8, TLS_T_CAP)
+    var rep: []u8 = slice(u8, raw, TLS_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var lis: sysnet.Socket = sysnet.listen_on(net, sysnet.loopback(0), 4) catch sysnet.closed()
+    let bound: sysnet.SocketAddr = sysnet.local_addr(lis) catch sysnet.addr(0, 0)
+    var sctx: tls.Context = tls.server_context(a, TLS_T_CERT, TLS_T_KEY)
+
+    // **Right CA, wrong name.** The certificate chains to what the client trusts; it is
+    // for `localhost` and the client dialed `example.com`. This must not complete.
+    var client: i64 = 0
+    var server: i64 = 0
+    concurrent {
+        let h = spawn client_roundtrip(bound.port as i64, 1, 1)
+        server = serve_one(net, lis, sctx)
+        client = await h
+    }
+    test.eq_i64(c, rep, "the client refused: verify-failed", client, 100 + (tls.TLS_VERIFY_FAILED as i64))
+    test.eq_i64(c, rep, "so the server never saw ping", server, 0)
+
+    tls.free_context(sctx)
+    sysnet.close_socket(lis) catch nothing()
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_client_that_trusts_nothing_connects_but_does_not_verify() -> bool {
+    var raw: *mut u8 = alloc(u8, TLS_T_CAP)
+    var rep: []u8 = slice(u8, raw, TLS_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var lis: sysnet.Socket = sysnet.listen_on(net, sysnet.loopback(0), 4) catch sysnet.closed()
+    let bound: sysnet.SocketAddr = sysnet.local_addr(lis) catch sysnet.addr(0, 0)
+    var sctx: tls.Context = tls.server_context(a, TLS_T_CERT, TLS_T_KEY)
+
+    // The control for the two above: the same server, a client with no CA. The handshake
+    // completes (encryption without authentication) and the session SAYS it did not verify.
+    var client: i64 = 0
+    var server: i64 = 0
+    concurrent {
+        let h = spawn client_roundtrip(bound.port as i64, 0, 0)
+        server = serve_one(net, lis, sctx)
+        client = await h
+    }
+    test.eq_i64(c, rep, "the server saw ping", server, 1)
+    test.eq_i64(c, rep, "the client got pong and reports NOT verified", client, 1)
+
+    tls.free_context(sctx)
+    sysnet.close_socket(lis) catch nothing()
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn refusals_happen_before_any_socket_is_touched() -> bool {
+    var raw: *mut u8 = alloc(u8, TLS_T_CAP)
+    var rep: []u8 = slice(u8, raw, TLS_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // A server context with a missing key fails at LOAD, with OpenSSL's reason attached.
+    var bad: tls.Context = tls.server_context(a, TLS_T_CERT, "examples/std/fixtures/zz_no_such_key.pem")
+    test.is_false(c, rep, "a missing key file refuses the context", tls.context_is_open(bad))
+    var why: String = string_new()
+    tls.last_error(why)
+    test.is_true(c, rep, "and the library said why", string_view(why).len > 0)
+
+    // A client context trusts nothing until told, and a missing CA file is a false, not a
+    // silently-unverified context.
+    var cc: tls.Context = tls.client_context()
+    test.is_true(c, rep, "a client context opens", tls.context_is_open(cc))
+    test.is_false(c, rep, "verifying nothing yet", tls.verifies(cc))
+    test.is_false(c, rep, "a missing CA file is refused", tls.trust(cc, a, "examples/std/fixtures/zz_no_ca.pem"))
+    test.is_false(c, rep, "and left the context non-verifying", tls.verifies(cc))
+    test.is_true(c, rep, "the fixture CA loads", tls.trust(cc, a, TLS_T_CERT))
+    test.is_true(c, rep, "and turns verification on", tls.verifies(cc))
+
+    // Sessions on a bad descriptor or the wrong kind of context refuse by type.
+    var s0: tls.Session = tls.client_session(cc, a, 0 - 1, "localhost")
+    test.is_false(c, rep, "no session on a bad descriptor", tls.is_established(s0))
+    test.eq_i64(c, rep, "refused, not failed", tls.outcome(s0) as i64, tls.TLS_REFUSED as i64)
+    var s1: tls.Session = tls.server_session(cc, 0 - 1)
+    test.is_false(c, rep, "a client context cannot serve", tls.is_established(s1))
+    test.is_false(c, rep, "writing to no session is false", tls.write_all(s0, "x"))
+    test.eq_str(c, rep, "outcome names", tls.outcome_name(tls.TLS_VERIFY_FAILED), "verify-failed")
+
+    string_free(why)
+    tls.free_context(cc)
+    tls.free_context(bad)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
