@@ -114,6 +114,14 @@ versions are snapshots, not stability promises.
 
 ### Changed
 
+- **The content-triggered link rule is one function.** `-pthread`, `-lssl -lcrypto` and
+  `-lws2_32` were kept in three copies — the driver's two build sites and the test
+  harness — and a program could link under `jestyrc build` and fail under `cargo test`
+  (`tls_test` did, until the third copy learned OpenSSL). `link_args` in `main.rs` now
+  returns the whole argument tail in the order GNU ld needs, every site that links emitted
+  C calls it, and a unit test pins the order and the triggers on the argument list without
+  running a compiler. Nothing reaches `CC_FLAGS`; no attest manifest changes.
+
 - **A computed value may no longer be passed to a `mut`/`out` parameter of a type with no
   indirection (A11).** `twice(a + b)` into `mut n: i64` used to compile (the value parked in
   a compound literal) and the callee's writes went nowhere anyone could read. It is now an

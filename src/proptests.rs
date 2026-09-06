@@ -12235,10 +12235,7 @@ mod c_oracle {
         let mut cmd = Command::new(&cc);
         cmd.args(crate::CC_FLAGS);
         cmd.args(crate::cc_platform_defines());
-        if c_src.contains("pthread") {
-            cmd.arg("-pthread");
-        }
-        link_and_finish(&mut cmd, &exe, &cfile, &c_src);
+        cmd.args(crate::link_args(&exe, &cfile, &c_src));
         let st = cmd.status().unwrap();
         assert!(st.success(), "gcc failed for {rel}");
         let out = Command::new(&exe).output().unwrap();
@@ -12253,31 +12250,11 @@ mod c_oracle {
 
     /// Compile `rel` to an executable and return its path (does NOT run it) — for
     /// programs that take command-line arguments, like the self-hosting lexer.
-    /// Append the output name, the source file, and any platform link libraries — **in that
-    /// order**, which is the whole reason this is a helper rather than four copies.
     ///
-    /// GNU ld resolves `-l` libraries against the objects it has seen SO FAR, so a library
-    /// listed before the `.c` file resolves nothing and the link fails exactly as if the
-    /// flag were missing. Getting that wrong once cost a debugging round on
-    /// `undefined reference to __imp_socket` with the flag visibly present in the command.
-    ///
-    /// Winsock is content-triggered (the same shape as `-pthread`) and host-gated: both
-    /// `@cfg` branches are always emitted, so the source names `winsock2.h` on Linux too,
-    /// where `-lws2_32` does not exist.
-    fn link_and_finish(cmd: &mut Command, exe: &std::path::Path, cfile: &std::path::Path, c_src: &str) {
-        cmd.arg("-o").arg(exe).arg(cfile);
-        // The same content-triggered rules as `main.rs`'s two link sites. **This is a
-        // third copy of the rule**, the hazard §3o of the handoff records — `tls_test`
-        // linked under the driver and failed under this harness until the line below
-        // existed. Folding the three into one function is the fix owed.
-        if c_src.contains("openssl/ssl.h") {
-            cmd.arg("-lssl").arg("-lcrypto");
-        }
-        if cfg!(windows) && c_src.contains("winsock2.h") {
-            cmd.arg("-lws2_32");
-        }
-    }
-
+    /// The link tail — `-pthread`, `-o`, the source, then the content-triggered libraries
+    /// in the order GNU ld needs — is `crate::link_args`, the driver's own rule. The
+    /// harness used to carry its own copy, and `tls_test` linked under the driver and
+    /// failed here until that copy learned OpenSSL; there is no copy to teach now.
     pub(super) fn build_exe(rel: &str) -> std::path::PathBuf {
         let prog = crate::module::load(rel);
         assert!(!prog.diags.iter().any(|d| d.is_error()), "load errors in {rel}: {:?}", prog.diags);
@@ -12303,10 +12280,7 @@ mod c_oracle {
         // `CC_FLAGS`/attest command is untouched.
         #[cfg(windows)]
         cmd.arg("-Wl,--stack,67108864");
-        if c_src.contains("pthread") {
-            cmd.arg("-pthread");
-        }
-        link_and_finish(&mut cmd, &exe, &cfile, &c_src);
+        cmd.args(crate::link_args(&exe, &cfile, &c_src));
         assert!(cmd.status().unwrap().success(), "gcc failed for {rel}");
         exe
     }
@@ -16949,9 +16923,7 @@ fn main() -> i32 {
         let st = Command::new(&cc)
             .args(crate::CC_FLAGS)
             .args(crate::cc_platform_defines())
-            .arg("-o")
-            .arg(&exe)
-            .arg(&cfile)
+            .args(crate::link_args(&exe, &cfile, &c_src))
             .output()
             .unwrap();
         assert!(st.status.success(), "{label}: gcc failed: {}", String::from_utf8_lossy(&st.stderr));
@@ -17349,9 +17321,7 @@ fn main() -> i32 {
             let out = Command::new(&cc)
                 .args(crate::CC_FLAGS)
                 .args(crate::cc_platform_defines())
-                .arg(&cfile)
-                .arg("-o")
-                .arg(&exe)
+                .args(crate::link_args(&exe, &cfile, &full))
                 .output()
                 .unwrap();
             assert!(
@@ -18995,9 +18965,7 @@ fn main() -> i32 {
         let st = Command::new(&cc)
             .args(crate::CC_FLAGS)
             .args(crate::cc_platform_defines())
-            .arg("-o")
-            .arg(&out_exe)
-            .arg(&cfile)
+            .args(crate::link_args(&out_exe, &cfile, &c_src))
             .status()
             .unwrap();
         assert!(st.success(), "the PORT's C for {file} does not compile");
@@ -19108,7 +19076,8 @@ fn main() -> i32 {
         let mut cmd = Command::new(&cc);
         cmd.args(crate::CC_FLAGS);
         cmd.args(crate::cc_platform_defines());
-        assert!(cmd.arg("-o").arg(&texe).arg(&cfile).status().unwrap().success(), "gcc failed on the test harness");
+        cmd.args(crate::link_args(&texe, &cfile, &c_src));
+        assert!(cmd.status().unwrap().success(), "gcc failed on the test harness");
         let out = Command::new(&texe).output().unwrap();
         assert!(out.status.success(), "test harness exited non-zero");
         let stdout = String::from_utf8(out.stdout).unwrap();
@@ -19386,13 +19355,8 @@ fn main() -> i32 {
         cmd.args(crate::cc_platform_defines());
         #[cfg(windows)]
         cmd.arg("-Wl,--stack,67108864");
-        if c1.contains("pthread") {
-            cmd.arg("-pthread");
-        }
-        assert!(
-            cmd.arg("-o").arg(&jc2).arg(&cfile).status().unwrap().success(),
-            "gcc failed on jc1's C for the flattened compiler"
-        );
+        cmd.args(crate::link_args(&jc2, &cfile, &c1));
+        assert!(cmd.status().unwrap().success(), "gcc failed on jc1's C for the flattened compiler");
         // C2 = jc2(concat). The fixed point: C2 ≡ C1.
         let out2 = Command::new(&jc2).arg(&path).output().unwrap();
         assert!(out2.status.success(), "jc2 failed on the flattened compiler");
@@ -19510,10 +19474,8 @@ fn main() -> i32 {
             let mut cmd = Command::new(&cc);
             cmd.args(crate::CC_FLAGS);
             cmd.args(crate::cc_platform_defines());
-            assert!(
-                { link_and_finish(&mut cmd, &exe, &cfile, &c_src); cmd.status().unwrap().success() },
-                "gcc failed on jc1's C for {path}"
-            );
+            cmd.args(crate::link_args(&exe, &cfile, &c_src));
+            assert!(cmd.status().unwrap().success(), "gcc failed on jc1's C for {path}");
             let got = Command::new(&exe).output().unwrap();
             // The Rust reference compiles + runs the same P.
             let want_exe = build_exe(&path);
@@ -19660,10 +19622,7 @@ fn main() -> i32 {
         let mut cmd = Command::new(&cc);
         cmd.args(crate::CC_FLAGS);
         cmd.args(crate::cc_platform_defines());
-        if c_src.contains("pthread") {
-            cmd.arg("-pthread");
-        }
-        link_and_finish(&mut cmd, &exe, &cfile, &c_src);
+        cmd.args(crate::link_args(&exe, &cfile, &c_src));
         assert!(cmd.status().unwrap().success(), "gcc failed for {rel}");
         let out = Command::new(&exe).output().unwrap();
         (String::from_utf8(out.stdout).unwrap(), out.status.code().unwrap_or(-1))

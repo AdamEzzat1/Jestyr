@@ -953,6 +953,15 @@ Invisible from here because the half that went missing was the POSIX one and the
 only ever compiled on Windows locally. All four now route through one definition
 (`cc_platform_defines()` / its `cgen.jtr` mirror).
 
+**The same duplication had a second instance — the LINK rule — and it is folded too
+(2026-09-06).** `-pthread`/`-lssl -lcrypto`/`-lws2_32` were three hand-kept copies (both
+driver sites and the harness's `link_and_finish`), and `tls_test` linked under the driver
+and failed under the harness until the third copy learned OpenSSL. `main.rs::link_args`
+returns the argument tail in ld's order; a unit test (`link_rule`) pins the order and the
+triggers on the list itself, without a compiler. Every emitted-C link site calls it — which
+turned up that the full fixpoint had carried no `-pthread` at all. The port's driver keeps
+its copy by necessity; `jc_build_matrix` holds it to the same libraries.
+
 **Two guards, and the second exists because the first could not have caught the fourth
 site.** `every_cc_invocation_carries_the_platform_defines` scans `proptests.rs` and demands
 the baseline on the line IMMEDIATELY after `CC_FLAGS` — "a few lines later" is where the

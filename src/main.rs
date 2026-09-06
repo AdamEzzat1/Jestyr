@@ -937,33 +937,10 @@ fn build_one(source: &str, output: &str) -> ExitCode {
     let exe = format!("{output}{}", std::env::consts::EXE_SUFFIX);
     let mut cmd = Command::new(&cc);
     cmd.args(cc_base_flags());
-    if c_src.contains("pthread") {
-        cmd.arg("-pthread");
-    }
-    // **Winsock must be LINKED as well as included, and it must be linked LAST.**
-    // `<winsock2.h>` declares the socket API but the implementation lives in `ws2_32.dll`,
-    // which mingw does not link by default -- so `std/sysnet` compiled and then failed with
-    // `undefined reference to __imp_socket`. Same content-triggered shape as the `-pthread`
-    // rule above.
-    //
-    // **The position is load-bearing.** GNU ld resolves libraries left to right against the
-    // objects seen SO FAR, so `-lws2_32` placed before the `.c` file resolves nothing and
-    // the link fails exactly as if the flag were missing. It goes after the source, which is
-    // why this is appended here rather than beside the `-pthread` line.
-    //
-    // Host-gated as well as text-gated: both `@cfg` branches are always emitted -- that is
-    // the whole design -- so the source names `winsock2.h` on Linux too, where `-lws2_32`
-    // does not exist and would fail a link that was about to succeed.
-    cmd.arg("-o").arg(&exe).arg(&c_file);
-    // OpenSSL, the same content-triggered shape, after the source for the same reason.
-    // `-lssl` names `-lcrypto` symbols, so crypto comes last. Not host-gated: the header
-    // is the same name on every platform and only a program that binds it pays for it.
-    if c_src.contains("openssl/ssl.h") {
-        cmd.arg("-lssl").arg("-lcrypto");
-    }
-    if cfg!(windows) && c_src.contains("winsock2.h") {
-        cmd.arg("-lws2_32");
-    }
+    // Winsock must be LINKED as well as included (`std/sysnet` compiled and then failed
+    // with `undefined reference to __imp_socket`), and every such library must follow
+    // the source file. The rule, and why its order is load-bearing, lives in `link_args`.
+    cmd.args(link_args(Path::new(&exe), &c_file, &c_src));
     match cmd.status() {
         Ok(s) if s.success() => ExitCode::SUCCESS,
         Ok(s) => {
@@ -1235,6 +1212,106 @@ fn cc_base_flags() -> Vec<&'static str> {
     flags
 }
 
+/// **The one link rule.** The tail of every cc command that produces an executable from
+/// emitted C: the content-triggered link flags, the output name, the source file, and the
+/// content-triggered libraries — **in that order**. The driver's two build sites and every
+/// harness that links a program call this and nothing else, so a program that links under
+/// `jestyrc build` links under `cargo test` too. It used to be three hand-kept copies
+/// (§3o of the tier-5 handoff): `tls_test` linked under the driver and failed under the
+/// harness until the third copy learned OpenSSL, which is the failure a rule kept in one
+/// place cannot have.
+///
+/// Every library is **content-triggered** — the emitted C names the header it needs, and
+/// only a program that binds it pays for it — and none of them reach [`CC_FLAGS`], the
+/// constant every `jestyr attest` manifest hashes.
+///
+/// - `-pthread` when the C mentions pthreads (structured concurrency). A driver flag, so
+///   its position is free; it goes first by convention.
+/// - `-o <exe> <cfile>` next. **The position of what follows is load-bearing.** GNU ld
+///   resolves `-l` libraries against the objects it has seen SO FAR, so a library listed
+///   before the `.c` file resolves nothing and the link fails exactly as if the flag were
+///   missing — `undefined reference to __imp_socket` with `-lws2_32` visibly present in
+///   the command cost a debugging round.
+/// - `-lssl -lcrypto` when the C names `openssl/ssl.h`. `-lssl` needs `-lcrypto` symbols,
+///   so crypto is last of the two. Not host-gated: the header has one name on every
+///   platform.
+/// - `-lws2_32` when the C names `winsock2.h`, **on Windows only**: both `@cfg` branches
+///   are always emitted, so the source names the header on Linux too, where the library
+///   does not exist and would fail a link that was about to succeed.
+///
+/// A pure function of the C text so a test can pin the order and the triggers without
+/// running a compiler.
+fn link_args(exe: &Path, cfile: &Path, c_src: &str) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if c_src.contains("pthread") {
+        args.push("-pthread".into());
+    }
+    args.push("-o".into());
+    args.push(exe.into());
+    args.push(cfile.into());
+    if c_src.contains("openssl/ssl.h") {
+        args.push("-lssl".into());
+        args.push("-lcrypto".into());
+    }
+    if cfg!(windows) && c_src.contains("winsock2.h") {
+        args.push("-lws2_32".into());
+    }
+    args
+}
+
+#[cfg(test)]
+mod link_rule {
+    //! The link rule, pinned as data: which text triggers which library, and the order.
+    //! No compiler runs here — the ORDER is the property ld cares about and the one a
+    //! hand-kept copy got wrong, so it is asserted on the argument list itself.
+    use super::link_args;
+    use std::path::Path;
+
+    fn args(c_src: &str) -> Vec<String> {
+        link_args(Path::new("out"), Path::new("prog.c"), c_src)
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn pos(v: &[String], s: &str) -> usize {
+        v.iter().position(|a| a == s).unwrap_or_else(|| panic!("`{s}` missing from {v:?}"))
+    }
+
+    #[test]
+    fn a_plain_program_links_nothing_extra() {
+        assert_eq!(args("int main(void){return 0;}"), ["-o", "out", "prog.c"]);
+    }
+
+    #[test]
+    fn every_library_follows_the_source_and_crypto_follows_ssl() {
+        let v = args("#include <pthread.h>\n#include <openssl/ssl.h>\n#include <winsock2.h>\n");
+        assert_eq!(pos(&v, "-pthread"), 0, "pthread first: {v:?}");
+        let src = pos(&v, "prog.c");
+        assert_eq!(pos(&v, "-o") + 1, pos(&v, "out"), "-o names the exe: {v:?}");
+        assert!(pos(&v, "-lssl") > src, "-lssl must follow the source: {v:?}");
+        assert_eq!(pos(&v, "-lcrypto"), pos(&v, "-lssl") + 1, "crypto right after ssl: {v:?}");
+        if cfg!(windows) {
+            assert!(pos(&v, "-lws2_32") > src, "-lws2_32 must follow the source: {v:?}");
+            assert_eq!(v, ["-pthread", "-o", "out", "prog.c", "-lssl", "-lcrypto", "-lws2_32"]);
+        } else {
+            assert!(!v.iter().any(|a| a == "-lws2_32"), "no winsock library off Windows: {v:?}");
+            assert_eq!(v, ["-pthread", "-o", "out", "prog.c", "-lssl", "-lcrypto"]);
+        }
+    }
+
+    #[test]
+    fn each_trigger_is_independent() {
+        assert_eq!(args("#include <openssl/ssl.h>"), ["-o", "out", "prog.c", "-lssl", "-lcrypto"]);
+        assert_eq!(args("pthread_create"), ["-pthread", "-o", "out", "prog.c"]);
+        // A mention of the header's NAME is the trigger, exactly as the driver has always
+        // read it — `winsock2.h` inside a comment counts, and that is deliberate: both
+        // `@cfg` branches are emitted, so the name is present whenever the code is.
+        let w = args("/* winsock2.h */");
+        assert_eq!(w.iter().any(|a| a == "-lws2_32"), cfg!(windows), "{w:?}");
+    }
+}
+
 fn build_and_maybe_run(path: &str, c_src: &str, run: bool) -> ExitCode {
     let stem = Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("out");
     let mut c_file = std::env::temp_dir();
@@ -1256,18 +1333,7 @@ fn build_and_maybe_run(path: &str, c_src: &str, run: bool) -> ExitCode {
 
     let mut cmd = Command::new(&cc);
     cmd.args(cc_base_flags());
-    // Structured-concurrency output uses pthreads; link it only when present.
-    if c_src.contains("pthread") {
-        cmd.arg("-pthread");
-    }
-    // See the note at the other link site: `-lws2_32` must follow the source file.
-    cmd.arg("-o").arg(&exe).arg(&c_file);
-    if c_src.contains("openssl/ssl.h") {
-        cmd.arg("-lssl").arg("-lcrypto");
-    }
-    if cfg!(windows) && c_src.contains("winsock2.h") {
-        cmd.arg("-lws2_32");
-    }
+    cmd.args(link_args(&exe, &c_file, c_src));
     let status = cmd.status();
     match status {
         Ok(s) if s.success() => {}
