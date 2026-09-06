@@ -1167,6 +1167,22 @@ means either making the ASTs agree, or deriving spawn symbols from a per-spawn o
 instead of an `ExprId` (small on each side, but churns every spawn-bearing golden and
 attest hash).
 
+#### A11 (decision half). ~~Should a `mut` argument that aliases nothing be refused?~~ — **YES, CLOSED both sides**
+
+`check_mut_value_arg` in `escape.rs` and `escape.jtr`: a `mut`/`out` argument that is not
+a place (name, `self`, field/index/deref chain) and whose INFERRED type transitively holds
+no indirection is an error. The type is the boundary — `add(s as Buf)` stays accepted, a
+struct with a `*mut T` field stays accepted, an `i64` or a `P{ x: 1 }` of plain fields is
+refused. Unknown/opaque/generic types answer "has indirection" so only provable cases are
+refused. One corpus file carried the shape (`mut_arg_value.jtr`) and was rewritten; the
+eight-probe differential `jestyr_mut_value_arg_matches_reference` was watched disagreeing
+before the mirror. **Shared, pre-existing port limitation, now load-bearing for one more
+rule:** the port's call checks resolve a bare-`Name` callee only and defer qualified
+`mod.f(...)` (comment at `escape.jtr` "qualified `mod.f` resolution deferred"), so this
+refusal, give-away and slice-alias all fire on `jestyrc` and not on `jc` for a QUALIFIED
+call. Zero corpus files reach it; a probe through `mod.f(a + b)` would be the first, and
+closing it means one resolution helper shared by three checks.
+
 #### A12. ~~`return ok(local)` drops the local it carries out~~ — **CLOSED, both sides**
 
 Closed the same day it was found. `cgen.rs`: `as_returned_name` feeds `collect_moved` for a

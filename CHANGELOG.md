@@ -5,6 +5,18 @@ versions are snapshots, not stability promises.
 
 ## Unreleased
 
+### Changed
+
+- **A computed value may no longer be passed to a `mut`/`out` parameter of a type with no
+  indirection (A11).** `twice(a + b)` into `mut n: i64` used to compile (the value parked in
+  a compound literal) and the callee's writes went nowhere anyone could read. It is now an
+  error on both compilers: *"cannot pass a computed value to the `mut` parameter `n` of
+  `twice`: the type `i64` holds no indirection … bind the value to a `var` and pass that"*.
+  The boundary is the type, not the syntax: a value that carries a pointer — a slice cast,
+  a call returning a slice, a struct with a `*mut` field — is still accepted, because its
+  element writes really reach the caller. One corpus file carried the refused shape and
+  was rewritten; eight probes (four refused, four accepted) run through both toolchains.
+
 ### Fixed
 
 - **`return ok(local)` no longer drops the local it returns (A12).** For a struct that owns

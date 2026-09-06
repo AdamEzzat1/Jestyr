@@ -14653,6 +14653,78 @@ fn g(p: *mut i32) -> i32 {
         eprintln!("whole-corpus escape golden: {checked} files' diagnostic sets identical");
     }
 
+    /// **A11, differentially — a computed value in `mut`/`out` position.**
+    ///
+    /// The corpus is deliberately free of the refused shape (the one file that carried
+    /// it, `mut_arg_value.jtr`, was rewritten when the rule landed), so the whole-corpus
+    /// escape golden is structurally blind to this rule: a port with no mirror would
+    /// agree on every corpus file and disagree on every program that trips it. These
+    /// programs do trip it — and the ones that must NOT are here too, because the rule's
+    /// boundary is the TYPE (indirection or not), and a rule that refused `add(s as Buf)`
+    /// would take away the A7/A11 lowering it exists beside.
+    ///
+    /// The first assertion per case keeps the probe from going vacuous: the reference
+    /// must actually emit (or not emit) the refusal before the port is compared to it.
+    #[test]
+    fn jestyr_mut_value_arg_matches_reference() {
+        let exe = build_exe("examples/std/escape_cli.jtr");
+        let refused = [
+            // an arithmetic value into a `mut` scalar
+            "fn twice(mut n: i64) -> i64 { n = n + n  return n }\n\
+             fn main() -> i32 { var a: i64 = 3  var b: i64 = 4  print_int(twice(a + b))  return 0 }",
+            // a struct literal of plain fields into a `mut` struct
+            "struct P { x: i64 }\n\
+             fn bump(mut p: P) { p.x = p.x + 1 }\n\
+             fn main() -> i32 { bump(P{ x: 1 })  return 0 }",
+            // a literal into an `out` parameter
+            "fn fill(out n: i64) { n = 1 }\n\
+             fn main() -> i32 { fill(1 + 2)  return 0 }",
+            // a call's result into a `mut` scalar
+            "fn mk() -> i64 { return 5 }\n\
+             fn twice(mut n: i64) -> i64 { n = n + n  return n }\n\
+             fn main() -> i32 { print_int(twice(mk()))  return 0 }",
+        ];
+        let accepted = [
+            // the same call with a PLACE
+            "fn twice(mut n: i64) -> i64 { n = n + n  return n }\n\
+             fn main() -> i32 { var a: i64 = 3  print_int(twice(a))  return 0 }",
+            // a field of a place
+            "struct P { x: i64 }\n\
+             fn twice(mut n: i64) -> i64 { n = n + n  return n }\n\
+             fn main() -> i32 { var p: P = P{ x: 2 }  print_int(twice(p.x))  return 0 }",
+            // a value WITH indirection: a slice cast (the A11 lowering's reason to exist)
+            "distinct Buf = []i64\n\
+             fn add100(mut xs: Buf) { for i in 0..xs.len { xs[i] = xs[i] + 100 } }\n\
+             fn main() -> i32 { var raw: *mut i64 = alloc(i64, 3)  var s: []i64 = slice(i64, raw, 3)  add100(s as Buf)  free_ptr(raw)  return 0 }",
+            // a struct literal whose type carries a pointer field
+            "struct Q { p: *mut i64, n: i64 }\n\
+             fn touch(mut q: Q) { q.n = q.n + 1 }\n\
+             fn main() -> i32 { var raw: *mut i64 = alloc(i64, 1)  touch(Q{ p: raw, n: 0 })  free_ptr(raw)  return 0 }",
+        ];
+        for (i, src) in refused.iter().enumerate() {
+            let want = rust_escape_dump(src);
+            assert!(
+                want.iter().any(|l| l.contains("holds no indirection")),
+                "refused probe {i} is not refused by the reference — the rule or the probe moved: {want:?}"
+            );
+            let f = std::env::temp_dir().join(format!("jestyr_mut_value_refused_{i}.jtr"));
+            std::fs::write(&f, src).unwrap();
+            let got = jestyr_escape_dump(&exe, f.to_str().unwrap());
+            assert_eq!(got, want, "the toolchains disagree on the A11 refusal for: {src}");
+        }
+        for (i, src) in accepted.iter().enumerate() {
+            let want = rust_escape_dump(src);
+            assert!(
+                !want.iter().any(|l| l.contains("holds no indirection")),
+                "accepted probe {i} is refused by the reference — the boundary is the TYPE: {want:?}"
+            );
+            let f = std::env::temp_dir().join(format!("jestyr_mut_value_accepted_{i}.jtr"));
+            std::fs::write(&f, src).unwrap();
+            let got = jestyr_escape_dump(&exe, f.to_str().unwrap());
+            assert_eq!(got, want, "the toolchains disagree on an accepted A11 shape for: {src}");
+        }
+    }
+
     /// **The `Unknown` finalization, differentially — the rung the corpus cannot guard.**
     ///
     /// `jestyr_escape_dump_matches_reference` above compares the whole corpus, but it is

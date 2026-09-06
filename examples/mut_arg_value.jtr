@@ -7,6 +7,11 @@
 // unary '&' operand", with no span and no Jestyr message: `jestyrc check` passed and only
 // the C compiler objected.
 //
+// Two halves, decided separately. The LOWERING accepts any value (below). The LANGUAGE
+// then refuses the values whose type holds no indirection (A11), because for those the
+// callee's writes reach nothing — so what this file exercises is exactly the value forms
+// that share their indirection with the caller.
+//
 // The value is now parked in a compound literal of array type, `(T[1]){ v }`, which
 // decays to `T*` and reads back as a place. Its lifetime is the enclosing block, so the
 // address outlives the call.
@@ -30,10 +35,12 @@ fn add100(mut xs: Buf) { for i in 0..xs.len { xs[i] = xs[i] + 100 } }
 
 fn add1000(mut xs: []i64) { for i in 0..xs.len { xs[i] = xs[i] + 1000 } }
 
-// A `mut` scalar whose argument is a computed value. Nothing here is observable to the
-// caller — there is no indirection to share — but it must COMPILE rather than fall
-// through to gcc. Whether the language should refuse this shape outright is a separate
-// question from whether the backend can lower it.
+// A `mut` scalar. Its argument below is a PLACE, because a computed value here —
+// `twice(a + b)` — is now refused outright (A11): an `i64` holds no indirection, so the
+// callee's writes would land in a temporary nothing can read, and a call that looks like
+// it mutates something and mutates nothing is a bug at the call site. The refusal lives
+// in `escape` on both sides; `jestyr_mut_value_arg_matches_reference` carries the shapes
+// this file no longer can. The value forms that REMAIN below all carry indirection.
 fn twice(mut n: i64) -> i64 { n = n + n  return n }
 
 // A `mut self` method that hands one of its own FIELDS to a `mut` parameter. This is the
@@ -70,10 +77,12 @@ fn main() -> i32 {
     add1000(s[0 .. 2])
     for i in 0..3 { print_int(s[i]) }        // 1101  1102  103
 
-    // An ARITHMETIC value in `mut` position: the shape that used to reach gcc.
+    // A scalar `mut` argument must be a place: the sum is bound first. (`twice(a + b)`
+    // is the A11 refusal — see the comment on `twice`.)
     var a: i64 = 3
     var b: i64 = 4
-    print_int(twice(a + b) / 2)              // (7 + 7) / 2 = 7
+    var sum: i64 = a + b
+    print_int(twice(sum) / 2)                // (7 + 7) / 2 = 7
 
     // The `mut self` field case: the callee writes into `self.total`, and the object must
     // actually change. If `*self` were parked as a copy the write would land there and the

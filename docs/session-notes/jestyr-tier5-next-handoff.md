@@ -8,10 +8,11 @@ defects — one session at a time). §2 is the parallel work (library breadth �
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1355 passed / 0 failed / 3 ignored** (full ladder, 785s, after `std/kv`). The `std/kv`
-commit sits on `claude/tier5-compiler-handoff-75c515`, a fast-forward of the package-substrate
-branch; **neither is merged to master and the kv commit is not pushed.** CI was fully green —
-all four jobs — at the substrate branch's head.
+**1357 passed / 0 failed / 3 ignored** (full ladder after `std/kv`, A12 and A11; the two new
+tests are `return_ok_local_moves_the_local` and `jestyr_mut_value_arg_matches_reference`).
+Those commits sit on `claude/tier5-compiler-handoff-75c515`, a fast-forward of the
+package-substrate branch; **neither is merged to master and the new commits are not
+pushed.** CI was fully green — all four jobs — at the substrate branch's head.
 
 The long-form history is `docs/session-notes/jestyr-tier5-handoff.md`. Read its §5 for the
 area inventory (rewritten and current) and §6A for the defect register. Everything below
@@ -57,11 +58,12 @@ Every item here touches the compiler's own closure, owes a port mirror, and forc
 reseed. **They cannot run in parallel with each other or with anything else that reseeds**
 (see §3). Do them one at a time, in this order.
 
-> **THE SERIAL QUEUE IS EMPTY OF ACTIONABLE WORK AGAIN.** 1.1 (A7), 1.2 (A6), 1.3 (A8),
-> 1.4 (B1), **A11's lowering half** and **1.6 (A12, `return ok(local)`)** are all done, each
-> mirror watched failing. What is left here is **one language QUESTION** (should a `mut`
-> argument that aliases nothing be refused? — §1.1b) and **1.5 (B2), deferred on
-> measurement**, bigger than everything above it combined.
+> **THE SERIAL QUEUE HAS ONE ENTRY LEFT, AND IT IS THE MEASURED DEFERRAL.** 1.1 (A7), 1.2
+> (A6), 1.3 (A8), 1.4 (B1), **1.6 (A12, `return ok(local)`)** and **both halves of A11** (the
+> lowering, and the language decision — a computed value into a `mut` param of an
+> indirection-free type is now REFUSED, both sides) are done, each mirror watched failing.
+> What is left is **1.5 (B2)**, `extern` binding a C global, deferred on measurement and
+> bigger than everything above it combined.
 >
 > **So the next session should be fanning out on §2**, and §2 parallelises where §1 could not.
 > Read §3 first — the sixteen closure modules are a global lock, and the reseed is the thing
@@ -133,7 +135,26 @@ amount of staring at the arm did.** The corpus file now carries that shape perma
 wrong value, not a crash. `Index` genuinely cannot reach the catch-all; every other kind can,
 and the guard has to be right about all of them.
 
-**Still open — a language question, not a lowering one.** Should a `mut` argument that aliases
+**DECIDED AND DONE: refused, both sides.** A `mut`/`out` argument that is not a place and
+whose type holds no indirection is an error in `escape` (`check_mut_value_arg` /
+`check_mut_value_arg` in `escape.jtr`): *"cannot pass a computed value to the `mut`
+parameter `n` of `twice`: the type `i64` holds no indirection, so the callee's writes would
+land in a temporary nothing can read — bind the value to a `var` and pass that"*. The
+boundary is the TYPE, exactly as the paragraph below asked: `add(s as Buf)` and `f(mk_slice())`
+stay accepted because a slice's `ptr` is shared; a struct with a `*mut T` field stays
+accepted; `i64`, `bool`, `P{ x: 1 }` of plain fields are refused. The ARGUMENT's inferred
+type is what is tested (a `Ty` on both call shapes, where the declared parameter type is an
+AST type on the method path), and `Opaque`/`Unknown`/generic answer "has indirection" so the
+rule refuses only what it can prove. Corpus sweep: exactly one file carried the shape
+(`mut_arg_value.jtr`, `twice(a + b)`), rewritten to bind the sum first; the corpus is
+otherwise clean. `jestyr_mut_value_arg_matches_reference` carries four refused and four
+accepted shapes through both toolchains — the port was watched disagreeing on the first
+before the mirror landed. Reseed owed and done. **One shared limitation, pre-existing:** the
+port's call checks (give-away, slice alias, this) resolve a bare `Name` callee only and defer
+qualified `mod.f(...)`, so a computed value into a `mut` param through a QUALIFIED call is
+refused by `jestyrc` and not by `jc`. Recorded in §6A; the corpus has no such call.
+
+The question as it stood, kept for the record: should a `mut` argument that aliases
 **nothing** be refused? `f(mut a + b)` is unobservable by construction: there is no
 indirection to share, so the callee's write cannot be seen. Refusing it fits the language's
 character (it already refuses `spawn` with `mut` params, and `@copy` with non-Copy fields).
@@ -291,9 +312,15 @@ reseed. The fix is in `collect_moved`, the move ANALYSIS, not in the `return` lo
 ### 1.5 — B2: `extern` binding a C global — MEASURED, then deferred
 
 The principled answer for foreign globals, and no longer needed for anything urgent
-(`environ` went through an intrinsic instead). **Measured before deferring:** a new item kind
-means 252 `Item::` match sites across nine reference files plus 42 in the port, and it must
-also reach `attest` (a global is ABI) and `doc`. Larger than everything above it combined.
+(`environ` went through an intrinsic instead). **Measured before deferring, and re-measured
+2026-09-05:** a new item kind means **257** `Item::` match sites across **seventeen**
+reference files (the old "252 across nine" undercounted the files: `cgen` 65, `typeck` 48,
+`parser` 42, `proptests` 23, `escape` 13, `module` 12, `doc` 10, `printer` 9, `attest` 8,
+and eight more) plus 42 in the port, and it must also reach `attest` (a global is ABI) and
+`doc`. Larger than everything above it combined, and — the reason it stays deferred rather
+than started — a HALF-DONE item kind is worse than none: every unmatched site is a compile
+error on the reference and a silent fall-through in the port. It is one session's work with
+nothing else in it, started with the `Item::` sweep, not a thing to fit beside other work.
 
 ### Not in this queue, deliberately
 
