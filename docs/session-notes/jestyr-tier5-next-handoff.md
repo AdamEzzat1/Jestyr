@@ -515,7 +515,7 @@ done until its count is in that table.
 | ~~Service supervision / restart policy~~ | **DONE: `std/supervise`** — see §2b. |
 | ~~Sandbox: cwd, process groups, fs capability projection~~ | **DONE: `std/sandbox`** — see the entry below. |
 | ~~Config: live reload, nesting~~ | **DONE: `std/livecfg`** — see the section below. |
-| Rewrite `std/plugin` as a server on the pipe transport | Tier 4 leftover. One-process-per-call only because the transport did not exist; it does now (`start_piped`/`capture`). |
+| ~~Rewrite `std/plugin` as a server on the pipe transport~~ | **DONE** — see the section below. It also added `std/sysstdio` (nothing in the tree could read its own stdin) and `sysproc.output_ready`. |
 
 ### ~~Config live reload + nesting~~ — **DONE: `std/livecfg`**
 
@@ -621,6 +621,47 @@ cache sees a byte. The end-to-end `jc add` shape is now a test: publish, load, r
 minimally, fetch through the cache, and fetch the same package over HTTP. Not built:
 signatures (a hash is not authentication), yanking, mirrors, publishing over HTTP.
 
+### ~~`std/plugin` on the pipe transport~~ — **DONE: a plugin server, plus `std/sysstdio`**
+
+`connect`/`call`/`hangup` on `sysproc.start_piped`, `serve(handler)` on the plugin's side,
+the file mode kept as `call_once`. Suite 4 → 10, a pinned demo (`jplugin`,
+`examples/std/plugin_server_demo.jtr`), five mutations watched failing, no reseed. What a
+successor should not re-derive:
+
+* **`hangup` is close_input → drain → wait, and the drain is bounded by the budget.** Any
+  other order deadlocks; `capture` is the first two steps and is why it exists.
+* **A new module was needed to read stdin at all.** Nothing in the tree could: `std/file`
+  opens PATHS and `print_*` writes through the C runtime. That is the fact that settles the
+  A4 argument — a text-safe framing (newline-delimited, hex payload) would still have needed
+  a raw stdin reader, so once one is written the raw WRITER is one more function and the
+  escaping disappears. `_setmode` was rejected separately: it switches a stream `print_*`
+  also writes to, and does nothing for stdin.
+* **`sysproc.output_ready` is the whole reason a timeout can exist.** `PeekNamedPipe` works
+  on anonymous pipes despite its name and is the only non-blocking question Windows answers
+  about one (an anonymous pipe cannot be opened overlapped). A FAILED query reports READY,
+  never "wait more" — a bounded loop must end on its own budget or on a read, not on a lie.
+* **One budget cannot be both a tolerance and a timeout**, and this cost a session to learn.
+  A first call pays for the child's start (75–120ms through `cmd.exe`, a 485ms outlier over
+  120 starts); a warm call answers in under a millisecond. A single 300ms budget lost ~1 run
+  in 15 on an IDLE machine — it looked like a miscompile, it was a race. Hence `set_budget`:
+  connect roomy, hear from the plugin once, then tighten. A timeout asserted before the
+  process is known to be up asserts nothing.
+* **A killed plugin holds the host's stdout.** `terminate` reaches the `cmd.exe` that
+  `start_piped` started, not the plugin under it, so a napping plugin is orphaned WITH the
+  host's inherited handles — anything capturing the host's output (`$(…)`, `Command::output`)
+  waits for the orphan before it sees EOF. A 10-second nap made a 2-second demo take 10
+  seconds to read; the nap is 3s for that reason and no other. A Job object would fix it and
+  `sysproc` has none.
+* **`decode` checks the CRC before the version.** A corrupt frame can carry any version, and
+  "unsupported version" for bit rot sends a caller after a deployment mismatch that never
+  happened. That ordering is one of the mutations.
+* **A server-mode plugin fails with an ERROR frame, not an exit code**, because it has no
+  exit code to give per call: code first in the payload, message after, host reports
+  `PLUGIN_FAILED` and the connection STAYS UP.
+* Not built: concurrent calls on one connection, plugin-initiated messages, streaming
+  payloads, a sandbox, and a write bounded by the budget (that needs a writable-readiness
+  query `sysproc` does not offer — a request larger than the pipe buffer can still block).
+
 ### ~~TLS (area 8)~~ — **DONE: `std/tls`, by binding OpenSSL**
 
 Contexts, blocking sessions over a `sysnet` descriptor, verification that includes the
@@ -682,7 +723,7 @@ substrate and its registry layer; storage V2; HTTP V2; TLS. **This section is th
 what remains**, so nobody has to reconcile §1, §2, the long note's §6A/§6B and the
 CHANGELOG to find it.
 
-### Unbuilt — the six second-wave modules (parallel-safe, none reseeds)
+### Unbuilt — the five remaining second-wave modules (parallel-safe, none reseeds)
 
 | module | what | the one thing to know first |
 |---|---|---|
@@ -691,7 +732,7 @@ CHANGELOG to find it.
 | ~~**Service supervision**~~ | **DONE: `std/supervise`** (below) | restart policy, budget window, backoff, `stop_all`, events; no tree |
 | ~~**Sandbox**~~ | **DONE: `std/sandbox`** (§2 entry above) | `sysproc.start_at` is the one primitive; the jail is a `sandbox.Jail` a child reads with `inherited`, NOT a change to `fs.host()` (closure module) |
 | ~~**Config live reload + nesting**~~ | **DONE: `std/livecfg`** (§2 above) | candidate-then-swap; a shadowed file value is not validated; `step`, not `poll` |
-| **`std/plugin` on the pipe transport** | a plugin as a server on `sysproc.start_piped` | Tier 4 leftover; one-process-per-call only because the transport did not exist |
+| ~~**`std/plugin` on the pipe transport**~~ | **DONE** (§2 entry above) | `sysstdio` was the missing half — nothing in the tree could read its own stdin; `terminate` still kills the SHELL, not the plugin |
 
 ### ~~Trace spans~~ — **DONE: `std/trace`**
 
@@ -814,7 +855,7 @@ successor should not re-derive:
 | **A13** | **Drop glue under COLLIDING type names.** Three `Writer` types in one closure; a struct holding `json.Writer` emitted `jestyr_impl_Drop__Writer__drop` (bare name, no such fn) → link error; had the names lined up it would have `fclose`d the wrong struct. AND the quiet half, found by the probe: a `file.Writer` local was never dropped at all in such a program (its canonical key found no impl), and `escape`'s consuming rule answered "no Drop" for it. | **CLOSED 2026-09-06, reference-only.** One defect, two sites: `typeck::register_impls` was the one item pass that never set `cur_mod`, so the impl target lowered in a stale module, degraded to `Opaque("Writer")` and was keyed under the BARE name; cgen's `aggregate_drop_fields`/`enum_drop_variants` matched the decl by bare spelling and lowered field types from the EMITTING module (`ast_type_to_ty_in(.., decl_mod)` now). The port was already correct — its loader renames colliding types in the token stream, so its typeck and cgen never see a bare `Writer` — and the two compilers agree byte-for-byte on the probe; **no port change, no reseed** (the drift guard said so). Probe: `examples/std/drop_collide_demo.jtr` (`jdropcollide`: a scope-dropped `file.Writer` proven by the file size read back, a `log.Logger` held from a module that never imports `json`) + `drop_glue_under_colliding_type_names_finds_the_right_impl_and_only_that_one` in `module.rs` + the demo in the port-vs-reference run comparison. `httpd_test`'s route-around (the dropped `sysfs` import) is no longer needed. |
 | **A14** | The port's loader renamed a LOCAL sharing a colliding fn's name (`body`, `now`) — token-level rename by spelling. | **CLOSED this pass** (loader tracks the current fn's binders). Residual: a block-local binder is kept until the fn ends, so a fn-valued use of that name after the block would go unrenamed; no corpus program does it. |
 | **Link rules in three places** | `-pthread`/`-lws2_32`/`-lssl -lcrypto` were content-triggered in `main.rs` twice and in `proptests::link_and_finish` once; `tls_test` linked under the driver and failed under the harness until the third copy learned OpenSSL. | **CLOSED 2026-09-06.** `main.rs::link_args(exe, cfile, c_src)` is the one rule — a pure function returning the argument tail (`-pthread`, `-o exe cfile`, `-lssl -lcrypto`, `-lws2_32` on Windows) so its ORDER is pinned by a unit test (`main.rs::link_rule`, three tests) with no compiler running. Both driver sites, `build_exe`/`build_and_run`/the test-mode runner, the fixpoint (which had had NO `-pthread`), the subset fixpoint, the inline-probe runner, the layout probe and the port's distinct-members test all call it; hand-written C probes (signal numbers, `windows.h` layouts, the SIMD lane oracle, the warning gate's compile-only probe) do not, on purpose — they are not emitted programs. **The port's driver keeps its own copy by necessity** (a different language); it is the remaining second site, and `jc_build_matrix` is what holds it to the same libraries. |
-| **A4** | Windows: `capture` + print does not round-trip a child's bytes (text-mode stdout). | Recorded decision, not a bug to fix blind: binary stdout re-baselines many goldens. |
+| **A4** | Windows: `capture` + print does not round-trip a child's bytes (text-mode stdout). | Still true of `print_*`, and still not a thing to fix blind — flipping stdout to binary re-baselines many goldens. **But it is no longer a wall**: `std/sysstdio` goes around the C runtime entirely (`GetStdHandle` + `ReadFile`/`WriteFile`; `read(0)`/`write(1)` on POSIX), so a program that must move exact bytes over its own stdin/stdout has a route that changes no golden and touches no other stream. `std/plugin` sends a CR, an LF, a NUL and non-UTF-8 bytes through a real child and back, byte for byte, over it. |
 | **A10 / sanitizers** | No sanitizer has ever run over the emitted C. | CI-only: no `libasan` here. `selfhost_fixpoint_subset` is the harness. |
 | **Second C compiler** | Only gcc has ever compiled the output. | CI-only: no clang here; MSVC takes neither `-std=c11` nor `-Werror=`. |
 | **`#line` gap** | The port emits no `#line`; `jestyrc attest` and `jc attest` disagree on `c-sha256` for a module-path build. | Invisible to every golden (they strip `#line`). Needs a module-path C golden first. |

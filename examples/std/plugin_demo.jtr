@@ -37,7 +37,7 @@ const RESP_PATH: str = "zz_jhost_resp.bin"
 fn attempt(mut h: plugin.Host, read a: Allocator, read cmd: str, read label: str,
            read request: []u8, mut response: []u8) {
     print_str(label)
-    let r: plugin.Reply = plugin.call(h, a, cmd, REQ_PATH, RESP_PATH, request, response)
+    let r: plugin.Reply = plugin.call_once(h, a, cmd, REQ_PATH, RESP_PATH, request, response)
     print_str(plugin.outcome_name(r.outcome))
     if plugin.succeeded(r) {
         print_str(from_utf8(response[0 .. r.len]))

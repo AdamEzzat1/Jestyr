@@ -180,6 +180,48 @@ versions are snapshots, not stability promises.
   use the construct on a reason of its own: a `match` over an IMPORTED error set is
   exhaustive over a set the importing module does not own.
 
+- **`std/plugin` server mode, and `std/sysstdio`** — a plugin is now a LONG-LIVED process on
+  `sysproc`'s pipe transport instead of one process per call over two files. `connect` starts
+  it with `start_piped` and keeps it, `call` writes one framed request and reads one framed
+  response, `hangup` does close-input → drain → wait (the only deadlock-free order); on the
+  plugin's side `serve(handler)` is the loop a `main` runs until EOF. The old file mode
+  survives as `call_once` because it is a different trade — a hook invoked once per event —
+  not an older version of the same one, and both share the frame, the CRC and the outcome
+  names. Two failures that `system()` could not express are now expressible: a plugin that
+  stops answering is killed inside a budget (`PLUGIN_TIMED_OUT`, `wait_or_kill`), and a
+  server-mode plugin can fail without dying by answering with an ERROR frame carrying its own
+  code (`PLUGIN_FAILED`, connection still up).
+
+  **The budget is `set_budget`-able, and that is the design decision worth arguing with.** A
+  first call pays for the child's start — measured at 75–120ms through `cmd.exe`, with a
+  485ms outlier over 120 starts — while a warm call answers in under a millisecond, so one
+  number cannot be both a tolerance for the first and a timeout for the rest. A host connects
+  roomy, hears from the plugin once, then tightens; a timeout that can only trip after the
+  plugin has been heard from is evidence about the plugin rather than about the machine. The
+  earlier single-budget draft lost about one run in fifteen on an idle machine.
+
+  Framing is binary on RAW HANDLES, against trap A4: Windows text-mode stdout turns `\n` into
+  `\r\n`, so `std/sysstdio` bypasses the C runtime entirely (`GetStdHandle` +
+  `ReadFile`/`WriteFile`, `read(0)`/`write(1)` on POSIX) rather than escaping the payload or
+  flipping `_setmode` on a stream the runtime also writes to. Nothing is escaped because
+  nothing needs to be, and the deciding case is exercised: `\r`, `\n`, a NUL and two non-UTF-8
+  bytes make the round trip host → plugin → host byte for byte, as `[]u8` throughout
+  (`from_utf8` traps on exactly those bytes). `sysproc` gained `output_ready` — `PeekNamedPipe`
+  on Windows, `poll` on POSIX under `std/syspoll`'s signature — which is what lets a bounded
+  read exist at all.
+
+  Suite 4 → 10 tests: six new ones drive the server-mode host against real children that are
+  NOT plugins, since every failure it must tell apart is a way of not answering and a shell
+  spells all of them (`exit 3` → failed with its code, `exit 0` silent → bad-response, prose →
+  bad-response, NTSTATUS exit → crashed, never-writes → timed-out and killed, denied spawner →
+  refused). Five mutations watched failing: the version judged before the checksum (a corrupt
+  future-version frame then reads as a deployment mismatch), a clean exit-0 EOF trusted as the
+  plugin's own failure, a budget kill reported as a crash, the stream header's length believed
+  without its magic, and `output_ready` never reporting a readable pipe. `plugin_server_demo`
+  (`jplugin`) pins the whole thing: several calls proven to be one process by a counter in the
+  replies, the hostile payload back in hex, and a plugin killed mid-nap with the host
+  continuing.
+
 - **`std/tls`** — TLS over a `sysnet` socket by binding OpenSSL (area 8). A client context
   that trusts nothing until `trust` gives it a CA, a server context that checks its key
   against its certificate at load, blocking `client_session`/`server_session` handshakes

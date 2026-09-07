@@ -1,0 +1,250 @@
+// examples/std/plugin_server_demo.jtr — `jplugin`, one plugin process, many calls, and every
+// way it can let the host down without taking the host with it.
+//
+// Run:  jestyrc run examples/std/plugin_server_demo.jtr <path-to-plugin_echo-exe>
+//
+// ─── What this demonstrates ───────────────────────────────────────────────────
+//
+// `std/plugin`'s server mode: the host connects to `examples/std/plugin_echo.jtr` ONCE and
+// talks to it over its pipes. The evidence that it is one process is in the plugin's own
+// replies — each carries `#<n>`, the number of requests that process answered before this
+// one — so the first three answers reading `#0`, `#1`, `#2` cannot have come from three
+// invocations.
+//
+// Then the transport's deciding property: a payload holding `\r`, `\n`, a NUL and two bytes
+// that are not UTF-8 goes to the plugin and comes back byte for byte. On Windows the C
+// runtime's text-mode stdout would have turned the `\n` into `\r\n` on the way back; the
+// frames never pass through it (`std/sysstdio`), and this call is the test of that claim.
+// The bytes are printed as hex because THIS program's stdout is text-mode too.
+//
+// Then the failures, told apart:
+//
+//   * a plugin that reports its own error in an ERROR frame  -> failed, with its code and
+//     message — and the connection is still up, which the next call proves
+//   * a plugin that writes prose instead of a frame          -> bad-response, connection down
+//   * a plugin that sleeps past a tightened budget           -> timed-out: killed, host continues
+//   * a host with no permission to start anything            -> refused, nothing ran
+//
+// A fresh connection after the kill answers `#0` again — a new process — and `hangup` ends it
+// cleanly: input closed, output drained, exit 0 collected. Nothing here is a crash, an abort,
+// or a hung host, and the transcript is exact: `jplugin_keeps_one_plugin_and_survives_it`
+// asserts every line.
+//
+// ─── Why this program runs for about three seconds ────────────────────────────
+//
+// Not because it waits for anything. The timing-out call costs 400ms, and everything else is
+// milliseconds. The tail is the KILLED PLUGIN: `terminate` reaches the `cmd.exe` that
+// `start_piped` started, not the plugin beneath it, so the sleeper is orphaned rather than
+// killed and sleeps out `ECHO_NAP_NANOS`. It was started with this program's own stdout among
+// its inherited handles, so a reader capturing this transcript — a shell's `$(…)`, the
+// pinned test's `Command::output` — sees no end-of-file until the orphan is gone. The output
+// is complete long before that; only the close is late. Killing the whole tree wants a Job
+// object, which `std/sysproc` does not have and which its header already records as absent.
+
+import "plugin"
+import "sysproc"
+import "env"
+import "time"
+
+const DEMO_CAP: usize = 4096
+
+// **Two budgets, because a first call and a warm call are not the same event.** Both numbers
+// were measured, not guessed, and getting this wrong is what made an earlier draft of this
+// transcript a coin flip.
+//
+// `DEMO_ROOMY` is what every connection is opened with. The first call on it pays for the
+// child's start — 75–120ms through `cmd.exe` on this machine, with a 485ms outlier over 120
+// starts, and worse under a loaded build — and no healthy call here ever approaches twenty
+// seconds, so this number is never actually spent. It is a ceiling that keeps a slow machine
+// from rewriting the transcript.
+//
+// `DEMO_TIGHT` is what the connection is re-set to AFTER the plugin has answered once, for
+// the single call that is meant to time out. By then the process is up and a round trip is
+// under a millisecond, so 400ms is roughly four hundred times what the call needs and still
+// a small fraction of the plugin's nap (`ECHO_NAP_NANOS`, three seconds). Both margins are
+// wide, which is what makes the `timed-out` line below a property of the plugin rather than
+// a statement about how busy this machine was.
+const DEMO_ROOMY: i64 = 20000000000
+const DEMO_TIGHT: i64 = 400000000
+
+fn load(mut buf: []u8, read text: str) -> usize {
+    for i in 0..text.len {
+        buf[i] = text[i]
+    }
+    return text.len
+}
+
+// One call, reported the same way every time: the outcome by name, then the answer if there
+// is one, or the plugin's code and message if it failed on its own terms.
+fn attempt(mut h: plugin.Conn, read label: str, read request: []u8, mut response: []u8) -> plugin.Reply {
+    print_str(label)
+    let r: plugin.Reply = plugin.call(h, request, response)
+    print_str(plugin.outcome_name(r.outcome))
+    if plugin.succeeded(r) {
+        print_str(from_utf8(response[0 .. r.len]))
+    } else if r.outcome == plugin.PLUGIN_FAILED {
+        print_str("code")
+        print_int(r.exit_code as i64)
+        print_str(from_utf8(response[0 .. r.len]))
+    }
+    return r
+}
+
+fn hex_of(read b: []u8) -> String {
+    var s: String = string_new()
+    let digits: str = "0123456789abcdef"
+    for i in 0..b.len {
+        if i > 0 { string_push(s, " ") }
+        let v: i32 = b[i] as i32
+        string_push(s, substr(digits, (v >> 4) as usize, ((v >> 4) as usize) + 1))
+        string_push(s, substr(digits, (v & 15) as usize, ((v & 15) as usize) + 1))
+    }
+    return s
+}
+
+fn same(read a: []u8, read b: []u8) -> bool {
+    if a.len != b.len { return false }
+    for i in 0..a.len {
+        if a[i] != b[i] { return false }
+    }
+    return true
+}
+
+fn refused_conn() -> plugin.Conn {
+    print_str("refused")
+    return plugin.no_conn()
+}
+
+fn main() -> i32 {
+    if env.argc() < 2 {
+        print_str("usage: plugin_server_demo <plugin-executable>")
+        return 0
+    }
+    let cmd: str = env.argv(1)
+    var clk: time.Clock = time.host()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    var raw: *mut u8 = alloc(u8, DEMO_CAP)
+    var req: []u8 = slice(u8, raw, DEMO_CAP)
+    var rraw: *mut u8 = alloc(u8, DEMO_CAP)
+    var resp: []u8 = slice(u8, rraw, DEMO_CAP)
+
+    print_str("-- jplugin --")
+
+    var h: plugin.Conn = plugin.connect(sp, clk, cmd, DEMO_ROOMY) catch plugin.no_conn()
+    print_str("connected")
+    print_bool(plugin.is_up(h))
+
+    // Three calls, one process: the plugin numbers its answers.
+    let n1: usize = load(req, "hello from the host")
+    attempt(h, "-- the first call --", req[0 .. n1], resp)
+    let n2: usize = load(req, "the same process?")
+    attempt(h, "-- the second --", req[0 .. n2], resp)
+    let n3: usize = load(req, "still")
+    attempt(h, "-- the third --", req[0 .. n3], resp)
+
+    // The hostile payload: `a\r\nb\0c` then 0xFF 0xFE. Expected back: `#3 ` and the same bytes
+    // with the letters upper-cased — nothing else touched.
+    print_str("-- a payload with CR, LF, NUL and bytes that are not UTF-8 --")
+    req[0] = 97 as u8      // a
+    req[1] = 13 as u8      // \r
+    req[2] = 10 as u8      // \n
+    req[3] = 98 as u8      // b
+    req[4] = 0 as u8       // NUL
+    req[5] = 99 as u8      // c
+    req[6] = 255 as u8
+    req[7] = 254 as u8
+    var eraw: *mut u8 = alloc(u8, 16)
+    var expect: []u8 = slice(u8, eraw, 16)
+    let ep: usize = load(expect, "#3 ")
+    expect[ep + 0] = 65 as u8
+    expect[ep + 1] = 13 as u8
+    expect[ep + 2] = 10 as u8
+    expect[ep + 3] = 66 as u8
+    expect[ep + 4] = 0 as u8
+    expect[ep + 5] = 67 as u8
+    expect[ep + 6] = 255 as u8
+    expect[ep + 7] = 254 as u8
+    let r4: plugin.Reply = plugin.call(h, req[0 .. 8], resp)
+    print_str(plugin.outcome_name(r4.outcome))
+    var hx: String = hex_of(resp[0 .. r4.len])
+    print_str(string_view(hx))
+    string_free(hx)
+    print_str("byte for byte")
+    print_bool(same(resp[0 .. r4.len], expect[0 .. ep + 8]))
+    free_ptr(eraw)
+
+    // The plugin fails on its own terms: an error frame, and it is still there afterwards.
+    let n5: usize = load(req, "!fail this one")
+    attempt(h, "-- a plugin that reports its own error --", req[0 .. n5], resp)
+    print_str("still up")
+    print_bool(plugin.is_up(h))
+    let n6: usize = load(req, "after the error")
+    attempt(h, "-- and the same process answers the next call --", req[0 .. n6], resp)
+
+    // Prose on the frame stream: the honest answer is bad-response, and the connection ends.
+    let n7: usize = load(req, "!silent")
+    attempt(h, "-- a plugin that writes prose instead of a frame --", req[0 .. n7], resp)
+    print_str("still up")
+    print_bool(plugin.is_up(h))
+    let n8: usize = load(req, "anyone there?")
+    attempt(h, "-- a call on a connection that is over --", req[0 .. n8], resp)
+    print_str("first connection: calls, failures")
+    print_int(plugin.conn_calls(h))
+    print_int(plugin.conn_failures(h))
+    plugin.hangup(h)
+
+    // A fresh connection, and a plugin that sleeps past the budget: killed, and the host is
+    // still here to say so.
+    //
+    // **It answers an ordinary call first, and then the budget is tightened — neither step is
+    // decoration.** A budget wide enough to cover a cold process start times out for plugins
+    // that are perfectly healthy on a busy machine, so a transcript pinned on it says more
+    // about the machine than about the plugin. Hearing from the process first establishes
+    // that it is up and talking; `set_budget` then narrows the next call to 400ms, which a
+    // warm round trip beats by three orders of magnitude and a three-second nap cannot. The
+    // `timed-out` below is therefore attributable to the nap and to nothing else.
+    var h2: plugin.Conn = plugin.connect(sp, clk, cmd, DEMO_ROOMY) catch plugin.no_conn()
+    let n8b: usize = load(req, "awake?")
+    attempt(h2, "-- a second plugin, answering normally --", req[0 .. n8b], resp)
+    plugin.set_budget(h2, DEMO_TIGHT)
+    print_str("budget now, in ms")
+    print_int(plugin.budget_of(h2) / 1000000)
+    let n9: usize = load(req, "!sleep")
+    attempt(h2, "-- and then sleeping past the tightened budget --", req[0 .. n9], resp)
+    print_str("the plugin was killed")
+    print_bool(sysproc.is_signalled(plugin.exit_status(h2)))
+    print_str("the host is still standing")
+    print_bool(true)
+    plugin.hangup(h2)
+
+    // And another after the kill — a new process, numbering from zero again — hung up cleanly.
+    var h3: plugin.Conn = plugin.connect(sp, clk, cmd, DEMO_ROOMY) catch plugin.no_conn()
+    let n10: usize = load(req, "a new process")
+    attempt(h3, "-- a fresh connection after the kill --", req[0 .. n10], resp)
+    let st: sysproc.Status = plugin.hangup(h3)
+    print_str("-- hung up --")
+    print_str(sysproc.state_name(sysproc.state_of(st)))
+    print_int(sysproc.code_of(st) as i64)
+    print_str("down now")
+    print_bool(plugin.is_up(h3) == false)
+
+    // A host that may not start anything refuses before touching the plugin at all.
+    print_str("-- a host with no permission --")
+    var dsp: sysproc.Spawner = sysproc.denied()
+    var d: plugin.Conn = plugin.connect(dsp, clk, cmd, DEMO_ROOMY) catch |e| match e {
+        PluginRefused => refused_conn(),
+        _ => plugin.no_conn()
+    }
+    print_str("nothing was started")
+    print_bool(sysproc.started(dsp) == 0 and sysproc.refused(dsp) == 1)
+
+    // The spawner's books: three processes, one refusal.
+    print_str("-- the books --")
+    print_str("processes started")
+    print_int(sysproc.started(sp))
+
+    free_ptr(rraw)
+    free_ptr(raw)
+    return 0
+}

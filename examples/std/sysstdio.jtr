@@ -1,0 +1,162 @@
+// std/sysstdio.jtr — the process's OWN standard streams, as raw bytes.
+//
+// TIER: `sys`. Binds four symbols and imports `std/syserr` for the failure code.
+//
+// ─── Why a module for two functions ───────────────────────────────────────────
+//
+// Nothing in this tree could read its own stdin: `std/file` opens PATHS, and the `print_*`
+// intrinsics write text through the C runtime's `stdout`. A program on the far end of a pipe
+// — a plugin server under `std/plugin`, a filter, anything started by `sysproc.start_piped`
+// — needs the other half: read whatever the parent wrote, write whatever it answers, and
+// move BYTES rather than lines.
+//
+// ─── The text-mode trap (A4), and why this bypasses it instead of switching it off ──
+//
+// On Windows the C runtime opens `stdout` in TEXT mode, so every `\n` a program writes
+// through it arrives as `\r\n` at the other end. Any protocol that frames bytes through
+// `print_str` is silently corrupted the first time a payload holds a newline — that is the
+// recorded trap, and it is why `sysproc.capture` + `print_*` does not round-trip a child's
+// output.
+//
+// The usual fix is `_setmode(_fileno(stdout), _O_BINARY)`. It is not the fix taken here, for
+// two reasons. First, it changes the mode of a stream the RUNTIME also writes to: a plugin
+// that logged a line through `print_str` while serving would then push text into the frame
+// stream in binary mode, or frames into it in text mode, depending on which call came first —
+// a global switch with two owners. Second, it does nothing for stdin's side of the same
+// question. So this module does not touch the C runtime's streams at all: it asks the OS
+// for the standard HANDLES (`GetStdHandle`) and reads and writes them with `ReadFile`/
+// `WriteFile`, which have no text mode to switch. On POSIX the equivalent is `read(0)` and
+// `write(1)`, which never had one. Neither path shares a buffer with `print_*`, and a byte
+// written here is the byte that arrives — which `std/plugin`'s hostile-payload round trip
+// (`\r`, `\n`, a NUL, bytes that are not UTF-8) is the test of.
+//
+// **The consequence for callers:** these streams and the `print_*` intrinsics are two
+// different doors onto the same descriptor. A program that uses both interleaves them in an
+// order the C runtime's buffering decides. A plugin serving frames on stdout must not
+// print to it — `eprint_str` goes to stderr, which is a different descriptor here even when
+// a parent has merged the two into one pipe.
+//
+// ─── What this does NOT do ────────────────────────────────────────────────────
+//
+// No readiness query, no timeout, no stderr reader. A server's stdin is read by the server
+// and nobody else, so a blocking read is the right shape; the bounded reads belong to the
+// PARENT, and `sysproc.output_ready` is where they live.
+//
+// Worked example:  examples/std/plugin_echo.jtr (a plugin server on these two calls)
+// Run the tests:   jestyrc test examples/std/plugin_test.jtr (the frame layer over them)
+
+import "syserr"
+
+// **Every symbol `std/sysproc` also binds is bound here under an ALIAS, with the same
+// signature.** A second declaration under the bare name is a duplicate definition the
+// moment one program imports both modules — which `std/plugin` does — and typeck keys its
+// function table on the C symbol, so the signatures must agree as well. The corpus sweep
+// `one_c_symbol_has_one_signature_across_the_whole_std_corpus` holds the second half.
+@cfg(windows) extern "windows.h" fn GetStdHandle(which: u32) -> cptr
+@cfg(windows) extern "windows.h" fn stdio_read_file = "ReadFile"(h: cptr, buf: cptr, n: u32, got: cptr, ov: cptr) -> i32
+@cfg(windows) extern "windows.h" fn stdio_write_file = "WriteFile"(h: cptr, buf: cptr, n: u32, put: cptr, ov: cptr) -> i32
+
+// `read` is a keyword besides, and `write` is what `std/sysproc` aliases.
+@cfg(posix) extern "unistd.h" fn stdio_read = "read"(fd: i64, buf: cptr, n: usize) -> i64
+@cfg(posix) extern "unistd.h" fn stdio_write = "write"(fd: i64, buf: cptr, n: usize) -> i64
+
+// STD_INPUT_HANDLE is `(DWORD)-10`, STD_OUTPUT_HANDLE `(DWORD)-11`. Written as the unsigned
+// values the header defines rather than as negatives cast at the call.
+const SYSSTDIO_STD_INPUT: u32 = 4294967286
+const SYSSTDIO_STD_OUTPUT: u32 = 4294967285
+
+// ERROR_BROKEN_PIPE: what a read reports on Windows when the writer is gone. It is an error
+// return, not a zero-length read — the same recognition `std/sysproc`'s reader makes.
+const SYSSTDIO_ERROR_BROKEN_PIPE: i32 = 109
+
+@cfg(windows) fn raw_read(buf: *mut u8, n: usize) -> i64 {
+    var got: *mut u32 = alloc(u32, 1)
+    unsafe { (got + 0).* = 0 }
+    let rc: i32 = stdio_read_file(GetStdHandle(SYSSTDIO_STD_INPUT), buf as cptr, n as u32, got as cptr, null)
+    var k: u32 = 0
+    unsafe { k = (got + 0).* }
+    free_ptr(got)
+    if rc != 0 { return k as i64 }
+    if syserr.last_raw() == SYSSTDIO_ERROR_BROKEN_PIPE { return 0 }
+    return 0 - 1
+}
+
+@cfg(posix) fn raw_read(buf: *mut u8, n: usize) -> i64 {
+    return stdio_read(0, buf as cptr, n)
+}
+
+@cfg(windows) fn raw_write(buf: *mut u8, n: usize) -> i64 {
+    var put: *mut u32 = alloc(u32, 1)
+    unsafe { (put + 0).* = 0 }
+    let rc: i32 = stdio_write_file(GetStdHandle(SYSSTDIO_STD_OUTPUT), buf as cptr, n as u32, put as cptr, null)
+    var k: u32 = 0
+    unsafe { k = (put + 0).* }
+    free_ptr(put)
+    if rc == 0 { return 0 - 1 }
+    return k as i64
+}
+
+@cfg(posix) fn raw_write(buf: *mut u8, n: usize) -> i64 {
+    return stdio_write(1, buf as cptr, n)
+}
+
+// Read up to `buf.len` bytes from this process's stdin. **Zero means EOF** — the writer
+// closed its end — and is not an error; -1 is. Blocks until something arrives.
+pub fn read_stdin(mut buf: []u8) -> i64 {
+    if buf.len == 0 { return 0 }
+    var scratch: *mut u8 = alloc(u8, buf.len)
+    let got: i64 = raw_read(scratch, buf.len)
+    if got > 0 {
+        var i: usize = 0
+        for i < got as usize {
+            var b: u8 = 0
+            unsafe { b = (scratch + i).* }
+            buf[i] = b
+            i = i + 1
+        }
+    }
+    free_ptr(scratch)
+    return got
+}
+
+// Read EXACTLY `buf.len` bytes, or report why not: the count read when it fell short. A
+// short answer is EOF (or an error) in the middle of what the caller expected — for a
+// framed protocol that is a truncated frame, and the caller wants to know the difference
+// between "nothing at all" (a clean hangup) and "part of one" (a torn stream).
+pub fn read_stdin_exact(mut buf: []u8) -> usize {
+    var got: usize = 0
+    for got < buf.len {
+        var win: []u8 = buf[got .. buf.len]
+        let n: i64 = read_stdin(win)
+        if n <= 0 { return got }
+        got = got + n as usize
+    }
+    return got
+}
+
+// Write `data` to this process's stdout, bytes exactly as given. Returns bytes written or
+// -1. A SHORT write is possible on a pipe whose reader is slow; `write_stdout_all` loops.
+pub fn write_stdout(read data: []u8) -> i64 {
+    if data.len == 0 { return 0 }
+    var scratch: *mut u8 = alloc(u8, data.len)
+    var i: usize = 0
+    for i < data.len {
+        unsafe { (scratch + i).* = data[i] }
+        i = i + 1
+    }
+    let put: i64 = raw_write(scratch, data.len)
+    free_ptr(scratch)
+    return put
+}
+
+// Keep writing until everything is gone. Returns what was written; less than `data.len`
+// means the reader went away.
+pub fn write_stdout_all(read data: []u8) -> i64 {
+    var off: usize = 0
+    for off < data.len {
+        let n: i64 = write_stdout(data[off .. data.len])
+        if n <= 0 { return off as i64 }
+        off = off + n as usize
+    }
+    return off as i64
+}

@@ -1569,3 +1569,62 @@ const SPROC_CREATE_SUSPENDED: i32 = 4
 @cfg(posix) pub fn resume(mut c: Child) -> bool {
     return c.live
 }
+
+// ---- readiness: can the output be read WITHOUT blocking? -----------------------------
+//
+// Added for `std/plugin`'s server mode. A pipe read blocks until the child writes or
+// closes, so a parent with a BUDGET cannot simply call `read_output`: a child that does
+// neither would hold it for as long as it likes, and the budget would be decoration. The
+// question a bounded reader needs is "would a read return now?", asked before every read
+// and answered without one.
+//
+// `PeekNamedPipe` works on ANONYMOUS pipes despite its name, and it is the only
+// non-blocking question Windows answers about one — `WSAPoll` is sockets-only, and an
+// anonymous pipe cannot be opened overlapped. On POSIX a pipe is a descriptor like any
+// other and `poll` answers, bound under the SAME signature `std/syspoll` binds it with,
+// deliberately: one C symbol, one signature, corpus-wide (the sweep named in the
+// platform section above is what holds that).
+@cfg(windows) extern "windows.h" fn PeekNamedPipe(h: cptr, buf: cptr, n: u32, got: cptr, avail: cptr, left: cptr) -> i32
+@cfg(posix) extern "poll.h" fn poll(fds: cptr, n: u64, timeout_ms: i32) -> i32
+
+// Would a read on `h` return WITHOUT blocking? True when bytes are waiting AND when the
+// other end is gone — a read then returns EOF at once, which is `std/syspoll`'s definition
+// of readable and the only one a timeout loop can use. A failed query is reported as
+// ready rather than as "wait more": a caller's bounded loop must end on its own budget or
+// on a read, never on a lie that keeps it sleeping.
+@cfg(windows) fn pipe_ready(h: i64) -> bool {
+    var avail: *mut u32 = alloc(u32, 1)
+    unsafe { (avail + 0).* = 0 }
+    let rc: i32 = PeekNamedPipe(h as cptr, null, 0, null, avail as cptr, null)
+    var k: u32 = 0
+    unsafe { k = (avail + 0).* }
+    free_ptr(avail)
+    // A broken pipe — the child closed its end — FAILS the peek with ERROR_BROKEN_PIPE,
+    // exactly as `pipe_read` fails at EOF. Ready, because the read will return 0 now.
+    if rc == 0 { return true }
+    return k > 0
+}
+
+@cfg(posix) fn pipe_ready(h: i64) -> bool {
+    // One `struct pollfd`: `{ int fd; short events; short revents; }`, 8 bytes, the
+    // layout `std/syspoll` pins against the real kernel. `events` is POLLIN (1); ANY
+    // `revents` bit — readable, hung up, error — means a read returns at once.
+    var pfd: *mut u8 = alloc(u8, 8)
+    zero_bytes(pfd, 8)
+    let fw: *mut i32 = pfd as *mut i32
+    unsafe { (fw + 0).* = h as i32 }
+    unsafe { (pfd + 4).* = 1 as u8 }
+    let rc: i32 = poll(pfd as cptr, 1, 0)
+    free_ptr(pfd)
+    if rc == 0 { return false }
+    return true
+}
+
+// Can `read_output` return right now? `std/plugin`'s host asks this, sleeps a slice of
+// its budget on its `time.Clock` when the answer is no, and kills the child when the
+// budget is gone. A child without an output pipe is reported ready — `read_output`
+// answers -1 at once, and a loop waiting for readiness would otherwise never end.
+pub fn output_ready(read c: Child) -> bool {
+    if c.outp == SPROC_NO_PIPE { return true }
+    return pipe_ready(c.outp)
+}
