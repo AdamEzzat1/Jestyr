@@ -593,11 +593,46 @@ CHANGELOG to find it.
 | module | what | the one thing to know first |
 |---|---|---|
 | **Crypto bindings** | HMAC, signing/verification, a hash interface | Bindings over `sha256`/OpenSSL, not algorithms; `std/tls` shows the `extern "openssl/*.h"` shape and the link rule is already in place |
-| **Trace spans** | a span per unit of work, parent ids, a dump | `Span` is taken three times (`http`, `diag`, `@span`) — pick another word; fn-pointer vtable, not a trait (`@no_alloc` passes vacuously through a trait) |
+| ~~**Trace spans**~~ | **DONE: `std/trace`** — see the entry below this table | |
 | **Service supervision** | restart policy over `std/sysproc`, backoff, a supervision tree | the lifecycle (`std/service`) is complete; this is a supervisor OVER children, its own module |
 | **Sandbox** | cwd, process groups, fs capability projection onto a child | `sysproc.jtr:113` names all three; `fs.Fs` gates the parent and nothing projects it |
 | **Config live reload + nesting** | re-read on change, nested sections | `std/syswatch` + `std/config` exist; composing them is the module |
 | **`std/plugin` on the pipe transport** | a plugin as a server on `sysproc.start_piped` | Tier 4 leftover; one-process-per-call only because the transport did not exist |
+
+### ~~Trace spans~~ — **DONE: `std/trace`**
+
+Timed, nested **segments** (the word `span` is taken three times) with attributes, from a
+`Tracer` that is GIVEN a `time.Clock` and an exporter — `std/log`'s shape with nesting and
+a stopwatch. Seven tests, none touching the OS; a pinned demo (`jtrace`,
+`examples/std/trace_demo.jtr`); four mutations watched failing; no reseed (nothing in the
+closure changed). What a successor should not re-derive:
+
+* **The exporter is a `@copy` struct of a `*mut u8` and four fn pointers** (`on_open`,
+  `on_str`, `on_i64`, `on_close` — a visitor over ONE finished segment), the `Allocator`
+  shape. A trait would let `@no_alloc` pass vacuously. A caller's own exporter is four
+  functions over a block of counters (`a_caller_can_write_its_own_exporter`).
+* **Records arrive in END order with a parent id; the tracer never builds the tree.** The
+  demo rebuilds it from the JSON with `json.get` by id — that is the consumer's job.
+* **`end(t, id)` names the segment.** Inner segments still open are ABANDONED (discarded,
+  counted, never exported) and `id` ends normally; an id that is not open is `unmatched`.
+  An `end` that closed "the innermost" could never notice the early-`return` bug.
+* **Attributes go on the innermost open segment, and a parent may add more after a child
+  ended** (`status` after `db`). That keeps the arena a LIFO stack: names, keys and values
+  are released when their segment ends, so a tracer's memory is its `make` size for life.
+* **Four counters, because four fixes:** `dropped` (size the tracer), `truncated` (the
+  segment still exports what fit; the caller saw `false`), `abandoned` (a mis-nesting),
+  `unmatched` (a stale id). A freed tracer refuses without counting.
+* **`to_text` and `to_jsonl` share one state and one record scratch**; a record is built
+  whole and copied, or withheld and counted in `out_lost` — never a half line. Quoting is
+  `log.needs_quoting` + `json.put_str`, so there is ONE answer to "what does a quoted logfmt
+  value look like".
+* **`to_log` takes the logger and uses two clocks**: `ts` is the logger's, `dur` the
+  tracer's; `start` is not repeated in the record. The logger's level threshold still
+  applies (a DEBUG tracer through an INFO logger ships nothing, and the logger counts it).
+* **Ids are a per-tracer counter from 1; 0 means "no parent" and "refused".** A globally
+  unique id is the shipper's job, not the code's.
+* Not built: sampling, cross-process propagation, shared trace ids, batching, a wire
+  protocol.
 
 Plus the layer the breadth pass stopped short of: **the `jc add` command** over
 `manifest` + `registry` + `resolve` + `lockfile` + `cache` (every piece exists and is tested

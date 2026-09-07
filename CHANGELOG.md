@@ -7,6 +7,29 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/trace`** — timed, nested segments of work with attributes, exported to whoever is
+  listening. A `Tracer` is GIVEN a `time.Clock` and an `Exporter` (`std/log`'s design: no
+  ambient tracer, no global), so under `time.manual()` every duration and every id is
+  exact. The unit is a **segment**, because `Span` is taken three times in this tree
+  (`http`, `diag`, `@span`). The exporter is a fn-pointer vtable — `on_open`/`on_str`/
+  `on_i64`/`on_close`, a visitor over one finished segment — and not a trait, because
+  `@no_alloc` passes vacuously through a trait method; three ship: `to_text` (a logfmt
+  line), `to_jsonl` (one JSON object per line, same keys in the same order) and `to_log`
+  (one `std/log` record per segment, the logger's clock for `ts`, the tracer's for `dur`).
+  Records arrive in END order carrying a parent id; a consumer that wants the tree rebuilds
+  it. Bounded at `make` and every refusal is counted by name: `dropped` (a `begin` past the
+  stack or arena), `truncated` (an attribute that did not fit — the segment still exports
+  what it had), `abandoned` (a child still open when an outer segment ended, or at `free`;
+  discarded, never exported), `unmatched` (`end` of an id that is not open). `end(t, id)`
+  names the segment on purpose: that is what makes the early-`return` mis-nesting
+  observable. 7 tests, none touching the OS; the centre parses the JSON rendering back
+  with `std/json` and compares fifteen fields against the text line. Four mutations watched
+  failing: `dur` reported as `now` instead of `now - start`; the JSON exporter dropping
+  `parent`; the abandoned count not incremented; a refused attribute not counted. Demo
+  `jtrace` (`examples/std/trace_demo.jtr`) traces one request three ways and rebuilds the
+  tree from its own JSON; transcript pinned. Not built: sampling, propagation, shared trace
+  ids, batching, a wire protocol.
+
 - **`std/tls`** — TLS over a `sysnet` socket by binding OpenSSL (area 8). A client context
   that trusts nothing until `trust` gives it a CA, a server context that checks its key
   against its certificate at load, blocking `client_session`/`server_session` handshakes

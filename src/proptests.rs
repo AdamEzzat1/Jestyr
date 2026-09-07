@@ -2469,6 +2469,102 @@ mod log_structured {
     }
 }
 
+/// **`jtrace` — one request timed three ways, and the tree rebuilt from its own output.**
+///
+/// `examples/std/trace_demo.jtr` is `std/trace`'s consumer. `handle_request` opens a
+/// `request` segment with `parse` and `db` nested inside it and is run three times, on
+/// tracers that differ only in the exporter they were handed: text for a person, JSON lines
+/// for a machine, and `std/log` for a service that already has a log. The routine does not
+/// know which; the destination is a property of the `Tracer`, which is the separation the
+/// module exists to make — and the ids agree across the three runs because each tracer's
+/// ids are a counter from 1, not anything ambient.
+///
+/// **The assertion that earns the word "nested" is the rebuild.** Records arrive in END
+/// order carrying only a parent ID, so the demo parses its JSON back with `std/json`, finds
+/// `db`'s parent BY ID and prints its name, and checks the parent's duration covers both
+/// children and the gap between them (40 + 10 + 300 = 350). A child timed against the wrong
+/// clock, or an exporter that lost a field, fails there rather than printing a plausible
+/// trace.
+#[cfg(all(test, feature = "c-oracle"))]
+mod trace_segments {
+    use super::*;
+
+    #[test]
+    fn jtrace_times_one_request_three_ways_and_rebuilds_the_tree() {
+        let exe = super::c_oracle::build_exe("examples/std/trace_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the trace demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        // Exact, because every tracer and the logger run on `time.manual()`: the starts and
+        // durations below are the clocks' readings. The logger's clock is never advanced,
+        // so `ts` is 1000 on every record while `dur` still comes from the tracer's.
+        let want = "-- jtrace --\n\
+                    -- as a person reads it --\n\
+                    id=2 parent=1 name=parse start=1000 dur=40 bytes=512\n\
+                    id=3 parent=1 name=db start=1050 dur=300 query=\"select id from items\" rows=3\n\
+                    id=1 parent=0 name=request start=1000 dur=350 method=GET path=/items status=200\n\
+                    -- as a machine reads it --\n\
+                    {\"id\":2,\"parent\":1,\"name\":\"parse\",\"start\":1000,\"dur\":40,\"bytes\":512}\n\
+                    {\"id\":3,\"parent\":1,\"name\":\"db\",\"start\":1050,\"dur\":300,\"query\":\"select id from items\",\"rows\":3}\n\
+                    {\"id\":1,\"parent\":0,\"name\":\"request\",\"start\":1000,\"dur\":350,\"method\":\"GET\",\"path\":\"/items\",\"status\":200}\n\
+                    -- as one log record each --\n\
+                    ts=1000 level=info msg=parse id=2 parent=1 dur=40 bytes=512\n\
+                    ts=1000 level=info msg=db id=3 parent=1 dur=300 query=\"select id from items\" rows=3\n\
+                    ts=1000 level=info msg=request id=1 parent=0 dur=350 method=GET path=/items status=200\n\
+                    -- read back --\n\
+                    records exported\n\
+                    3\n\
+                    records parsed back\n\
+                    3\n\
+                    every record parsed\n\
+                    true\n\
+                    the parent of db is\n\
+                    request\n\
+                    children took\n\
+                    340\n\
+                    the request took\n\
+                    350\n\
+                    the request covers its children\n\
+                    true\n\
+                    finished\n\
+                    9\n\
+                    dropped\n\
+                    0\n\
+                    abandoned\n\
+                    0\n\
+                    logged\n\
+                    3";
+        assert_eq!(out.trim_end(), want, "the trace demo's transcript changed:\n{out}");
+
+        // Anti-vacuity: `true` appears twice, so a containment check would pass for a demo
+        // printing it unconditionally.
+        assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
+
+        // **The parent was found by id, not by position.** The name `request` is exported
+        // once per rendering — as a logfmt field, a JSON pair and a log message — and once
+        // more as the answer to the lookup, on a line of its own; the child records precede
+        // it in every rendering (end order), so a demo that printed the first line's name
+        // would have said `parse`. (A bare substring count would also see the two prose
+        // labels "the request took" / "the request covers its children".)
+        assert_eq!(out.matches("name=request").count(), 1, "{out}");
+        assert_eq!(out.matches("\"name\":\"request\"").count(), 1, "{out}");
+        assert_eq!(out.matches("msg=request").count(), 1, "{out}");
+        assert_eq!(out.matches("\nrequest\n").count(), 1, "the lookup's answer, alone on a line:\n{out}");
+        assert!(out.contains("the parent of db is\nrequest\n"), "{out}");
+
+        // The three renderings carry the same records: every `dur` value of the text lines
+        // appears in the JSON and in the log, so a renderer that dropped or renumbered one
+        // would move a count here even if the exact transcript were relaxed.
+        for dur in ["dur=40", "dur=300", "dur=350"] {
+            assert_eq!(out.matches(dur).count(), 2, "{dur} once in text, once in the log:\n{out}");
+        }
+        for dur in ["\"dur\":40,", "\"dur\":300,", "\"dur\":350,"] {
+            assert_eq!(out.matches(dur).count(), 1, "{dur} once in the JSON:\n{out}");
+        }
+    }
+}
+
 /// **`jstage` — the atomic-publish demo, end to end through the real filesystem.**
 ///
 /// `examples/std/sysfs_demo.jtr` is `std/sysfs`'s consumer, not an illustration of it: it
@@ -20091,6 +20187,12 @@ fn main() -> i32 {
             // archive refused before it is stored; then the same fetch over HTTP against
             // `std/httpd`'s static route on a spawned thread — the `jc add` shape, end to end.
             ("registry_test", 2),
+            // **No test touches the OS**: a tracer reaches it only through the `time.Clock`
+            // and the exporter it is given. The centre is one run rendered as text AND as
+            // JSON lines, the JSON parsed back and compared field by field — a name with a
+            // space, a value with a quote and a newline — plus every refusal counted:
+            // dropped, truncated, abandoned (an outer `end` over an open child), unmatched.
+            ("trace_test", 7),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

@@ -113,6 +113,7 @@ BUILD_OK tar_demo
 BUILD_OK test_demo
 BUILD_OK test_fixture_demo
 BUILD_OK time_demo
+BUILD_OK trace_demo
 BUILD_OK try_read
 BUILD_OK typeck_cli
 BUILD_OK writer_demo
