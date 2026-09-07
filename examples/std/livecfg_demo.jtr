@@ -1,0 +1,185 @@
+// examples/std/livecfg_demo.jtr — `jlivecfg`: a configuration that follows its file, and
+// never half-way.
+//
+//   jestyrc run examples/std/livecfg_demo.jtr
+//
+// A service starts from an INI file, and the file is edited under it four times: a value
+// moves, an edit carries one good change beside one bad value, a secret is rotated, and a
+// line the environment overrides is changed. The transcript shows what each edit did to
+// the generation — and the third edit is the point: **the old configuration survives it
+// whole**, the good change included, and the fault is printed as `file:line:col` with a
+// caret under the key.
+//
+// ─── Driven by `reload_now`, with the watcher alongside ───────────────────────────
+//
+// Every edit here is applied with `reload_now` rather than waited for through the
+// watcher, and that is what makes the transcript exact: a watcher says WHEN to look, in
+// its own time, and a program whose output depended on that time would print a different
+// transcript on a loaded machine. The watcher is real all the same — the directory is
+// watched from the start — and the last section shows it: the loop is asked whether the
+// edits woke it, and one `step` drains it and re-reads the file, finding nothing new. On
+// a manual clock, so the one number that comes from a clock is the number the program
+// chose.
+//
+// The output is asserted to the line by `jlivecfg_keeps_the_previous_configuration_whole`.
+
+import "livecfg"
+import "config"
+import "syswatch"
+import "runtime"
+import "fs"
+import "sysfs"
+import "mem"
+import "time"
+import "sink"
+
+const LC_D_ROOT: str = "zz_livecfg_demo"
+const LC_D_FILE: str = "zz_livecfg_demo/app.ini"
+const LC_D_CAP: usize = 4096
+
+fn nothing() { }
+
+fn no_watch() -> syswatch.Watcher {
+    return syswatch.closed()
+}
+
+// The change callback: one line per moved key. A secret arrives already redacted — the
+// callback could not print it if it tried, which is the property the module claims.
+fn announce(ctx: *mut u8, key: str, old: str, new: str) {
+    var raw: *mut u8 = alloc(u8, 256)
+    var buf: []u8 = slice(u8, raw, 256)
+    var s: sink.Sink = sink.new()
+    sink.put_str(s, buf, "  ")
+    sink.put_str(s, buf, key)
+    sink.put_str(s, buf, ": ")
+    sink.put_str(s, buf, old)
+    sink.put_str(s, buf, " -> ")
+    sink.put_str(s, buf, new)
+    print_str(sink.view(s, buf))
+    free_ptr(raw)
+}
+
+fn mark(ctx: *mut u8, id: i64, now: i64) { }
+
+fn schema(mut l: livecfg.Live) {
+    livecfg.declare(l, "server.port", config.CFG_INT, false)
+    livecfg.declare(l, "server.tls.port", config.CFG_INT, false)
+    livecfg.declare(l, "workers", config.CFG_INT, false)
+    livecfg.declare(l, "region", config.CFG_STR, false)
+    livecfg.declare(l, "api_token", config.CFG_STR, true)
+    livecfg.apply(l, "server.port", "8080", config.CFG_DEFAULT)
+    livecfg.apply(l, "server.tls.port", "8443", config.CFG_DEFAULT)
+    livecfg.apply(l, "workers", "4", config.CFG_DEFAULT)
+    livecfg.apply(l, "region", "us-east", config.CFG_DEFAULT)
+}
+
+// Write the file and reload, printing the outcome and the generation.
+fn edit(mut h: fs.Fs, mut l: livecfg.Live, read text: str) {
+    fs.put(h, LC_D_FILE, text)
+    let r: i32 = livecfg.reload_now(l)
+    print_str(livecfg.outcome_name(r))
+    print_str("generation")
+    print_int(livecfg.generation(l) as i32)
+}
+
+fn dump(mut buf: []u8, read l: livecfg.Live) {
+    var s: sink.Sink = sink.new()
+    livecfg.render(s, buf, l)
+    print_str(sink.view(s, buf))
+}
+
+fn problems(mut buf: []u8, read l: livecfg.Live) {
+    var s: sink.Sink = sink.new()
+    livecfg.render_problems(s, buf, l)
+    print_str(sink.view(s, buf))
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var raw: *mut u8 = alloc(u8, LC_D_CAP)
+    var buf: []u8 = slice(u8, raw, LC_D_CAP)
+
+    // Scrub first, not last, for `jwatch`'s reason.
+    fs.erase(h, LC_D_FILE)
+    let gone: bool = sysfs.remove_dir(h, a, LC_D_ROOT) catch false
+    let made: bool = sysfs.make_dir(h, a, LC_D_ROOT) catch false
+    fs.put(h, LC_D_FILE, "region = eu-west\napi_token = s3cr3t-one\n[server]\nport = 8080\n[server.tls]\nport = 8443\n")
+
+    print_str("-- jlivecfg --")
+    var w: syswatch.Watcher = syswatch.open_dir(h, a, LC_D_ROOT) catch no_watch()
+    var l: livecfg.Live = livecfg.make(a, time.manual(1000), fs.host(), w, LC_D_FILE)
+    schema(l)
+    livecfg.on_change(l, livecfg.change(null, &announce))
+    print_str("watching the file's directory")
+    print_bool(livecfg.watching(l))
+
+    // The environment says 16 workers; nothing the file says will change that.
+    livecfg.apply(l, "workers", "16", config.CFG_ENV)
+
+    print_str("-- first load --")
+    let r0: i32 = livecfg.reload_now(l)
+    print_str(livecfg.outcome_name(r0))
+    print_str("generation, applied at")
+    print_int(livecfg.generation(l) as i32)
+    print_int(livecfg.applied_at(l) as i32)
+    dump(buf, l)
+
+    // A component is handed `server.tls` and reads its port without knowing where it sits.
+    var tls: config.Section = config.sub_section(config.section("server"), "tls")
+    print_str("the tls component reads its own port")
+    print_int(livecfg.get_int(l, livecfg.section_key(l, tls, "port")) as i32)
+
+    print_str("-- edit 1: the port moves --")
+    edit(h, l, "region = eu-west\napi_token = s3cr3t-one\n[server]\nport = 9090\n[server.tls]\nport = 8443\n")
+
+    // **The edit that matters.** The tls port moves to 8444 — a valid change — beside a
+    // region that is fine and a `server.port` that is a word. Nothing lands: not the bad
+    // value, and not the good one either. The previous configuration stands whole.
+    print_str("-- edit 2: one good change beside one bad value --")
+    edit(h, l, "region = eu-west\napi_token = s3cr3t-one\n[server]\nport = nine-thousand\n[server.tls]\nport = 8444\n")
+    print_str("problems")
+    print_int(livecfg.problem_count(l) as i32)
+    problems(buf, l)
+    print_str("the previous configuration stands, the good change included")
+    print_int(livecfg.get_int(l, livecfg.by_name(l, "server.port")) as i32)
+    print_int(livecfg.get_int(l, livecfg.section_key(l, tls, "port")) as i32)
+
+    print_str("-- edit 3: the secret is rotated --")
+    edit(h, l, "region = eu-west\napi_token = s3cr3t-two\n[server]\nport = 9090\n[server.tls]\nport = 8443\n")
+
+    // The file's `workers` line is new, and it is the one line the environment owns. The
+    // effective configuration does not move, so neither does the generation.
+    print_str("-- edit 4: a line the environment owns --")
+    edit(h, l, "region = eu-west\napi_token = s3cr3t-two\nworkers = 2\n[server]\nport = 9090\n[server.tls]\nport = 8443\n")
+    print_str("workers, and where the value came from")
+    let wk: i32 = livecfg.by_name(l, "workers")
+    print_int(livecfg.get_int(l, wk) as i32)
+    print_str(config.origin_name(livecfg.origin_of(l, wk)))
+
+    // The watcher saw every edit above. Asked through the loop with a bounded wait — the
+    // handle is level-triggered and stays signaled until a step drains it — and then one
+    // step re-reads the file and finds nothing the last `reload_now` did not.
+    print_str("-- the watcher --")
+    var rt: runtime.Runtime = runtime.make(a, time.manual(0))
+    runtime.set_poller(rt, livecfg.poller(l))
+    let tok: runtime.CancelToken = runtime.token(rt)
+    runtime.watch(rt, livecfg.handle(l), tok, runtime.task(null, &mark))
+    let e: runtime.Event = runtime.poll_for(rt, 2000000000)
+    print_str("the edits woke the loop")
+    print_bool(e.kind == RT_READY)
+    print_str("a step drains the watcher and re-reads the file")
+    print_str(livecfg.outcome_name(livecfg.step(l)))
+    print_str("reloads, rejections, generation")
+    print_int(livecfg.reloads(l) as i32)
+    print_int(livecfg.rejections(l) as i32)
+    print_int(livecfg.generation(l) as i32)
+
+    runtime.cancel_all(rt, tok)
+    runtime.free(rt)
+    livecfg.free(l)
+    free_ptr(raw)
+    fs.erase(h, LC_D_FILE)
+    let bye: bool = sysfs.remove_dir(h, a, LC_D_ROOT) catch false
+    return 0
+}
