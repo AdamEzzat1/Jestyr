@@ -105,6 +105,7 @@ BUILD_OK service_demo
 BUILD_OK slice_algos
 BUILD_OK str_demo
 BUILD_OK strmap_demo
+BUILD_OK supervise_demo
 BUILD_OK sysfs_demo
 BUILD_OK sysnet_demo
 BUILD_OK sysproc_demo

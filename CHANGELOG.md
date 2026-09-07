@@ -7,6 +7,38 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/supervise`** — a supervisor over `std/sysproc` child PROCESSES (the second-wave
+  "service supervision" module; `std/service` is the lifecycle of the program you are in,
+  this keeps OTHER programs running). A bounded child table with a per-child `Policy`:
+  restart `never`/`on_failure`/`always`, a budget of N restarts within a window of M ns
+  (the budget counts RESTARTS — N = 3 restarts the third crash and gives up on the fourth;
+  N = 0 gives up at the first; negative is unlimited), a fixed or doubling-with-cap backoff
+  that resets to its base when a run outlasted the window. `tick` is one step with no
+  thread of its own — reap via `try_wait`, decide, schedule by deadline on the injected
+  `time.Clock`, start what is due — and a child changes phase at most once per tick, so an
+  exit and its restart are two observable steps even at zero delay. Per-child state
+  (`phase_of`, `outcome_of`, `last_code_of`, `restarts_of`, `gave_up`, `due_of`),
+  `next_deadline` for a driver's sleep, `stop_all` (`terminate` + `wait_or_kill`, cancels
+  scheduled restarts, reports the kill count), and an event callback (ctx + fn pointer:
+  started/exited/restarted/gave-up/stopped, each carrying a detail).
+
+  **Two clocks, on purpose.** The supervisor's own clock is POLICY time; `poll_for` takes
+  a second clock that is the time a caller can afford to SPEND blocking. In a test the
+  first is `time.manual()` while the children are real processes exiting in real time,
+  which the second waits on — one clock could not be both, and a supervisor that reached
+  for `time.host()` itself would touch the OS behind the caller's back. **A start the
+  platform refuses is final** (`SUP_OUT_START_FAILED`, not a crash the budget retries).
+  `sysproc` grew `start_exec(path, args)` — a program started DIRECTLY, no shell — because
+  killing `cmd.exe /c prog` ends `cmd.exe` and orphans `prog`, the very process a
+  supervisor is in charge of. 10 tests, every one over real children on a manual policy
+  clock; watched failing: the budget off by one (`>` for `>=`), a backoff that never
+  doubles, a window that never closes, and a `stop_all` that leaves a waiting child.
+  Demo `jsupervise` (the demo re-invokes itself as its three children) pinned exactly.
+  Not built: a supervision tree, graceful (signal-then-kill) shutdown, dependency order,
+  logging (events go to the callback). **Finding:** importing `core` beside any module
+  with a fallible function breaks type-checking — `core.Result`'s variants `ok`/`err`
+  shadow the intrinsics — so the demo renders its numbers itself.
+
 - **`std/tls`** — TLS over a `sysnet` socket by binding OpenSSL (area 8). A client context
   that trusts nothing until `trust` gives it a CA, a server context that checks its key
   against its certificate at load, blocking `client_session`/`server_session` handshakes

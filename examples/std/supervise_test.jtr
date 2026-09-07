@@ -1,0 +1,569 @@
+// std/supervise_test.jtr — the restart policy, checked against REAL children.
+//
+// The module's claims are all about what a supervisor decides when a process it started
+// goes away, so every test here starts real processes — a fake `try_wait` would prove the
+// policy against the fake. What the tests do NOT do is let real time into the policy: the
+// supervisor runs on `time.manual(0)`, so every deadline, window and backoff below is a
+// number the test chose, and a second clock (`time.host()`) is spent only on waiting for
+// the real exits.
+//
+// The child programs are picked at RUN time through `syserr.host_plat()` rather than
+// through `@cfg`, so this file needs no golden entry. They are started with `add_exec` —
+// a program and its arguments, no shell — because the long-running one has to be KILLED
+// and killing a shell leaves the program it started alive (see `sysproc.start_exec`).
+// `cmd.exe /c exit N` and `/bin/true`/`/bin/false` are the quick exits; the long-runner is
+// `powershell.exe -NoProfile -Command Start-Sleep 30` (silent, and on every PATH) against
+// `/bin/sleep 30`. The crash code differs — 3 against `false`'s 1 — so it is a query too.
+//
+// **If a test here HANGS rather than fails, it is a driver that waited on a child that will
+// never exit** — `poll_for` returns only when a running child has gone, and the long-runner
+// does not go on its own. Every wait has a budget and every loop a round cap for exactly
+// that reason.
+//
+// Run:  jestyrc test examples/std/supervise_test.jtr
+
+import "mem"
+import "supervise"
+import "syserr"
+import "sysproc"
+import "time"
+import "test"
+import "test_report"
+
+const SV_REPORT_CAP: usize = 4096
+const SV_MS: i64 = 1000000
+// The most real time any single wait for an exit is allowed: a quick child exits in tens
+// of milliseconds, and a loaded machine gets two orders of magnitude of slack.
+const SV_WAIT: i64 = 20000000000
+
+// ---- the children -----------------------------------------------------------------
+
+fn on_windows() -> bool { return syserr.host_plat() == syserr.SYSERR_PLAT_WINDOWS }
+
+fn quiet_path() -> str { if on_windows() { return "cmd.exe" }  return "/bin/true" }
+fn quiet_args() -> str { if on_windows() { return "/c exit 0" }  return "" }
+fn crash_path() -> str { if on_windows() { return "cmd.exe" }  return "/bin/false" }
+fn crash_args() -> str { if on_windows() { return "/c exit 3" }  return "" }
+fn crash_code() -> i64 { if on_windows() { return 3 }  return 1 }
+fn long_path() -> str { if on_windows() { return "powershell.exe" }  return "/bin/sleep" }
+fn long_args() -> str { if on_windows() { return "-NoProfile -Command Start-Sleep 30" }  return "30" }
+
+// ---- an event tally -------------------------------------------------------------------
+//
+// Ten counters behind the `ctx` pointer: how many times each of the five events fired, and
+// the SUM of their `detail`s — so "two restarts" and "the give-up carried 2" are both one
+// number, and a callback that ignored its context could not satisfy either.
+
+fn tally(ctx: *mut u8, kind: i32, slot: usize, detail: i32) {
+    let t: *mut i64 = ctx as *mut i64
+    let k: usize = kind as usize
+    var n: i64 = 0
+    unsafe { n = (t + k).* }
+    unsafe { (t + k).* = n + 1 }
+    var d: i64 = 0
+    unsafe { d = (t + 5 + k).* }
+    unsafe { (t + 5 + k).* = d + detail as i64 }
+}
+
+fn new_tally() -> *mut i64 {
+    var t: *mut i64 = alloc(i64, 10)
+    var i: usize = 0
+    for i < 10 {
+        unsafe { (t + i).* = 0 }
+        i = i + 1
+    }
+    return t
+}
+
+fn fired(t: *mut i64, kind: i32) -> i64 {
+    let v: i64 = unsafe { (t + kind as usize).* }
+    return v
+}
+
+fn details(t: *mut i64, kind: i32) -> i64 {
+    let v: i64 = unsafe { (t + 5 + kind as usize).* }
+    return v
+}
+
+// ---- the driver -------------------------------------------------------------------------
+
+// Drive `s` until nothing is running or waiting: wait on real time for exits, move the
+// policy clock to the next deadline when only restarts are pending. NOT for a supervisor
+// holding a long-runner — `poll_for` would spend its whole budget on a child that never
+// exits. Returns the rounds it took.
+fn drive(mut s: supervise.Supervisor, mut wall: time.Clock, max_rounds: i64) -> i64 {
+    var rounds: i64 = 0
+    for supervise.active(s) > 0 {
+        if rounds >= max_rounds { break }
+        supervise.tick(s)
+        if supervise.running(s) > 0 { supervise.poll_for(s, wall, SV_WAIT) }
+        let nd: i64 = supervise.next_deadline(s)
+        if nd >= 0 {
+            let now: i64 = supervise.now(s)
+            if nd > now { supervise.advance(s, nd - now) }
+        }
+        rounds = rounds + 1
+    }
+    return rounds
+}
+
+// Move the policy clock to `to`.
+fn clock_to(mut s: supervise.Supervisor, to: i64) {
+    let now: i64 = supervise.now(s)
+    if to > now { supervise.advance(s, to - now) }
+}
+
+// ---- registration -------------------------------------------------------------------
+
+// A registered child is WAITING with its first start due now, and nothing runs until the
+// first `tick`. The table is bounded, and a budget the history ring cannot count is refused.
+@test fn nothing_runs_until_the_first_tick() -> bool {
+    var raw: *mut u8 = alloc(u8, SV_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SV_REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var wall: time.Clock = time.host()
+    var s: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 2)
+
+    test.eq_usize(c, rep, "capacity", supervise.capacity(s), 2)
+    test.eq_i64(c, rep, "the first slot is 0", supervise.add_exec(s, quiet_path(), quiet_args(), supervise.never()), 0)
+    test.eq_usize(c, rep, "one child", supervise.count(s), 1)
+    test.eq_i64(c, rep, "it is waiting", supervise.phase_of(s, 0) as i64, supervise.SUP_WAITING as i64)
+    test.eq_i64(c, rep, "due now", supervise.due_of(s, 0), 0)
+    test.eq_i64(c, rep, "which next_deadline reports", supervise.next_deadline(s), 0)
+    test.eq_i64(c, rep, "nothing has started", supervise.starts(s), 0)
+    test.eq_usize(c, rep, "nothing is running", supervise.running(s), 0)
+    test.eq_usize(c, rep, "one is active", supervise.active(s), 1)
+
+    // A budget the ring cannot see all of is refused rather than miscounted.
+    let over: supervise.Policy = supervise.policy(supervise.SUP_ALWAYS, supervise.SUP_HIST_CAP as i64 + 1, 0, 0)
+    test.eq_i64(c, rep, "a budget over the ring is refused", supervise.add_exec(s, quiet_path(), quiet_args(), over), 0 - 1)
+    test.eq_usize(c, rep, "and nothing was added", supervise.count(s), 1)
+    test.eq_i64(c, rep, "the second slot is 1", supervise.add_exec(s, quiet_path(), quiet_args(), supervise.never()), 1)
+    test.eq_i64(c, rep, "a full table refuses", supervise.add_exec(s, quiet_path(), quiet_args(), supervise.never()), 0 - 1)
+
+    // A slot that does not exist reads as a child that is not there.
+    test.eq_i64(c, rep, "an absent slot is stopped", supervise.phase_of(s, 7) as i64, supervise.SUP_STOPPED as i64)
+    test.eq_i64(c, rep, "with no restarts", supervise.restarts_of(s, 7), 0)
+    test.eq_i64(c, rep, "and no outcome", supervise.outcome_of(s, 7) as i64, supervise.SUP_OUT_NONE as i64)
+
+    test.eq_i64(c, rep, "the first tick starts both", supervise.tick(s), 2)
+    test.eq_usize(c, rep, "two running", supervise.running(s), 2)
+    test.eq_i64(c, rep, "two starts", supervise.starts(s), 2)
+
+    drive(s, wall, 10)
+    test.eq_i64(c, rep, "slot 0 is done", supervise.phase_of(s, 0) as i64, supervise.SUP_DONE as i64)
+    test.eq_i64(c, rep, "slot 1 is done", supervise.phase_of(s, 1) as i64, supervise.SUP_DONE as i64)
+    test.eq_usize(c, rep, "nothing is active", supervise.active(s), 0)
+    supervise.free(s)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- `never` ---------------------------------------------------------------------------
+
+// Under `never` an exit is final, whatever the code, and every fact about it is readable:
+// phase, outcome, code, restarts. The events fire in order with their context.
+@test fn a_clean_exit_under_never_is_final_and_reported() -> bool {
+    var raw: *mut u8 = alloc(u8, SV_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SV_REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var wall: time.Clock = time.host()
+    var t: *mut i64 = new_tally()
+    var s: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 2)
+    supervise.set_events(s, t as *mut u8, &tally)
+
+    supervise.add_exec(s, quiet_path(), quiet_args(), supervise.never())
+    supervise.add_exec(s, crash_path(), crash_args(), supervise.never())
+    supervise.tick(s)
+    test.eq_i64(c, rep, "started fired twice", fired(t, supervise.SUP_EV_STARTED), 2)
+
+    drive(s, wall, 10)
+    test.eq_i64(c, rep, "the clean one is done", supervise.phase_of(s, 0) as i64, supervise.SUP_DONE as i64)
+    test.eq_i64(c, rep, "it exited", supervise.outcome_of(s, 0) as i64, supervise.SUP_OUT_EXITED as i64)
+    test.eq_i64(c, rep, "with code 0", supervise.last_code_of(s, 0) as i64, 0)
+    test.eq_i64(c, rep, "the crash is done too: never means never", supervise.phase_of(s, 1) as i64, supervise.SUP_DONE as i64)
+    test.eq_i64(c, rep, "with its own code", supervise.last_code_of(s, 1) as i64, crash_code())
+    test.eq_i64(c, rep, "no restarts", supervise.restarts_of(s, 1), 0)
+    test.is_false(c, rep, "and no budget spent", supervise.gave_up(s, 1))
+    test.eq_i64(c, rep, "two exits", supervise.exits(s), 2)
+    test.eq_i64(c, rep, "two starts", supervise.starts(s), 2)
+    test.eq_i64(c, rep, "nothing is due", supervise.next_deadline(s), 0 - 1)
+
+    test.eq_i64(c, rep, "exited fired twice", fired(t, supervise.SUP_EV_EXITED), 2)
+    test.eq_i64(c, rep, "carrying the codes", details(t, supervise.SUP_EV_EXITED), crash_code())
+    test.eq_i64(c, rep, "no restart event", fired(t, supervise.SUP_EV_RESTARTED), 0)
+    test.eq_i64(c, rep, "no give-up event", fired(t, supervise.SUP_EV_GAVE_UP), 0)
+
+    // With nothing running there is nothing to wait for, and `poll_for` says so at once.
+    let t0: i64 = time.read_nanos(wall)
+    test.eq_i64(c, rep, "poll_for sees no exit", supervise.poll_for(s, wall, SV_WAIT), 0)
+    test.is_true(c, rep, "and did not wait for one", time.read_nanos(wall) - t0 < 5000 * SV_MS)
+    supervise.free(s)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(t)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- `on_failure` and `always` -------------------------------------------------------
+
+// `on_failure` restarts a crash and leaves a clean exit alone; the budget counts RESTARTS,
+// so N = 2 means two restarts and a give-up on the third crash, with the count in the event.
+@test fn on_failure_restarts_only_a_crash_and_counts_it() -> bool {
+    var raw: *mut u8 = alloc(u8, SV_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SV_REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var wall: time.Clock = time.host()
+    var t: *mut i64 = new_tally()
+    var s: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 2)
+    supervise.set_events(s, t as *mut u8, &tally)
+
+    let p: supervise.Policy = supervise.policy(supervise.SUP_ON_FAILURE, 2, 0, 0)
+    supervise.add_exec(s, crash_path(), crash_args(), p)
+    supervise.add_exec(s, quiet_path(), quiet_args(), p)
+    drive(s, wall, 40)
+
+    test.is_true(c, rep, "the crasher gave up", supervise.gave_up(s, 0))
+    test.eq_i64(c, rep, "phase says so", supervise.phase_of(s, 0) as i64, supervise.SUP_GAVE_UP as i64)
+    test.eq_i64(c, rep, "after two restarts", supervise.restarts_of(s, 0), 2)
+    test.eq_i64(c, rep, "its last code is the crash", supervise.last_code_of(s, 0) as i64, crash_code())
+    test.eq_i64(c, rep, "the clean one is done", supervise.phase_of(s, 1) as i64, supervise.SUP_DONE as i64)
+    test.eq_i64(c, rep, "never restarted", supervise.restarts_of(s, 1), 0)
+    test.is_false(c, rep, "and did not give up", supervise.gave_up(s, 1))
+
+    test.eq_i64(c, rep, "four starts in all", supervise.starts(s), 4)
+    test.eq_i64(c, rep, "four exits", supervise.exits(s), 4)
+    test.eq_i64(c, rep, "one give-up", supervise.gave_ups(s), 1)
+    test.eq_i64(c, rep, "restarted fired twice", fired(t, supervise.SUP_EV_RESTARTED), 2)
+    test.eq_i64(c, rep, "with ordinals 1 and 2", details(t, supervise.SUP_EV_RESTARTED), 3)
+    test.eq_i64(c, rep, "gave-up fired once", fired(t, supervise.SUP_EV_GAVE_UP), 1)
+    test.eq_i64(c, rep, "carrying the restart count", details(t, supervise.SUP_EV_GAVE_UP), 2)
+    supervise.free(s)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(t)
+    free_ptr(raw)
+    return ok
+}
+
+// `always` restarts a CLEAN exit too, until the budget is spent; N = 0 gives up at the
+// first exit, and that is a legal policy rather than an error.
+@test fn always_restarts_a_clean_exit_until_the_budget_is_spent() -> bool {
+    var raw: *mut u8 = alloc(u8, SV_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SV_REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var wall: time.Clock = time.host()
+    var s: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 2)
+
+    supervise.add_exec(s, quiet_path(), quiet_args(), supervise.policy(supervise.SUP_ALWAYS, 2, 0, 0))
+    supervise.add_exec(s, quiet_path(), quiet_args(), supervise.policy(supervise.SUP_ALWAYS, 0, 0, 0))
+    drive(s, wall, 40)
+
+    test.is_true(c, rep, "N = 2 gave up", supervise.gave_up(s, 0))
+    test.eq_i64(c, rep, "after two restarts of a clean exit", supervise.restarts_of(s, 0), 2)
+    test.eq_i64(c, rep, "whose code was 0 every time", supervise.last_code_of(s, 0) as i64, 0)
+    test.is_true(c, rep, "N = 0 gave up", supervise.gave_up(s, 1))
+    test.eq_i64(c, rep, "at the first exit", supervise.restarts_of(s, 1), 0)
+    test.eq_i64(c, rep, "four starts: 3 + 1", supervise.starts(s), 4)
+    test.eq_i64(c, rep, "two give-ups", supervise.gave_ups(s), 2)
+    supervise.free(s)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- the window ----------------------------------------------------------------------
+
+// The budget is N restarts within a WINDOW on the policy clock. The same crashing child
+// under the same policy: with the clock still, one restart inside the window spends the
+// budget; with the clock jumping past the window between crashes, it never does.
+@test fn the_budget_is_a_window_on_the_policy_clock() -> bool {
+    var raw: *mut u8 = alloc(u8, SV_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SV_REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var wall: time.Clock = time.host()
+    var t: *mut i64 = new_tally()
+    let p: supervise.Policy = supervise.policy(supervise.SUP_ON_FAILURE, 1, 1000 * SV_MS, 0)
+
+    // (a) the clock never moves.
+    var still: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 1)
+    supervise.add_exec(still, crash_path(), crash_args(), p)
+    drive(still, wall, 20)
+    test.is_true(c, rep, "with the clock still, the budget is spent", supervise.gave_up(still, 0))
+    test.eq_i64(c, rep, "after one restart", supervise.restarts_of(still, 0), 1)
+    supervise.free(still)
+
+    // (b) the clock jumps two seconds after every restart, so each crash finds the last
+    // restart outside the window.
+    var jump: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 1)
+    supervise.set_events(jump, t as *mut u8, &tally)
+    supervise.add_exec(jump, crash_path(), crash_args(), p)
+    supervise.tick(jump)
+    var k: i64 = 0
+    for k < 3 {
+        supervise.poll_for(jump, wall, SV_WAIT)         // the crash, reaped; a restart scheduled
+        supervise.tick(jump)                            // the restart
+        supervise.advance(jump, 2000 * SV_MS)           // and the window closes behind it
+        k = k + 1
+    }
+    supervise.poll_for(jump, wall, SV_WAIT)
+    test.eq_i64(c, rep, "three restarts", supervise.restarts_of(jump, 0), 3)
+    test.is_false(c, rep, "and the budget is not spent", supervise.gave_up(jump, 0))
+    test.eq_i64(c, rep, "a fourth is waiting", supervise.phase_of(jump, 0) as i64, supervise.SUP_WAITING as i64)
+    test.eq_i64(c, rep, "due now", supervise.due_of(jump, 0), 6000 * SV_MS)
+
+    // `stop_all` cancels a scheduled restart and says it killed nothing.
+    test.eq_i64(c, rep, "stop_all killed nothing", supervise.stop_all(jump), 0)
+    test.eq_i64(c, rep, "the child is stopped", supervise.phase_of(jump, 0) as i64, supervise.SUP_STOPPED as i64)
+    test.eq_i64(c, rep, "its outcome is the crash it really had", supervise.outcome_of(jump, 0) as i64, supervise.SUP_OUT_EXITED as i64)
+    test.eq_i64(c, rep, "stopped fired once", fired(t, supervise.SUP_EV_STOPPED), 1)
+    test.eq_i64(c, rep, "as a cancellation, not a kill", details(t, supervise.SUP_EV_STOPPED), 0)
+    test.eq_usize(c, rep, "nothing is active", supervise.active(jump), 0)
+    supervise.free(jump)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(t)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- backoff ---------------------------------------------------------------------------
+
+// A restart is scheduled by DEADLINE on the policy clock: not started before its time, and
+// started by the first tick at or after it. Doubling doubles from the base and stops at the
+// cap; a run that outlasted the window resets it to the base.
+@test fn a_doubling_backoff_schedules_by_deadline_and_is_capped() -> bool {
+    var raw: *mut u8 = alloc(u8, SV_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SV_REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var wall: time.Clock = time.host()
+    var s: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 1)
+
+    // N = 4 on purpose: by the last step there ARE four restarts in the history, so a
+    // supervisor that counted them without the window would give up right there.
+    let base: supervise.Policy = supervise.policy(supervise.SUP_ON_FAILURE, 4, 1000 * SV_MS, 100 * SV_MS)
+    let p: supervise.Policy = supervise.doubling(base, 300 * SV_MS)
+    supervise.add_exec(s, crash_path(), crash_args(), p)
+    supervise.tick(s)
+
+    supervise.poll_for(s, wall, SV_WAIT)
+    test.eq_i64(c, rep, "after the first crash: waiting", supervise.phase_of(s, 0) as i64, supervise.SUP_WAITING as i64)
+    test.eq_i64(c, rep, "due at 100ms", supervise.due_of(s, 0), 100 * SV_MS)
+    test.eq_i64(c, rep, "next_deadline agrees", supervise.next_deadline(s), 100 * SV_MS)
+
+    clock_to(s, 50 * SV_MS)
+    test.eq_i64(c, rep, "at 50ms nothing changes", supervise.tick(s), 0)
+    test.eq_usize(c, rep, "and nothing runs", supervise.running(s), 0)
+    clock_to(s, 100 * SV_MS)
+    test.eq_i64(c, rep, "at 100ms the restart happens", supervise.tick(s), 1)
+    test.eq_i64(c, rep, "restart 1", supervise.restarts_of(s, 0), 1)
+
+    supervise.poll_for(s, wall, SV_WAIT)
+    test.eq_i64(c, rep, "the delay doubled: due at 300ms", supervise.due_of(s, 0), 300 * SV_MS)
+    clock_to(s, 300 * SV_MS)
+    supervise.tick(s)
+    supervise.poll_for(s, wall, SV_WAIT)
+    test.eq_i64(c, rep, "capped at 300ms: due at 600ms", supervise.due_of(s, 0), 600 * SV_MS)
+    clock_to(s, 600 * SV_MS)
+    supervise.tick(s)
+    supervise.poll_for(s, wall, SV_WAIT)
+    test.eq_i64(c, rep, "and stays capped: due at 900ms", supervise.due_of(s, 0), 900 * SV_MS)
+    clock_to(s, 900 * SV_MS)
+    supervise.tick(s)
+    test.eq_i64(c, rep, "restart 4", supervise.restarts_of(s, 0), 4)
+
+    // This run outlasts the window: the clock moves 2s while it is up, so when its crash is
+    // reaped the delay is the base again, not the cap.
+    clock_to(s, 2900 * SV_MS)
+    supervise.poll_for(s, wall, SV_WAIT)
+    test.eq_i64(c, rep, "a long run resets the backoff: due at 3000ms", supervise.due_of(s, 0), 3000 * SV_MS)
+    test.is_false(c, rep, "and the old restarts fell out of the window", supervise.gave_up(s, 0))
+    supervise.free(s)
+
+    // The fixed backoff, for contrast: the same delay every time.
+    var f: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 1)
+    supervise.add_exec(f, crash_path(), crash_args(), base)
+    supervise.tick(f)
+    supervise.poll_for(f, wall, SV_WAIT)
+    test.eq_i64(c, rep, "fixed: due at 100ms", supervise.due_of(f, 0), 100 * SV_MS)
+    clock_to(f, 100 * SV_MS)
+    supervise.tick(f)
+    supervise.poll_for(f, wall, SV_WAIT)
+    test.eq_i64(c, rep, "fixed: due at 200ms", supervise.due_of(f, 0), 200 * SV_MS)
+    supervise.free(f)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// An exit and the restart it earns are two observable steps even when the delay is zero:
+// the tick that reaps leaves the child WAITING with its start due NOW, and the next tick
+// starts it — a child changes phase at most once per tick.
+@test fn an_exit_and_its_restart_are_two_ticks_even_at_zero_delay() -> bool {
+    var raw: *mut u8 = alloc(u8, SV_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SV_REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var wall: time.Clock = time.host()
+    var s: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 1)
+
+    supervise.add_exec(s, crash_path(), crash_args(), supervise.policy(supervise.SUP_ON_FAILURE, 3, 0, 0))
+    supervise.tick(s)
+    test.eq_i64(c, rep, "poll_for saw the exit", supervise.poll_for(s, wall, SV_WAIT), 1)
+    test.eq_i64(c, rep, "the child is waiting, not running", supervise.phase_of(s, 0) as i64, supervise.SUP_WAITING as i64)
+    test.eq_i64(c, rep, "due now", supervise.due_of(s, 0), supervise.now(s))
+    test.eq_i64(c, rep, "one exit so far", supervise.exits(s), 1)
+    test.eq_i64(c, rep, "one start so far", supervise.starts(s), 1)
+    test.eq_i64(c, rep, "the next tick changes one child", supervise.tick(s), 1)
+    test.eq_i64(c, rep, "which is now running", supervise.phase_of(s, 0) as i64, supervise.SUP_RUNNING as i64)
+    test.eq_i64(c, rep, "as its first restart", supervise.restarts_of(s, 0), 1)
+    supervise.free(s)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- stopping --------------------------------------------------------------------------
+
+// `stop_all` kills what is running, cancels what is waiting, leaves what is done alone, and
+// reports what it did: the return is the kill count, and the STOPPED event's detail tells a
+// kill from a cancellation. Idempotent.
+@test fn stop_all_kills_the_running_and_cancels_the_waiting() -> bool {
+    var raw: *mut u8 = alloc(u8, SV_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SV_REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var wall: time.Clock = time.host()
+    var t: *mut i64 = new_tally()
+    var s: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 3)
+    supervise.set_events(s, t as *mut u8, &tally)
+
+    supervise.add_exec(s, long_path(), long_args(), supervise.never())
+    // A crash whose restart is five seconds out on a clock that never moves: it will be
+    // WAITING when `stop_all` reaches it.
+    supervise.add_exec(s, crash_path(), crash_args(), supervise.policy(supervise.SUP_ON_FAILURE, 3, 0, 5000 * SV_MS))
+    supervise.add_exec(s, quiet_path(), quiet_args(), supervise.never())
+    test.eq_i64(c, rep, "three started", supervise.tick(s), 3)
+
+    // Wait until the two quick ones have gone. `poll_for` returns on the FIRST exit, which
+    // may be either of them, so this loops until both are where they will stay.
+    var rounds: i64 = 0
+    for rounds < 20 {
+        if supervise.phase_of(s, 1) == supervise.SUP_WAITING and supervise.phase_of(s, 2) == supervise.SUP_DONE { break }
+        supervise.poll_for(s, wall, SV_WAIT)
+        rounds = rounds + 1
+    }
+    test.eq_i64(c, rep, "the long-runner is still running", supervise.phase_of(s, 0) as i64, supervise.SUP_RUNNING as i64)
+    test.eq_i64(c, rep, "the crasher is waiting for its restart", supervise.phase_of(s, 1) as i64, supervise.SUP_WAITING as i64)
+    test.eq_i64(c, rep, "the quick one is done", supervise.phase_of(s, 2) as i64, supervise.SUP_DONE as i64)
+
+    test.eq_i64(c, rep, "stop_all killed one", supervise.stop_all(s), 1)
+    test.eq_i64(c, rep, "the long-runner is stopped", supervise.phase_of(s, 0) as i64, supervise.SUP_STOPPED as i64)
+    test.eq_i64(c, rep, "and was signalled", supervise.outcome_of(s, 0) as i64, supervise.SUP_OUT_SIGNALLED as i64)
+    test.eq_i64(c, rep, "the crasher is stopped", supervise.phase_of(s, 1) as i64, supervise.SUP_STOPPED as i64)
+    test.eq_i64(c, rep, "with the outcome it really had", supervise.outcome_of(s, 1) as i64, supervise.SUP_OUT_EXITED as i64)
+    test.eq_i64(c, rep, "and its real code", supervise.last_code_of(s, 1) as i64, crash_code())
+    test.eq_i64(c, rep, "the done one is left alone", supervise.phase_of(s, 2) as i64, supervise.SUP_DONE as i64)
+    test.eq_i64(c, rep, "killed counts one", supervise.killed(s), 1)
+    test.eq_usize(c, rep, "nothing is active", supervise.active(s), 0)
+    test.eq_i64(c, rep, "stopped fired twice", fired(t, supervise.SUP_EV_STOPPED), 2)
+    test.eq_i64(c, rep, "one kill, one cancellation", details(t, supervise.SUP_EV_STOPPED), 1)
+    test.eq_i64(c, rep, "a second stop_all does nothing", supervise.stop_all(s), 0)
+    test.eq_i64(c, rep, "and kills nothing more", supervise.killed(s), 1)
+    supervise.free(s)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(t)
+    free_ptr(raw)
+    return ok
+}
+
+// A start the platform refuses — a denied capability, a program that does not exist — is
+// final: `SUP_GAVE_UP` with `SUP_OUT_START_FAILED`, not a crash the budget retries. And
+// the shell form works through the shell, as `sysproc.start` does.
+@test fn a_start_that_fails_gives_up_rather_than_retrying() -> bool {
+    var raw: *mut u8 = alloc(u8, SV_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SV_REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var wall: time.Clock = time.host()
+    var t: *mut i64 = new_tally()
+    let retry: supervise.Policy = supervise.policy(supervise.SUP_ALWAYS, 5, 0, 0)
+
+    var d: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.denied(), 1)
+    supervise.set_events(d, t as *mut u8, &tally)
+    supervise.add_exec(d, quiet_path(), quiet_args(), retry)
+    test.eq_i64(c, rep, "the tick changed the child", supervise.tick(d), 1)
+    test.is_true(c, rep, "denied: gave up", supervise.gave_up(d, 0))
+    test.eq_i64(c, rep, "because the start failed", supervise.outcome_of(d, 0) as i64, supervise.SUP_OUT_START_FAILED as i64)
+    test.eq_i64(c, rep, "no start counted", supervise.starts(d), 0)
+    test.eq_i64(c, rep, "one give-up", supervise.gave_ups(d), 1)
+    test.eq_i64(c, rep, "no restarts", supervise.restarts_of(d, 0), 0)
+    test.eq_i64(c, rep, "started never fired", fired(t, supervise.SUP_EV_STARTED), 0)
+    test.eq_i64(c, rep, "gave-up fired", fired(t, supervise.SUP_EV_GAVE_UP), 1)
+    test.eq_usize(c, rep, "nothing is active", supervise.active(d), 0)
+    supervise.free(d)
+
+    var m: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 1)
+    supervise.add_exec(m, "/nonexistent/jestyr_no_such_program", "", retry)
+    supervise.tick(m)
+    test.is_true(c, rep, "missing program: gave up", supervise.gave_up(m, 0))
+    test.eq_i64(c, rep, "because the start failed", supervise.outcome_of(m, 0) as i64, supervise.SUP_OUT_START_FAILED as i64)
+    test.eq_i64(c, rep, "no start counted", supervise.starts(m), 0)
+    supervise.free(m)
+
+    // `exit 0` means the same thing in `cmd.exe` and `sh`.
+    var sh: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 1)
+    supervise.add(sh, "exit 0", supervise.never())
+    drive(sh, wall, 10)
+    test.eq_i64(c, rep, "a shell line ran", supervise.phase_of(sh, 0) as i64, supervise.SUP_DONE as i64)
+    test.eq_i64(c, rep, "and exited 0", supervise.last_code_of(sh, 0) as i64, 0)
+    test.eq_i64(c, rep, "one start", supervise.starts(sh), 1)
+    supervise.free(sh)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(t)
+    free_ptr(raw)
+    return ok
+}
+
+// `poll_for` spends at most its budget on the clock it is HANDED, and that clock is not the
+// policy clock: with a manual one the wait costs nothing and the policy clock does not move.
+// With nothing running it returns without touching the clock at all.
+@test fn poll_for_gives_up_on_its_budget_without_an_exit() -> bool {
+    var raw: *mut u8 = alloc(u8, SV_REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, SV_REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var s: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 1)
+
+    supervise.add_exec(s, long_path(), long_args(), supervise.never())
+    supervise.tick(s)
+    var fake: time.Clock = time.manual(0)
+    test.eq_i64(c, rep, "no exit inside the budget", supervise.poll_for(s, fake, 50 * SV_MS), 0)
+    test.is_true(c, rep, "the whole budget was waited", time.read_nanos(fake) >= 50 * SV_MS)
+    test.eq_i64(c, rep, "the policy clock did not move", supervise.now(s), 0)
+    test.eq_i64(c, rep, "the child is still running", supervise.phase_of(s, 0) as i64, supervise.SUP_RUNNING as i64)
+
+    test.eq_i64(c, rep, "stop_all killed it", supervise.stop_all(s), 1)
+    var idle: time.Clock = time.manual(0)
+    test.eq_i64(c, rep, "with nothing running, no exit", supervise.poll_for(s, idle, 50 * SV_MS), 0)
+    test.eq_i64(c, rep, "and no waiting", time.read_nanos(idle), 0)
+    supervise.free(s)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
