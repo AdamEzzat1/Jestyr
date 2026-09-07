@@ -8,10 +8,12 @@ defects — one session at a time). §2 is the parallel work (library breadth �
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1364 passed / 0 failed / 3 ignored** (full ladder after A13 and the link-rule fold, 510 s;
-the new tests are `drop_glue_under_colliding_type_names_finds_the_right_impl_and_only_that_one`,
-`jdropcollide_drops_the_right_writer_and_only_that_one` and the three in `main.rs::link_rule`;
-before them 1359 after HTTP V2, TLS and the registry layer).
+**1371 passed / 0 failed / 3 ignored** (full ladder after the SIX second-wave modules, 671 s;
+before them 1364 after A13 and the link-rule fold, and 1359 after HTTP V2, TLS and the
+registry layer). The second wave added six suites to `io_suites_pass`
+(`trace_test` 7, `livecfg_test` 7, `supervise_test` 10, `crypto_test` 5, `sandbox_test` 8,
+`plugin_test` 10, the last replacing an entry of 4), six `BUILD_OK` lines to the build
+matrix, and six pinned demo transcripts.
 Those commits sit on `claude/tier5-compiler-handoff-75c515`, a fast-forward of the
 package-substrate branch; **not merged to master.** CI was fully green — all four jobs — at
 the substrate branch's head; the Linux ladder has not run since `std/kv`.
