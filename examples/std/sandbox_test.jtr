@@ -1,0 +1,527 @@
+// std/sandbox_test.jtr — the unit suite for `std/sandbox`, written with `std/test`.
+//
+// A sibling file rather than colocated, per the convention in docs/stdlib-roadmap.md.
+//
+// Two halves. The jail is a pure fence over paths and a text projection, so four of its
+// five tests touch no process at all — the round trip, the fence on both sides (with real
+// files, because "the read was refused" only means something next to "the same read through
+// `host` lands"), the `..` refusal, and the monotonicity of `narrow` — and the fifth reaches
+// the platform only to be turned away, which is how the two ways a start can fail are told
+// apart. The other three start real children through the platform shell, because a working
+// directory, an environment and a process group are things only the OS can confirm — a child
+// writes a RELATIVELY named file and the parent asks where it landed, which is spelled the
+// same in `cmd.exe` and `sh`.
+//
+// The group test is the one with a clock in it: it terminates the SHELL alone, shows the
+// grandchild survived that, then terminates the group and waits — bounded — for it to
+// empty. If a mutation makes `terminate_group` a no-op this test fails after its budget;
+// it does not hang. The two sleeper commands are `@cfg`-split (there is no portable sleep),
+// which is also why this file is in `CGEN_GOLDEN_ALLOWLIST`.
+//
+// Run:  jestyrc test examples/std/sandbox_test.jtr
+
+import "sandbox"
+import "sysproc"
+import "sysfs"
+import "fs"
+import "env"
+import "mem"
+import "time"
+import "str"
+import "syserr"
+import "test"
+import "test_report"
+
+const SBT_CAP: usize = 2048
+const SBT_ROOT_NAME: str = "jestyr_sandbox_test_root"
+
+// A sleeper whose shell keeps a GRANDCHILD alive, and the grandchild SAYS it is alive by
+// writing a marker before it sleeps — so the test can wait for the grandchild to exist
+// rather than kill the shell in the milliseconds before it has spawned anything (which is
+// exactly what happened on the first run: the shell died childless and the group emptied
+// for the wrong reason). The grandchild is a second shell; the sleeper under it is one
+// process more, and every one of them is in the group.
+@cfg(posix) fn sleeper_cmd() -> str { return "sh -c 'echo x> jestyr_sandbox_marker.txt; sleep 30'; exit 0" }
+@cfg(windows) fn sleeper_cmd() -> str { return "cmd /c \"echo x> jestyr_sandbox_marker.txt & ping -n 30 127.0.0.1 > nul\"" }
+
+// Echo the projection variable into a relatively named file.
+@cfg(posix) fn echo_var_cmd() -> str { return "echo \"$JESTYR_FS_JAIL\"> jestyr_sandbox_env_probe.txt" }
+@cfg(windows) fn echo_var_cmd() -> str { return "echo %JESTYR_FS_JAIL%> jestyr_sandbox_env_probe.txt" }
+
+// `<temp>/<SBT_ROOT_NAME>`, created. Owned by the caller.
+fn scratch_root(mut h: fs.Fs, read a: Allocator) -> String {
+    var e: env.Env = env.host()
+    var root: String = sysfs.temp_dir(e)
+    string_push(root, "/")
+    string_push(root, SBT_ROOT_NAME)
+    let made: bool = sysfs.make_dir(h, a, string_view(root)) catch false
+    return root
+}
+
+// `<root>/<name>`, owned.
+fn under(read root: str, read name: str) -> String {
+    var p: String = string_new()
+    string_push(p, root)
+    string_push(p, "/")
+    string_push(p, name)
+    return p
+}
+
+// Every file a test may leave under `root` (and the one the cwd control leaves here).
+fn scrub(mut h: fs.Fs, read root: str) {
+    var p1: String = under(root, "inside.txt")
+    var p2: String = under(root, "jestyr_sandbox_cwd_probe.txt")
+    var p3: String = under(root, "jestyr_sandbox_env_probe.txt")
+    var p4: String = under(root, "jestyr_sandbox_marker.txt")
+    fs.erase(h, string_view(p1))
+    fs.erase(h, string_view(p2))
+    fs.erase(h, string_view(p3))
+    fs.erase(h, string_view(p4))
+    string_free(p4)
+    string_free(p3)
+    string_free(p2)
+    string_free(p1)
+    fs.erase(h, "jestyr_sandbox_cwd_probe.txt")
+}
+
+// `scrub`, then the directory itself — RETRIED for up to two seconds, because on Windows
+// a process that was just terminated still holds its working directory open for a few
+// milliseconds after the job reports it gone, and the group test's sleepers ran in `root`.
+fn teardown(mut h: fs.Fs, read a: Allocator, read root: str) {
+    scrub(h, root)
+    var clk: time.Clock = time.host()
+    var waited: i64 = 0
+    var removed: bool = sysfs.remove_dir(h, a, root) catch false
+    for removed == false and sysfs.exists(h, a, root) {
+        if waited >= 2000000000 { break }
+        waited = waited + time.wait(clk, 10000000)
+        removed = sysfs.remove_dir(h, a, root) catch false
+    }
+}
+
+// Wait up to `budget` nanoseconds for `p` to appear.
+fn wait_for_file(mut h: fs.Fs, mut clk: time.Clock, read p: str, budget: i64) -> bool {
+    var waited: i64 = 0
+    for fs.present(h, p) == false {
+        if waited >= budget { return false }
+        waited = waited + time.wait(clk, 10000000)
+    }
+    return true
+}
+
+fn stamp_jail(mut slot: i32, v: i32) -> sandbox.Jail {
+    slot = v
+    return sandbox.unjailed(fs.denied())
+}
+
+// `narrow`, with the refusal recorded in `escaped` rather than aborting the test.
+// `catch |e| <expr>` rather than `catch |e| match e { SandboxEscapes => … }`: `narrow` has
+// exactly one error, so the match adds nothing but a second place to edit.
+fn narrowed(read parent: sandbox.Jail, take f: fs.Fs, read root: str, mut escaped: i32) -> sandbox.Jail {
+    var why: i32 = 0
+    var j: sandbox.Jail = sandbox.narrow(parent, f, root) catch |e| stamp_jail(why, 1)
+    escaped = why
+    return j
+}
+
+// ---- the jail, without a process --------------------------------------------------------
+
+// No variable, no fence: the unjailed host, and the lookup was made — so a sealed
+// environment gives exactly today's behaviour rather than a surprise.
+@test fn without_the_variable_a_process_inherits_the_unjailed_host() -> bool {
+    var raw: *mut u8 = alloc(u8, SBT_CAP)
+    var rep: []u8 = slice(u8, raw, SBT_CAP)
+    var c: test.Check = test.new()
+
+    var e: env.Env = env.sealed()
+    var j: sandbox.Jail = sandbox.inherited(e)
+    test.is_false(c, rep, "not jailed", sandbox.is_jailed(j))
+    test.is_true(c, rep, "can read", sandbox.can_read(j))
+    test.is_true(c, rep, "can write", sandbox.can_write(j))
+    test.is_true(c, rep, "everything is inside", sandbox.inside(j, "/anywhere/at/all"))
+    test.eq_i64(c, rep, "one lookup was made", env.lookups(e), 1)
+    var pj: String = sandbox.project(j)
+    test.eq_str(c, rep, "projects as the bare mode", string_view(pj), "rw")
+    string_free(pj)
+    sandbox.free(j)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The projection is text, and the text is the jail: parse(render(j)) has the same mode and
+// the same (unified) root, and an unknown mode fails CLOSED.
+@test fn a_projection_round_trips_and_an_unknown_mode_is_denied() -> bool {
+    var raw: *mut u8 = alloc(u8, SBT_CAP)
+    var rep: []u8 = slice(u8, raw, SBT_CAP)
+    var c: test.Check = test.new()
+
+    var j: sandbox.Jail = sandbox.jail(fs.read_only(), "C:\\srv\\app\\")
+    test.eq_str(c, rep, "the root is unified", sandbox.root_of(j), "C:/srv/app")
+    var text: String = sandbox.project(j)
+    test.eq_str(c, rep, "rendered", string_view(text), "ro C:/srv/app")
+
+    var back: sandbox.Jail = sandbox.from_projection(string_view(text))
+    test.is_true(c, rep, "jailed again", sandbox.is_jailed(back))
+    test.eq_str(c, rep, "same root", sandbox.root_of(back), "C:/srv/app")
+    test.is_true(c, rep, "still readable", sandbox.can_read(back))
+    test.is_false(c, rep, "still not writable", sandbox.can_write(back))
+    var again: String = sandbox.project(back)
+    test.eq_str(c, rep, "and renders identically", string_view(again), string_view(text))
+
+    // A root with a space in it survives: the split is at the FIRST space.
+    var spaced: sandbox.Jail = sandbox.from_projection("rw /home/a user/work")
+    test.eq_str(c, rep, "a spaced root", sandbox.root_of(spaced), "/home/a user/work")
+    test.is_true(c, rep, "rw", sandbox.can_write(spaced))
+
+    var odd: sandbox.Jail = sandbox.from_projection("zz /tmp")
+    test.is_false(c, rep, "unknown mode cannot read", sandbox.can_read(odd))
+    test.is_false(c, rep, "unknown mode cannot write", sandbox.can_write(odd))
+    test.is_true(c, rep, "but the fence is kept", sandbox.is_jailed(odd))
+
+    var none: sandbox.Jail = sandbox.from_projection("none")
+    test.is_false(c, rep, "`none` alone is denied", sandbox.can_read(none))
+    test.is_false(c, rep, "and unjailed", sandbox.is_jailed(none))
+
+    sandbox.free(none)
+    sandbox.free(odd)
+    sandbox.free(spaced)
+    sandbox.free(back)
+    sandbox.free(j)
+    string_free(again)
+    string_free(text)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **The fence, with the filesystem as witness.** Inside lands and reads back; the same
+// operations one directory up are refused and the file up there is untouched. `..` is
+// refused even when it would resolve to somewhere inside. A relative path is resolved
+// against the current directory — which is this test's working tree, outside the root.
+@test fn the_root_is_a_fence_and_traversal_is_refused() -> bool {
+    var raw: *mut u8 = alloc(u8, SBT_CAP)
+    var rep: []u8 = slice(u8, raw, SBT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var root: String = scratch_root(h, a)
+    let r: str = string_view(root)
+    scrub(h, r)
+
+    var outside: String = under(r, "../jestyr_sandbox_test_outside.txt")
+    var e: env.Env = env.host()
+    var tmp: String = sysfs.temp_dir(e)
+    var outside_abs: String = under(string_view(tmp), "jestyr_sandbox_test_outside.txt")
+    var inside: String = under(r, "inside.txt")
+    fs.put(h, string_view(outside_abs), "outside-secret")
+    test.is_true(c, rep, "control: the outside file exists", fs.present(h, string_view(outside_abs)))
+
+    var j: sandbox.Jail = sandbox.jail(fs.host(), r)
+    test.is_true(c, rep, "the root itself is inside", sandbox.inside(j, r))
+    test.is_true(c, rep, "inside: put", sandbox.put(j, string_view(inside), "inside-bytes"))
+    var got: String = sandbox.open_text(j, string_view(inside))
+    test.eq_str(c, rep, "inside: read back", string_view(got), "inside-bytes")
+    string_free(got)
+    test.is_true(c, rep, "inside: present", sandbox.present(j, string_view(inside)))
+
+    // A sibling of the root spelled absolutely: three refusals.
+    test.is_false(c, rep, "outside: present", sandbox.present(j, string_view(outside_abs)))
+    var denied: String = sandbox.open_text(j, string_view(outside_abs))
+    test.eq_usize(c, rep, "outside: read is empty", string_view(denied).len, 0)
+    string_free(denied)
+    test.is_false(c, rep, "outside: erase", sandbox.erase(j, string_view(outside_abs)))
+    test.is_true(c, rep, "and the outside file is untouched", fs.present(h, string_view(outside_abs)))
+
+    // The same file reached through `..`: refused as a shape, not resolved.
+    test.is_false(c, rep, "traversal: put", sandbox.put(j, string_view(outside), "x"))
+    var trav: String = under(r, "sub/../inside.txt")
+    test.is_false(c, rep, "traversal that would land inside is still refused", sandbox.present(j, string_view(trav)))
+    string_free(trav)
+
+    // Relative: resolved against the current directory, which is not under the root.
+    test.is_false(c, rep, "relative from outside: put", sandbox.put(j, "jestyr_sandbox_rel.txt", "x"))
+    test.is_false(c, rep, "and nothing landed here", fs.present(h, "jestyr_sandbox_rel.txt"))
+
+    // A different directory that merely SHARES the root's prefix is outside.
+    var prefixed: String = string_new()
+    string_push(prefixed, r)
+    string_push(prefixed, "_sibling/x.txt")
+    test.is_false(c, rep, "a prefix-sharing sibling is outside", sandbox.inside(j, string_view(prefixed)))
+    string_free(prefixed)
+
+    test.eq_i64(c, rep, "six refusals, all at the fence", sandbox.refused(j), 6)
+    test.eq_i64(c, rep, "and two reads through the policy", sandbox.reads(j), 2)
+
+    sandbox.free(j)
+    fs.erase(h, string_view(outside_abs))
+    fs.erase(h, string_view(inside))
+    string_free(inside)
+    string_free(outside_abs)
+    string_free(tmp)
+    string_free(outside)
+    teardown(h, a, r)
+    string_free(root)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **At most as permissive.** A child's jail is the meet of the policies under a root the
+// parent already contains; the root may not escape and the mode may not widen.
+@test fn narrowing_never_widens_the_parent() -> bool {
+    var raw: *mut u8 = alloc(u8, SBT_CAP)
+    var rep: []u8 = slice(u8, raw, SBT_CAP)
+    var c: test.Check = test.new()
+    var esc: i32 = 0
+
+    var parent: sandbox.Jail = sandbox.jail(fs.host(), "/srv/app")
+
+    var deeper: sandbox.Jail = narrowed(parent, fs.host(), "/srv/app/data", esc)
+    test.eq_i64(c, rep, "deeper: allowed", esc as i64, 0)
+    test.eq_str(c, rep, "deeper: root", sandbox.root_of(deeper), "/srv/app/data")
+    test.is_true(c, rep, "deeper: rw under rw", sandbox.can_write(deeper))
+
+    var ro: sandbox.Jail = narrowed(parent, fs.read_only(), "/srv/app/data", esc)
+    test.is_false(c, rep, "asking for less gives less", sandbox.can_write(ro))
+    test.is_true(c, rep, "but reads stay", sandbox.can_read(ro))
+
+    var escaped: sandbox.Jail = narrowed(parent, fs.host(), "/etc", esc)
+    test.eq_i64(c, rep, "/etc escapes /srv/app", esc as i64, 1)
+    var shared: sandbox.Jail = narrowed(parent, fs.host(), "/srv/application", esc)
+    test.eq_i64(c, rep, "a prefix-sharing sibling escapes too", esc as i64, 1)
+    var up: sandbox.Jail = narrowed(parent, fs.host(), "/srv/app/../other", esc)
+    test.eq_i64(c, rep, "`..` escapes", esc as i64, 1)
+
+    var same: sandbox.Jail = narrowed(parent, fs.host(), "", esc)
+    test.eq_i64(c, rep, "empty root: allowed", esc as i64, 0)
+    test.eq_str(c, rep, "and keeps the parent's", sandbox.root_of(same), "/srv/app")
+
+    // The parent is read-only: a child that asks for `host` does not get it.
+    var ro_parent: sandbox.Jail = sandbox.jail(fs.read_only(), "/srv/app")
+    var wants_more: sandbox.Jail = narrowed(ro_parent, fs.host(), "/srv/app/x", esc)
+    test.eq_i64(c, rep, "ro parent: allowed", esc as i64, 0)
+    test.is_false(c, rep, "ro parent: still cannot write", sandbox.can_write(wants_more))
+    test.is_true(c, rep, "ro parent: can read", sandbox.can_read(wants_more))
+
+    // The parent is denied: nothing comes back readable.
+    var no_parent: sandbox.Jail = sandbox.jail(fs.denied(), "/srv")
+    var nothing: sandbox.Jail = narrowed(no_parent, fs.host(), "/srv/a", esc)
+    test.is_false(c, rep, "denied parent: cannot read", sandbox.can_read(nothing))
+
+    // An unjailed parent can fence its child anywhere.
+    var free_parent: sandbox.Jail = sandbox.unjailed(fs.host())
+    var anywhere: sandbox.Jail = narrowed(free_parent, fs.host(), "/anywhere", esc)
+    test.eq_i64(c, rep, "unjailed parent: allowed", esc as i64, 0)
+    test.is_true(c, rep, "unjailed parent: the child is fenced", sandbox.is_jailed(anywhere))
+
+    sandbox.free(anywhere)
+    sandbox.free(free_parent)
+    sandbox.free(nothing)
+    sandbox.free(no_parent)
+    sandbox.free(wants_more)
+    sandbox.free(ro_parent)
+    sandbox.free(same)
+    sandbox.free(up)
+    sandbox.free(shared)
+    sandbox.free(escaped)
+    sandbox.free(ro)
+    sandbox.free(deeper)
+    sandbox.free(parent)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- real children --------------------------------------------------------------------
+
+// A child started in `cwd` names a file relatively and it lands THERE. The control is the
+// same command with no directory: the file lands in the parent's own directory instead.
+@test fn a_child_starts_in_the_directory_it_is_given() -> bool {
+    var raw: *mut u8 = alloc(u8, SBT_CAP)
+    var rep: []u8 = slice(u8, raw, SBT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var sp: sysproc.Spawner = sysproc.host()
+    var root: String = scratch_root(h, a)
+    let r: str = string_view(root)
+    scrub(h, r)
+    var probe: String = under(r, "jestyr_sandbox_cwd_probe.txt")
+    let cmd: str = "echo x> jestyr_sandbox_cwd_probe.txt"
+
+    var j: sandbox.Jail = sandbox.unjailed(fs.host())
+    var ch: sysproc.Child = sandbox.start(sp, cmd, r, j) catch sysproc.no_child()
+    test.is_true(c, rep, "the child started", sysproc.is_live(ch))
+    let st: sysproc.Status = sysproc.wait(ch)
+    sysproc.release(ch)
+    test.is_true(c, rep, "and exited", sysproc.is_exited(st))
+    test.is_true(c, rep, "the file is in the directory it was given", fs.present(h, string_view(probe)))
+    test.is_false(c, rep, "and not here", fs.present(h, "jestyr_sandbox_cwd_probe.txt"))
+    fs.erase(h, string_view(probe))
+
+    // Control: no directory means the parent's.
+    var ch2: sysproc.Child = sandbox.start(sp, cmd, "", j) catch sysproc.no_child()
+    sysproc.wait(ch2)
+    sysproc.release(ch2)
+    test.is_true(c, rep, "control: with no directory it lands here", fs.present(h, "jestyr_sandbox_cwd_probe.txt"))
+    test.is_false(c, rep, "control: and not there", fs.present(h, string_view(probe)))
+    fs.erase(h, "jestyr_sandbox_cwd_probe.txt")
+
+    test.eq_i64(c, rep, "the spawner counted both", sysproc.started(sp), 2)
+
+    sandbox.free(j)
+    string_free(probe)
+    teardown(h, a, r)
+    string_free(root)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The projection REACHES the child as an environment variable — echoed back by the shell
+// into a file in the root, and equal to what `project` rendered. And the rest of the
+// environment came along: the shell was found on `PATH`, or nothing would have run.
+@test fn the_projection_reaches_the_child_through_its_environment() -> bool {
+    var raw: *mut u8 = alloc(u8, SBT_CAP)
+    var rep: []u8 = slice(u8, raw, SBT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var sp: sysproc.Spawner = sysproc.host()
+    var root: String = scratch_root(h, a)
+    let r: str = string_view(root)
+    scrub(h, r)
+    var probe: String = under(r, "jestyr_sandbox_env_probe.txt")
+
+    var j: sandbox.Jail = sandbox.jail(fs.read_only(), r)
+    var want: String = sandbox.project(j)
+    var ch: sysproc.Child = sandbox.start(sp, echo_var_cmd(), r, j) catch sysproc.no_child()
+    test.is_true(c, rep, "the child started", sysproc.is_live(ch))
+    sysproc.wait(ch)
+    sysproc.release(ch)
+
+    var text: String = fs.open_text(h, string_view(probe))
+    test.eq_str(c, rep, "the child saw the projection", str.trimmed(string_view(text)), string_view(want))
+    test.is_true(c, rep, "and it names the root", str.has_suffix(str.trimmed(string_view(text)), SBT_ROOT_NAME))
+
+    // The parent's own environment is NOT changed by projecting onto a child.
+    var e: env.Env = env.host()
+    test.is_false(c, rep, "the parent is not jailed by its own projection", env.present(e, sandbox.SBOX_JAIL_VAR))
+
+    string_free(text)
+    string_free(want)
+    sandbox.free(j)
+    fs.erase(h, string_view(probe))
+    string_free(probe)
+    teardown(h, a, r)
+    string_free(root)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **The two ways `start` can fail, told apart the way `start` tells them apart.** A working
+// directory that is not there is the PLATFORM's failure: nothing is started, the spawner
+// counts no refusal, and `syserr.last_raw()` is still the platform's own non-zero number one
+// frame further out than `start` reads it — which is what makes `SandboxFailed`'s payload
+// the real code rather than a stale one. A spawner that was never allowed is the
+// CAPABILITY's refusal: the spawner counts it and the platform is never reached.
+//
+// Neither branch destructures `sandbox`'s error set, deliberately: `start`'s own rule is
+// that the counter is the discriminant, and a test that re-spelled the variants would be
+// testing a different mechanism from the one that ships.
+@test fn a_platform_failure_and_a_capability_refusal_are_told_apart() -> bool {
+    var raw: *mut u8 = alloc(u8, SBT_CAP)
+    var rep: []u8 = slice(u8, raw, SBT_CAP)
+    var c: test.Check = test.new()
+    var j: sandbox.Jail = sandbox.unjailed(fs.host())
+
+    var sp: sysproc.Spawner = sysproc.host()
+    var ch: sysproc.Child = sandbox.start(sp, "exit 0", "/no/such/jestyr/sandbox/dir", j) catch sysproc.no_child()
+    let code: i32 = syserr.last_raw()
+    test.is_false(c, rep, "nothing started", sysproc.is_live(ch))
+    test.is_true(c, rep, "the platform said why, in its own number", code > 0)
+    test.eq_i64(c, rep, "the spawner counted no refusal: this was not the capability", sysproc.refused(sp), 0)
+    test.eq_i64(c, rep, "and no start", sysproc.started(sp), 0)
+
+    var no: sysproc.Spawner = sysproc.denied()
+    var ch2: sysproc.Child = sandbox.start(no, "exit 0", "", j) catch sysproc.no_child()
+    test.is_false(c, rep, "nothing started here either", sysproc.is_live(ch2))
+    test.eq_i64(c, rep, "and this one the spawner did count", sysproc.refused(no), 1)
+    test.eq_i64(c, rep, "the platform was never reached", sysproc.started(no), 0)
+
+    // The same two, through the grouped form: a refused start leaves no group behind.
+    var g: sandbox.Group = sandbox.no_group()
+    var ch3: sysproc.Child = sandbox.start_grouped(no, "exit 0", "", j, g) catch sysproc.no_child()
+    test.is_false(c, rep, "grouped: nothing started", sysproc.is_live(ch3))
+    test.is_false(c, rep, "grouped: and no group is left live", sandbox.is_group_live(g))
+    test.eq_i64(c, rep, "grouped: counted as a refusal", sysproc.refused(no), 2)
+
+    sandbox.free(j)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **THE group test.** The shell is terminated alone and its sleeper survives — that is the
+// hole a group closes — then the group is terminated and, within a bounded wait, empties.
+// A `terminate_group` that did nothing fails this after ten seconds; it cannot hang it.
+@test fn a_group_reaches_the_grandchild_that_terminate_did_not() -> bool {
+    var raw: *mut u8 = alloc(u8, SBT_CAP)
+    var rep: []u8 = slice(u8, raw, SBT_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+    var clk: time.Clock = time.host()
+
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var root: String = scratch_root(h, a)
+    let r: str = string_view(root)
+    scrub(h, r)
+    var marker: String = under(r, "jestyr_sandbox_marker.txt")
+
+    var j: sandbox.Jail = sandbox.unjailed(fs.host())
+    var g: sandbox.Group = sandbox.no_group()
+    test.is_false(c, rep, "no group yet", sandbox.is_group_live(g))
+    var ch: sysproc.Child = sandbox.start_grouped(sp, sleeper_cmd(), r, j, g) catch sysproc.no_child()
+    test.is_true(c, rep, "the child started", sysproc.is_live(ch))
+    test.is_true(c, rep, "the group is live", sandbox.is_group_live(g))
+    test.is_true(c, rep, "and it is running", sysproc.is_running(sysproc.try_wait(ch)))
+    test.is_false(c, rep, "the group is not empty", sandbox.group_empty(g))
+    // The grandchild announces itself; only then is killing the shell a fair experiment.
+    test.is_true(c, rep, "the grandchild reported in", wait_for_file(h, clk, string_view(marker), 10000000000))
+
+    // A live group refuses a second start into it.
+    var busy: sysproc.Child = sandbox.start_grouped(sp, "exit 0", "", j, g) catch sysproc.no_child()
+    test.is_false(c, rep, "a live group is busy", sysproc.is_live(busy))
+
+    // Kill the shell alone. Its sleeper is a grandchild and outlives it.
+    test.is_true(c, rep, "terminate accepted", sysproc.terminate(ch))
+    let st: sysproc.Status = sysproc.wait(ch)
+    sysproc.release(ch)
+    test.is_true(c, rep, "the shell is gone", sysproc.is_signalled(st))
+    test.is_false(c, rep, "but the group is still not empty: the grandchild survived", sandbox.group_empty(g))
+
+    // Now the group.
+    test.is_true(c, rep, "terminate_group accepted", sandbox.terminate_group(g))
+    test.is_true(c, rep, "and the group emptied within ten seconds", sandbox.wait_group_empty(g, clk, 10000000000))
+    sandbox.release_group(g)
+    test.is_false(c, rep, "released", sandbox.is_group_live(g))
+    test.is_true(c, rep, "a released group is empty by definition", sandbox.group_empty(g))
+    test.is_false(c, rep, "and cannot be terminated", sandbox.terminate_group(g))
+
+    sandbox.free(j)
+    string_free(marker)
+    teardown(h, a, r)
+    string_free(root)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

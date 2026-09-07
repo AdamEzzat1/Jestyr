@@ -1,0 +1,623 @@
+// std/sandbox.jtr — what a child is allowed to BE: where it runs, whom it dies with, and
+// which files its own code may touch.
+//
+// TIER: `sys`. Over `std/sysproc`'s primitives; capability-gated through the same
+// `sysproc.Spawner`, and the file half through an `fs.Fs` policy value.
+//
+// ─── Three facts a child is born with, and one entry point for them ───────────
+//
+// `std/sysproc`'s header used to list "no environment control, no working directory, no
+// process groups" as what was still missing. All three are the same kind of thing: a fact
+// the platform will only set at the instant a process comes into being (`CreateProcessA`'s
+// arguments; the child's own calls between `fork` and `exec`). `sysproc.start_at` is that
+// instant, exposed once. This module is the POLICY over it:
+//
+//   * **A working directory** (`start`'s `cwd`). A child started in a directory can name
+//     its files relatively, which is what makes the projection below usable at all.
+//   * **A group** (`start_grouped`): the child and every descendant it spawns, as ONE thing
+//     to terminate. A `terminate` of the child alone leaves its grandchildren running with
+//     nobody's name on them; a group takes them along. Windows: a Job object, joined while
+//     the child is still suspended, so no grandchild can be born outside it. POSIX: a fresh
+//     process group, so `kill(-pgid)` reaches every process that stayed in it.
+//   * **A jail** (`Jail`): an `fs.Fs` policy plus a ROOT directory, projected onto the child
+//     through its environment so that the child's OWN `std/sandbox` code honours it.
+//
+// ─── What the jail is, and what it is NOT ────────────────────────────────────
+//
+// **It is a capability the child's Jestyr code honours. It is not an OS sandbox.** The
+// child is told, in `JESTYR_FS_JAIL`, the most it may do; a child that calls
+// `sandbox.inherited` and goes through the `Jail` gets exactly `std/fs`'s three states
+// (`host`/`read_only`/`denied`) fenced to a subtree, with every refusal counted. A child
+// that reaches for `read_file` directly, or one written in another language, sees nothing
+// in its way. That is the same trade every capability in this tree makes (`std/process`
+// argues it at length) and it is stated here because the word "sandbox" invites the other
+// reading. A real OS jail — seccomp, AppContainer, chroot — is a different module with a
+// different tier.
+//
+// **The fence is lexical.** A path is inside the root if, after separators are unified and
+// a relative path is resolved against the process's current directory, it begins with the
+// root followed by a separator (or is the root). A `..` segment ANYWHERE is refused
+// outright rather than resolved, because a lexical resolver that folds `a/../../etc` is a
+// second `realpath` that agrees with the platform's until a symlink. Symlinks are therefore
+// the known hole: a link inside the root that points outside is followed. Closing it needs
+// the platform's own canonicalisation, which `std/sysfs.canonical` has — and this module
+// does not call, so it stays free of the allocator-taking `sys` layer for the child's side.
+//
+// **At most as permissive.** `narrow(parent, f, root)` is how a jailed process builds the
+// jail for ITS child: the mode is the meet of both (`read_only` under `host` is
+// `read_only`; `host` under `read_only` is still `read_only`), and a root outside the
+// parent's is refused as `SandboxEscapes`. `inherited` + `narrow` + `start` is the honest
+// path; a caller that builds `jail(fs.host(), "/")` directly holds `fs.host()` already,
+// which was ambient all along.
+//
+// **Why the environment, and why one variable.** Jestyr cannot set a variable in its own
+// process, so the projection is added at spawn time by `sysproc.start_at`, which appends
+// ONE `NAME=value` to the inherited block. The value is `<mode> <root>` — a space, because
+// the one place the text is ever re-read by something other than this module is a shell
+// echo in the test suite, and a `|` or `&` there is an operator. A root containing a space
+// survives (the split is at the FIRST space); an unknown mode reads as `denied`, so a
+// corrupted projection fails closed. No variable at all means exactly what today means:
+// the unjailed host.
+//
+// ─── What is deliberately not here ────────────────────────────────────────────
+//
+// No pipes (`sysproc.start_piped` has them; a sandboxed AND piped child is a `start_at`
+// variant with handles, owed when a consumer needs it). No resource limits, no user
+// switching, no network policy. No `chroot`. No environment REMOVAL — a child gets the
+// parent's whole environment plus the projection, because removing variables is a policy
+// of its own with `PATH` as its first casualty.
+//
+// Worked example:  examples/std/sandbox_demo.jtr
+// Run the tests:   jestyrc test examples/std/sandbox_test.jtr
+
+import "sysproc"
+import "fs"
+import "env"
+import "time"
+import "syserr"
+import "str"
+import "path"
+
+// ---- the platform ------------------------------------------------------------------
+//
+// `kill`, `WaitForSingleObject` and `CloseHandle` are already bound by `std/sysproc`, which
+// every program using this module also links, and a second declaration of a bare name in
+// one program is a duplicate definition. So the three are bound through the DECLARED
+// ALIAS form with this module's own names — the same types as `sysproc`'s, deliberately,
+// since `extern_signature_agreement` sweeps every binding of a C symbol across the corpus.
+
+@cfg(posix) extern "signal.h" fn sys_kill = "kill"(pid: i64, sig: i32) -> i32
+@cfg(posix) extern "unistd.h" fn getpid() -> i64
+@cfg(posix) extern "unistd.h" fn getcwd(buf: cptr, n: usize) -> cptr
+
+@cfg(windows) extern "windows.h" fn CreateJobObjectA(sa: cptr, name: cptr) -> cptr
+@cfg(windows) extern "windows.h" fn AssignProcessToJobObject(job: cptr, h: cptr) -> i32
+@cfg(windows) extern "windows.h" fn TerminateJobObject(job: cptr, code: u32) -> i32
+@cfg(windows) extern "windows.h" fn QueryInformationJobObject(job: cptr, cls: i32, buf: cptr, n: u32, got: cptr) -> i32
+@cfg(windows) extern "windows.h" fn OpenProcess(access: u32, inherit: i32, pid: u32) -> cptr
+@cfg(windows) extern "windows.h" fn GetCurrentProcessId() -> u32
+@cfg(windows) extern "windows.h" fn GetCurrentDirectoryA(n: u32, buf: cptr) -> u32
+@cfg(windows) extern "windows.h" fn sbox_wait = "WaitForSingleObject"(h: cptr, ms: u32) -> i32
+@cfg(windows) extern "windows.h" fn sbox_close = "CloseHandle"(h: cptr) -> i32
+
+// ---- the numbers -------------------------------------------------------------------
+//
+// Every Windows constant below is MEASURED by `the_windows_job_constants_match_the_real_
+// headers` in `src/proptests.rs`, the way `std/sysproc`'s are. Prefixed `SBOX_` because a
+// module `const` is emitted under its bare name.
+
+// JOBOBJECT_BASIC_ACCOUNTING_INFORMATION on x86-64: four LARGE_INTEGERs then four DWORDs;
+// `ActiveProcesses` is the third DWORD. `JobObjectBasicAccountingInformation` is class 1.
+const SBOX_JOB_ACCOUNTING_CLASS: i32 = 1
+const SBOX_JOB_ACCOUNTING_LEN: usize = 48
+const SBOX_JOB_ACTIVE_WORD: usize = 10        // byte 40, read as a 32-bit word
+const SBOX_SYNCHRONIZE: u32 = 1048576         // the access right a liveness wait needs
+const SBOX_WAIT_TIMEOUT: i32 = 258            // WAIT_TIMEOUT
+const SBOX_ERROR_ACCESS_DENIED: i32 = 5       // a process exists but may not be opened
+// What a terminated group's members are reported as: `std/sysproc`'s own convention, so
+// `wait` on such a child says `signalled` rather than inventing a second code.
+const SBOX_KILL_CODE: u32 = 137
+
+// POSIX. `SIGKILL` and `ESRCH` ("no such process") are the same numbers on Linux and macOS.
+const SBOX_SIGKILL: i32 = 9
+const SBOX_ESRCH: i32 = 3
+const SBOX_EPERM: i32 = 1
+
+// The longest directory either platform hands back (see `std/sysfs`).
+const SBOX_PATH_CAP: usize = 4096
+
+// How long `wait_group_empty` sleeps between checks — the same floor `sysproc` uses.
+const SBOX_POLL_NANOS: i64 = 1000000
+
+// The variable a child reads its jail from.
+pub const SBOX_JAIL_VAR: str = "JESTYR_FS_JAIL"
+
+// ---- the jail ------------------------------------------------------------------------
+
+// An `fs.Fs` policy fenced to a root. `@move`: it owns the root's storage.
+//
+// `jailed` false means "no root" — the whole tree, at whatever the inner policy allows —
+// which is what a process that was told nothing gets.
+@move pub struct Jail {
+    inner: fs.Fs,
+    root: String,
+    jailed: bool,
+    refused: i64,
+}
+
+// Push `p` onto `dst` with every `\` as `/` and no trailing separator (a bare `/` keeps
+// it). The one spelling everything below compares.
+fn push_unified(mut dst: String, read p: str) {
+    var n: usize = p.len
+    for n > 1 {
+        if path.is_sep(p[n - 1] as i32) { n = n - 1 } else { break }
+    }
+    var i: usize = 0
+    for i < n {
+        if path.is_sep(p[i] as i32) {
+            string_push(dst, "/")
+        } else {
+            string_push(dst, p[i .. i + 1])
+        }
+        i = i + 1
+    }
+}
+
+// `f`, everywhere. What a process that inherited no projection gets.
+pub fn unjailed(take f: fs.Fs) -> Jail {
+    return Jail{ inner: f, root: string_new(), jailed: false, refused: 0 }
+}
+
+// `f`, only under `root`. An empty root is `unjailed`.
+pub fn jail(take f: fs.Fs, read root: str) -> Jail {
+    if root.len == 0 { return unjailed(f) }
+    var r: String = string_new()
+    push_unified(r, root)
+    return Jail{ inner: f, root: r, jailed: true, refused: 0 }
+}
+
+// Give the root's storage back.
+pub fn free(mut j: Jail) {
+    string_free(j.root)
+    j.root = string_new()
+    j.jailed = false
+}
+
+@no_alloc @no_os pub fn is_jailed(read j: Jail) -> bool { return j.jailed }
+pub fn can_read(read j: Jail) -> bool { return fs.can_read(j.inner) }
+pub fn can_write(read j: Jail) -> bool { return fs.can_write(j.inner) }
+
+// The root, unified (`/` separators, no trailing one); empty when unjailed.
+pub fn root_of(read j: Jail) -> read str {
+    return string_view(j.root)
+}
+
+// Every operation this handle refused, for either reason — outside the fence (counted
+// here) or against the inner policy (counted by `std/fs`).
+pub fn refused(read j: Jail) -> i64 {
+    return j.refused + fs.refused(j.inner)
+}
+
+// Reads and writes the inner policy performed.
+pub fn reads(read j: Jail) -> i64 { return fs.reads(j.inner) }
+pub fn writes(read j: Jail) -> i64 { return fs.writes(j.inner) }
+
+// Windows compares paths without regard to case; POSIX does not.
+@cfg(windows) @no_alloc @no_os fn same_path_text(read a: str, read b: str) -> bool {
+    return str.eq_ignore_case(a, b)
+}
+
+@cfg(posix) @no_alloc @no_os fn same_path_text(read a: str, read b: str) -> bool {
+    return str.eq(a, b)
+}
+
+// Does the unified path `p` contain a `..` segment?
+@no_alloc @no_os fn has_dotdot(read p: str) -> bool {
+    var i: usize = 0
+    for i + 1 < p.len {
+        if (p[i] as i32) == 46 and (p[i + 1] as i32) == 46 {
+            let at_start: bool = i == 0 or (p[i - 1] as i32) == 47
+            let at_end: bool = i + 2 == p.len or (p[i + 2] as i32) == 47
+            if at_start and at_end { return true }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Is `p` inside the fence? Always, for an unjailed handle. A relative path is resolved
+// against the CURRENT directory first, which is where `start`'s `cwd` pays off.
+pub fn inside(read j: Jail, read p: str) -> bool {
+    if j.jailed == false { return true }
+    var full: String = string_new()
+    if path.is_abs(p) {
+        push_unified(full, p)
+    } else {
+        var here: String = current_dir()
+        push_unified(full, string_view(here))
+        string_free(here)
+        string_push(full, "/")
+        push_unified(full, p)
+    }
+    let f: str = string_view(full)
+    let r: str = string_view(j.root)
+    var yes: bool = false
+    if has_dotdot(f) == false and f.len >= r.len {
+        if same_path_text(f[0 .. r.len], r) {
+            if f.len == r.len {
+                yes = true
+            } else if (f[r.len] as i32) == 47 {
+                yes = true
+            }
+        }
+    }
+    string_free(full)
+    return yes
+}
+
+// Read the whole file at `p`. Outside the fence: an EMPTY owned String and a counted
+// refusal — `std/fs.open_text`'s own answer for a denied handle, for its reason.
+pub fn open_text(mut j: Jail, read p: str) -> String {
+    if inside(j, p) == false {
+        j.refused = j.refused + 1
+        return string_new()
+    }
+    return fs.open_text(j.inner, p)
+}
+
+// Write `data` to `p`. False (counted) outside the fence or against the policy.
+pub fn put(mut j: Jail, read p: str, read data: str) -> bool {
+    if inside(j, p) == false {
+        j.refused = j.refused + 1
+        return false
+    }
+    return fs.put(j.inner, p, data)
+}
+
+// Does `p` exist? False (counted) outside the fence: an existence probe is a read.
+pub fn present(mut j: Jail, read p: str) -> bool {
+    if inside(j, p) == false {
+        j.refused = j.refused + 1
+        return false
+    }
+    return fs.present(j.inner, p)
+}
+
+// Delete `p`. False (counted) outside the fence or against the policy.
+pub fn erase(mut j: Jail, read p: str) -> bool {
+    if inside(j, p) == false {
+        j.refused = j.refused + 1
+        return false
+    }
+    return fs.erase(j.inner, p)
+}
+
+// ---- projecting the jail -------------------------------------------------------------
+
+// The three states, as text. `none` for `denied`.
+fn mode_word(read f: fs.Fs) -> str {
+    if fs.can_write(f) { return "rw" }
+    if fs.can_read(f) { return "ro" }
+    return "none"
+}
+
+// The meet of two policies: readable only if both are, writable only if both are.
+fn fs_meet(read a: fs.Fs, read b: fs.Fs) -> fs.Fs {
+    let r: bool = fs.can_read(a) and fs.can_read(b)
+    let w: bool = fs.can_write(a) and fs.can_write(b)
+    if r and w { return fs.host() }
+    if r { return fs.read_only() }
+    return fs.denied()
+}
+
+// The jail as the text a child is given: `<mode> <root>`, or just `<mode>` when unjailed.
+pub fn project(read j: Jail) -> String {
+    var s: String = string_new()
+    string_push(s, mode_word(j.inner))
+    if j.jailed {
+        string_push(s, " ")
+        string_push(s, string_view(j.root))
+    }
+    return s
+}
+
+// The jail a projection describes. An unknown mode is `denied`, never `host`.
+pub fn from_projection(read v: str) -> Jail {
+    let sp: isize = str.index_of(v, " ")
+    if sp < 0 { return jail(mode_fs(v), v[0 .. 0]) }
+    let cut: usize = sp as usize
+    let mode: str = v[0 .. cut]
+    let root: str = v[cut + 1 .. v.len]
+    return jail(mode_fs(mode), root)
+}
+
+// The policy a mode word names. Anything unrecognised is `denied`.
+fn mode_fs(read mode: str) -> fs.Fs {
+    if str.eq(mode, "rw") { return fs.host() }
+    if str.eq(mode, "ro") { return fs.read_only() }
+    return fs.denied()
+}
+
+// The jail THIS process was started under: `JESTYR_FS_JAIL` through `e`, or the unjailed
+// host when there is none — which is exactly what every program had before this module.
+pub fn inherited(mut e: env.Env) -> Jail {
+    let v: str = env.lookup(e, SBOX_JAIL_VAR)
+    if v.len == 0 { return unjailed(fs.host()) }
+    return from_projection(v)
+}
+
+// The jail for a CHILD of a process holding `parent`: policy `f` met with the parent's,
+// under `root` — which must be inside the parent's, or `SandboxEscapes`. An empty `root`
+// keeps the parent's.
+pub fn narrow(read parent: Jail, f: fs.Fs, read root: str) -> Jail !{ SandboxEscapes } {
+    let m: fs.Fs = fs_meet(parent.inner, f)
+    if root.len == 0 {
+        return ok(jail(m, string_view(parent.root)))
+    }
+    if inside(parent, root) == false { return err(SandboxEscapes) }
+    return ok(jail(m, root))
+}
+
+// ---- the group ---------------------------------------------------------------------
+
+// A child and its descendants, as one thing. On Windows `job` is a Job object's handle;
+// on POSIX `pgid` is the process group.
+pub struct Group {
+    job: i64,
+    pgid: i64,
+    live: bool,
+}
+
+// A group that holds nothing — what `start_grouped` fills in.
+@no_alloc @no_os pub fn no_group() -> Group {
+    return Group{ job: 0, pgid: 0, live: false }
+}
+
+@no_alloc @no_os pub fn is_group_live(read g: Group) -> bool { return g.live }
+
+@cfg(windows) fn group_open(mut g: Group) -> bool {
+    let h: cptr = CreateJobObjectA(null, null)
+    if h == null { return false }
+    g.job = h as i64
+    g.pgid = 0
+    g.live = true
+    return true
+}
+
+@cfg(posix) fn group_open(mut g: Group) -> bool {
+    g.job = 0
+    g.pgid = 0
+    g.live = true
+    return true
+}
+
+@cfg(windows) fn group_add(mut g: Group, read c: sysproc.Child) -> bool {
+    return AssignProcessToJobObject(g.job as cptr, sysproc.handle_of(c) as cptr) != 0
+}
+
+@cfg(posix) fn group_add(mut g: Group, read c: sysproc.Child) -> bool {
+    // `start_at(.., apart: true)` already made the child a group leader; its pid IS the
+    // group.
+    g.pgid = sysproc.pid_of(c)
+    return true
+}
+
+// Is nobody left in the group? Answers "no" when it cannot tell, so a bounded wait on it
+// times out honestly rather than reporting a kill that may not have happened.
+@cfg(windows) pub fn group_empty(read g: Group) -> bool {
+    if g.live == false { return true }
+    var buf: *mut u8 = alloc(u8, SBOX_JOB_ACCOUNTING_LEN)
+    var i: usize = 0
+    for i < SBOX_JOB_ACCOUNTING_LEN {
+        unsafe { (buf + i).* = 0 }
+        i = i + 1
+    }
+    let rc: i32 = QueryInformationJobObject(g.job as cptr, SBOX_JOB_ACCOUNTING_CLASS, buf as cptr, SBOX_JOB_ACCOUNTING_LEN as u32, null)
+    var active: u32 = 1
+    if rc != 0 {
+        let w: *mut u32 = buf as *mut u32
+        unsafe { active = (w + SBOX_JOB_ACTIVE_WORD).* }
+    }
+    free_ptr(buf)
+    return active == 0
+}
+
+@cfg(posix) pub fn group_empty(read g: Group) -> bool {
+    if g.live == false { return true }
+    // Signal 0 delivers nothing and reports whether there is anyone to deliver to.
+    if sys_kill(0 - g.pgid, 0) == 0 { return false }
+    return syserr.last_raw() == SBOX_ESRCH
+}
+
+// Kill every process in the group. Returns whether the platform accepted the request —
+// not whether they are gone, which `wait_group_empty` answers.
+@cfg(windows) pub fn terminate_group(mut g: Group) -> bool {
+    if g.live == false { return false }
+    return TerminateJobObject(g.job as cptr, SBOX_KILL_CODE) != 0
+}
+
+@cfg(posix) pub fn terminate_group(mut g: Group) -> bool {
+    if g.live == false { return false }
+    return sys_kill(0 - g.pgid, SBOX_SIGKILL) == 0
+}
+
+// Wait up to `timeout_nanos` for the group to empty. A poll on both platforms, driven by
+// `clk`, for `sysproc.wait_timeout`'s reason: one loop, testable on a manual clock.
+pub fn wait_group_empty(mut g: Group, mut clk: time.Clock, timeout_nanos: i64) -> bool {
+    var waited: i64 = 0
+    var empty: bool = group_empty(g)
+    for empty == false {
+        if waited >= timeout_nanos { break }
+        var slice: i64 = SBOX_POLL_NANOS
+        let left: i64 = timeout_nanos - waited
+        if slice > left { slice = left }
+        waited = waited + time.wait(clk, slice)
+        empty = group_empty(g)
+    }
+    return empty
+}
+
+// Give the group's handle back. Idempotent. Does NOT kill anything: a Job is not
+// kill-on-close here, on purpose — that needs `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, a
+// second layout claim, and a caller that wants the members dead says so with
+// `terminate_group`.
+@cfg(windows) pub fn release_group(mut g: Group) {
+    if g.live == false { return }
+    sbox_close(g.job as cptr)
+    g.job = 0
+    g.live = false
+}
+
+@cfg(posix) pub fn release_group(mut g: Group) {
+    g.pgid = 0
+    g.live = false
+}
+
+// ---- starting ----------------------------------------------------------------------
+
+// **A refusal is told from a failure by the SPAWNER'S OWN COUNTER, not by re-spelling
+// `sysproc`'s error variants here.** `catch |e| match e { SysProcFailed(..) => …,
+// SysProcRefused => … }` would work today and would stop compiling the day `sysproc` grows
+// a third variant, because a `match` over an imported error set is exhaustive over a set
+// this module does not own. `sysproc.refused` going up is the same fact, told by the module
+// whose fact it is. The platform's code is read straight after the call for the same reason
+// `sysproc` reads it there — it is `errno`/`GetLastError` and it is only true immediately;
+// `a_platform_failure_and_a_capability_refusal_are_told_apart` measures that it is still the
+// platform's own number one frame further out than this.
+
+// `NAME=value` for the child's environment.
+fn env_line(read j: Jail) -> String {
+    var s: String = string_new()
+    string_push(s, SBOX_JAIL_VAR)
+    string_push(s, "=")
+    var p: String = project(j)
+    string_push(s, string_view(p))
+    string_free(p)
+    return s
+}
+
+// Start `cmd` (through the platform shell, as `sysproc` does) in `cwd` (empty: inherit)
+// with `j` projected onto it. The child is not in a group: a `terminate` reaches it alone.
+pub fn start(mut sp: sysproc.Spawner, read cmd: str, read cwd: str, read j: Jail) -> sysproc.Child !{ SandboxFailed(i32), SandboxRefused } {
+    var ev: String = env_line(j)
+    let turned_away: i64 = sysproc.refused(sp)
+    var ch: sysproc.Child = sysproc.start_at(sp, cmd, cwd, string_view(ev), false) catch sysproc.no_child()
+    let code: i32 = syserr.last_raw()
+    string_free(ev)
+    if sysproc.is_live(ch) == false {
+        if sysproc.refused(sp) > turned_away { return err(SandboxRefused) }
+        return err(SandboxFailed(code))
+    }
+    return ok(ch)
+}
+
+// `start`, with the child placed in `g` — which must be `no_group()` and is filled in —
+// before it runs its first instruction, so every descendant is in the group too.
+pub fn start_grouped(mut sp: sysproc.Spawner, read cmd: str, read cwd: str, read j: Jail, mut g: Group) -> sysproc.Child !{ SandboxFailed(i32), SandboxRefused, SandboxBusy } {
+    if g.live { return err(SandboxBusy) }
+    if group_open(g) == false {
+        let c0: i32 = syserr.last_raw()
+        return err(SandboxFailed(c0))
+    }
+    var ev: String = env_line(j)
+    let turned_away: i64 = sysproc.refused(sp)
+    var ch: sysproc.Child = sysproc.start_at(sp, cmd, cwd, string_view(ev), true) catch sysproc.no_child()
+    let code: i32 = syserr.last_raw()
+    string_free(ev)
+    if sysproc.is_live(ch) == false {
+        release_group(g)
+        if sysproc.refused(sp) > turned_away { return err(SandboxRefused) }
+        return err(SandboxFailed(code))
+    }
+    if group_add(g, ch) == false {
+        // A child that could not be grouped must not be left running ungrouped: that is
+        // the one outcome this function exists to rule out.
+        let c1: i32 = syserr.last_raw()
+        sysproc.terminate(ch)
+        sysproc.wait(ch)
+        sysproc.release(ch)
+        release_group(g)
+        return err(SandboxFailed(c1))
+    }
+    sysproc.resume(ch)
+    return ok(ch)
+}
+
+// ---- asking the platform ---------------------------------------------------------------
+
+// This process's own id.
+@cfg(windows) pub fn own_pid() -> i64 {
+    return GetCurrentProcessId() as i64
+}
+
+@cfg(posix) pub fn own_pid() -> i64 {
+    return getpid()
+}
+
+// Does a process with this id exist and not yet exited? A process that exists but may
+// not be opened counts as alive. Ids are reused, so a "yes" long after an exit is a
+// different process; ask promptly.
+@cfg(windows) pub fn pid_alive(pid: i64) -> bool {
+    let h: cptr = OpenProcess(SBOX_SYNCHRONIZE, 0, pid as u32)
+    if h == null {
+        return syserr.last_raw() == SBOX_ERROR_ACCESS_DENIED
+    }
+    let w: i32 = sbox_wait(h, 0)
+    sbox_close(h)
+    return w == SBOX_WAIT_TIMEOUT
+}
+
+@cfg(posix) pub fn pid_alive(pid: i64) -> bool {
+    if sys_kill(pid, 0) == 0 { return true }
+    return syserr.last_raw() == SBOX_EPERM
+}
+
+// Wait up to `timeout_nanos` for `pid` to be gone. **A group that reports itself empty is
+// not yet a set of signalled process objects**: `TerminateJobObject` returns once the
+// members are terminated, the Job's `ActiveProcesses` reaches zero then, and each process
+// object is signalled a few milliseconds later when its last thread has unwound. A caller
+// that asks `pid_alive` in that gap is told the truth about the object and the wrong thing
+// about the process; this is the bounded form.
+pub fn wait_pid_gone(pid: i64, mut clk: time.Clock, timeout_nanos: i64) -> bool {
+    var waited: i64 = 0
+    var alive: bool = pid_alive(pid)
+    for alive {
+        if waited >= timeout_nanos { break }
+        var slice: i64 = SBOX_POLL_NANOS
+        let left: i64 = timeout_nanos - waited
+        if slice > left { slice = left }
+        waited = waited + time.wait(clk, slice)
+        alive = pid_alive(pid)
+    }
+    return alive == false
+}
+
+// The current directory, owned. Empty if the platform would not say.
+@cfg(windows) pub fn current_dir() -> String {
+    var buf: *mut u8 = alloc(u8, SBOX_PATH_CAP)
+    let n: u32 = GetCurrentDirectoryA(SBOX_PATH_CAP as u32, buf as cptr)
+    var s: String = string_new()
+    if n > 0 and (n as usize) < SBOX_PATH_CAP {
+        string_push(s, from_utf8(slice(u8, buf, n as usize)))
+    }
+    free_ptr(buf)
+    return s
+}
+
+@cfg(posix) pub fn current_dir() -> String {
+    var buf: *mut u8 = alloc(u8, SBOX_PATH_CAP)
+    let got: cptr = getcwd(buf as cptr, SBOX_PATH_CAP)
+    var s: String = string_new()
+    if got != null {
+        var n: usize = 0
+        for n < SBOX_PATH_CAP {
+            var b: u8 = 0
+            unsafe { b = (buf + n).* }
+            if (b as i32) == 0 { break }
+            n = n + 1
+        }
+        string_push(s, from_utf8(slice(u8, buf, n)))
+    }
+    free_ptr(buf)
+    return s
+}

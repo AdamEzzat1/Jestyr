@@ -1679,6 +1679,73 @@ int main(void) {
             .parse()
             .unwrap()
     }
+
+    /// **The Job-object constants `std/sandbox` and `sysproc.start_at` rely on, re-measured.**
+    ///
+    /// `sandbox.group_empty` reads `ActiveProcesses` out of a
+    /// `JOBOBJECT_BASIC_ACCOUNTING_INFORMATION` at a hard-coded word, `pid_alive` opens a
+    /// process with `SYNCHRONIZE`, and `start_at` creates the child with `CREATE_SUSPENDED`
+    /// so the Job can be joined before its first instruction. Each is a claim about a
+    /// foreign header, and a wrong one is not loud: a wrong word reads `TotalProcesses`
+    /// (never zero) and a group that emptied looks permanently occupied. Parsed out of the
+    /// shipped sources rather than restated, like the two probes above.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_job_constants_match_the_real_headers() {
+        let konst_in = |file: &str, name: &str| -> i64 {
+            let src = std::fs::read_to_string(file).unwrap();
+            let line = src
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("const {name}:")))
+                .unwrap_or_else(|| panic!("`{name}` is gone from {file}"));
+            let rhs = line.split('=').nth(1).expect("a const has a value");
+            rhs.split("//").next().unwrap().trim().parse::<i64>().unwrap_or_else(|_| {
+                panic!("`{name}` is no longer a plain integer literal: {line}")
+            })
+        };
+        let sbox = "examples/std/sandbox.jtr";
+        let sproc = "examples/std/sysproc.jtr";
+
+        let probe = r#"
+#include <windows.h>
+#include <stddef.h>
+#include <stdio.h>
+int main(void) {
+  printf("%d %zu %zu %lu %d %d %lu %d\n",
+    (int)JobObjectBasicAccountingInformation,
+    sizeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION),
+    offsetof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, ActiveProcesses) / 4,
+    (unsigned long)SYNCHRONIZE,
+    (int)WAIT_TIMEOUT,
+    (int)ERROR_ACCESS_DENIED,
+    (unsigned long)CREATE_SUSPENDED,
+    (int)ESRCH);
+  return 0;
+}
+"#;
+        let dir = std::env::temp_dir();
+        let cfile = dir.join("jestyr_sandbox_job_probe.c");
+        let exe = dir.join(format!("jestyr_sandbox_job_probe{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&cfile, probe).unwrap();
+        let cc = crate::find_c_compiler().expect("this test needs a C compiler on PATH");
+        let st = std::process::Command::new(&cc).arg(&cfile).arg("-o").arg(&exe).status().unwrap();
+        assert!(st.success(), "the job probe must compile against <windows.h>");
+        let out = std::process::Command::new(&exe).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let got: Vec<i64> = text.split_whitespace().map(|w| w.parse::<i64>().unwrap()).collect();
+        assert_eq!(got.len(), 8, "the probe's own output shape changed: {text}");
+
+        assert_eq!(konst_in(sbox, "SBOX_JOB_ACCOUNTING_CLASS"), got[0], "JobObjectBasicAccountingInformation");
+        assert_eq!(konst_in(sbox, "SBOX_JOB_ACCOUNTING_LEN"), got[1], "sizeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)");
+        assert_eq!(konst_in(sbox, "SBOX_JOB_ACTIVE_WORD"), got[2], "ActiveProcesses' 32-bit word");
+        assert_eq!(konst_in(sbox, "SBOX_SYNCHRONIZE"), got[3], "SYNCHRONIZE");
+        assert_eq!(konst_in(sbox, "SBOX_WAIT_TIMEOUT"), got[4], "WAIT_TIMEOUT");
+        assert_eq!(konst_in(sbox, "SBOX_ERROR_ACCESS_DENIED"), got[5], "ERROR_ACCESS_DENIED");
+        assert_eq!(konst_in(sproc, "SPROC_CREATE_SUSPENDED"), got[6], "CREATE_SUSPENDED");
+        // POSIX's `ESRCH` is also 3 in mingw's <errno.h>; the Linux ladder is where the
+        // value is load-bearing, but a probe that can run here should not skip it.
+        assert_eq!(konst_in(sbox, "SBOX_ESRCH"), got[7], "ESRCH");
+    }
 }
 
 /// **The extern declared alias — naming a C symbol Jestyr cannot spell.**
@@ -2067,15 +2134,22 @@ mod extern_signature_agreement {
         assert!(decls.len() > 40, "the extern sweep found almost nothing: {}", decls.len());
         let waits: Vec<&(String, String, String)> =
             decls.iter().filter(|(_, n, _)| n == "WaitForSingleObject").collect();
+        // `sysproc` and `syswatch` bind the bare name; `sandbox` binds it through the
+        // DECLARED ALIAS form (`sbox_wait = "WaitForSingleObject"`), because a second bare
+        // binding in one program is a duplicate definition. That the sweep counts three
+        // here is the witness that it reads the alias form too — an alias that escaped the
+        // sweep would be exactly the binding nobody was checking.
         assert_eq!(
             waits.len(),
-            2,
-            "syswatch and sysproc should both bind WaitForSingleObject: {waits:?}"
+            3,
+            "sysproc, syswatch and sandbox should all bind WaitForSingleObject: {waits:?}"
         );
-        assert_eq!(
-            waits[0].2, waits[1].2,
-            "the two WaitForSingleObject bindings must be identical"
-        );
+        for w in &waits[1..] {
+            assert_eq!(
+                waits[0].2, w.2,
+                "every WaitForSingleObject binding must be identical: {waits:?}"
+            );
+        }
     }
 }
 
@@ -2595,6 +2669,73 @@ mod crypto_bound {
         assert_eq!(verdicts.iter().filter(|l| **l == "true").count(), 7,
             "every untampered step must succeed:\n{out}");
         assert!(!out.contains("(refused)"), "both hashers must produce a digest:\n{out}");
+    }
+}
+
+/// **`jsandbox` — a child confined to a directory, jailed to a subtree, and taken down
+/// WITH its grandchild.**
+///
+/// `examples/std/sandbox_demo.jtr` is `std/sandbox`'s consumer and its own child: the
+/// program starts itself in a scratch directory, in a Job/process group, under a jail that
+/// allows the scratch directory and nothing beside it. The child writes a relatively named
+/// file (which lands in the scratch directory — the cwd claim), probes the jail four ways
+/// and writes what it saw INSIDE the jail (the projection claim: `denied` twice, the bytes
+/// twice, four refusals), and leaves a grandchild sleeping. The parent then shows the group
+/// is still occupied after the child exited, terminates the group, and waits — bounded —
+/// for the grandchild's pid to be gone (the group claim).
+///
+/// Nothing in the transcript is a path, a pid or a time, so it is pinned whole. The demo
+/// scrubs its scratch tree; the assertion at the end checks it did.
+#[cfg(all(test, feature = "c-oracle"))]
+mod sandbox_confine {
+    use super::*;
+
+    #[test]
+    fn jsandbox_confines_a_child_and_takes_its_grandchild_down() {
+        let exe = super::c_oracle::build_exe("examples/std/sandbox_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the sandbox demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jsandbox --\n\
+                    scratch tree ready\ntrue\n\
+                    the jail is fenced, read-write\ntrue\n\
+                    -- a child: in the scratch directory, in a group, under the jail --\n\
+                    started\ntrue\n\
+                    and exited on its own, cleanly\ntrue\n\
+                    -- where it ran --\n\
+                    its relatively named file is in the scratch directory\ntrue\n\
+                    and the directory it reported is that directory\ntrue\n\
+                    -- what the jail let it see (the child's own report) --\n\
+                    jailed true\n\
+                    mode rw\n\
+                    outside-absolute denied\n\
+                    outside-traversal denied\n\
+                    inside-relative inside-bytes\n\
+                    inside-absolute inside-bytes\n\
+                    refused 4\n\
+                    -- the group --\n\
+                    the grandchild reported in\ntrue\n\
+                    the child is gone but the group is not empty: the grandchild is in it\ntrue\n\
+                    and the grandchild is alive\ntrue\n\
+                    terminate the group\ntrue\n\
+                    the group emptied within the budget\ntrue\n\
+                    and the grandchild is gone, within the budget\ntrue\n\
+                    the grandchild's pid was real\ntrue\n\
+                    -- scrubbed --\ntrue";
+        assert_eq!(out.trim_end(), want, "the sandbox demo's transcript changed:\n{out}");
+
+        // Anti-vacuity: no claim may have come out `false`, and the child's report must not
+        // have found a hole in the fence.
+        assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
+        assert!(!out.contains("LEAKED"), "the jail must not have leaked:\n{out}");
+
+        let scratch = std::env::temp_dir().join("jestyr_sandbox_demo");
+        assert!(!scratch.exists(), "the demo must remove its scratch directory");
+        assert!(
+            !std::env::temp_dir().join("jestyr_sandbox_outside.txt").exists(),
+            "the demo must remove the file it planted outside the jail"
+        );
     }
 }
 
@@ -19119,6 +19260,14 @@ fn main() -> i32 {
         // is under byte-identity. The manifest format is pure text.
         "tls.jtr",
         "manifest.jtr",
+        // `std/sandbox` and its suite both carry `@cfg`, so
+        // `every_cfg_bearing_corpus_file_is_byte_identity_verified` requires them here —
+        // the guards a module emits for the platform it is NOT running on are exactly what
+        // no other gate on this machine can see. The demo is absent because it carries no
+        // `@cfg` of its own and holds cross-module struct types the unresolved dump
+        // degrades; `jc_build_matrix` gates it instead.
+        "sandbox.jtr",
+        "sandbox_test.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same
@@ -20434,6 +20583,15 @@ fn main() -> i32 {
             // refused for a flipped message byte, a flipped signature bit, a truncation and
             // the wrong key; every refusal before the caller's buffer is touched. Links OpenSSL.
             ("crypto_test", 5),
+            // Five cases that start nothing that runs (the projection round trip, the fence
+            // with real files on both sides, `..` refused as a shape, `narrow` never
+            // widening, and a platform failure told from a capability refusal by the
+            // spawner's counter) and three with real children through the platform shell:
+            // the working directory (a relatively named file lands where the child was
+            // started, with a control), the projection arriving as an environment variable,
+            // and a group that reaches the grandchild a `terminate` of the shell left
+            // behind — bounded, never a hang.
+            ("sandbox_test", 8),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

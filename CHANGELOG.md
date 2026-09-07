@@ -126,6 +126,60 @@ versions are snapshots, not stability promises.
   `crypto_test_pub.pem` (the TLS key's public half) and `crypto_test_other_key.pem` (a second
   RSA key for the wrong-key case), both from `openssl` with no config needed.
 
+- **`std/sandbox`** — what a child is allowed to BE: where it runs, whom it dies with, and
+  which files its own code may touch. `std/sysproc`'s header listed "no environment control,
+  no working directory, no process groups" as what was missing and `fs.Fs` gated only the
+  parent; all four are facts the platform will set only at the instant a process comes into
+  being, so `sysproc.start_at(sp, cmd, cwd, env_extra, apart)` is that instant exposed once
+  (`lpCurrentDirectory` and a copied `GetEnvironmentStringsA` block on Windows;
+  `chdir`/`setpgid(0,0)`/`execve` between `fork` and `exec` on POSIX) and is the only
+  addition to `sysproc`. Above it: `start` (a cwd and a projection), `start_grouped` (a Job
+  object / process group), `terminate_group` + a bounded `wait_group_empty`, and a `Jail`.
+
+  **A Job is joined while the child is still SUSPENDED**, because assigning after it runs
+  races a grandchild born outside the Job — the one outcome a group exists to rule out — so
+  `apart` is deliberately platform-shaped (POSIX makes a group leader outright; Windows
+  creates suspended and `sysproc.resume` is the other half) and `start_grouped` terminates a
+  child it could not group rather than leave it running ungrouped.
+
+  **The jail is a capability the child's own Jestyr code honours, not an OS sandbox** — said
+  in the header, because the word invites the other reading. A `Jail` is an `fs.Fs` plus a
+  root, projected into `JESTYR_FS_JAIL` as `<mode> <root>` and read back with
+  `sandbox.inherited(env)`; no variable means the unjailed host, exactly today's behaviour.
+  The fence is lexical, and a `..` segment is refused as a SHAPE rather than folded, because
+  a resolver that folds `a/../../etc` is a second `realpath` that agrees with the platform's
+  until a symlink — symlinks are the stated hole. `narrow` is the meet of two policies under
+  a root inside the parent's, so a jailed process can hand its child only less.
+  `fs.jtr` is untouched: it is a self-hosting closure module, and putting the projection in
+  `fs.host()` would force a reseed.
+
+  8 tests — five that start nothing that runs (the projection round trip with an unknown
+  mode failing closed, the fence with real files on both sides, `..` refused, `narrow` never
+  widening, and a platform failure told from a capability refusal), three with real children
+  through the platform shell, every one bounded — plus the `jsandbox` demo, which starts
+  itself in a scratch directory, in a group, under a jail, and shows the grandchild the child
+  left behind reached by a `terminate_group` that a `terminate` of the child alone missed.
+  Six mutations watched failing: the fence's separator check dropped (a prefix-sharing
+  sibling reads as inside, in two tests), `mode_fs`'s fallback turned to `fs.host()` (a
+  corrupt projection would fail OPEN), `start_at`'s `lpCurrentDirectory` never passed (the
+  child's relatively named file lands in the parent's directory), the environment block never
+  extended (the child echoes back the unexpanded variable name),
+  `AssignProcessToJobObject` skipped (the grandchild is never in the group), and
+  `TerminateJobObject` made a no-op — that last one failing after its ten-second budget
+  rather than hanging, which is the property a bounded group wait exists for. The Windows
+  Job/accounting constants are measured against `<windows.h>` by a C probe, the way
+  `sysproc`'s are.
+
+  **A port finding came out of the allowlist gate**: with imports unresolved, the
+  self-hosted `cgen.jtr` types a `catch |e| match e { … }`'s result temp from the match
+  (`void` for a type it cannot resolve) while its own `_ct` temp for the same type is `int`,
+  which is what the reference emits throughout. `catch |e| <expr>` and the bare
+  `catch <expr>` agree. Nothing real miscompiles — with imports resolved the type is known —
+  but a corpus file that is both `@cfg`-bearing and matches over an imported error set cannot
+  satisfy `every_cfg_bearing_corpus_file_is_byte_identity_verified`. `std/sandbox` does not
+  use the construct on a reason of its own: a `match` over an IMPORTED error set is
+  exhaustive over a set the importing module does not own.
+
 - **`std/tls`** — TLS over a `sysnet` socket by binding OpenSSL (area 8). A client context
   that trusts nothing until `trust` gives it a CA, a server context that checks its key
   against its certificate at load, blocking `client_session`/`server_session` handshakes
