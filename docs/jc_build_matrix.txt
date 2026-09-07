@@ -80,6 +80,7 @@ BUILD_OK ini_demo
 BUILD_OK intern_demo
 BUILD_OK kv_demo
 BUILD_OK lexer
+BUILD_OK livecfg_demo
 BUILD_OK log_demo
 BUILD_OK metrics_demo
 BUILD_OK mutex

@@ -7,6 +7,39 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/livecfg`** — a configuration that follows its file, and never half-way: live reload
+  plus nesting, composed from `std/config` (precedence by source, redaction by declaration),
+  `std/ini` (byte-span problems) and `std/syswatch`. A `Live` is GIVEN its clock, its `fs.Fs`,
+  its watcher and its schema; `step` is one pass of the caller's own loop (drain the watcher,
+  re-read only if it fired — no thread, no debounce) and `reload_now` is the same reload
+  without the watcher, for a caller with its own trigger.
+
+  **A reload that fails validation keeps the previous configuration WHOLE.** A reload never
+  touches the live configuration: it builds a CANDIDATE — a clone of the base (schema + every
+  non-file source) with the file applied on top — and swaps it in only when the file validated
+  completely. A file with one good change beside one bad value applies NEITHER; every problem
+  is kept with its byte span and `render_problems` turns them into `file:line:col` with a
+  caret under the key through `std/diag`. Building from the base rather than merging in place
+  is what makes a key REMOVED from the file revert to its default, and it is what keeps
+  precedence a property of the source: an env or cli value survives every reload as a
+  shadowed file value, and a shadowed value is NOT validated (`config.apply` answers shadowed
+  before it parses — stated in the header, pinned by a test). A `generation` counter moves
+  only when an effective value does — re-saving a file unchanged or editing a comment is
+  `same` — and a change callback (fn pointer + context) fires once per moved key with old and
+  new RENDERED through `config.render_value`, so a secret reports `**** -> ****` and never its
+  text. Nesting is additive to `config`: `[server.tls]` flattens to `server.tls.port`, and a
+  `config.Section` is a prefix VIEW onto the flat key space, not a tree. `std/config` gained
+  `clone`, `same_value`, `render_name`, `render_value`, `kind_of`, `is_secret` and the
+  `Section` family; nothing existing changed shape.
+
+  7 tests over a real scratch file, including a real `syswatch` edit waited for through the
+  runtime loop with a 2s bound; the pinned demo `jlivecfg` drives its four edits with
+  `reload_now` so the transcript is exact, and asks the loop afterwards whether the watcher
+  saw them. **Four mutations watched failing** (swap the candidate in despite faults; build
+  the candidate from the current configuration instead of the base; skip redaction in
+  `render_value`; advance the generation on every reload) — each caught by the test that
+  names it.
+
 - **`std/tls`** — TLS over a `sysnet` socket by binding OpenSSL (area 8). A client context
   that trusts nothing until `trust` gives it a CA, a server context that checks its key
   against its certificate at load, blocking `client_session`/`server_session` handshakes

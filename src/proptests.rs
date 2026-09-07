@@ -2394,6 +2394,87 @@ mod kv_durable {
     }
 }
 
+/// **`jlivecfg` — a configuration that follows its file, and never half-way.**
+///
+/// `examples/std/livecfg_demo.jtr` is `std/livecfg`'s consumer. An INI file is edited under
+/// a running service four times, each edit applied with `reload_now` so the transcript does
+/// not depend on the watcher's timing. The edit that matters is the second: a valid change
+/// to `server.tls.port` beside a `server.port` that is a word. The assertion is that NEITHER
+/// landed — the previous configuration stands whole, the good change included — and that
+/// the fault is printed as `file:line:col` with a caret under the key, through `std/diag`.
+///
+/// The rest pins the generation (moves on a value, not on a read: the fourth edit touches
+/// only a line the environment owns and is `same`), the change callback (a rotated secret
+/// reports `**** -> ****`; the token's text must be absent from the whole transcript), the
+/// section view (`server.tls` reads its own port), and the watcher: the directory was watched
+/// from the start, the loop confirms the edits woke it, and one `step` drains it and re-reads
+/// the file, finding nothing the last `reload_now` did not.
+#[cfg(all(test, feature = "c-oracle"))]
+mod livecfg_whole {
+    use super::*;
+
+    #[test]
+    fn jlivecfg_keeps_the_previous_configuration_whole() {
+        let exe = super::c_oracle::build_exe("examples/std/livecfg_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the livecfg demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jlivecfg --\n\
+                    watching the file's directory\ntrue\n\
+                    -- first load --\n\
+                    \x20 region: us-east -> eu-west\n\
+                    \x20 api_token: **** -> ****\n\
+                    changed\n\
+                    generation, applied at\n1\n1000\n\
+                    api_token=**** (file)\n\
+                    region=eu-west (file)\n\
+                    server.port=8080 (file)\n\
+                    server.tls.port=8443 (file)\n\
+                    workers=16 (env)\n\
+                    \n\
+                    the tls component reads its own port\n8443\n\
+                    -- edit 1: the port moves --\n\
+                    \x20 server.port: 8080 -> 9090\n\
+                    changed\n\
+                    generation\n2\n\
+                    -- edit 2: one good change beside one bad value --\n\
+                    rejected\n\
+                    generation\n2\n\
+                    problems\n1\n\
+                    error[E-INI]: refused by the schema\n\
+                    \x20 --> zz_livecfg_demo/app.ini:4:1\n\
+                    \x20  |\n\
+                    \x204 | port = nine-thousand\n\
+                    \x20  | ^^^^ not an integer\n\
+                    \n\
+                    the previous configuration stands, the good change included\n9090\n8443\n\
+                    -- edit 3: the secret is rotated --\n\
+                    \x20 api_token: **** -> ****\n\
+                    changed\n\
+                    generation\n3\n\
+                    -- edit 4: a line the environment owns --\n\
+                    same\n\
+                    generation\n3\n\
+                    workers, and where the value came from\n16\nenv\n\
+                    -- the watcher --\n\
+                    the edits woke the loop\ntrue\n\
+                    a step drains the watcher and re-reads the file\nsame\n\
+                    reloads, rejections, generation\n5\n1\n3";
+        assert_eq!(out.trim_end(), want, "the livecfg demo's transcript changed:\n{out}");
+
+        // Anti-vacuity: the two `true`s are the watcher opening and the loop waking; nothing
+        // may print `false`. The secret's text — either rotation — must never reach stdout:
+        // the callback and the render both go through `config`'s declaration-level redaction.
+        assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
+        assert!(!out.contains("s3cr3t"), "a secret's text must never be printed:\n{out}");
+        // Exactly one reload was rejected, and the counter agrees with the transcript.
+        assert_eq!(out.matches("\nrejected\n").count(), 1, "exactly one edit is rejected:\n{out}");
+
+        assert!(!std::path::Path::new("zz_livecfg_demo").exists(), "the demo must clean up after itself");
+    }
+}
+
 /// **`jlog` — one logging routine, two renderings, and the log reading itself back.**
 ///
 /// `examples/std/log_demo.jtr` is `std/log`'s consumer. `run_job` is written once and shipped
@@ -20091,6 +20172,13 @@ fn main() -> i32 {
             // archive refused before it is stored; then the same fetch over HTTP against
             // `std/httpd`'s static route on a spawned thread — the `jc add` shape, end to end.
             ("registry_test", 2),
+            // **A file with one good change beside one bad value applies NEITHER**: the previous
+            // configuration stands whole and the fault renders as `file:line:col` through `diag`.
+            // Plus: the generation moves on a value and not on a read, a key that leaves the
+            // file reverts to its default, a file value cannot outrank the env or the cli, a
+            // secret's change is reported as `**** -> ****` with its text absent, `[server.tls]`
+            // flattens to a dotted key a `Section` finds, and a real watcher edit reloads via `step`.
+            ("livecfg_test", 7),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

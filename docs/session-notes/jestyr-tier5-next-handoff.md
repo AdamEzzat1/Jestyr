@@ -514,8 +514,39 @@ done until its count is in that table.
 | Trace spans | **Pick another word first.** `Span` is taken three times: `http.Header` spans, `diag` source spans, and the `@span` work-span attribute. Use the fn-pointer vtable shape, not a trait — `@no_alloc` passes vacuously through a trait method. |
 | Service supervision / restart policy | The lifecycle is complete; a supervisor over `std/sysproc` is its own module. |
 | Sandbox: cwd, process groups, fs capability projection | `sysproc.jtr:113` names all three. `fs.Fs` gates the parent; nothing projects it onto a child. |
-| Config: live reload, nesting | `std/syswatch` exists; composing them is the caller's job today. |
+| ~~Config: live reload, nesting~~ | **DONE: `std/livecfg`** — see the section below. |
 | Rewrite `std/plugin` as a server on the pipe transport | Tier 4 leftover. One-process-per-call only because the transport did not exist; it does now (`start_piped`/`capture`). |
+
+### ~~Config live reload + nesting~~ — **DONE: `std/livecfg`**
+
+`std/config` + `std/ini` + `std/syswatch`, composed once. Seven tests over a real scratch
+file (one through the real watcher, waited for via the runtime loop with a 2s bound), a
+pinned demo (`jlivecfg`, `examples/std/livecfg_demo.jtr`, driven by `reload_now` so the
+transcript is exact, with the watcher asked afterwards), four mutations watched failing, no
+compiler change, no reseed. What a successor should not re-derive:
+
+* **A reload builds a CANDIDATE and swaps it in whole or not at all.** `config.clone(base)`
+  + `ini.load` into the clone; any non-shadowed problem drops the candidate. Applying key by
+  key and stopping at the fault was the mutation the central test exists to catch.
+* **The candidate comes from the BASE, not from `cur`.** `config.apply` can set but never
+  unset, so a merge in place keeps stale file values forever; from the base, a key removed
+  from the file reverts to its default. `Live` therefore owns TWO `Config`s with ids agreed
+  by construction (`declare`/`apply` go to both), and the schema is closed by the first load.
+* **A shadowed file value is not validated** — `config.apply` answers `CFG_SHADOWED` before
+  it parses. Stated in the header, pinned by a test; a caller who wants the other behaviour
+  changes that assertion on purpose.
+* **The generation counts reloads that MOVED a value**, decided by `config.same_value` over
+  ids (bytes, not origins). `reloads`/`rejections` say whether the file was read.
+* **Change reports go through `config.render_value`**, so redaction is the declaration's
+  decision in one place; there is no raw-value accessor on `Config`, on purpose.
+* **It is `step`, not `poll`**: `poll` is `std/syspoll`'s C symbol and `syswatch` links it.
+  `step` drains the watcher bounded (`LIVE_DRAIN_ROUNDS`) and answers `LIVE_QUIET` on a
+  closed watcher forever; `reload_now` is the trigger-agnostic form.
+* **A `Section` is a prefix VIEW onto the flat key space**, not a tree — `std/ini` already
+  flattens `[server.tls]` to `server.tls.port`. It owns its prefix (`String`; a struct may
+  not hold a `str`), so it has a `Drop` and is move-only.
+* Not built: debounce (the caller's, `syswatch_demo` shows one), watching for the file to
+  appear, schema hot-swap, env/cli parsing, a thread.
 
 ### ~~The registry layer~~ — **DONE: `std/manifest` + `std/registry`**
 
@@ -596,7 +627,7 @@ CHANGELOG to find it.
 | **Trace spans** | a span per unit of work, parent ids, a dump | `Span` is taken three times (`http`, `diag`, `@span`) — pick another word; fn-pointer vtable, not a trait (`@no_alloc` passes vacuously through a trait) |
 | **Service supervision** | restart policy over `std/sysproc`, backoff, a supervision tree | the lifecycle (`std/service`) is complete; this is a supervisor OVER children, its own module |
 | **Sandbox** | cwd, process groups, fs capability projection onto a child | `sysproc.jtr:113` names all three; `fs.Fs` gates the parent and nothing projects it |
-| **Config live reload + nesting** | re-read on change, nested sections | `std/syswatch` + `std/config` exist; composing them is the module |
+| ~~**Config live reload + nesting**~~ | **DONE: `std/livecfg`** (§2 above) | candidate-then-swap; a shadowed file value is not validated; `step`, not `poll` |
 | **`std/plugin` on the pipe transport** | a plugin as a server on `sysproc.start_piped` | Tier 4 leftover; one-process-per-call only because the transport did not exist |
 
 Plus the layer the breadth pass stopped short of: **the `jc add` command** over
