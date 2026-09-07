@@ -592,12 +592,49 @@ CHANGELOG to find it.
 
 | module | what | the one thing to know first |
 |---|---|---|
-| **Crypto bindings** | HMAC, signing/verification, a hash interface | Bindings over `sha256`/OpenSSL, not algorithms; `std/tls` shows the `extern "openssl/*.h"` shape and the link rule is already in place |
+| ~~**Crypto bindings**~~ | HMAC, signing/verification, a hash interface | **DONE: `std/crypto`** — see the section below this table |
 | **Trace spans** | a span per unit of work, parent ids, a dump | `Span` is taken three times (`http`, `diag`, `@span`) — pick another word; fn-pointer vtable, not a trait (`@no_alloc` passes vacuously through a trait) |
 | **Service supervision** | restart policy over `std/sysproc`, backoff, a supervision tree | the lifecycle (`std/service`) is complete; this is a supervisor OVER children, its own module |
 | **Sandbox** | cwd, process groups, fs capability projection onto a child | `sysproc.jtr:113` names all three; `fs.Fs` gates the parent and nothing projects it |
 | **Config live reload + nesting** | re-read on change, nested sections | `std/syswatch` + `std/config` exist; composing them is the module |
 | **`std/plugin` on the pipe transport** | a plugin as a server on `sysproc.start_piped` | Tier 4 leftover; one-process-per-call only because the transport did not exist |
+
+### ~~Crypto bindings~~ — **DONE: `std/crypto`, by binding OpenSSL's libcrypto**
+
+A `Hasher` vtable with two implementations (`EVP_MD` and `std/sha256`), `hmac`/`hmac_verify`,
+`sign`/`verify` with PEM-loaded keys, an error surface. Five tests, the `jcrypto` demo pinned
+(`jcrypto_hashes_macs_and_signs_deterministically`), four mutations watched failing, no
+reseed (it imports `sha256` and `fs` read-only). What a successor should not re-derive:
+
+* **The `EVP_MD` must never be bound to a Jestyr value.** `EVP_sha256()` returns a `const`
+  pointer and `cptr` emits as `void*`; `let md: cptr = EVP_sha256()` or returning it from a
+  fn is `-Wdiscarded-qualifiers`, which the emitted-C warning gate makes an ERROR. The
+  module dispatches on an `i32` algorithm id at each call (`digest_init`, `hmac_raw`,
+  `sign_init`, `verify_init`) and stores the id, not the pointer.
+* **A duplicate extern across modules is refused** (`duplicate definition of
+  ERR_get_error` — measured with a probe importing `tls` and a second binder). Anything
+  `tls` already binds must be bound under an alias: `extern "openssl/err.h" fn
+  err_get_error = "ERR_get_error"() -> u64`. Header-declared aliases work.
+* **`pub` and `out` are keywords**: `var pub: Key` and `var out: cptr` do not parse. Two
+  more for the recorded list.
+* **The in-language hasher is UTF-8-only**, because `sha256.push_sha256_hex(read data: str)`
+  is the only entry point and `std/sha256` is in the seed closure. Non-UTF-8 input makes
+  `finish` answer false. The fix is a `[]u8` entry point on `std/sha256` — a reseed, so a
+  serial item, and worth doing when the seed next moves anyway.
+* **`verify` answers `ok(false)` for every rejection and `err(CryptoRefused)` only when
+  the question could not be asked**; a rejected verify DRAINS OpenSSL's error queue so the
+  reason does not surface as the next caller's `last_error` (the suite checks this).
+* **`finish` hands the implementation exactly `digest_len` bytes**, and the EVP side checks
+  `EVP_DigestFinal_ex`'s reported length against it — the mutation that dropped the
+  length check was caught by that cross-check, not by a test written for it.
+* **Fixtures need no `openssl.cnf`**: `openssl rsa -pubout` and `openssl genrsa` run without
+  `-config` (only `req` needs it). `crypto_test_pub.pem` is the TLS key's public half;
+  `crypto_test_other_key.pem` is a second 2048-bit RSA key.
+* Not built: key generation, encryption, key exchange, PBKDF, EdDSA constructors, streaming
+  signatures, a passphrase callback for encrypted PEMs. Each is a binding away.
+* POSIX has never run this: the suite and demo are Windows-only so far (mingw's OpenSSL
+  1.1.1i). The Linux runner has `libssl-dev`, so the link should hold; the `HMAC()` one-shot
+  and `EVP_DigestSign` are 1.1.1 API on both.
 
 Plus the layer the breadth pass stopped short of: **the `jc add` command** over
 `manifest` + `registry` + `resolve` + `lockfile` + `cache` (every piece exists and is tested

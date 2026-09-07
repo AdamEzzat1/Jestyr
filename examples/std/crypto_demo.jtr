@@ -1,0 +1,120 @@
+// examples/std/crypto_demo.jtr — `jcrypto`: one message hashed two ways, MACed, signed, tampered.
+//
+// Run:  jestyrc run examples/std/crypto_demo.jtr
+//
+// ─── What this demonstrates ───────────────────────────────────────────────────
+//
+// A fixed message goes through both SHA-256 implementations behind the one `Hasher`
+// interface — OpenSSL's `EVP_sha256` and `std/sha256`, the hash `jestyr attest` commits to —
+// and the program prints whether they agree. Then the message is MACed under a short key
+// (the hex is a published vector), signed with the TLS fixture's private key, and verified
+// against the public key pulled out of its certificate; the same signature is then refused
+// for a message with one byte flipped, for a signature with one byte flipped, and under a
+// second key that had nothing to do with it.
+//
+// Every line is deterministic — RSA PKCS#1 v1.5 signs the same message to the same bytes,
+// and the signature is never printed anyway, only its length and each verdict — so
+// `jcrypto_hashes_macs_and_signs_deterministically` pins the transcript to the line.
+
+import "crypto"
+import "fs"
+
+const MESSAGE: str = "The quick brown fox jumps over the lazy dog"
+const KEY_PEM: str = "examples/std/fixtures/tls_test_key.pem"
+const CERT_PEM: str = "examples/std/fixtures/tls_test_cert.pem"
+const OTHER_PEM: str = "examples/std/fixtures/crypto_test_other_key.pem"
+
+// Hash `msg` through `h` and print the digest as hex.
+fn show_digest(mut h: crypto.Hasher, read msg: str, mut dst: []u8) {
+    let fine: bool = crypto.hash(h, crypto.as_bytes(msg), dst)
+    var line: String = string_new()
+    if fine { crypto.push_hex(line, dst[0 .. crypto.digest_len(h)]) } else { string_push(line, "(refused)") }
+    print_str(string_view(line))
+    string_free(line)
+}
+
+fn same_bytes(read a: []u8, read b: []u8) -> bool {
+    if a.len != b.len { return false }
+    var i: usize = 0
+    for i < a.len {
+        if a[i] != b[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn main() -> i32 {
+    var h: fs.Fs = fs.host()
+    print_str("-- jcrypto --")
+    print_str("message")
+    print_str(MESSAGE)
+
+    // ---- two SHA-256s, one interface ----
+    var raw1: *mut u8 = alloc(u8, 64)
+    var d1: []u8 = slice(u8, raw1, 64)
+    var raw2: *mut u8 = alloc(u8, 64)
+    var d2: []u8 = slice(u8, raw2, 64)
+    var evp: crypto.Hasher = crypto.evp_hasher(crypto.SHA256)
+    var own: crypto.Hasher = crypto.jestyr_hasher()
+    print_str("sha256 via openssl")
+    show_digest(evp, MESSAGE, d1)
+    print_str("sha256 via std/sha256")
+    show_digest(own, MESSAGE, d2)
+    print_str("the two agree")
+    print_bool(same_bytes(d1[0 .. 32], d2[0 .. 32]))
+    crypto.free_hasher(evp)
+    crypto.free_hasher(own)
+
+    // ---- a MAC ----
+    var rawm: *mut u8 = alloc(u8, 64)
+    var mac: []u8 = slice(u8, rawm, 64)
+    let mlen: usize = crypto.hmac(crypto.SHA256, crypto.as_bytes("key"), crypto.as_bytes(MESSAGE), mac) catch 0
+    print_str("hmac-sha256 under the key \"key\"")
+    var mh: String = string_new()
+    crypto.push_hex(mh, mac[0 .. mlen])
+    print_str(string_view(mh))
+    string_free(mh)
+    print_str("and it verifies in constant time")
+    print_bool(crypto.hmac_verify(crypto.SHA256, crypto.as_bytes("key"), crypto.as_bytes(MESSAGE), mac[0 .. mlen]) catch false)
+
+    // ---- a signature ----
+    var priv: crypto.Key = crypto.load_private_key(h, KEY_PEM)
+    var pubk: crypto.Key = crypto.load_cert_public_key(h, CERT_PEM)
+    var other: crypto.Key = crypto.load_private_key(h, OTHER_PEM)
+    print_str("keys loaded: private, the certificate's public, another private")
+    print_bool(crypto.key_is_open(priv))
+    print_bool(crypto.key_is_open(pubk))
+    print_bool(crypto.key_is_open(other))
+    let cap: usize = crypto.signature_len(priv)
+    var raws: *mut u8 = alloc(u8, cap)
+    var sig: []u8 = slice(u8, raws, cap)
+    let slen: usize = crypto.sign(priv, crypto.SHA256, crypto.as_bytes(MESSAGE), sig) catch 0
+    print_str("signature bytes")
+    print_int(slen as i64)
+    print_str("verified with the certificate's public key")
+    print_bool(crypto.verify(pubk, crypto.SHA256, crypto.as_bytes(MESSAGE), sig[0 .. slen]) catch false)
+
+    // ---- tampering ----
+    var tampered: String = string_new()
+    string_push(tampered, "The quick brown fox jumps over the lazy cog")
+    print_str("the same signature over a message with one letter changed")
+    print_bool(crypto.verify(pubk, crypto.SHA256, crypto.as_bytes(string_view(tampered)), sig[0 .. slen]) catch false)
+    string_free(tampered)
+    sig[slen / 2] = sig[slen / 2] ^ (1 as u8)
+    print_str("the signature with one bit flipped")
+    print_bool(crypto.verify(pubk, crypto.SHA256, crypto.as_bytes(MESSAGE), sig[0 .. slen]) catch false)
+    sig[slen / 2] = sig[slen / 2] ^ (1 as u8)
+    print_str("restored, it verifies again")
+    print_bool(crypto.verify(pubk, crypto.SHA256, crypto.as_bytes(MESSAGE), sig[0 .. slen]) catch false)
+    print_str("under a key that did not sign it")
+    print_bool(crypto.verify(other, crypto.SHA256, crypto.as_bytes(MESSAGE), sig[0 .. slen]) catch false)
+
+    crypto.free_key(priv)
+    crypto.free_key(pubk)
+    crypto.free_key(other)
+    free_ptr(raws)
+    free_ptr(rawm)
+    free_ptr(raw1)
+    free_ptr(raw2)
+    return 0
+}
