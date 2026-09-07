@@ -93,8 +93,10 @@
 // What `terminate` reaches is the child `start_piped` started, and on Windows that is
 // `cmd.exe`, not the plugin under it: the shell does not `exec`. The plugin is orphaned
 // with its stdin closed; a well-behaved server exits at that EOF, a wedged one lives until
-// it is not wedged. Killing the whole tree needs a process group or a Job object, which
-// `sysproc` does not have (its header says so) — recorded here rather than pretended.
+// it is not wedged. Killing the whole tree needs a process group or a Job object, and
+// `std/sandbox` now has exactly that (`sysproc.start_at`'s `apart`, `sandbox.terminate_group`)
+// — landed beside this module and NOT yet adopted here. Connecting through a sandbox is the
+// obvious next increment; until it happens, this paragraph is the honest state.
 //
 // The budget bounds READS. A request larger than the pipe's buffer (~64KB on Windows, 4KB on
 // Linux) sent to a plugin that is not reading blocks in `write_all` with no budget at all;
@@ -168,6 +170,7 @@ import "file"
 import "fs"
 import "process"
 import "str"
+import "syserr"
 import "sysproc"
 import "sysstdio"
 import "time"
@@ -386,18 +389,16 @@ pub fn connect(mut sp: sysproc.Spawner, take clk: time.Clock, read cmd: str, bud
         var none: sysproc.Child = sysproc.start_piped(sp, cmd) catch sysproc.no_child()
         return err(PluginRefused)
     }
-    var code: i32 = 0
-    var ch: sysproc.Child = sysproc.start_piped(sp, cmd) catch |e| match e {
-        SysProcFailed(n) => note_start_failure(n, code),
-        _ => sysproc.no_child()
-    }
+    // **The platform's code is read from the platform, not destructured out of
+    // `sysproc`'s error set.** A `match` over an IMPORTED set is exhaustive over names
+    // this module does not own, so it breaks the day `sysproc` grows a variant — the
+    // reason `std/sandbox` gives for the same choice. `syserr.last_raw()` one frame out
+    // is the same number `start_piped` would have put in `SysProcFailed`. The capability
+    // refusal cannot reach here: `can_start` answered it above.
+    var ch: sysproc.Child = sysproc.start_piped(sp, cmd) catch sysproc.no_child()
+    let code: i32 = syserr.last_raw()
     if sysproc.is_live(ch) == false { return err(PluginNoStart(code)) }
     return ok(Conn{ c: ch, clk: clk, budget: budget_nanos, calls: 0, failures: 0, up: true })
-}
-
-fn note_start_failure(n: i32, mut code: i32) -> sysproc.Child {
-    code = n
-    return sysproc.no_child()
 }
 
 // Is the plugin still there to be called?

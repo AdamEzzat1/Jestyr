@@ -864,6 +864,7 @@ successor should not re-derive:
 | **Uninitialized memory** | no facility; containers carry fake defaults (`smallvec.jtr:77`). | The hard part is the destructor rule for partially initialised aggregates. |
 | **`\u00XX` below 0x20** | passes through to the emitted C verbatim; C rejects it. | Small; lexer, both sides. |
 | **`check` is quiet on an undeclared bare name** | a typo (`eid` for `id`) passes every front-end check and dies in gcc. | Leniency exists for fn-pointer values and extern symbols; a rule refusing a name found in none of scope/consts/variants/fns/externs/globals is a two-sided `escape` item. |
+| **`catch \|e\| match e { … }` types its temp `void` in the port** (NEW, 2026-09-07) | With imports unresolved — the byte-identity golden's own condition — the reference degrades the result temp of the MATCH form to `int` and the port declares it `void` (`int _ct0 = …; void _cv1;`). `catch \|e\| <expr>` and the bare `catch <expr>` both agree, so it is the match arm's typing alone. | Found twice in one pass: `std/sandbox` met it first and avoided the construct, then `std/plugin` shipped it into an ALREADY-allowlisted file and turned both cgen goldens red. Nothing real miscompiles (with imports resolved the type is known), but a corpus file that is both `@cfg`-bearing and matches over another module's error set cannot satisfy the allowlist gate. Both modules now take the platform's code from `syserr.last_raw()` instead, on an independent reason: a `match` over an IMPORTED error set is exhaustive over names the importing module does not own. **The fix is in `cgen.jtr`'s catch lowering — a closure module, so it is serial work and owes a reseed.** Measured to the token: over the whole of `plugin_test.jtr` the ONLY difference is `void _cv64;` (port) against `int _cv64;` (reference), with the try temp `int _ct63` agreeing. `jestyr_cgen_test_mode_matches_reference` carries a NAMED exclusion for that one file which **asserts the divergence still exists** — fix the lowering and the test fails, telling you to delete the exclusion. |
 | **`core`'s `ok`/`err` shadow the intrinsics** (NEW, 2026-09-07) | Importing `std/core` beside any module that declares a fallible function breaks type-checking: `core.Result`'s variants are named `ok` and `err`, the same names as the result intrinsics, and the variant registration wins. | Found building `std/supervise`, which worked around it by rendering its own numbers rather than importing `core`. Same family as A5 (a `pub fn ok` shadowing the intrinsic, already a compile error) — but a *variant* reaches the name table by a different door than a `fn` does, so A5's refusal never fires. Decide whether the intrinsic names are reserved against variants too; if so it is a two-sided `escape` rule, and `core.Result` needs renamed variants. |
 | **`alog.jtr` header debt** | `alog.Cursor` is move-only by containment; the header does not say so. | A comment, owed on the next change to that file. |
 | **`std/cstring` has no `cstr` view** | a C string cannot be read back as `str`; `tls.protocol` was dropped for it. | Bind `strlen`, build a slice; small. |
@@ -924,6 +925,26 @@ is hardest to see, which is what happened and cost an extra CI round trip.
 ## §4. THE RULES THIS TREE KEEPS RELEARNING
 
 Read these before writing a test. Each cost a real failure.
+
+**A branch's own line numbers are not the base's — never splice a file by offset from a
+diff header.** Merging the six second-wave modules by hand, three of them had appended a
+section to the END of `sysproc.jtr`. Two spliced cleanly. The third also carried a
+five-line edit ABOVE the splice point, which shifted its file by three lines, so taking
+"everything after the base's last line" from ITS numbering re-copied three lines and left
+`release(c)` sitting at file scope. `cargo check` is blind to it (the file is Jestyr, not
+Rust) and the ladder reported it as four unrelated red tests — `io_suites_pass`, both cgen
+goldens and a parser dump — because every one of them parses the corpus. **After any
+hand-merge of a `.jtr` file, run `jestyrc check` on it and on each of its consumers before
+running anything else**, and verify the merge by CONTENT (every added line of every branch
+is present) rather than by line count.
+
+**A gate an agent did not run is a gate that did not run.** Each module was verified in its
+own worktree against the three gates its brief named, and all six were green. Two of the
+corpus-WIDE tests take any new or changed `examples/std/*.jtr` automatically and were in no
+brief: the lexeme golden broke on the first corpus file containing a token with a newline
+inside it, and both cgen goldens broke when a rewrite put `catch |e| match` into an
+already-allowlisted file. The brief's gate list must include every test that discovers its
+inputs by scanning a directory.
 
 **A rule that changes nothing owes a probe that it CAN fail — and the probe must be watched
 failing.** A whole-corpus sweep that is byte-identical before and after means every golden
