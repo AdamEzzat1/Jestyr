@@ -1307,9 +1307,6 @@ pub fn wait_or_kill(mut c: Child, mut clk: time.Clock, timeout_nanos: i64) -> St
     s.started = s.started + 1
     return ok(Child{ h: h, th: th, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: SPROC_NO_PIPE, outp: SPROC_NO_PIPE })
 }
-    release(c)
-    return s
-}
 
 // ---- facts decided at the instant of creation: cwd, one more variable, apartness ------
 //
