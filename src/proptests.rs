@@ -2475,6 +2475,66 @@ mod livecfg_whole {
     }
 }
 
+/// **`jsupervise` — three real children, one policy each, and every time a chosen number.**
+///
+/// `examples/std/supervise_demo.jtr` is `std/supervise`'s consumer. The children are the
+/// demo itself re-invoked with an argument (`job` exits 0, `crash` exits 3, `daemon` runs
+/// until killed), started through `sysproc.start_exec` so the handle the supervisor kills is
+/// the program's and not a shell's. The supervisor runs on `time.manual(0)`: the crasher's
+/// exits happen in real time, but every restart is scheduled on the policy clock and the
+/// demo MOVES the clock to each deadline — so 100ms, 300ms and 700ms are what a doubling
+/// backoff from 100ms capped at 400ms computes, not what the machine happened to do. The
+/// third crash is restarted and the fourth, finding three restarts in the window, gives up.
+#[cfg(all(test, feature = "c-oracle"))]
+mod supervise_policy {
+    use super::*;
+
+    #[test]
+    fn jsupervise_restarts_until_the_budget_is_spent() {
+        let exe = super::c_oracle::build_exe("examples/std/supervise_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the supervise demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jsupervise --\n\
+                    -- a daemon that runs until told, and a job that finishes --\n\
+                    t=0ms started #0 daemon\n\
+                    t=0ms started #1 job\n\
+                    t=0ms exited #1 job code=0\n\
+                    job: done, outcome=exited, last code=0, restarts=0, budget exhausted=false\n\
+                    -- a service that crashes: on-failure, 3 restarts in 10s, doubling 100ms capped at 400ms --\n\
+                    t=0ms started #2 crasher\n\
+                    t=0ms exited #2 crasher code=3\n\
+                    next start due at 100ms\n\
+                    clock -> 100ms\n\
+                    t=100ms restarted #2 crasher restart=1\n\
+                    t=100ms exited #2 crasher code=3\n\
+                    next start due at 300ms\n\
+                    clock -> 300ms\n\
+                    t=300ms restarted #2 crasher restart=2\n\
+                    t=300ms exited #2 crasher code=3\n\
+                    next start due at 700ms\n\
+                    clock -> 700ms\n\
+                    t=700ms restarted #2 crasher restart=3\n\
+                    t=700ms exited #2 crasher code=3\n\
+                    t=700ms gave-up #2 crasher restarts=3\n\
+                    crasher: gave-up, outcome=exited, last code=3, restarts=3, budget exhausted=true\n\
+                    -- shutting down --\n\
+                    t=700ms stopped #0 daemon killed=1\n\
+                    killed=1\n\
+                    daemon: stopped, outcome=signalled, signal=9, restarts=0, budget exhausted=false\n\
+                    -- totals --\n\
+                    starts=6 exits=6 gave-ups=1 killed=1 active=0";
+        assert_eq!(out.trim_end(), want, "the supervise demo's transcript changed:\n{out}");
+
+        // Anti-vacuity: the daemon must have been a REAL process that was really killed —
+        // `signalled` with the kill signal, never `exited` — and nothing may be left active,
+        // or a supervisor that lost its child would still print the same restart lines.
+        assert!(out.contains("outcome=signalled, signal=9"), "the daemon must be killed, not found exited:\n{out}");
+        assert!(out.contains("active=0"), "every child must have reached a final phase:\n{out}");
+    }
+}
+
 /// **`jlog` — one logging routine, two renderings, and the log reading itself back.**
 ///
 /// `examples/std/log_demo.jtr` is `std/log`'s consumer. `run_job` is written once and shipped
@@ -20281,6 +20341,12 @@ fn main() -> i32 {
             // secret's change is reported as `**** -> ****` with its text absent, `[server.tls]`
             // flattens to a dotted key a `Section` finds, and a real watcher edit reloads via `step`.
             ("livecfg_test", 7),
+            // **Every test starts REAL children and none lets real time into the policy.**
+            // The supervisor runs on `time.manual(0)` and a second clock is spent only on
+            // waiting for exits, so every deadline, window and backoff asserted is a number
+            // the test chose; the long-runner is really killed, and the two clocks are told
+            // apart by a wait on a manual clock that costs nothing.
+            ("supervise_test", 10),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

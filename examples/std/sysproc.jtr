@@ -1138,3 +1138,165 @@ pub fn wait_or_kill(mut c: Child, mut clk: time.Clock, timeout_nanos: i64) -> St
     release(c)
     return s
 }
+
+// ---- starting a PROGRAM, not a shell line ---------------------------------------------
+//
+// `start` goes through the platform shell, and that is right for a command: it is what
+// `std/process` does and what a caller's string was written for. It is wrong for a
+// SUPERVISED child, for a reason that only shows when the child is killed: the handle
+// this module holds is the SHELL's. `TerminateProcess` on `cmd.exe /c prog` ends `cmd.exe`
+// and leaves `prog` running as an orphan that nothing can reach any more — the very
+// process the supervisor was supposed to be in charge of. (POSIX `sh -c` usually `exec`s
+// a lone simple command in place, so the same call happens to kill the right process
+// there; "usually" is not a contract.)
+//
+// So this starts `path` DIRECTLY, with `args` as its arguments. No shell means no quoting
+// rules: `args` is split on single spaces and nothing else, and an argument containing a
+// space cannot be expressed. A caller who needs the shell's rules has `start`.
+//
+// On POSIX that is `posix_spawn(path, argv, environ)`, the same call `start` makes with
+// `/bin/sh -c` taken out of the middle. On Windows the command line is `"path" args`, and
+// the quotes are safe here where they were not for `start`: it is `cmd.exe` that strips a
+// leading quote pair, and there is no `cmd.exe` on this path — `CreateProcessA` parses a
+// quoted first token exactly as the C runtime will hand it to the child's `argv[0]`.
+//
+// The same capability gate, the same `Child`, the same waits. Only the first step differs.
+
+// How many space-separated words `args` holds. Runs of spaces count as one separator,
+// so `"a  b"` is two words and `""` is none.
+@no_alloc @no_os fn word_count(read args: str) -> usize {
+    var n: usize = 0
+    var in_word: bool = false
+    var i: usize = 0
+    for i < args.len {
+        if args[i] == 32 {
+            in_word = false
+        } else {
+            if in_word == false { n = n + 1 }
+            in_word = true
+        }
+        i = i + 1
+    }
+    return n
+}
+
+@cfg(posix) pub fn start_exec(mut s: Spawner, read path: str, read args: str) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+    if s.allowed == false {
+        s.refused = s.refused + 1
+        return err(SysProcRefused)
+    }
+
+    // argv = { path, word, word, …, NULL }: 64-bit pointer slots, as in `start`. Every
+    // word lives in ONE buffer, NUL-terminated in place, and the slots point into it — so
+    // there is one allocation to give back rather than one per word to remember.
+    let words: usize = word_count(args)
+    var argv: *mut i64 = alloc(i64, words + 2)
+    var pathp: *mut u8 = nul_copy(path)
+    var wbuf: *mut u8 = alloc(u8, args.len + 1)
+    unsafe { (argv + 0).* = pathp as i64 }
+    var slot: usize = 1
+    var n: usize = 0
+    var i: usize = 0
+    for i < args.len {
+        if args[i] != 32 {
+            unsafe { (argv + slot).* = (wbuf + n) as i64 }
+            slot = slot + 1
+            var j: usize = i
+            for j < args.len {
+                if args[j] == 32 { break }
+                unsafe { (wbuf + n).* = args[j] }
+                n = n + 1
+                j = j + 1
+            }
+            unsafe { (wbuf + n).* = 0 }
+            n = n + 1
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    unsafe { (argv + slot).* = 0 }
+
+    var pidp: *mut i64 = alloc(i64, 1)
+    unsafe { (pidp + 0).* = 0 }
+    // `env_block()` for the same reason `start` passes it: a null `envp` reaches `execve`
+    // unchanged and hands the child NOTHING.
+    let rc: i32 = posix_spawn(pidp as cptr, pathp as cptr, null, null, argv as cptr, env_block())
+    var pid: i64 = 0
+    unsafe { pid = (pidp + 0).* }
+    free_ptr(pidp)
+    free_ptr(wbuf)
+    free_ptr(argv)
+    free_ptr(pathp)
+
+    if rc != 0 { return err(SysProcFailed(rc)) }
+
+    s.started = s.started + 1
+    return ok(Child{ h: 0, th: 0, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: SPROC_NO_PIPE, outp: SPROC_NO_PIPE })
+}
+
+@cfg(windows) pub fn start_exec(mut s: Spawner, read path: str, read args: str) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+    if s.allowed == false {
+        s.refused = s.refused + 1
+        return err(SysProcRefused)
+    }
+
+    // `"path" args`, NUL-terminated. One buffer, built by hand: `nul_join` takes a prefix
+    // and a body, and this line has three parts.
+    var line: *mut u8 = alloc(u8, path.len + args.len + 4)
+    var n: usize = 0
+    unsafe { (line + n).* = 34 }
+    n = n + 1
+    var i: usize = 0
+    for i < path.len {
+        unsafe { (line + n).* = path[i] }
+        n = n + 1
+        i = i + 1
+    }
+    unsafe { (line + n).* = 34 }
+    n = n + 1
+    if args.len > 0 {
+        unsafe { (line + n).* = 32 }
+        n = n + 1
+        var k: usize = 0
+        for k < args.len {
+            unsafe { (line + n).* = args[k] }
+            n = n + 1
+            k = k + 1
+        }
+    }
+    unsafe { (line + n).* = 0 }
+
+    var si: *mut u8 = alloc(u8, SPROC_STARTUPINFO_LEN)
+    var pi: *mut u8 = alloc(u8, SPROC_PROCESS_INFO_LEN)
+    zero_bytes(si, SPROC_STARTUPINFO_LEN)
+    zero_bytes(pi, SPROC_PROCESS_INFO_LEN)
+    let sw: *mut u32 = si as *mut u32
+    unsafe { (sw + 0).* = SPROC_STARTUPINFO_LEN as u32 }
+
+    let rc: i32 = CreateProcessA(null, line as cptr, null, null, 0, 0, null, null, si as cptr, pi as cptr)
+    var code: i32 = 0
+    if rc == 0 { code = syserr.last_raw() }
+
+    var h: i64 = 0
+    var th: i64 = 0
+    var pid: i64 = 0
+    if rc != 0 {
+        let ps: *mut i64 = pi as *mut i64
+        unsafe { h = (ps + SPROC_PI_HPROCESS_SLOT).* }
+        unsafe { th = (ps + SPROC_PI_HTHREAD_SLOT).* }
+        let pw: *mut u32 = pi as *mut u32
+        var raw: u32 = 0
+        unsafe { raw = (pw + SPROC_PI_PID_WORD).* }
+        pid = raw as i64
+    }
+
+    free_ptr(pi)
+    free_ptr(si)
+    free_ptr(line)
+
+    if rc == 0 { return err(SysProcFailed(code)) }
+
+    s.started = s.started + 1
+    return ok(Child{ h: h, th: th, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: SPROC_NO_PIPE, outp: SPROC_NO_PIPE })
+}

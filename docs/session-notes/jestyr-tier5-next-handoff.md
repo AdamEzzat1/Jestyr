@@ -512,7 +512,7 @@ done until its count is in that table.
 |---|---|
 | Crypto: HMAC, signing, a hash interface | New modules importing `sha256` read-only. These are BINDINGS, not algorithms to write — `csrand` deliberately invents nothing. |
 | Trace spans | **Pick another word first.** `Span` is taken three times: `http.Header` spans, `diag` source spans, and the `@span` work-span attribute. Use the fn-pointer vtable shape, not a trait — `@no_alloc` passes vacuously through a trait method. |
-| Service supervision / restart policy | The lifecycle is complete; a supervisor over `std/sysproc` is its own module. |
+| ~~Service supervision / restart policy~~ | **DONE: `std/supervise`** — see §2b. |
 | Sandbox: cwd, process groups, fs capability projection | `sysproc.jtr:113` names all three. `fs.Fs` gates the parent; nothing projects it onto a child. |
 | ~~Config: live reload, nesting~~ | **DONE: `std/livecfg`** — see the section below. |
 | Rewrite `std/plugin` as a server on the pipe transport | Tier 4 leftover. One-process-per-call only because the transport did not exist; it does now (`start_piped`/`capture`). |
@@ -625,7 +625,7 @@ CHANGELOG to find it.
 |---|---|---|
 | **Crypto bindings** | HMAC, signing/verification, a hash interface | Bindings over `sha256`/OpenSSL, not algorithms; `std/tls` shows the `extern "openssl/*.h"` shape and the link rule is already in place |
 | ~~**Trace spans**~~ | **DONE: `std/trace`** — see the entry below this table | |
-| **Service supervision** | restart policy over `std/sysproc`, backoff, a supervision tree | the lifecycle (`std/service`) is complete; this is a supervisor OVER children, its own module |
+| ~~**Service supervision**~~ | **DONE: `std/supervise`** (below) | restart policy, budget window, backoff, `stop_all`, events; no tree |
 | **Sandbox** | cwd, process groups, fs capability projection onto a child | `sysproc.jtr:113` names all three; `fs.Fs` gates the parent and nothing projects it |
 | ~~**Config live reload + nesting**~~ | **DONE: `std/livecfg`** (§2 above) | candidate-then-swap; a shadowed file value is not validated; `step`, not `poll` |
 | **`std/plugin` on the pipe transport** | a plugin as a server on `sysproc.start_piped` | Tier 4 leftover; one-process-per-call only because the transport did not exist |
@@ -670,6 +670,43 @@ Plus the layer the breadth pass stopped short of: **the `jc add` command** over
 end to end; the command is the glue), and **request-body streaming** in `httpd` (a request
 must fit the connection buffer today).
 
+### ~~Service supervision~~ — **DONE: `std/supervise`**
+
+A `Supervisor` given a `time.Clock`, a `sysproc.Spawner` and an `Allocator`; a bounded
+struct-of-arrays child table; `Policy` (never/on_failure/always, N restarts in M ns, fixed
+or doubling-capped backoff); `tick`/`poll_for`/`stop_all`; per-child `phase_of`/
+`outcome_of`/`last_code_of`/`restarts_of`/`gave_up`/`due_of`; an event callback. Ten tests
+over REAL children, a pinned demo (`jsupervise`, `examples/std/supervise_demo.jtr`, which
+re-invokes itself as its children), four mutations watched failing, no reseed. What a
+successor should not re-derive:
+
+* **Two clocks.** The supervisor's clock is POLICY time; `poll_for(s, blk, budget)` takes
+  the clock a caller can SPEND. Tests run policy on `time.manual(0)` and wait on
+  `time.host()`; the demo's `t=…ms` lines are all policy time, which is why its transcript
+  is exact.
+* **The budget counts restarts, not exits**, in a ring of `SUP_HIST_CAP` (32) timestamps;
+  `add` refuses `max_restarts` above the ring. N = 0 gives up at the first crash; N < 0 is
+  unlimited; `window_nanos <= 0` means "ever".
+* **A child changes phase at most once per tick**: reap → `SUP_WAITING` with `due = now +
+  delay`, the NEXT tick starts it. A restart is recorded in the window at the time it
+  HAPPENS (the start), not when it was decided.
+* **A doubling delay resets to its base when the run outlasted the window** — the window
+  is the one notion of "stable"; no second number.
+* **A refused start is final** (`SUP_GAVE_UP` + `SUP_OUT_START_FAILED`), never retried.
+* **`stop_all` is `terminate` + `wait_or_kill(…, 0)`** so the child is reaped and released
+  whatever the kill reported; a waiting child is cancelled (`STOPPED` detail 0 vs 1 for a
+  kill). `free` calls it — a supervisor cannot leave orphans behind.
+* **Supervise with `add_exec`, not `add`.** `sysproc.start_exec(path, args)` (new, at the
+  end of `sysproc.jtr`) starts the program DIRECTLY: `TerminateProcess` on `cmd.exe /c
+  prog` kills `cmd.exe` and orphans `prog`. `args` split on single spaces, no quoting.
+* **`import "core"` beside any fallible-fn module fails to type-check**: `core.Result`'s
+  variants `ok`/`err` shadow the intrinsics ("a fallible function must return a result").
+  Recorded as an open gap below; the demo renders numbers with its own digit loop.
+* **Every probe over child processes needs a timeout**; a driver that `poll_for`s on a
+  long-runner spends its whole budget. The test suite's `drive` is for quick children only.
+* Not built: a supervision tree (a tree is a supervisor whose children are supervisors),
+  graceful signal-then-kill shutdown, dependency order, per-child stdout capture.
+
 ### Compiler defects and gaps — OPEN
 
 | id | what | status |
@@ -688,6 +725,7 @@ must fit the connection buffer today).
 | **`check` is quiet on an undeclared bare name** | a typo (`eid` for `id`) passes every front-end check and dies in gcc. | Leniency exists for fn-pointer values and extern symbols; a rule refusing a name found in none of scope/consts/variants/fns/externs/globals is a two-sided `escape` item. |
 | **`alog.jtr` header debt** | `alog.Cursor` is move-only by containment; the header does not say so. | A comment, owed on the next change to that file. |
 | **`std/cstring` has no `cstr` view** | a C string cannot be read back as `str`; `tls.protocol` was dropped for it. | Bind `strlen`, build a slice; small. |
+| **`import "core"` shadows the `ok`/`err` intrinsics** | `core.Result`'s variant constructors `ok(v)`/`err(e)` win over the intrinsics in EVERY module linked beside `core`, so a program importing `core` and any module with a fallible fn (`sysproc.start`) fails `check` with "a fallible function must return a result" at the other module's `return ok(…)`. Found by `supervise_demo` reaching for `core.format_i64`. | No corpus program imports `core` beside a fallible module today (`numbers.jtr` imports `core` + `io` only). Either the variants or the intrinsics have to yield; the intrinsic-shadowing rule (A5) refuses a `pub fn ok` but not an enum VARIANT. Two-sided (`escape`). |
 
 ### Known flake
 

@@ -1,0 +1,243 @@
+// examples/std/supervise_demo.jtr — `jsupervise`, three children and the policy that
+// keeps them: a job that finishes, a service that crashes until its budget is spent, and
+// a daemon that runs until it is told to stop.
+//
+// **The children are this same program, re-invoked.** A bare invocation is the
+// supervisor; `<program> job` exits 0 at once, `<program> crash` exits 3 at once, and
+// `<program> daemon` runs until it is killed (with a one-minute cap, so a supervisor that
+// died mid-demo could not leave it behind for ever). That is `env_inherit_demo`'s pattern
+// and it is chosen for the same reason: one spelling on both platforms, no shell in the
+// way, and nothing the children print — because they print NOTHING, and a child that
+// shared this transcript's stdout would have to.
+//
+// **Every time in the transcript is the policy clock, and the policy clock is manual.**
+// The children exit in real time, and the supervisor is told to wait for that on a second
+// clock it never reads for a decision; the restarts are scheduled at 100ms, 300ms and
+// 700ms because that is what a doubling backoff from 100ms computes, and the demo MOVES
+// the clock there. So `jsupervise_restarts_until_the_budget_is_spent` can assert the whole
+// transcript rather than pattern-match around wall time.
+//
+// Run:  jestyrc run examples/std/supervise_demo.jtr
+
+import "env"
+import "mem"
+import "supervise"
+import "sysproc"
+import "time"
+
+const JS_MS: i64 = 1000000
+// Real time the supervisor may spend waiting for one exit. A child exits in tens of
+// milliseconds; this is slack for a loaded machine, not a timing the transcript shows.
+const JS_WALL_BUDGET: i64 = 10000000000
+const JS_DAEMON_CAP: i64 = 60000000000
+
+// ---- the children -----------------------------------------------------------------
+
+fn run_child(read mode: str) -> i32 {
+    if str_eq(mode, "crash") { return 3 }
+    if str_eq(mode, "daemon") {
+        var clk: time.Clock = time.host()
+        var left: i64 = JS_DAEMON_CAP
+        for left > 0 {
+            left = left - time.wait(clk, 100 * JS_MS)
+        }
+        return 0
+    }
+    return 0
+}
+
+// ---- rendering ---------------------------------------------------------------------
+
+// Append `v`'s decimal digits. Not `core.format_i64`: `core` declares `enum Result { ok, err }`,
+// and its variant constructors collide with the `ok`/`err` intrinsics in every fallible
+// function of every module linked beside it — `sysproc.start` stops type-checking the
+// moment `core` is imported. Every value rendered here is a count, a code or a clock
+// reading, none of them negative.
+fn push_num(mut line: String, v: i64) {
+    if v >= 10 { push_num(line, v / 10) }
+    let d: i64 = v % 10
+    if d == 0 { string_push(line, "0") }
+    if d == 1 { string_push(line, "1") }
+    if d == 2 { string_push(line, "2") }
+    if d == 3 { string_push(line, "3") }
+    if d == 4 { string_push(line, "4") }
+    if d == 5 { string_push(line, "5") }
+    if d == 6 { string_push(line, "6") }
+    if d == 7 { string_push(line, "7") }
+    if d == 8 { string_push(line, "8") }
+    if d == 9 { string_push(line, "9") }
+}
+
+fn push_bool(mut line: String, v: bool) {
+    if v { string_push(line, "true") } else { string_push(line, "false") }
+}
+
+fn name_of(slot: usize) -> str {
+    if slot == 0 { return "daemon" }
+    if slot == 1 { return "job" }
+    return "crasher"
+}
+
+// The event callback. `ctx` points at the time the driver last moved the policy clock to,
+// so every event line carries the clock the supervisor decided on.
+fn on_event(ctx: *mut u8, kind: i32, slot: usize, detail: i32) {
+    let tp: *mut i64 = ctx as *mut i64
+    var t: i64 = 0
+    unsafe { t = (tp + 0).* }
+    var line: String = string_new()
+    string_push(line, "t=")
+    push_num(line, t / JS_MS)
+    string_push(line, "ms ")
+    string_push(line, supervise.event_name(kind))
+    string_push(line, " #")
+    push_num(line, slot as i64)
+    string_push(line, " ")
+    string_push(line, name_of(slot))
+    if kind == supervise.SUP_EV_EXITED {
+        string_push(line, " code=")
+        push_num(line, detail as i64)
+    }
+    if kind == supervise.SUP_EV_RESTARTED {
+        string_push(line, " restart=")
+        push_num(line, detail as i64)
+    }
+    if kind == supervise.SUP_EV_GAVE_UP {
+        string_push(line, " restarts=")
+        push_num(line, detail as i64)
+    }
+    if kind == supervise.SUP_EV_STOPPED {
+        string_push(line, " killed=")
+        push_num(line, detail as i64)
+    }
+    print_str(string_view(line))
+    string_free(line)
+}
+
+// What the supervisor knows about one child, in one line.
+fn report(read s: supervise.Supervisor, slot: usize) {
+    var line: String = string_new()
+    string_push(line, name_of(slot))
+    string_push(line, ": ")
+    string_push(line, supervise.phase_name(supervise.phase_of(s, slot)))
+    string_push(line, ", outcome=")
+    let o: i32 = supervise.outcome_of(s, slot)
+    string_push(line, supervise.outcome_name(o))
+    if o == supervise.SUP_OUT_SIGNALLED {
+        string_push(line, ", signal=")
+    } else {
+        string_push(line, ", last code=")
+    }
+    push_num(line, supervise.last_code_of(s, slot) as i64)
+    string_push(line, ", restarts=")
+    push_num(line, supervise.restarts_of(s, slot))
+    string_push(line, ", budget exhausted=")
+    push_bool(line, supervise.gave_up(s, slot))
+    print_str(string_view(line))
+    string_free(line)
+}
+
+// Move the policy clock to `to` and tell the event lines about it.
+fn clock_to(mut s: supervise.Supervisor, tb: *mut i64, to: i64) {
+    let now: i64 = supervise.now(s)
+    if to > now { supervise.advance(s, to - now) }
+    unsafe { (tb + 0).* = supervise.now(s) }
+    var line: String = string_new()
+    string_push(line, "clock -> ")
+    push_num(line, supervise.now(s) / JS_MS)
+    string_push(line, "ms")
+    print_str(string_view(line))
+    string_free(line)
+}
+
+// ---- the supervisor ------------------------------------------------------------------
+
+fn main() -> i32 {
+    // CHILD MODE: any argument at all. `argc` is 1 for a bare invocation.
+    if env.argc() > 1 { return run_child(env.argv(1)) }
+
+    let a: Allocator = mem.system_allocator()
+    var wall: time.Clock = time.host()
+    var tb: *mut i64 = alloc(i64, 1)
+    unsafe { (tb + 0).* = 0 }
+    var s: supervise.Supervisor = supervise.make(a, time.manual(0), sysproc.host(), 3)
+    supervise.set_events(s, tb as *mut u8, &on_event)
+    let me: str = env.program()
+
+    print_str("-- jsupervise --")
+
+    // ---- a daemon and a job ----------------------------------------------------------
+    //
+    // The daemon first, so that it is running under every line that follows: the point of
+    // a supervisor is what it does WHILE things run, and the job's exit is the only exit
+    // that can happen here, which is what keeps the transcript exact.
+    print_str("-- a daemon that runs until told, and a job that finishes --")
+    supervise.add_exec(s, me, "daemon", supervise.never())
+    supervise.add_exec(s, me, "job", supervise.never())
+    supervise.tick(s)
+    var rounds: i64 = 0
+    for supervise.phase_of(s, 1) != supervise.SUP_DONE {
+        if rounds >= 20 { break }
+        supervise.poll_for(s, wall, JS_WALL_BUDGET)
+        rounds = rounds + 1
+    }
+    report(s, 1)
+
+    // ---- a service that crashes -------------------------------------------------------
+    //
+    // Three restarts in ten seconds, doubling from 100ms and capped at 400ms. The crash is
+    // reaped on real time; the restart is scheduled on the policy clock, and the driver
+    // moves the clock to the deadline — that is the pair of lines before every restart.
+    print_str("-- a service that crashes: on-failure, 3 restarts in 10s, doubling 100ms capped at 400ms --")
+    let base: supervise.Policy = supervise.policy(supervise.SUP_ON_FAILURE, 3, 10000 * JS_MS, 100 * JS_MS)
+    supervise.add_exec(s, me, "crash", supervise.doubling(base, 400 * JS_MS))
+    supervise.tick(s)
+    rounds = 0
+    for supervise.active(s) > 1 {
+        if rounds >= 20 { break }
+        if supervise.running(s) > 1 { supervise.poll_for(s, wall, JS_WALL_BUDGET) }
+        let nd: i64 = supervise.next_deadline(s)
+        if nd >= 0 {
+            var line: String = string_new()
+            string_push(line, "next start due at ")
+            push_num(line, nd / JS_MS)
+            string_push(line, "ms")
+            print_str(string_view(line))
+            string_free(line)
+            clock_to(s, tb, nd)
+            supervise.tick(s)
+        }
+        rounds = rounds + 1
+    }
+    report(s, 2)
+
+    // ---- shutting down ------------------------------------------------------------------
+    print_str("-- shutting down --")
+    // The count is taken BEFORE it is printed: the STOPPED event fires inside `stop_all`,
+    // and a line split around the call would have the event land in the middle of it.
+    let k: i64 = supervise.stop_all(s)
+    var kl: String = string_new()
+    string_push(kl, "killed=")
+    push_num(kl, k)
+    print_str(string_view(kl))
+    string_free(kl)
+    report(s, 0)
+
+    print_str("-- totals --")
+    var tot: String = string_new()
+    string_push(tot, "starts=")
+    push_num(tot, supervise.starts(s))
+    string_push(tot, " exits=")
+    push_num(tot, supervise.exits(s))
+    string_push(tot, " gave-ups=")
+    push_num(tot, supervise.gave_ups(s))
+    string_push(tot, " killed=")
+    push_num(tot, supervise.killed(s))
+    string_push(tot, " active=")
+    push_num(tot, supervise.active(s) as i64)
+    print_str(string_view(tot))
+    string_free(tot)
+
+    supervise.free(s)
+    free_ptr(tb)
+    return 0
+}
