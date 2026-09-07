@@ -2214,6 +2214,114 @@ mod plugin_protocol {
     }
 }
 
+/// **`jplugin` — one plugin process, many calls, and every way it can let the host down.**
+///
+/// The server-mode counterpart of `jhost`: it compiles `plugin_echo.jtr` and hands its path to
+/// `plugin_server_demo.jtr`, which CONNECTS once and talks to it over its pipes. The plugin
+/// numbers its answers (`#0`, `#1`, `#2`, …), which is how the transcript proves one process
+/// answered them all — and why a fresh connection after the kill answers `#0` again.
+///
+/// The line that matters most is the hex dump: a payload holding `\r`, `\n`, a NUL and two
+/// bytes that are not UTF-8 goes to the plugin and comes back byte for byte. On Windows the
+/// C runtime's text-mode stdout would have turned the `0a` into `0d 0a` on the way back; the
+/// frames never pass through it (`std/sysstdio`), and this is the test of that claim — the
+/// trap A4 records, exercised rather than assumed.
+///
+/// Then the failures, told apart: an ERROR frame (`failed`, code 5, the connection still up
+/// and answering `#5` next), prose on the stream (`bad-response`, connection down), a plugin
+/// that sleeps past its budget (`timed-out`, killed, the host still standing), and a denied
+/// spawner (`refused`, nothing started).
+///
+/// **The timeout is staged in two steps and the test asserts the order**, because a single
+/// budget cannot be both a tolerance and a timeout. Every connection here opens with twenty
+/// seconds, which no healthy call approaches; the sleeping one first ANSWERS (`#0 AWAKE?`),
+/// which is what establishes that the process is up, and only then is the budget tightened
+/// to 400ms and the nap requested. Sized the other way — one budget short enough to fire —
+/// this transcript was a coin flip: a cold start through `cmd.exe` costs 75–120ms here with
+/// a 485ms outlier over 120 starts, and a 300ms budget lost about one run in fifteen on an
+/// idle machine.
+///
+/// The demo takes about three seconds, and none of it is waiting: `terminate` reaches the
+/// `cmd.exe` that `start_piped` started rather than the plugin under it, so the sleeper is
+/// orphaned holding the demo's inherited stdout, and `Command::output` below sees no EOF
+/// until its three-second nap ends. The transcript is complete long before that.
+#[cfg(all(test, feature = "c-oracle"))]
+mod plugin_server {
+    use super::*;
+
+    #[test]
+    fn jplugin_keeps_one_plugin_and_survives_it() {
+        let echo = super::c_oracle::build_exe("examples/std/plugin_echo.jtr");
+        let host = super::c_oracle::build_exe("examples/std/plugin_server_demo.jtr");
+        let run = std::process::Command::new(&host).arg(&echo).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the host must exit cleanly whatever the plugin does");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jplugin --\n\
+                    connected\ntrue\n\
+                    -- the first call --\n\
+                    ok\n#0 HELLO FROM THE HOST\n\
+                    -- the second --\n\
+                    ok\n#1 THE SAME PROCESS?\n\
+                    -- the third --\n\
+                    ok\n#2 STILL\n\
+                    -- a payload with CR, LF, NUL and bytes that are not UTF-8 --\n\
+                    ok\n\
+                    23 33 20 41 0d 0a 42 00 43 ff fe\n\
+                    byte for byte\ntrue\n\
+                    -- a plugin that reports its own error --\n\
+                    failed\ncode\n5\nthe plugin cannot do this\n\
+                    still up\ntrue\n\
+                    -- and the same process answers the next call --\n\
+                    ok\n#5 AFTER THE ERROR\n\
+                    -- a plugin that writes prose instead of a frame --\n\
+                    bad-response\n\
+                    still up\nfalse\n\
+                    -- a call on a connection that is over --\n\
+                    down\n\
+                    first connection: calls, failures\n8\n3\n\
+                    -- a second plugin, answering normally --\n\
+                    ok\n#0 AWAKE?\n\
+                    budget now, in ms\n400\n\
+                    -- and then sleeping past the tightened budget --\n\
+                    timed-out\n\
+                    the plugin was killed\ntrue\n\
+                    the host is still standing\ntrue\n\
+                    -- a fresh connection after the kill --\n\
+                    ok\n#0 A NEW PROCESS\n\
+                    -- hung up --\n\
+                    exited\n0\n\
+                    down now\ntrue\n\
+                    -- a host with no permission --\n\
+                    refused\n\
+                    nothing was started\ntrue\n\
+                    -- the books --\n\
+                    processes started\n3";
+        assert_eq!(out.trim_end(), want, "the plugin server demo's transcript changed:\n{out}");
+
+        // **The outcomes must be different WORDS.** A regression that collapsed any two
+        // would still produce a plausible transcript, so each is required to appear.
+        for verdict in ["ok", "failed", "bad-response", "timed-out", "down", "refused"] {
+            assert!(out.contains(&format!("\n{verdict}\n")), "outcome `{verdict}` is missing:\n{out}");
+        }
+        // The hostile payload's `0a` must come back as `0a`, not `0d 0a` — the text-mode
+        // trap, exercised. The `0d 0a` that IS there is the `\r\n` the payload carried.
+        assert!(out.contains("41 0d 0a 42 00 43 ff fe"), "the hostile payload did not round-trip:\n{out}");
+        assert!(!out.contains("0d 0d 0a"), "a text-mode stream doubled the CR:\n{out}");
+        // One process: the counter climbs across calls, and a new connection restarts it.
+        assert_eq!(out.matches("\n#0 ").count(), 3, "exactly three processes answered a first call:\n{out}");
+        // **The timing-out call is preceded by an answer from the same connection.** That is
+        // what makes `timed-out` a claim about the plugin: a budget large enough to cover a
+        // cold process start cannot also be a timeout, and one small enough to be a timeout
+        // fires on healthy plugins until the process is known to be up. The demo hears from
+        // it, tightens to 400ms with `set_budget`, and only then asks it to sleep.
+        let awake = out.find("#0 AWAKE?").expect("the second plugin must answer before it is timed:\n{out}");
+        let timed = out.find("\ntimed-out\n").expect("the timeout line is missing");
+        assert!(awake < timed, "the timeout must follow an answer from the same connection:\n{out}");
+        assert!(!out.contains("crashed"), "nothing in this transcript crashes:\n{out}");
+    }
+}
+
 /// **`jledger` — a log that crashes itself and says what it lost.**
 ///
 /// `examples/std/alog_demo.jtr` is `std/alog`'s consumer, and it is a consumer rather than an
@@ -18750,6 +18858,12 @@ fn main() -> i32 {
         "plugin_test.jtr",
         "plugin_echo.jtr",
         "plugin_demo.jtr",
+        // `sysstdio.jtr` binds `GetStdHandle`/`ReadFile`/`WriteFile` against `read`/`write`
+        // behind `@cfg`, so `every_cfg_bearing_corpus_file_is_byte_identity_verified`
+        // requires it. `plugin_server_demo.jtr` has no `@cfg` and holds a `plugin.Conn`
+        // as a scope-local (another module's struct), so it is gated by
+        // `jc_build_matrix` and its transcript test instead.
+        "sysstdio.jtr",
         "http.jtr",
         "tar.jtr",
         "tar_test.jtr",
@@ -20040,11 +20154,14 @@ fn main() -> i32 {
             // costs a second implementation of the frame and buys an independent encoder: a
             // test that corrupts a file the module wrote can only ever agree with the module.
             ("alog_test", 6),
-            // The frame and the refusals that happen before a process starts. The END-TO-END
-            // half — a real plugin, really invoked, failing three different ways — is
-            // `jhost_survives_every_way_a_plugin_can_fail`, because it needs a COMPILED
-            // plugin and a `.jtr` suite cannot build one.
-            ("plugin_test", 4),
+            // The frame and the refusals that happen before a process starts, plus the
+            // SERVER-MODE host against real children that are not plugins — `exit 3`,
+            // `exit 0`, a line of prose, a sleep past a manual-clock budget, an NTSTATUS
+            // exit — each told apart by name. The END-TO-END halves — a real plugin,
+            // really invoked — are `jhost_survives_every_way_a_plugin_can_fail` (one-shot)
+            // and `jplugin_keeps_one_plugin_and_survives_it` (server), because they need a
+            // COMPILED plugin and a `.jtr` suite cannot build one.
+            ("plugin_test", 10),
             // **Most of this suite is adversarial**, which is the right shape for an HTTP
             // parser: the ordinary cases are easy and every implementation gets them right,
             // and the vulnerabilities are all in messages that are well-formed and mean two

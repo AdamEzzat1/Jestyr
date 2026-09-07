@@ -1,25 +1,39 @@
-// examples/std/plugin_echo.jtr — the other side of the protocol: a real plugin.
+// examples/std/plugin_echo.jtr — the other side of the protocol: a real plugin, in both modes.
 //
-// A plugin's whole contract is three lines long:
+// **Started with no arguments it is a SERVER**: `plugin.serve` reads framed requests from its
+// stdin and writes framed responses to its stdout until the host hangs up. That is the
+// primary shape, and the whole plugin is the `answer` handler below plus one call.
 //
-//   1. read the request the host wrote,
-//   2. write a response,
-//   3. exit 0 IF AND ONLY IF a valid response is waiting.
+// **Started with two arguments it is a ONE-SHOT plugin**: read the request file, write the
+// response file, exit 0 IF AND ONLY IF a valid response is waiting. Rule 3 is the one that
+// matters there: the host reads an exit code of 0 as a promise, so every path that does not
+// leave a good response behind must exit non-zero — a bad frame, an unknown protocol
+// version, a failed write. A plugin that exits 0 having written nothing is the
+// `PLUGIN_BAD_RESPONSE` case, and it is the plugin's bug, not the host's.
 //
-// Rule 3 is the one that matters and the one this file exists to demonstrate. The host reads
-// an exit code of 0 as a promise, so every path that does not leave a good response behind
-// must exit non-zero — a bad frame, an unknown protocol version, a failed write. A plugin that
-// exits 0 having written nothing is the `PLUGIN_BAD_RESPONSE` case, and it is the plugin's
-// bug, not the host's.
+// In both modes the work is the same — upper-case the ASCII in the payload — and the
+// directives are the same words, so a host can see the same plugin misbehave the same way
+// through either transport:
 //
-// This one upper-cases its payload, and understands one directive: a payload beginning with
-// `!fail` makes it report an error the way a real plugin reports one it can describe.
+//   `!fail`    report an error the plugin can describe (an exit code, or an error frame)
+//   `!silent`  MISBEHAVE: exit 0 without answering (one-shot), or answer with prose instead of
+//              a frame (server) — the bad-response case, which no well-behaved plugin shows
+//   `!sleep`   stop answering for three seconds — longer than any budget a demo sets
+//   `!die`     exit mid-call with code 7, without answering
 //
-// Invoked as:  plugin_echo <request-path> <response-path>
+// In server mode every answer is prefixed with `#<n> ` — the number of requests this process
+// answered before this one — so a host can prove it is talking to ONE process. Payloads are
+// bytes, not text: the upper-casing touches ASCII letters and leaves every other byte alone,
+// which is what lets the host's hostile payload come back exactly.
+//
+// Invoked as:  plugin_echo                                (server)
+//              plugin_echo <request-path> <response-path> (one-shot)
 
 import "plugin"
+import "sysstdio"
 import "env"
 import "mem"
+import "time"
 
 const ECHO_CAP: usize = 4096
 
@@ -30,13 +44,85 @@ const ECHO_EXIT_BAD_FRAME: i32 = 3
 const ECHO_EXIT_BAD_VERSION: i32 = 4
 const ECHO_EXIT_WORK_FAILED: i32 = 5
 const ECHO_EXIT_WRITE_FAILED: i32 = 6
+const ECHO_EXIT_DIED: i32 = 7
+
+// How long `!sleep` sleeps. **Bounded from both sides, and the upper bound is the surprising
+// one.** It must comfortably outlast the budget of the call that means to time out —
+// `plugin_server_demo` tightens to 400ms first, so three seconds is over seven times that.
+// It must also be SHORT, because this is what a killed plugin costs its host in wall time:
+// `terminate` reaches `cmd.exe`, not this process, so a napping plugin is orphaned rather
+// than killed — and it was started with the host's own stdout among its inherited handles,
+// so anything CAPTURING the host's output (a shell's `$(…)`, the transcript test's
+// `Command::output`) waits for this nap to end before it sees end-of-file. A ten-second nap
+// made a two-second demo take ten seconds to read.
+const ECHO_NAP_NANOS: i64 = 3000000000
 
 fn main() -> i32 {
-    let a: Allocator = mem.system_allocator()
+    if env.argc() < 2 { return serve_forever() }
     if env.argc() < 3 { return ECHO_EXIT_BAD_ARGS }
-    let req_path: str = env.argv(1)
-    let resp_path: str = env.argv(2)
+    return answer_once(env.argv(1), env.argv(2))
+}
 
+// ---- server mode ---------------------------------------------------------------------
+
+fn serve_forever() -> i32 {
+    var nothing: *mut u8 = alloc(u8, 1)
+    let code: i32 = plugin.serve(nothing, &answer, ECHO_CAP)
+    free_ptr(nothing)
+    return code
+}
+
+// One request, answered. The `Served` carries the count in and the response length out.
+fn answer(ctx: *mut u8, read req: []u8, mut resp: []u8, mut s: plugin.Served) -> i32 {
+    if starts(req, req.len, "!fail") {
+        s.len = load(resp, "the plugin cannot do this")
+        return ECHO_EXIT_WORK_FAILED
+    }
+    if starts(req, req.len, "!silent") {
+        // **Misbehaving on purpose**: prose on the frame stream, which is what a plugin that
+        // logged to stdout would do. The host must see a bad response, not a hang.
+        var raw: *mut u8 = alloc(u8, 32)
+        var line: []u8 = slice(u8, raw, 32)
+        let n: usize = load(line, "oops, not a frame\n")
+        sysstdio.write_stdout_all(line[0 .. n])
+        free_ptr(raw)
+        s.len = 0
+        return 0
+    }
+    if starts(req, req.len, "!sleep") {
+        var clk: time.Clock = time.host()
+        time.wait(clk, ECHO_NAP_NANOS)
+        s.len = load(resp, "awake")
+        return 0
+    }
+    if starts(req, req.len, "!die") {
+        // Straight out, mid-call, no answer. `serve` never returns, so this is the plugin's
+        // own exit and the host sees the code.
+        die(ECHO_EXIT_DIED)
+        return 0
+    }
+    // `#<n> ` then the payload, upper-cased where it is ASCII and untouched elsewhere.
+    var n: usize = 0
+    resp[n] = 35 as u8              // #
+    n = n + 1
+    n = n + put_count(resp, n, s.count)
+    resp[n] = 32 as u8              // space
+    n = n + 1
+    var i: usize = 0
+    for i < req.len {
+        if n >= resp.len { break }
+        resp[n] = upper(req[i])
+        n = n + 1
+        i = i + 1
+    }
+    s.len = n
+    return 0
+}
+
+// ---- one-shot mode -------------------------------------------------------------------
+
+fn answer_once(read req_path: str, read resp_path: str) -> i32 {
+    let a: Allocator = mem.system_allocator()
     var raw: *mut u8 = alloc(u8, ECHO_CAP)
     var buf: []u8 = slice(u8, raw, ECHO_CAP)
     var status: i32 = 0
@@ -71,8 +157,7 @@ fn main() -> i32 {
     // The work: upper-case ASCII in place.
     var i: usize = 0
     for i < len {
-        let ch: i32 = buf[i] as i32
-        if ch >= 97 and ch <= 122 { buf[i] = (ch - 32) as u8 }
+        buf[i] = upper(buf[i])
         i = i + 1
     }
 
@@ -84,6 +169,14 @@ fn main() -> i32 {
     return 0
 }
 
+// ---- helpers -------------------------------------------------------------------------
+
+fn upper(b: u8) -> u8 {
+    let ch: i32 = b as i32
+    if ch >= 97 and ch <= 122 { return (ch - 32) as u8 }
+    return b
+}
+
 // Does the first `len` bytes of `buf` begin with `pre`?
 fn starts(read buf: []u8, len: usize, read pre: str) -> bool {
     if len < pre.len { return false }
@@ -92,3 +185,35 @@ fn starts(read buf: []u8, len: usize, read pre: str) -> bool {
     }
     return true
 }
+
+fn load(mut buf: []u8, read text: str) -> usize {
+    for i in 0..text.len {
+        buf[i] = text[i]
+    }
+    return text.len
+}
+
+// Decimal digits of `v` at `buf[at ..]`; returns how many.
+fn put_count(mut buf: []u8, at: usize, v: i64) -> usize {
+    if v == 0 {
+        buf[at] = 48 as u8
+        return 1
+    }
+    var digits: usize = 0
+    var t: i64 = v
+    for t > 0 {
+        digits = digits + 1
+        t = t / 10
+    }
+    var k: usize = digits
+    var w: i64 = v
+    for k > 0 {
+        buf[at + k - 1] = ((w % 10) as i32 + 48) as u8
+        w = w / 10
+        k = k - 1
+    }
+    return digits
+}
+
+// Leave, now, with `code`: the process's own exit, from inside the handler.
+extern "stdlib.h" fn die = "exit"(code: i32)

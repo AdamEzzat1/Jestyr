@@ -97,6 +97,7 @@ BUILD_OK parser_cli
 BUILD_OK path_demo
 BUILD_OK plugin_demo
 BUILD_OK plugin_echo
+BUILD_OK plugin_server_demo
 BUILD_OK process_demo
 BUILD_OK reductions
 BUILD_OK runtime_demo

@@ -1,7 +1,9 @@
 // std/plugin.jtr — calling code you did not compile, and surviving it.
 //
-// TIER: `std`. It composes `std/process` (spawning), `std/file` (the messages) and
-// `std/alog`'s checksum; it binds nothing itself.
+// TIER: `sys`. The server mode composes `std/sysproc` (a child beside its parent, with
+// pipes), `std/sysstdio` (the plugin's own streams) and `std/time` (the budget); the
+// one-shot mode composes `std/process`, `std/file` and `std/fs`. The frame uses `std/alog`'s
+// checksum. It binds nothing itself.
 //
 // ─── What a plugin protocol is FOR ────────────────────────────────────────────
 //
@@ -9,48 +11,102 @@
 // crashes, hangs on a null pointer, or corrupts its heap must not take the host with it. An
 // in-process plugin is a dynamic library and shares the host's fate.
 //
-// So the value of this module is not the calling — it is the FAILURE TAXONOMY. Four things can
-// go wrong and they have four different fixes, which is why they are four different answers
-// rather than one `bool`:
+// So the value of this module is not the calling — it is the FAILURE TAXONOMY. Things can go
+// wrong in several different ways and they have different fixes, which is why they are
+// different answers rather than one `bool`:
 //
 //   PLUGIN_OK            the plugin answered
-//   PLUGIN_FAILED        it ran and reported an error itself (its own exit code)
+//   PLUGIN_FAILED        it ran and reported an error itself (its own code)
 //   PLUGIN_CRASHED       it did not exit normally, or could not be started at all
-//   PLUGIN_BAD_RESPONSE  it exited 0 and what it wrote is not a valid response
+//   PLUGIN_BAD_RESPONSE  what it wrote is not a valid response, or it wrote nothing
+//   PLUGIN_REFUSED       the capability said no; nothing ran
+//   PLUGIN_TIMED_OUT     it did not answer within the budget and was killed
+//   PLUGIN_DOWN          the connection is over — a previous call killed it, or `hangup` did
 //
 // Collapsing those is what makes plugin systems miserable to debug. `PLUGIN_BAD_RESPONSE` in
 // particular is the one everybody forgets: a plugin that exits 0 having written nothing, or
 // half a message, or a message for a protocol version it invented, has FAILED — and an exit
 // code of 0 says it succeeded.
 //
-// ─── The transport, and the limitation that chose it ──────────────────────────
+// ─── The transport: a SERVER on a pipe, and the one-shot mode it replaces ─────
 //
-// **One request, one response, one process per call.** The host writes a request file, runs
-// the plugin with both paths as arguments, and reads the response file.
+// **The primary API is a long-lived plugin: one process, many requests.** `connect` starts the
+// plugin with `sysproc.start_piped` and keeps it; `call` writes one framed request to its
+// stdin and reads one framed response from its stdout; `hangup` closes its input, drains,
+// and waits. On the plugin's side `serve` is the loop a plugin's `main` runs: read a request,
+// call the handler, write the response, until EOF. The cost of a process start is paid once
+// per connection rather than once per call, and — the part that matters more — the host now
+// has a moment in which to change its mind: a plugin that does not answer inside the budget
+// is killed and the call says so. Under `system()` there was no such moment, and the old
+// header recorded "no timeouts" as a genuine hole. `std/sysproc` is what closed it.
 //
-// That is not the design anyone would pick first. A long-lived plugin server — one process,
-// many requests, streaming — is better in every way except that **it cannot be built on what
-// this tree has.** `std/process` runs commands through `system()`, which BLOCKS until the child
-// exits, so a host can never both run a plugin and talk to it. The loopback-socket design
-// `std/sysnet` would otherwise support needs a child running CONCURRENTLY with its parent, and
-// that needs `posix_spawn`/`CreateProcess` — a real `sys` module, not a wrapper. Named here as
-// the unblocker rather than worked around.
+// **The one-shot mode is kept** — `call_once` with two file paths, `read_request`/
+// `write_response` on the plugin's side — because it is a different trade, not an older
+// version of the same one: a plugin invoked once per event the way a `git` hook or a linter
+// is, written against `std/file` alone, with no server loop to get wrong. The two share the
+// frame, the checksum and the outcome names, so a host can move a plugin from one to the
+// other without re-learning what its answers mean. (It was `call`; the plain name went to
+// the primary API, and Jestyr has no overloading.)
 //
-// So the cost is a process start per call, which is real: a plugin invoked per source file in
-// a build is paying milliseconds each time. That is the trade this shape makes, and it is the
-// same one `git` hooks and most linter plugins make.
+// ─── Framing over the pipe: length-prefixed BINARY, on raw handles ────────────
 //
-// **Paths as ARGUMENTS, not shell redirection.** `plugin < req > resp` works in both `cmd.exe`
-// and `sh`, and it was still not chosen: the plugin would then have to read stdin, and nothing
-// in this tree can — `std/file` opens paths. Arguments keep the plugin side writable in Jestyr
-// with the modules that exist.
+// The frame below is written to the pipe exactly as it is written to a file: header,
+// payload, checksum trailer, no escaping. That is a deliberate choice against the recorded
+// trap (A4): on Windows the C runtime's `stdout` is in TEXT mode and turns every `\n` into
+// `\r\n`, which corrupts any binary frame that goes through `print_*`. The two ways out are
+// a text-safe framing — newline-delimited, payload hex-encoded, which doubles every byte
+// and still needs a raw stdin reader that did not exist — or bytes that never pass through
+// the C runtime's text layer at all. `std/sysstdio` is the second: it reads and writes the OS
+// handles directly (`ReadFile`/`WriteFile` on Windows, `read`/`write` on POSIX), and those
+// have no text mode to switch. Nothing is escaped because nothing needs to be, and the
+// deciding property is TESTED rather than assumed: `jplugin` sends a payload holding `\r`,
+// `\n`, a NUL and bytes that are not UTF-8 through a real plugin and gets it back byte for
+// byte. Payloads are `[]u8` throughout, never `String` — `from_utf8` traps on the bytes this
+// protocol must carry.
+//
+// **A plugin serving frames must not print to stdout.** `print_str` and `sysstdio` are two
+// doors onto one descriptor, and the C runtime's buffering decides the order. `eprint_str`
+// is fine: stderr is a different descriptor in the plugin even when the host has merged the
+// two into one pipe — in which case the diagnostic lands in the frame stream and the host
+// reports `PLUGIN_BAD_RESPONSE`, which is the honest answer to a plugin that talked out of
+// turn.
+//
+// ─── The budget, and what a timeout really kills ──────────────────────────────
+//
+// A call's budget is spent on a `time.Clock` the host was given, so a test can drive it with
+// `time.manual()` and a hung plugin costs no real seconds. The host never blocks in a read it
+// might not return from: it asks `sysproc.output_ready` first, sleeps a slice of the budget
+// when the answer is no, and when the budget is gone it terminates the child, reaps it and
+// reports `PLUGIN_TIMED_OUT`. The connection is then DOWN — a plugin that stopped answering
+// mid-stream cannot be resynchronised — and the host reconnects if it wants more.
+//
+// **The budget is `set_budget`-able for one reason, and it was measured rather than
+// guessed.** The FIRST call on a connection pays for the child's start — 75–120ms through
+// `cmd.exe` here, with a 485ms outlier over 120 starts — while every call after it is a warm
+// round trip on a pipe and answers in under a millisecond. One number cannot be both a
+// tolerance for the first and a timeout for the rest: sized for the start it never fires,
+// and sized for the round trip it fires on healthy plugins. So a host connects with a roomy
+// budget, hears from the plugin once, and tightens. A timeout that trips only after the
+// plugin has been heard from is evidence about the plugin; one that can trip on a cold start
+// is evidence about the machine.
+//
+// What `terminate` reaches is the child `start_piped` started, and on Windows that is
+// `cmd.exe`, not the plugin under it: the shell does not `exec`. The plugin is orphaned
+// with its stdin closed; a well-behaved server exits at that EOF, a wedged one lives until
+// it is not wedged. Killing the whole tree needs a process group or a Job object, which
+// `sysproc` does not have (its header says so) — recorded here rather than pretended.
+//
+// The budget bounds READS. A request larger than the pipe's buffer (~64KB on Windows, 4KB on
+// Linux) sent to a plugin that is not reading blocks in `write_all` with no budget at all;
+// `PLUGIN_MAX_PAYLOAD` is the frame's limit, not the pipe's. Bounding the write needs a
+// writable-readiness query that `sysproc` does not offer.
 //
 // ─── The message frame ────────────────────────────────────────────────────────
 //
-//     offset 0      (4 bytes)  magic   "JPL1", so a file that is not a message is refused
+//     offset 0      (4 bytes)  magic   "JPL1", so a stream that is not a message is refused
 //                                      before its length is believed
 //     offset 4      (2 bytes)  version protocol version, LITTLE-ENDIAN
-//     offset 6      (2 bytes)  kind    request or response
+//     offset 6      (2 bytes)  kind    request, response, or error
 //     offset 8      (4 bytes)  len     payload length, LITTLE-ENDIAN
 //     offset 12     (len)      payload
 //     offset 12+len (4 bytes)  crc     CRC-32 of everything before it
@@ -64,7 +120,17 @@
 //
 // **The magic is first and is checked first**, because everything after it is only meaningful
 // if this is a message at all. Without it, a truncated file of zeroes parses as a
-// version-0 message of length 0 and passes its checksum.
+// version-0 message of length 0 and passes its checksum. On a STREAM it does one more job:
+// the header is read before the payload, so the length is believed only once the magic is
+// right, and a plugin that wrote prose instead of a frame is refused after twelve bytes
+// rather than after a four-gigabyte read.
+//
+// **An ERROR frame is how a server-mode plugin fails without dying.** In one-shot mode a
+// plugin reports an error with its exit code; a server has no exit code to give per call, so
+// it answers with `PLUGIN_KIND_ERROR` — the first four bytes of the payload its own code,
+// little-endian, the rest a message — and stays alive. The host reports `PLUGIN_FAILED`
+// with that code in `exit_code` and the message in the response buffer, so the same field
+// means "the plugin's own code" in both modes.
 //
 // **The checksum is `alog.crc32`**, deliberately reused rather than reimplemented: two CRC
 // implementations in one tree is two places to be wrong about one question, and that one is
@@ -77,7 +143,7 @@
 // ─── Version negotiation, and why it is a REFUSAL and not a fallback ──────────
 //
 // The request carries `PLUGIN_VERSION`. A plugin that does not know that version must refuse —
-// `read_request` returns `PLUGIN_BAD_VERSION` and the plugin is expected to exit non-zero
+// `read_request` returns `PLUGIN_BAD_VERSION`, `serve` exits with `PLUGIN_EXIT_BAD_VERSION` —
 // rather than answer.
 //
 // It is not a negotiation, and that is a decision: a plugin that "does its best" with a
@@ -86,13 +152,15 @@
 //
 // ─── What this does NOT do ────────────────────────────────────────────────────
 //
-// No timeouts. `system()` blocks, and there is no way to interrupt it from here — a plugin that
-// hangs hangs the host, which is a genuine hole and the second reason to want a real spawn.
-// No streaming, no concurrent calls, no plugin-initiated messages, and no sandbox: a plugin is
-// a program running with the host's privileges. `process.denied()` refuses to run anything at
-// all, which is the only enforcement this tier has.
+// No concurrent calls on one connection (a call is a request then its response, in turn), no
+// plugin-initiated messages, no streaming payloads, and no sandbox: a plugin is a program
+// running with the host's privileges. `sysproc.denied()` and `process.denied()` refuse to run
+// anything at all, which is the only enforcement this tier has. `serve` reads stdin and
+// nothing else, so a plugin cannot be a server AND take arguments for its work — the
+// arguments it was started with are the configuration it gets.
 //
-// Worked example:  examples/std/plugin_demo.jtr (host) + examples/std/plugin_echo.jtr (plugin)
+// Worked example:  examples/std/plugin_server_demo.jtr (host) + examples/std/plugin_echo.jtr
+//                  (plugin, both modes); examples/std/plugin_demo.jtr (the one-shot host)
 // Run the tests:   jestyrc test examples/std/plugin_test.jtr
 
 import "alog"
@@ -100,6 +168,9 @@ import "file"
 import "fs"
 import "process"
 import "str"
+import "sysproc"
+import "sysstdio"
+import "time"
 
 // ---- the frame ------------------------------------------------------------------
 
@@ -110,29 +181,47 @@ pub const PLUGIN_MAX_PAYLOAD: usize = 4194304
 
 pub const PLUGIN_KIND_REQUEST: i64 = 1
 pub const PLUGIN_KIND_RESPONSE: i64 = 2
+pub const PLUGIN_KIND_ERROR: i64 = 3       // a server-mode plugin's own failure, with its code
 
 // ---- what a call can answer ------------------------------------------------------
 //
-// Four, because there are four different fixes. See the header.
+// Seven, because there are seven different fixes. See the header.
 
 pub const PLUGIN_OK: i32 = 0
 pub const PLUGIN_FAILED: i32 = 1           // it ran and reported an error itself
 pub const PLUGIN_CRASHED: i32 = 2          // did not exit normally, or never started
-pub const PLUGIN_BAD_RESPONSE: i32 = 3     // exited 0 and wrote something unusable
+pub const PLUGIN_BAD_RESPONSE: i32 = 3     // wrote something unusable, or nothing
 pub const PLUGIN_REFUSED: i32 = 4          // the capability said no
+pub const PLUGIN_TIMED_OUT: i32 = 5        // did not answer in the budget; killed
+pub const PLUGIN_DOWN: i32 = 6             // the connection is over; reconnect
 
 @no_alloc @no_os pub fn outcome_name(o: i32) -> str {
     if o == PLUGIN_OK { return "ok" }
     if o == PLUGIN_FAILED { return "failed" }
     if o == PLUGIN_CRASHED { return "crashed" }
     if o == PLUGIN_BAD_RESPONSE { return "bad-response" }
-    return "refused"
+    if o == PLUGIN_REFUSED { return "refused" }
+    if o == PLUGIN_TIMED_OUT { return "timed-out" }
+    if o == PLUGIN_DOWN { return "down" }
+    return "unknown"
 }
 
 // What a plugin's `read_request` reports.
 pub const PLUGIN_REQ_OK: i32 = 0
 pub const PLUGIN_BAD_FRAME: i32 = 1        // not a message, or corrupt
 pub const PLUGIN_BAD_VERSION: i32 = 2      // a version this plugin does not know
+
+// What `serve` returns, for the plugin's `main` to return. Distinct numbers so a host — or a
+// person reading a log — can tell which refusal ended the server without a response to read.
+pub const PLUGIN_EXIT_OK: i32 = 0          // the host hung up between frames
+pub const PLUGIN_EXIT_BAD_FRAME: i32 = 3   // the stream is not frames
+pub const PLUGIN_EXIT_BAD_VERSION: i32 = 4 // a version this plugin does not know
+pub const PLUGIN_EXIT_WRITE_FAILED: i32 = 6 // the host went away mid-answer
+pub const PLUGIN_EXIT_TRUNCATED: i32 = 7   // EOF inside a frame
+
+// How long the host sleeps between readiness checks while a call's budget runs. A floor,
+// not a promise — `time.wait` reports what it really waited, and that is what is charged.
+const PLUGIN_POLL_NANOS: i64 = 1000000
 
 // ---- little-endian, written explicitly -------------------------------------------
 
@@ -194,17 +283,44 @@ pub const PLUGIN_BAD_VERSION: i32 = 2      // a version this plugin does not kno
     return total
 }
 
+// **The header, read on its own.** On a stream the host and the plugin both read twelve
+// bytes, ask this, and only then read the payload it announces. Returns the payload length,
+// or -1 for anything that is not the header of a message: bad magic, an impossible length.
+// The kind and the version are NOT judged here — a whole frame is needed for the checksum,
+// and the checksum is checked before either is trusted (see `decode`).
+@no_alloc @no_os pub fn header_len(read hdr: []u8) -> isize {
+    if hdr.len < PLUGIN_HEADER { return 0 - 1 }
+    if magic_ok(hdr) == false { return 0 - 1 }
+    let plen: i64 = get_u32(hdr, 8)
+    if plen < 0 or plen > (PLUGIN_MAX_PAYLOAD as i64) { return 0 - 1 }
+    return plen as isize
+}
+
+// The kind a whole frame claims. Meaningful only after `decode_any` accepted it.
+@no_alloc @no_os pub fn frame_kind(read frame: []u8) -> i64 {
+    if frame.len < PLUGIN_HEADER { return 0 }
+    return get_u16(frame, 6)
+}
+
 // Validate a frame and report its payload length, or -1 if it is not a usable message of
 // `want_kind`. `bad_version` is set when the frame is well-formed but speaks another version —
 // the one failure a caller reports differently from corruption.
 @no_alloc @no_os fn decode(read frame: []u8, want_kind: i64, mut bad_version: bool) -> isize {
+    let plen: isize = decode_any(frame, bad_version)
+    if plen < 0 { return plen }
+    if get_u16(frame, 6) != want_kind { return 0 - 1 }
+    return plen
+}
+
+// `decode` without the kind check — a server-mode host accepts EITHER a response or an
+// error frame and asks `frame_kind` afterwards.
+@no_alloc @no_os fn decode_any(read frame: []u8, mut bad_version: bool) -> isize {
     bad_version = false
     if frame.len < PLUGIN_HEADER + PLUGIN_TRAILER { return 0 - 1 }
     if magic_ok(frame) == false { return 0 - 1 }
     let plen: i64 = get_u32(frame, 8)
     if plen < 0 or plen > (PLUGIN_MAX_PAYLOAD as i64) { return 0 - 1 }
     if ((PLUGIN_HEADER + PLUGIN_TRAILER) as i64) + plen != (frame.len as i64) { return 0 - 1 }
-    if get_u16(frame, 6) != want_kind { return 0 - 1 }
     // **The checksum is verified BEFORE the version is trusted.** A corrupt frame can carry any
     // version at all, and reporting "unsupported version" for what is really bit rot sends a
     // caller after entirely the wrong bug.
@@ -217,7 +333,407 @@ pub const PLUGIN_BAD_VERSION: i32 = 2      // a version this plugin does not kno
     return plen as isize
 }
 
-// ---- the host side ----------------------------------------------------------------
+// ---- what a call answers ---------------------------------------------------------
+
+// What a call answers: an outcome, the plugin's own code, and the response length.
+//
+// `@copy`: three scalars. The response BYTES land in the caller's buffer, which is the shape
+// every reader in this tree takes — a `Reply` that owned its payload would be an allocation
+// per call for data the caller already has somewhere to put.
+//
+// `exit_code` is the plugin's OWN code: its exit code in one-shot mode, the code it put in an
+// error frame in server mode, the signal or exit code that ended it for `PLUGIN_CRASHED`.
+// For `PLUGIN_FAILED` from a server, `len` is the length of the plugin's message, copied into
+// the response buffer — a failure that can describe itself should be allowed to.
+@copy pub struct Reply {
+    pub outcome: i32,
+    pub exit_code: i32,
+    pub len: usize,
+}
+
+@no_alloc @no_os pub fn succeeded(read r: Reply) -> bool { return r.outcome == PLUGIN_OK }
+
+// ---- the host side: SERVER MODE ------------------------------------------------------
+
+// A connection to a running plugin. `@move` because it owns a `sysproc.Child`, which is
+// itself a resource the language refuses to duplicate; `hangup` exactly once, and `is_up`
+// says whether that has happened (or a failure did it first).
+@move pub struct Conn {
+    c: sysproc.Child,
+    clk: time.Clock,
+    budget: i64,
+    calls: i64,
+    failures: i64,
+    up: bool,
+}
+
+// A `Conn` that names nothing: what `connect` hands back through `catch`, and what a caller
+// compares against without a separate optional. Every call on it is `PLUGIN_DOWN`.
+pub fn no_conn() -> Conn {
+    return Conn{ c: sysproc.no_child(), clk: time.manual(0), budget: 0, calls: 0, failures: 0, up: false }
+}
+
+// Start `cmd` as a plugin server and keep it. `budget_nanos` is what each call may take
+// before the plugin is killed; `clk` is where that time is measured, so a test hands in
+// `time.manual()` and a hung plugin costs nothing real.
+//
+// The same command semantics as `sysproc.start_piped` — the platform shell — and the same
+// capability gate, refused as `PluginRefused` before anything runs.
+pub fn connect(mut sp: sysproc.Spawner, take clk: time.Clock, read cmd: str, budget_nanos: i64) -> Conn !{ PluginRefused, PluginNoStart(i32) } {
+    if sysproc.can_start(sp) == false {
+        // Through the spawner, so its refusal counter sees the attempt the way it would
+        // have seen a direct call — a test that hands code a denied spawner asks both.
+        var none: sysproc.Child = sysproc.start_piped(sp, cmd) catch sysproc.no_child()
+        return err(PluginRefused)
+    }
+    var code: i32 = 0
+    var ch: sysproc.Child = sysproc.start_piped(sp, cmd) catch |e| match e {
+        SysProcFailed(n) => note_start_failure(n, code),
+        _ => sysproc.no_child()
+    }
+    if sysproc.is_live(ch) == false { return err(PluginNoStart(code)) }
+    return ok(Conn{ c: ch, clk: clk, budget: budget_nanos, calls: 0, failures: 0, up: true })
+}
+
+fn note_start_failure(n: i32, mut code: i32) -> sysproc.Child {
+    code = n
+    return sysproc.no_child()
+}
+
+// Is the plugin still there to be called?
+@no_alloc @no_os pub fn is_up(read h: Conn) -> bool { return h.up }
+@no_alloc @no_os pub fn conn_calls(read h: Conn) -> i64 { return h.calls }
+@no_alloc @no_os pub fn conn_failures(read h: Conn) -> i64 { return h.failures }
+@no_alloc @no_os pub fn budget_of(read h: Conn) -> i64 { return h.budget }
+
+// Change what the NEXT call may take. The budget belongs to the connection rather than to
+// the call because it is also what bounds `hangup`'s drain, but a host does not owe every
+// call the same patience: a handshake on a cold process must tolerate the tens or hundreds
+// of milliseconds a process start costs, while the call after it is a warm round trip on a
+// pipe and a host that still allowed seconds for it has no timeout worth the name.
+//
+// Splitting those is what makes a timeout a PROPERTY instead of a race. A budget that must
+// cover a cold start is necessarily far larger than a warm answer needs, so a call that
+// exceeds it proves something only when the process is known to be up — and the way to know
+// that is to have just heard from it, then tighten. `plugin_server_demo` does exactly that,
+// and it is why its transcript is pinnable at all.
+@no_alloc @no_os pub fn set_budget(mut h: Conn, nanos: i64) { h.budget = nanos }
+
+// How the plugin ended, once it has: `SPROC_RUNNING` while the connection is up. The
+// child's cached status, which `sysproc` keeps after `release` for exactly this question.
+@no_alloc @no_os pub fn exit_status(read h: Conn) -> sysproc.Status { return sysproc.last_status(h.c) }
+
+// What a bounded read reports.
+const PLUGIN_RD_OK: i32 = 0
+const PLUGIN_RD_TIMEOUT: i32 = 1
+const PLUGIN_RD_EOF: i32 = 2
+const PLUGIN_RD_ERROR: i32 = 3
+
+// Read exactly `buf.len` bytes of the plugin's output, or say why not. Never blocks in a
+// read: readiness is asked first, and `waited` — carried across the reads of one call —
+// is charged with what the clock really slept.
+fn read_exact(mut h: Conn, mut buf: []u8, mut waited: i64) -> i32 {
+    var got: usize = 0
+    for got < buf.len {
+        if sysproc.output_ready(h.c) {
+            var win: []u8 = buf[got .. buf.len]
+            let n: i64 = sysproc.read_output(h.c, win)
+            if n == 0 { return PLUGIN_RD_EOF }
+            if n < 0 { return PLUGIN_RD_ERROR }
+            got = got + n as usize
+        } else {
+            if waited >= h.budget { return PLUGIN_RD_TIMEOUT }
+            var slice: i64 = PLUGIN_POLL_NANOS
+            let left: i64 = h.budget - waited
+            if slice > left { slice = left }
+            waited = waited + time.wait(h.clk, slice)
+        }
+    }
+    return PLUGIN_RD_OK
+}
+
+// The plugin stopped talking mid-call: find out how it ended and name it. EOF with a clean
+// exit is `PLUGIN_BAD_RESPONSE` (it promised an answer and gave none — the one-shot rule); a
+// non-zero exit is `PLUGIN_FAILED` with that code; a signal, or on Windows an NTSTATUS exit
+// (the high bit set, so negative as `i32` — what an access violation reports), is
+// `PLUGIN_CRASHED`. Bounded: a plugin whose shell lingers is killed after the budget.
+fn went_away(mut h: Conn) -> Reply {
+    let st: sysproc.Status = sysproc.wait_or_kill(h.c, h.clk, h.budget)
+    h.up = false
+    let code: i32 = sysproc.code_of(st)
+    if sysproc.is_signalled(st) { return fail_conn(h, PLUGIN_CRASHED, code, 0) }
+    if code < 0 { return fail_conn(h, PLUGIN_CRASHED, code, 0) }
+    if code != 0 { return fail_conn(h, PLUGIN_FAILED, code, 0) }
+    return fail_conn(h, PLUGIN_BAD_RESPONSE, 0, 0)
+}
+
+// The budget is gone: kill it, reap it, and say so. `wait_or_kill` with no budget is one
+// liveness check, the kill, the reap and the release — the composition every timeout wants.
+fn give_up(mut h: Conn) -> Reply {
+    let st: sysproc.Status = sysproc.wait_or_kill(h.c, h.clk, 0)
+    h.up = false
+    return fail_conn(h, PLUGIN_TIMED_OUT, sysproc.code_of(st), 0)
+}
+
+// The stream cannot be trusted any more (bad magic, a failed checksum): the plugin is
+// coherent enough to be hung up on politely, so it is — and the connection is over.
+fn desync(mut h: Conn) -> Reply {
+    let st: sysproc.Status = end_conn(h)
+    return fail_conn(h, PLUGIN_BAD_RESPONSE, sysproc.code_of(st), 0)
+}
+
+fn fail_conn(mut h: Conn, outcome: i32, code: i32, len: usize) -> Reply {
+    h.failures = h.failures + 1
+    return Reply{ outcome: outcome, exit_code: code, len: len }
+}
+
+// Send one request and read its answer. The response bytes land in `response`; `len` says
+// how many. A plugin that answers with an error frame is `PLUGIN_FAILED` and stays up; every
+// other failure ends the connection, and `is_up` says so.
+pub fn call(mut h: Conn, read request: []u8, mut response: []u8) -> Reply {
+    h.calls = h.calls + 1
+    if h.up == false { return fail_conn(h, PLUGIN_DOWN, sysproc.code_of(sysproc.last_status(h.c)), 0) }
+
+    // The request, as one write. See the header on what bounds this and what does not.
+    let total: usize = PLUGIN_HEADER + PLUGIN_TRAILER + request.len
+    var raw: *mut u8 = alloc(u8, total)
+    var frame: []u8 = slice(u8, raw, total)
+    let n: usize = encode(frame, PLUGIN_KIND_REQUEST, PLUGIN_VERSION, request)
+    if n == 0 {
+        free_ptr(raw)
+        return fail_conn(h, PLUGIN_REFUSED, 0, 0)
+    }
+    let put: i64 = sysproc.write_all(h.c, frame[0 .. n])
+    free_ptr(raw)
+    // A short write means the reader is gone — the plugin died before or while reading.
+    if put != (n as i64) { return went_away(h) }
+
+    // The header first, so the length is believed only once the magic is right.
+    var waited: i64 = 0
+    var hraw: *mut u8 = alloc(u8, PLUGIN_HEADER)
+    var hdr: []u8 = slice(u8, hraw, PLUGIN_HEADER)
+    let hr: i32 = read_exact(h, hdr, waited)
+    if hr != PLUGIN_RD_OK {
+        free_ptr(hraw)
+        if hr == PLUGIN_RD_TIMEOUT { return give_up(h) }
+        return went_away(h)
+    }
+    let plen: isize = header_len(hdr)
+    if plen < 0 {
+        free_ptr(hraw)
+        return desync(h)
+    }
+
+    // Then the whole frame, header copied in front so the checksum covers what it must.
+    let flen: usize = PLUGIN_HEADER + PLUGIN_TRAILER + (plen as usize)
+    var fraw: *mut u8 = alloc(u8, flen)
+    var whole: []u8 = slice(u8, fraw, flen)
+    var i: usize = 0
+    for i < PLUGIN_HEADER {
+        whole[i] = hdr[i]
+        i = i + 1
+    }
+    free_ptr(hraw)
+    var rest: []u8 = whole[PLUGIN_HEADER .. flen]
+    let rr: i32 = read_exact(h, rest, waited)
+    if rr != PLUGIN_RD_OK {
+        free_ptr(fraw)
+        if rr == PLUGIN_RD_TIMEOUT { return give_up(h) }
+        return went_away(h)
+    }
+    var badver: bool = false
+    let got: isize = decode_any(whole, badver)
+    if got < 0 {
+        free_ptr(fraw)
+        return desync(h)
+    }
+    let kind: i64 = frame_kind(whole)
+
+    // An error frame: the plugin's own code, then its message, and the plugin stays up.
+    if kind == PLUGIN_KIND_ERROR {
+        if got < 4 {
+            free_ptr(fraw)
+            return desync(h)
+        }
+        let code: i32 = get_u32(whole, PLUGIN_HEADER) as i32
+        let mlen: usize = (got as usize) - 4
+        var take_len: usize = mlen
+        if take_len > response.len { take_len = response.len }
+        var k: usize = 0
+        for k < take_len {
+            response[k] = whole[PLUGIN_HEADER + 4 + k]
+            k = k + 1
+        }
+        free_ptr(fraw)
+        return fail_conn(h, PLUGIN_FAILED, code, take_len)
+    }
+    if kind != PLUGIN_KIND_RESPONSE {
+        free_ptr(fraw)
+        return desync(h)
+    }
+    if (got as usize) > response.len {
+        free_ptr(fraw)
+        // The connection is still coherent — the plugin answered, the caller's buffer is
+        // what fell short — but the answer is lost, and a caller that retries with a bigger
+        // buffer needs the connection, so it is kept.
+        return fail_conn(h, PLUGIN_BAD_RESPONSE, 0, 0)
+    }
+    var j: usize = 0
+    for j < got as usize {
+        response[j] = whole[PLUGIN_HEADER + j]
+        j = j + 1
+    }
+    free_ptr(fraw)
+    return Reply{ outcome: PLUGIN_OK, exit_code: 0, len: got as usize }
+}
+
+// Close the plugin's input, drain what it still has to say, and wait for it — the one
+// deadlock-free order, bounded by the budget at each step so a plugin that will not leave
+// is killed rather than waited on. Idempotent: a second hangup reports the first's status.
+pub fn hangup(mut h: Conn) -> sysproc.Status {
+    if h.up == false { return sysproc.last_status(h.c) }
+    return end_conn(h)
+}
+
+fn end_conn(mut h: Conn) -> sysproc.Status {
+    sysproc.close_input(h.c)
+    // Drain, bounded. A well-behaved server writes nothing after its last answer and closes
+    // at EOF; this loop ends on that EOF, or on the budget.
+    var waited: i64 = 0
+    var scratch: *mut u8 = alloc(u8, 4096)
+    var win: []u8 = slice(u8, scratch, 4096)
+    var going: bool = true
+    for going {
+        if sysproc.output_ready(h.c) {
+            let n: i64 = sysproc.read_output(h.c, win)
+            if n <= 0 { going = false }
+        } else {
+            if waited >= h.budget {
+                going = false
+            } else {
+                var slice: i64 = PLUGIN_POLL_NANOS
+                let left: i64 = h.budget - waited
+                if slice > left { slice = left }
+                waited = waited + time.wait(h.clk, slice)
+            }
+        }
+    }
+    free_ptr(scratch)
+    let st: sysproc.Status = sysproc.wait_or_kill(h.c, h.clk, h.budget)
+    h.up = false
+    return st
+}
+
+// ---- the plugin side: SERVER MODE -------------------------------------------------------
+
+// What a handler is told about the call it is answering, and what it tells back.
+//
+// `len` is the handler's: how many bytes of the response buffer it filled. `count` is the
+// server's: how many requests this process has answered before this one, so a plugin can
+// prove in its reply that it is one long-lived process rather than one per call.
+pub struct Served {
+    pub len: usize,
+    pub count: i64,
+}
+
+// A handler answers one request. The request bytes are read-only; the response buffer is
+// the handler's to fill, reporting how much in `s.len`. It returns 0 to send the buffer as
+// the answer, or its own non-zero code to send an ERROR frame carrying that code and the
+// buffer as a message — the host sees `PLUGIN_FAILED` with the code. The `runtime.Task`
+// shape (a fn pointer plus the context it is called with), for the reason every handler in
+// this tree takes it: a closure that captures cannot be stored, a fn pointer can.
+pub fn serve(ctx: *mut u8, f: fn(*mut u8, read []u8, mut []u8, mut Served) -> i32, cap: usize) -> i32 {
+    var hraw: *mut u8 = alloc(u8, PLUGIN_HEADER)
+    var hdr: []u8 = slice(u8, hraw, PLUGIN_HEADER)
+    // Frame buffers: the largest request or response this server will carry.
+    let fcap: usize = PLUGIN_HEADER + PLUGIN_TRAILER + cap
+    var iraw: *mut u8 = alloc(u8, fcap)
+    var inb: []u8 = slice(u8, iraw, fcap)
+    var rraw: *mut u8 = alloc(u8, cap)
+    var resp: []u8 = slice(u8, rraw, cap)
+    var oraw: *mut u8 = alloc(u8, fcap + 4)
+    var outb: []u8 = slice(u8, oraw, fcap + 4)
+    var mraw: *mut u8 = alloc(u8, cap + 4)
+    var msg: []u8 = slice(u8, mraw, cap + 4)
+
+    var count: i64 = 0
+    var code: i32 = PLUGIN_EXIT_OK
+    var going: bool = true
+    for going {
+        // The header, on its own. Nothing at all is the host hanging up — the normal end.
+        let hn: usize = sysstdio.read_stdin_exact(hdr)
+        if hn == 0 {
+            going = false
+        } else if hn < PLUGIN_HEADER {
+            code = PLUGIN_EXIT_TRUNCATED
+            going = false
+        } else {
+            let plen: isize = header_len(hdr)
+            if plen < 0 or (plen as usize) > cap {
+                code = PLUGIN_EXIT_BAD_FRAME
+                going = false
+            } else {
+                let flen: usize = PLUGIN_HEADER + PLUGIN_TRAILER + (plen as usize)
+                var i: usize = 0
+                for i < PLUGIN_HEADER {
+                    inb[i] = hdr[i]
+                    i = i + 1
+                }
+                var rest: []u8 = inb[PLUGIN_HEADER .. flen]
+                let rn: usize = sysstdio.read_stdin_exact(rest)
+                if rn < rest.len {
+                    code = PLUGIN_EXIT_TRUNCATED
+                    going = false
+                } else {
+                    var badver: bool = false
+                    let got: isize = decode(inb[0 .. flen], PLUGIN_KIND_REQUEST, badver)
+                    if got < 0 {
+                        if badver { code = PLUGIN_EXIT_BAD_VERSION } else { code = PLUGIN_EXIT_BAD_FRAME }
+                        going = false
+                    } else {
+                        var s: Served = Served{ len: 0, count: count }
+                        let rc: i32 = f(ctx, inb[PLUGIN_HEADER .. PLUGIN_HEADER + (got as usize)], resp, s)
+                        var rlen: usize = s.len
+                        if rlen > cap { rlen = cap }
+                        var on: usize = 0
+                        if rc == 0 {
+                            on = encode(outb, PLUGIN_KIND_RESPONSE, PLUGIN_VERSION, resp[0 .. rlen])
+                        } else {
+                            // The code first, then the message — the layout the host reads.
+                            put_u32(msg, 0, rc as i64)
+                            var k: usize = 0
+                            for k < rlen {
+                                msg[4 + k] = resp[k]
+                                k = k + 1
+                            }
+                            on = encode(outb, PLUGIN_KIND_ERROR, PLUGIN_VERSION, msg[0 .. 4 + rlen])
+                        }
+                        // **A failed write must NOT exit 0.** A half-written response with a
+                        // success code is exactly what the host cannot detect any other way.
+                        if on == 0 or sysstdio.write_stdout_all(outb[0 .. on]) != (on as i64) {
+                            code = PLUGIN_EXIT_WRITE_FAILED
+                            going = false
+                        }
+                        count = count + 1
+                    }
+                }
+            }
+        }
+    }
+
+    free_ptr(mraw)
+    free_ptr(oraw)
+    free_ptr(rraw)
+    free_ptr(iraw)
+    free_ptr(hraw)
+    return code
+}
+
+// ---- the host side: ONE-SHOT MODE -----------------------------------------------------
+//
+// One request, one response, one process per call: the host writes a request file, runs the
+// plugin with both paths as arguments, and reads the response file. See the header on when
+// this is the right shape. Nothing below changed when the server mode arrived.
 
 // A host that may call plugins. It is `process.Process` plus `fs.Fs` because a call needs
 // both — and both are the caller's to grant, so a function that calls plugins says so in its
@@ -236,19 +752,6 @@ pub fn host(take p: process.Process, take f: fs.Fs) -> Host {
 @no_alloc @no_os pub fn calls(read h: Host) -> i64 { return h.calls }
 @no_alloc @no_os pub fn failures(read h: Host) -> i64 { return h.failures }
 
-// What a call answers: an outcome, the plugin's exit code, and the response length.
-//
-// `@copy`: three scalars. The response BYTES land in the caller's buffer, which is the shape
-// every reader in this tree takes — a `Reply` that owned its payload would be an allocation
-// per call for data the caller already has somewhere to put.
-@copy pub struct Reply {
-    pub outcome: i32,
-    pub exit_code: i32,
-    pub len: usize,
-}
-
-@no_alloc @no_os pub fn succeeded(read r: Reply) -> bool { return r.outcome == PLUGIN_OK }
-
 // Call `cmd`, handing it `request` and reading its answer into `response`.
 //
 // `req_path` and `resp_path` are the two files the plugin is told about; they are the caller's
@@ -260,7 +763,7 @@ pub fn host(take p: process.Process, take f: fs.Fs) -> Host {
 // that, and this module does NOT quote it: quoting differs between `cmd.exe` and `sh`, and a
 // half-right quoting rule is worse than a documented restriction. `plugin_paths_must_not_
 // contain_spaces` pins the refusal.
-pub fn call(mut h: Host, read a: Allocator, read cmd: str, read req_path: str, read resp_path: str,
+pub fn call_once(mut h: Host, read a: Allocator, read cmd: str, read req_path: str, read resp_path: str,
             read request: []u8, mut response: []u8) -> Reply {
     h.calls = h.calls + 1
     // **Both capabilities are checked BEFORE anything happens**, and the process one is
@@ -355,7 +858,7 @@ fn fail(mut h: Host, outcome: i32, code: i32) -> Reply {
     return false
 }
 
-// ---- the plugin side ----------------------------------------------------------------
+// ---- the plugin side: ONE-SHOT MODE ------------------------------------------------------
 
 // Read the request a host wrote at `path` into `payload`. Returns its length, or -1 with
 // `status` saying why.
