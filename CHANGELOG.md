@@ -34,17 +34,32 @@ versions are snapshots, not stability promises.
   `fs.jtr` is untouched: it is a self-hosting closure module, and putting the projection in
   `fs.host()` would force a reseed.
 
-  7 tests — four with no process (the projection round trip with an unknown mode failing
-  closed, the fence with real files on both sides, `..` refused, `narrow` never widening),
-  three with real children through the platform shell, every one bounded — plus the
-  `jsandbox` demo, which starts itself in a scratch directory, in a group, under a jail, and
-  shows the grandchild the child left behind reached by a `terminate_group` that a
-  `terminate` of the child alone missed. Four mutations watched failing: the fence's
-  separator check dropped (traversal leaks), `TerminateJobObject` made a no-op (the group
-  never empties, within its budget rather than hanging), `mode_fs`'s fallback turned to
-  `fs.host()` (a corrupt projection would fail OPEN), and `AssignProcessToJobObject` skipped
-  (the grandchild survives the group). The Windows Job/accounting constants are measured
-  against `<windows.h>` by a C probe, the way `sysproc`'s are.
+  8 tests — five that start nothing that runs (the projection round trip with an unknown
+  mode failing closed, the fence with real files on both sides, `..` refused, `narrow` never
+  widening, and a platform failure told from a capability refusal), three with real children
+  through the platform shell, every one bounded — plus the `jsandbox` demo, which starts
+  itself in a scratch directory, in a group, under a jail, and shows the grandchild the child
+  left behind reached by a `terminate_group` that a `terminate` of the child alone missed.
+  Six mutations watched failing: the fence's separator check dropped (a prefix-sharing
+  sibling reads as inside, in two tests), `mode_fs`'s fallback turned to `fs.host()` (a
+  corrupt projection would fail OPEN), `start_at`'s `lpCurrentDirectory` never passed (the
+  child's relatively named file lands in the parent's directory), the environment block never
+  extended (the child echoes back the unexpanded variable name),
+  `AssignProcessToJobObject` skipped (the grandchild is never in the group), and
+  `TerminateJobObject` made a no-op — that last one failing after its ten-second budget
+  rather than hanging, which is the property a bounded group wait exists for. The Windows
+  Job/accounting constants are measured against `<windows.h>` by a C probe, the way
+  `sysproc`'s are.
+
+  **A port finding came out of the allowlist gate**: with imports unresolved, the
+  self-hosted `cgen.jtr` types a `catch |e| match e { … }`'s result temp from the match
+  (`void` for a type it cannot resolve) while its own `_ct` temp for the same type is `int`,
+  which is what the reference emits throughout. `catch |e| <expr>` and the bare
+  `catch <expr>` agree. Nothing real miscompiles — with imports resolved the type is known —
+  but a corpus file that is both `@cfg`-bearing and matches over an imported error set cannot
+  satisfy `every_cfg_bearing_corpus_file_is_byte_identity_verified`. `std/sandbox` does not
+  use the construct on a reason of its own: a `match` over an IMPORTED error set is
+  exhaustive over a set the importing module does not own.
 
 - **`std/tls`** — TLS over a `sysnet` socket by binding OpenSSL (area 8). A client context
   that trusts nothing until `trust` gives it a CA, a server context that checks its key

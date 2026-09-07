@@ -2134,15 +2134,22 @@ mod extern_signature_agreement {
         assert!(decls.len() > 40, "the extern sweep found almost nothing: {}", decls.len());
         let waits: Vec<&(String, String, String)> =
             decls.iter().filter(|(_, n, _)| n == "WaitForSingleObject").collect();
+        // `sysproc` and `syswatch` bind the bare name; `sandbox` binds it through the
+        // DECLARED ALIAS form (`sbox_wait = "WaitForSingleObject"`), because a second bare
+        // binding in one program is a duplicate definition. That the sweep counts three
+        // here is the witness that it reads the alias form too — an alias that escaped the
+        // sweep would be exactly the binding nobody was checking.
         assert_eq!(
             waits.len(),
-            2,
-            "syswatch and sysproc should both bind WaitForSingleObject: {waits:?}"
+            3,
+            "sysproc, syswatch and sandbox should all bind WaitForSingleObject: {waits:?}"
         );
-        assert_eq!(
-            waits[0].2, waits[1].2,
-            "the two WaitForSingleObject bindings must be identical"
-        );
+        for w in &waits[1..] {
+            assert_eq!(
+                waits[0].2, w.2,
+                "every WaitForSingleObject binding must be identical: {waits:?}"
+            );
+        }
     }
 }
 

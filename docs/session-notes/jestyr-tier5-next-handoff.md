@@ -521,7 +521,7 @@ done until its count is in that table.
 
 A working directory, a group and a jail for a child, over ONE additive `sysproc` primitive.
 Eight tests (five that start nothing that runs, three with real children through the shell),
-self-spawning demo (`jsandbox`, `examples/std/sandbox_demo.jtr`), four mutations watched
+self-spawning demo (`jsandbox`, `examples/std/sandbox_demo.jtr`), six mutations watched
 failing, no reseed (`fs.jtr` is untouched — see the first bullet). What a successor should
 not re-derive:
 
