@@ -2582,9 +2582,18 @@ mod crypto_bound {
         // Anti-vacuity: exactly three refusals — the changed message, the flipped bit, the
         // other key — and every other verdict a `true`. A hasher that refused would print
         // `(refused)` in place of a digest; none may.
-        assert_eq!(out.matches("\nfalse\n").count() + usize::from(out.trim_end().ends_with("false")), 3,
+        //
+        // **Counted as whole LINES, and that is the point.** The first version of these two
+        // counts searched for `"\nfalse\n"` and `"\ntrue\n"` in the raw text, which is wrong
+        // twice over: `str::matches` is non-overlapping, so three consecutive `true` lines
+        // read as two, and the final `false` was counted once by the search and again by an
+        // `ends_with` on the trimmed output. Both numbers were therefore unreachable and the
+        // assertion could only ever fail — it had never run when it was written.
+        let verdicts: Vec<&str> = out.trim_end().lines().collect();
+        assert_eq!(verdicts.iter().filter(|l| **l == "false").count(), 3,
             "exactly the three tampered cases may be refused:\n{out}");
-        assert_eq!(out.matches("\ntrue\n").count(), 7, "every untampered step must succeed:\n{out}");
+        assert_eq!(verdicts.iter().filter(|l| **l == "true").count(), 7,
+            "every untampered step must succeed:\n{out}");
         assert!(!out.contains("(refused)"), "both hashers must produce a digest:\n{out}");
     }
 }
@@ -12609,6 +12618,25 @@ mod c_oracle {
         run_jestyr_lexer(lexer_exe, file, &[])
     }
 
+    /// Put the reference's lexemes through the **same transport** the port's have to
+    /// survive: one lexeme per line of stdout.
+    ///
+    /// **A token may CONTAIN a newline** — a string literal continued with a trailing
+    /// backslash (`examples/std/trace_test.jtr` is the first corpus file to write one) —
+    /// and a line-delimited protocol cannot carry it whole. The port prints that token
+    /// and [`run_jestyr_lexer`] reads it back as several lines; the reference's lexer
+    /// returns it as one `String`. Splitting the reference's the same way is what makes
+    /// the two comparable, and it is a property of the TRANSPORT, not of either lexer.
+    ///
+    /// **The port is not merely assumed correct here.** `jestyr_lexer_kinds_match_reference_on_corpus`
+    /// compares one kind LABEL per token — labels never contain a newline — so it sees the
+    /// true token count on both sides, and it agrees. A port that really ended the string
+    /// early would produce different *tokens* after it (`id`, `=`, `4`, …), which both this
+    /// split comparison and the kind stream would still catch.
+    fn through_line_transport(lexemes: Vec<String>) -> Vec<String> {
+        lexemes.iter().flat_map(|t| t.split('\n')).map(|s| s.to_string()).collect()
+    }
+
     /// The Jestyr lexer's *kind-label* stream for a file (the parser's input, P2 golden).
     fn jestyr_kinds(lexer_exe: &std::path::Path, file: &str) -> Vec<String> {
         run_jestyr_lexer(lexer_exe, file, &["kinds"])
@@ -21431,7 +21459,7 @@ fn main() -> i32 {
         for p in &files {
             let f = p.to_str().unwrap();
             let src = std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {f}: {e}"));
-            let want = rust_lexemes(&src);
+            let want = through_line_transport(rust_lexemes(&src));
             let got = jestyr_lexemes(&lexer, f);
             assert_eq!(got, want, "Jestyr lexer diverged from the reference on {f}");
         }
