@@ -520,7 +520,7 @@ done until its count is in that table.
 ### ~~Sandbox (cwd, process groups, fs capability projection)~~ — **DONE: `std/sandbox`**
 
 A working directory, a group and a jail for a child, over ONE additive `sysproc` primitive.
-Seven tests (four with no process, three with real children through the shell), a pinned
+Eight tests (five that start nothing that runs, three with real children through the shell),
 self-spawning demo (`jsandbox`, `examples/std/sandbox_demo.jtr`), four mutations watched
 failing, no reseed (`fs.jtr` is untouched — see the first bullet). What a successor should
 not re-derive:
@@ -555,6 +555,28 @@ not re-derive:
 * `kill`, `WaitForSingleObject` and `CloseHandle` are bound by `sysproc` already; a second
   bare binding in the same program is a duplicate definition, so `sandbox` uses the alias
   form (`sys_kill`, `sbox_wait`, `sbox_close`).
+* **A new corpus file carrying `@cfg` owes a `CGEN_GOLDEN_ALLOWLIST` entry**, and the gate
+  that says so (`every_cfg_bearing_corpus_file_is_byte_identity_verified`) is NOT behind
+  `c-oracle` — a plain `cargo test` fails until both `sandbox.jtr` and `sandbox_test.jtr`
+  are listed. That is deliberate: the guards a module emits for the platform it is not
+  running on are what no other gate on this machine can see. The demo is absent because it
+  carries no `@cfg` of its own.
+* **PORT FINDING, measured and worked around by design rather than by a hack:
+  `catch |e| match e { … }` types its result temp from the MATCH, `catch |e| <expr>` from
+  the try-expression.** With imports unresolved (the byte-identity golden's own condition)
+  the reference degrades an unknown type to `int` everywhere, and so does the port — except
+  for the match form's temp, which it declares `void`: `int _ct0 = …; void _cv1;` beside the
+  reference's `int _cv1`. Both `catch |e| <expr>` and the bare `catch <expr>` (a ternary, no
+  temp at all) agree. Nothing real miscompiles — with imports resolved the type is known —
+  but a corpus file that is BOTH `@cfg`-bearing and `catch |e| match`-ing over another
+  module's type cannot satisfy the allowlist gate, which is how this was found. The fix is
+  in `cgen.jtr`'s catch lowering (a closure module: not touchable from a std-module session).
+  `std/sandbox` does not use the construct, and its reason stands on its own: a `match` over
+  an IMPORTED error set is exhaustive over a set the importing module does not own, so it
+  breaks the day `sysproc` grows a variant. `sysproc.refused` going up is the same fact told
+  by the module whose fact it is, and `syserr.last_raw()` read straight after the call is the
+  platform's code — measured one frame further out than `start` reads it by
+  `a_platform_failure_and_a_capability_refusal_are_told_apart`.
 * Windows-verified only: everything. The POSIX branches (`chdir`/`setpgid`/`execve`,
   `kill(-pgid, 0)` as the group probe, `getcwd`) compile and are owed to the Linux ladder.
 

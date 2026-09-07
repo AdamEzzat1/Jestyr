@@ -475,14 +475,15 @@ pub fn wait_group_empty(mut g: Group, mut clk: time.Clock, timeout_nanos: i64) -
 
 // ---- starting ----------------------------------------------------------------------
 
-// How `start_at`'s refusal is told apart from its failure through a `catch`: the slot is
-// stamped with `SBOX_WHY_REFUSED` or the platform's code, and a dead `no_child` comes back.
-const SBOX_WHY_REFUSED: i32 = 0 - 1
-
-fn stamp_child(mut slot: i32, v: i32) -> sysproc.Child {
-    slot = v
-    return sysproc.no_child()
-}
+// **A refusal is told from a failure by the SPAWNER'S OWN COUNTER, not by re-spelling
+// `sysproc`'s error variants here.** `catch |e| match e { SysProcFailed(..) => …,
+// SysProcRefused => … }` would work today and would stop compiling the day `sysproc` grows
+// a third variant, because a `match` over an imported error set is exhaustive over a set
+// this module does not own. `sysproc.refused` going up is the same fact, told by the module
+// whose fact it is. The platform's code is read straight after the call for the same reason
+// `sysproc` reads it there — it is `errno`/`GetLastError` and it is only true immediately;
+// `a_platform_failure_and_a_capability_refusal_are_told_apart` measures that it is still the
+// platform's own number one frame further out than this.
 
 // `NAME=value` for the child's environment.
 fn env_line(read j: Jail) -> String {
@@ -499,15 +500,13 @@ fn env_line(read j: Jail) -> String {
 // with `j` projected onto it. The child is not in a group: a `terminate` reaches it alone.
 pub fn start(mut sp: sysproc.Spawner, read cmd: str, read cwd: str, read j: Jail) -> sysproc.Child !{ SandboxFailed(i32), SandboxRefused } {
     var ev: String = env_line(j)
-    var why: i32 = 0
-    var ch: sysproc.Child = sysproc.start_at(sp, cmd, cwd, string_view(ev), false) catch |e| match e {
-        SysProcFailed(code) => stamp_child(why, code),
-        SysProcRefused => stamp_child(why, SBOX_WHY_REFUSED),
-    }
+    let turned_away: i64 = sysproc.refused(sp)
+    var ch: sysproc.Child = sysproc.start_at(sp, cmd, cwd, string_view(ev), false) catch sysproc.no_child()
+    let code: i32 = syserr.last_raw()
     string_free(ev)
     if sysproc.is_live(ch) == false {
-        if why == SBOX_WHY_REFUSED { return err(SandboxRefused) }
-        return err(SandboxFailed(why))
+        if sysproc.refused(sp) > turned_away { return err(SandboxRefused) }
+        return err(SandboxFailed(code))
     }
     return ok(ch)
 }
@@ -521,16 +520,14 @@ pub fn start_grouped(mut sp: sysproc.Spawner, read cmd: str, read cwd: str, read
         return err(SandboxFailed(c0))
     }
     var ev: String = env_line(j)
-    var why: i32 = 0
-    var ch: sysproc.Child = sysproc.start_at(sp, cmd, cwd, string_view(ev), true) catch |e| match e {
-        SysProcFailed(code) => stamp_child(why, code),
-        SysProcRefused => stamp_child(why, SBOX_WHY_REFUSED),
-    }
+    let turned_away: i64 = sysproc.refused(sp)
+    var ch: sysproc.Child = sysproc.start_at(sp, cmd, cwd, string_view(ev), true) catch sysproc.no_child()
+    let code: i32 = syserr.last_raw()
     string_free(ev)
     if sysproc.is_live(ch) == false {
         release_group(g)
-        if why == SBOX_WHY_REFUSED { return err(SandboxRefused) }
-        return err(SandboxFailed(why))
+        if sysproc.refused(sp) > turned_away { return err(SandboxRefused) }
+        return err(SandboxFailed(code))
     }
     if group_add(g, ch) == false {
         // A child that could not be grouped must not be left running ungrouped: that is

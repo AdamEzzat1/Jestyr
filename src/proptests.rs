@@ -18934,6 +18934,14 @@ fn main() -> i32 {
         // is under byte-identity. The manifest format is pure text.
         "tls.jtr",
         "manifest.jtr",
+        // `std/sandbox` and its suite both carry `@cfg`, so
+        // `every_cfg_bearing_corpus_file_is_byte_identity_verified` requires them here —
+        // the guards a module emits for the platform it is NOT running on are exactly what
+        // no other gate on this machine can see. The demo is absent because it carries no
+        // `@cfg` of its own and holds cross-module struct types the unresolved dump
+        // degrades; `jc_build_matrix` gates it instead.
+        "sandbox.jtr",
+        "sandbox_test.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same
@@ -20225,13 +20233,15 @@ fn main() -> i32 {
             // archive refused before it is stored; then the same fetch over HTTP against
             // `std/httpd`'s static route on a spawned thread — the `jc add` shape, end to end.
             ("registry_test", 2),
-            // Four cases with no process (the projection round trip, the fence with real
-            // files on both sides, `..` refused as a shape, `narrow` never widening) and
-            // three with real children through the platform shell: the working directory
-            // (a relatively named file lands where the child was started, with a control),
-            // the projection arriving as an environment variable, and a group that reaches
-            // the grandchild a `terminate` of the shell left behind — bounded, never a hang.
-            ("sandbox_test", 7),
+            // Five cases that start nothing that runs (the projection round trip, the fence
+            // with real files on both sides, `..` refused as a shape, `narrow` never
+            // widening, and a platform failure told from a capability refusal by the
+            // spawner's counter) and three with real children through the platform shell:
+            // the working directory (a relatively named file lands where the child was
+            // started, with a control), the projection arriving as an environment variable,
+            // and a group that reaches the grandchild a `terminate` of the shell left
+            // behind — bounded, never a hang.
+            ("sandbox_test", 8),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

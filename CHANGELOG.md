@@ -7,6 +7,45 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/sandbox`** — what a child is allowed to BE: where it runs, whom it dies with, and
+  which files its own code may touch. `std/sysproc`'s header listed "no environment control,
+  no working directory, no process groups" as what was missing and `fs.Fs` gated only the
+  parent; all four are facts the platform will set only at the instant a process comes into
+  being, so `sysproc.start_at(sp, cmd, cwd, env_extra, apart)` is that instant exposed once
+  (`lpCurrentDirectory` and a copied `GetEnvironmentStringsA` block on Windows;
+  `chdir`/`setpgid(0,0)`/`execve` between `fork` and `exec` on POSIX) and is the only
+  addition to `sysproc`. Above it: `start` (a cwd and a projection), `start_grouped` (a Job
+  object / process group), `terminate_group` + a bounded `wait_group_empty`, and a `Jail`.
+
+  **A Job is joined while the child is still SUSPENDED**, because assigning after it runs
+  races a grandchild born outside the Job — the one outcome a group exists to rule out — so
+  `apart` is deliberately platform-shaped (POSIX makes a group leader outright; Windows
+  creates suspended and `sysproc.resume` is the other half) and `start_grouped` terminates a
+  child it could not group rather than leave it running ungrouped.
+
+  **The jail is a capability the child's own Jestyr code honours, not an OS sandbox** — said
+  in the header, because the word invites the other reading. A `Jail` is an `fs.Fs` plus a
+  root, projected into `JESTYR_FS_JAIL` as `<mode> <root>` and read back with
+  `sandbox.inherited(env)`; no variable means the unjailed host, exactly today's behaviour.
+  The fence is lexical, and a `..` segment is refused as a SHAPE rather than folded, because
+  a resolver that folds `a/../../etc` is a second `realpath` that agrees with the platform's
+  until a symlink — symlinks are the stated hole. `narrow` is the meet of two policies under
+  a root inside the parent's, so a jailed process can hand its child only less.
+  `fs.jtr` is untouched: it is a self-hosting closure module, and putting the projection in
+  `fs.host()` would force a reseed.
+
+  7 tests — four with no process (the projection round trip with an unknown mode failing
+  closed, the fence with real files on both sides, `..` refused, `narrow` never widening),
+  three with real children through the platform shell, every one bounded — plus the
+  `jsandbox` demo, which starts itself in a scratch directory, in a group, under a jail, and
+  shows the grandchild the child left behind reached by a `terminate_group` that a
+  `terminate` of the child alone missed. Four mutations watched failing: the fence's
+  separator check dropped (traversal leaks), `TerminateJobObject` made a no-op (the group
+  never empties, within its budget rather than hanging), `mode_fs`'s fallback turned to
+  `fs.host()` (a corrupt projection would fail OPEN), and `AssignProcessToJobObject` skipped
+  (the grandchild survives the group). The Windows Job/accounting constants are measured
+  against `<windows.h>` by a C probe, the way `sysproc`'s are.
+
 - **`std/tls`** — TLS over a `sysnet` socket by binding OpenSSL (area 8). A client context
   that trusts nothing until `trust` gives it a CA, a server context that checks its key
   against its certificate at load, blocking `client_session`/`server_session` handshakes

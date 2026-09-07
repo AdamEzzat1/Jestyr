@@ -2,13 +2,15 @@
 //
 // A sibling file rather than colocated, per the convention in docs/stdlib-roadmap.md.
 //
-// Two halves. The jail is a pure fence over paths and a text projection, so its four tests
-// touch no process: the round trip, the fence on both sides (with real files, because "the
-// read was refused" only means something next to "the same read through `host` lands"),
-// the `..` refusal, and the monotonicity of `narrow`. The other three start real children
-// through the platform shell, because a working directory, an environment and a process
-// group are things only the OS can confirm — a child writes a RELATIVELY named file and
-// the parent asks where it landed, which is spelled the same in `cmd.exe` and `sh`.
+// Two halves. The jail is a pure fence over paths and a text projection, so four of its
+// five tests touch no process at all — the round trip, the fence on both sides (with real
+// files, because "the read was refused" only means something next to "the same read through
+// `host` lands"), the `..` refusal, and the monotonicity of `narrow` — and the fifth reaches
+// the platform only to be turned away, which is how the two ways a start can fail are told
+// apart. The other three start real children through the platform shell, because a working
+// directory, an environment and a process group are things only the OS can confirm — a child
+// writes a RELATIVELY named file and the parent asks where it landed, which is spelled the
+// same in `cmd.exe` and `sh`.
 //
 // The group test is the one with a clock in it: it terminates the SHELL alone, shows the
 // grandchild survived that, then terminates the group and waits — bounded — for it to
@@ -26,6 +28,7 @@ import "env"
 import "mem"
 import "time"
 import "str"
+import "syserr"
 import "test"
 import "test_report"
 
@@ -112,11 +115,11 @@ fn stamp_jail(mut slot: i32, v: i32) -> sandbox.Jail {
 }
 
 // `narrow`, with the refusal recorded in `escaped` rather than aborting the test.
+// `catch |e| <expr>` rather than `catch |e| match e { SandboxEscapes => … }`: `narrow` has
+// exactly one error, so the match adds nothing but a second place to edit.
 fn narrowed(read parent: sandbox.Jail, take f: fs.Fs, read root: str, mut escaped: i32) -> sandbox.Jail {
     var why: i32 = 0
-    var j: sandbox.Jail = sandbox.narrow(parent, f, root) catch |e| match e {
-        SandboxEscapes => stamp_jail(why, 1),
-    }
+    var j: sandbox.Jail = sandbox.narrow(parent, f, root) catch |e| stamp_jail(why, 1)
     escaped = why
     return j
 }
@@ -419,6 +422,49 @@ fn narrowed(read parent: sandbox.Jail, take f: fs.Fs, read root: str, mut escape
     teardown(h, a, r)
     string_free(root)
 
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **The two ways `start` can fail, told apart the way `start` tells them apart.** A working
+// directory that is not there is the PLATFORM's failure: nothing is started, the spawner
+// counts no refusal, and `syserr.last_raw()` is still the platform's own non-zero number one
+// frame further out than `start` reads it — which is what makes `SandboxFailed`'s payload
+// the real code rather than a stale one. A spawner that was never allowed is the
+// CAPABILITY's refusal: the spawner counts it and the platform is never reached.
+//
+// Neither branch destructures `sandbox`'s error set, deliberately: `start`'s own rule is
+// that the counter is the discriminant, and a test that re-spelled the variants would be
+// testing a different mechanism from the one that ships.
+@test fn a_platform_failure_and_a_capability_refusal_are_told_apart() -> bool {
+    var raw: *mut u8 = alloc(u8, SBT_CAP)
+    var rep: []u8 = slice(u8, raw, SBT_CAP)
+    var c: test.Check = test.new()
+    var j: sandbox.Jail = sandbox.unjailed(fs.host())
+
+    var sp: sysproc.Spawner = sysproc.host()
+    var ch: sysproc.Child = sandbox.start(sp, "exit 0", "/no/such/jestyr/sandbox/dir", j) catch sysproc.no_child()
+    let code: i32 = syserr.last_raw()
+    test.is_false(c, rep, "nothing started", sysproc.is_live(ch))
+    test.is_true(c, rep, "the platform said why, in its own number", code > 0)
+    test.eq_i64(c, rep, "the spawner counted no refusal: this was not the capability", sysproc.refused(sp), 0)
+    test.eq_i64(c, rep, "and no start", sysproc.started(sp), 0)
+
+    var no: sysproc.Spawner = sysproc.denied()
+    var ch2: sysproc.Child = sandbox.start(no, "exit 0", "", j) catch sysproc.no_child()
+    test.is_false(c, rep, "nothing started here either", sysproc.is_live(ch2))
+    test.eq_i64(c, rep, "and this one the spawner did count", sysproc.refused(no), 1)
+    test.eq_i64(c, rep, "the platform was never reached", sysproc.started(no), 0)
+
+    // The same two, through the grouped form: a refused start leaves no group behind.
+    var g: sandbox.Group = sandbox.no_group()
+    var ch3: sysproc.Child = sandbox.start_grouped(no, "exit 0", "", j, g) catch sysproc.no_child()
+    test.is_false(c, rep, "grouped: nothing started", sysproc.is_live(ch3))
+    test.is_false(c, rep, "grouped: and no group is left live", sandbox.is_group_live(g))
+    test.eq_i64(c, rep, "grouped: counted as a refusal", sysproc.refused(no), 2)
+
+    sandbox.free(j)
     let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
