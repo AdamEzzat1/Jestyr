@@ -95,6 +95,37 @@ versions are snapshots, not stability promises.
   with a fallible function breaks type-checking — `core.Result`'s variants `ok`/`err`
   shadow the intrinsics — so the demo renders its numbers itself.
 
+- **`std/crypto`** — hashing, HMAC and signatures by binding OpenSSL's libcrypto (the
+  second-wave crypto bindings). A `Hasher` is a fn-pointer vtable (`init`/`update`/`finish`
+  plus an opaque context — the `mem.Allocator` shape, not a trait, because `@no_alloc`
+  passes vacuously through a trait) with two implementations: `evp_hasher(SHA256|SHA512)`
+  over `EVP_MD` and `jestyr_hasher()` over `std/sha256`, the hash `attest` commits to. `hmac`
+  / `hmac_verify` (SHA-256, SHA-512; the comparison is `csrand.ct_eq`), `sign` / `verify` over
+  `EVP_DigestSign`/`EVP_DigestVerify` with keys loaded from PEM text or through an `fs.Fs`
+  (a private key, a `PUBLIC KEY`, or the public key inside a certificate), and an error
+  surface (`CryptoRefused`/`CryptoFailed`/`CryptoTooSmall` plus `last_error` in OpenSSL's
+  words). **`verify` answers `false` for anything the library does not accept and refuses
+  only when it could not ask** — a closed key, a public key handed to `sign`, an unknown
+  algorithm — because collapsing "could not verify" into "did not" is the safe direction.
+  5 tests: both SHA-256s on the NIST vectors and on an 800-byte message streamed in uneven
+  pieces (identical bytes demanded), RFC 4231 cases 1, 2 and 6 (the long key), sign → verify
+  under the certificate's key and the `PUBLIC KEY` PEM, then a flipped message byte, a flipped
+  signature bit, a truncation, the wrong digest and the wrong key all refused; refusals
+  before a byte of the caller's buffer moves. Four mutations watched failing (`ct_eq` → always
+  true; `verify` accepting everything; the in-language hasher's hex decode dropping a nibble;
+  `finish` skipping its length check). The `jcrypto` demo transcript is pinned.
+
+  Bindings, not algorithms — `std/csrand`'s rule. The `EVP_MD` is never held in a Jestyr
+  value: `EVP_sha256()` returns a `const` pointer and `cptr` is `void*`, so binding one to the
+  other trips `-Werror=discarded-qualifiers` in the emitted-C gate; four dispatchers choose
+  the digest at the call instead. `ERR_get_error`/`ERR_error_string_n` are bound under
+  aliases because `std/tls` binds them by name and one program may import both (a duplicate
+  extern is refused — measured). The in-language hasher accepts UTF-8 only, because
+  `sha256.push_sha256_hex` takes a `str` and `std/sha256` is in the seed closure; it refuses
+  other bytes at `finish` rather than hashing something else. Two fixtures added:
+  `crypto_test_pub.pem` (the TLS key's public half) and `crypto_test_other_key.pem` (a second
+  RSA key for the wrong-key case), both from `openssl` with no config needed.
+
 - **`std/tls`** — TLS over a `sysnet` socket by binding OpenSSL (area 8). A client context
   that trusts nothing until `trust` gives it a CA, a server context that checks its key
   against its certificate at load, blocking `client_session`/`server_session` handshakes

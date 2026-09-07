@@ -2535,6 +2535,60 @@ mod supervise_policy {
     }
 }
 
+/// **`jcrypto` — one message hashed by two SHA-256s, MACed, signed, and tampered with.**
+///
+/// `examples/std/crypto_demo.jtr` is `std/crypto`'s consumer. The fixed message goes through
+/// OpenSSL's `EVP_sha256` and through `std/sha256` behind the one `Hasher` interface, and the
+/// two digests are printed and compared; then it is MACed under the key `"key"` (a published
+/// HMAC-SHA256 vector), signed with the TLS fixture's private key and verified against the
+/// public key extracted from its certificate. The same signature is then refused for a
+/// message with one letter changed, for a signature with one bit flipped, and under a
+/// second RSA key — and accepted again once the bit is restored.
+///
+/// Every line is deterministic: RSA PKCS#1 v1.5 is a deterministic scheme and the program
+/// prints only the signature's LENGTH and each verdict, never its bytes. Links OpenSSL
+/// (`-lssl -lcrypto`, content-triggered through `openssl/ssl.h`).
+#[cfg(all(test, feature = "c-oracle"))]
+mod crypto_bound {
+    use super::*;
+
+    #[test]
+    fn jcrypto_hashes_macs_and_signs_deterministically() {
+        let exe = super::c_oracle::build_exe("examples/std/crypto_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the crypto demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jcrypto --\n\
+                    message\n\
+                    The quick brown fox jumps over the lazy dog\n\
+                    sha256 via openssl\n\
+                    d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592\n\
+                    sha256 via std/sha256\n\
+                    d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592\n\
+                    the two agree\ntrue\n\
+                    hmac-sha256 under the key \"key\"\n\
+                    f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8\n\
+                    and it verifies in constant time\ntrue\n\
+                    keys loaded: private, the certificate's public, another private\ntrue\ntrue\ntrue\n\
+                    signature bytes\n256\n\
+                    verified with the certificate's public key\ntrue\n\
+                    the same signature over a message with one letter changed\nfalse\n\
+                    the signature with one bit flipped\nfalse\n\
+                    restored, it verifies again\ntrue\n\
+                    under a key that did not sign it\nfalse";
+        assert_eq!(out.trim_end(), want, "the crypto demo's transcript changed:\n{out}");
+
+        // Anti-vacuity: exactly three refusals — the changed message, the flipped bit, the
+        // other key — and every other verdict a `true`. A hasher that refused would print
+        // `(refused)` in place of a digest; none may.
+        assert_eq!(out.matches("\nfalse\n").count() + usize::from(out.trim_end().ends_with("false")), 3,
+            "exactly the three tampered cases may be refused:\n{out}");
+        assert_eq!(out.matches("\ntrue\n").count(), 7, "every untampered step must succeed:\n{out}");
+        assert!(!out.contains("(refused)"), "both hashers must produce a digest:\n{out}");
+    }
+}
+
 /// **`jlog` — one logging routine, two renderings, and the log reading itself back.**
 ///
 /// `examples/std/log_demo.jtr` is `std/log`'s consumer. `run_job` is written once and shipped
@@ -20347,6 +20401,11 @@ fn main() -> i32 {
             // the test chose; the long-runner is really killed, and the two clocks are told
             // apart by a wait on a manual clock that costs nothing.
             ("supervise_test", 10),
+            // OpenSSL's SHA-256 and `std/sha256` held to each other and to NIST through one
+            // fn-pointer interface; HMAC against RFC 4231 (long key included); a signature
+            // refused for a flipped message byte, a flipped signature bit, a truncation and
+            // the wrong key; every refusal before the caller's buffer is touched. Links OpenSSL.
+            ("crypto_test", 5),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");
