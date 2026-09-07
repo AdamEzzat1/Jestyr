@@ -427,12 +427,38 @@ fn narrowed(read parent: sandbox.Jail, take f: fs.Fs, read root: str, mut escape
     return ok
 }
 
-// **The two ways `start` can fail, told apart the way `start` tells them apart.** A working
-// directory that is not there is the PLATFORM's failure: nothing is started, the spawner
-// counts no refusal, and `syserr.last_raw()` is still the platform's own non-zero number one
-// frame further out than `start` reads it — which is what makes `SandboxFailed`'s payload
-// the real code rather than a stale one. A spawner that was never allowed is the
-// CAPABILITY's refusal: the spawner counts it and the platform is never reached.
+// **A directory that is not there fails at a DIFFERENT MOMENT on each platform, and the
+// Linux ladder is what said so.** This test asserted the Windows shape on both and was
+// green here for a week: `CreateProcessA` validates `lpCurrentDirectory` itself, so nothing
+// is started and the spawner's `started` stays 0. POSIX cannot answer that early — `fork`
+// has already succeeded by the time the child runs `chdir`, so the start IS counted and the
+// failure is the child's exit status (126, which `sysproc`'s child sets for exactly this).
+// Neither is a bug; the contract is per-platform and `std/sandbox`'s header now says so.
+//
+// **What is the same on both, and is the point of the test:** this is the PLATFORM failing,
+// not the CAPABILITY refusing, and the discriminant is the spawner's refusal counter
+// staying at 0. That half is asserted here, unsplit.
+@cfg(windows) fn a_missing_directory_is_seen(mut c: test.Check, mut rep: []u8, mut sp: sysproc.Spawner, mut ch: sysproc.Child) {
+    // `syserr.last_raw()` is read by the caller one frame further out than `start` reads it,
+    // which is what makes the payload the real code rather than a stale one.
+    test.is_false(c, rep, "nothing started", sysproc.is_live(ch))
+    test.is_true(c, rep, "the platform said why, in its own number", syserr.last_raw() > 0)
+    test.eq_i64(c, rep, "and no start", sysproc.started(sp), 0)
+}
+
+@cfg(posix) fn a_missing_directory_is_seen(mut c: test.Check, mut rep: []u8, mut sp: sysproc.Spawner, mut ch: sysproc.Child) {
+    // No `last_raw()` assertion here: the fork SUCCEEDED, so there is no platform error to
+    // read at this point and any non-zero value would be a leftover from something else.
+    test.eq_i64(c, rep, "the fork succeeded, so the start was counted", sysproc.started(sp), 1)
+    let st: sysproc.Status = sysproc.wait(ch)
+    test.is_true(c, rep, "the child exited rather than running", sysproc.is_exited(st))
+    test.eq_i64(c, rep, "and it died of the directory: 126", sysproc.code_of(st) as i64, 126)
+}
+
+// **The two ways `start` can fail, told apart the way `start` tells them apart.** A spawner
+// that was never allowed is the CAPABILITY's refusal: the spawner counts it and the platform
+// is never reached. A working directory that is not there is the PLATFORM's failure, seen at
+// whichever moment that platform can see it (above).
 //
 // Neither branch destructures `sandbox`'s error set, deliberately: `start`'s own rule is
 // that the counter is the discriminant, and a test that re-spelled the variants would be
@@ -445,11 +471,8 @@ fn narrowed(read parent: sandbox.Jail, take f: fs.Fs, read root: str, mut escape
 
     var sp: sysproc.Spawner = sysproc.host()
     var ch: sysproc.Child = sandbox.start(sp, "exit 0", "/no/such/jestyr/sandbox/dir", j) catch sysproc.no_child()
-    let code: i32 = syserr.last_raw()
-    test.is_false(c, rep, "nothing started", sysproc.is_live(ch))
-    test.is_true(c, rep, "the platform said why, in its own number", code > 0)
+    a_missing_directory_is_seen(c, rep, sp, ch)
     test.eq_i64(c, rep, "the spawner counted no refusal: this was not the capability", sysproc.refused(sp), 0)
-    test.eq_i64(c, rep, "and no start", sysproc.started(sp), 0)
 
     var no: sysproc.Spawner = sysproc.denied()
     var ch2: sysproc.Child = sandbox.start(no, "exit 0", "", j) catch sysproc.no_child()

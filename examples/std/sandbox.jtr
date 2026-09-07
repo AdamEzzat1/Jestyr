@@ -59,6 +59,21 @@
 // corrupted projection fails closed. No variable at all means exactly what today means:
 // the unjailed host.
 //
+// ─── A bad working directory fails at a different MOMENT on each platform ─────
+//
+// **This is a contract difference a caller has to know, and it was found by the Linux
+// ladder rather than by reasoning.** Windows validates the directory inside
+// `CreateProcessA`: the start fails, nothing runs, and the spawner's `started` stays 0.
+// POSIX cannot answer that early — `fork` has already succeeded by the time the child
+// reaches `chdir` — so the start IS counted and the child exits 126 instead. A caller that
+// must treat a missing directory as "nothing ran" therefore has to WAIT for the child on
+// POSIX rather than trust the return, and `sysproc`'s 126 is the agreed code for it.
+//
+// Both are the PLATFORM failing rather than the capability refusing, and that half is the
+// same everywhere: the spawner's refusal counter stays at 0. Making the two uniform would
+// mean reporting the child's failure back through a CLOEXEC pipe before `exec` — a real
+// technique, not attempted here, because it cannot be tested on this machine.
+//
 // ─── What is deliberately not here ────────────────────────────────────────────
 //
 // No pipes (`sysproc.start_piped` has them; a sandboxed AND piped child is a `start_at`
