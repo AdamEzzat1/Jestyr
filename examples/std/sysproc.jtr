@@ -112,8 +112,11 @@
 //
 // ─── What is still not here ───────────────────────────────────────────────────
 //
-// No environment control, no working directory, no process groups. Each is a real thing
-// to want and none of them is needed to lift the ceiling this module exists to lift.
+// ~~No environment control, no working directory, no process groups.~~ All three now
+// have ONE additive entry point, `start_at` at the bottom of this file, because all three
+// are facts that can only be decided at the instant a process comes into being. The
+// policy above them — what a group is, what a jail projects — is `std/sandbox`'s. Nothing
+// above `start_at` changed.
 //
 // **The environment a child inherits is now the SAME on both platforms** (see `env_block`
 // at the `posix_spawn` call). What follows is the difference as it stood, kept because the
@@ -1137,4 +1140,263 @@ pub fn wait_or_kill(mut c: Child, mut clk: time.Clock, timeout_nanos: i64) -> St
     }
     release(c)
     return s
+}
+
+// ---- facts decided at the instant of creation: cwd, one more variable, apartness ------
+//
+// **Everything above this line is unchanged.** What follows is the one entry point the
+// header's "still not here" list was waiting for, and it is here rather than in
+// `std/sandbox` for a single reason: a working directory, an environment and a process
+// group are all things a process is BORN with. Windows sets them in `CreateProcessA`'s
+// arguments; POSIX sets them in the child between `fork` and `exec`. Neither can be
+// changed from outside after the fact without a race — a child that starts and THEN is
+// moved into a group may already have spawned a grandchild that is not in it — so the
+// primitive has to be here, at the one moment the platform offers. The POLICY (what a
+// group is for, what a jail projects) is `std/sandbox`'s and is not repeated here.
+//
+// `env_extra` is ONE `NAME=value` string appended to the INHERITED environment, not a
+// replacement for it. Jestyr has no way to set a variable in its own process (`std/env`
+// reads only), and a child that received only the extra would lose `PATH`, which is the
+// exact asymmetry `start` closed. On POSIX the parent's `environ` (`env_block()`) is copied
+// into a fresh array with one more slot; on Windows `GetEnvironmentStringsA` is copied with
+// one more entry, and it is appended rather than inserted in sorted order because the C
+// runtime's `getenv` does not rely on the order and rebuilding the block sorted would be a
+// second parser for a format nobody else reads.
+//
+// `apart` is the platform-shaped half, stated rather than smoothed over: on POSIX the child
+// becomes the leader of a NEW process group (`setpgid(0, 0)` before `exec`, and the parent
+// repeats it so a signal to `-pid` cannot race the child), which is the whole mechanism;
+// on Windows there is no group to join at creation, so the child is created SUSPENDED and
+// the caller puts it in a Job object BEFORE it runs a single instruction, then `resume`s
+// it. A caller that forgets `resume` on Windows has a child that never runs; on POSIX
+// `resume` is a no-op that answers whether the child is live.
+//
+// `cwd` may be empty (inherit). On POSIX a `chdir` that fails makes the child exit 126
+// before `exec`, the shell's own "cannot execute" code; on Windows `CreateProcessA` fails
+// and the caller gets the platform's number.
+
+@cfg(posix) extern "unistd.h" fn chdir(path: cptr) -> i32
+@cfg(posix) extern "unistd.h" fn setpgid(pid: i64, pgid: i64) -> i32
+@cfg(posix) extern "unistd.h" fn execve(path: cptr, argv: cptr, envp: cptr) -> i32
+
+@cfg(windows) extern "windows.h" fn GetEnvironmentStringsA() -> cptr
+@cfg(windows) extern "windows.h" fn FreeEnvironmentStringsA(block: cptr) -> i32
+@cfg(windows) extern "windows.h" fn ResumeThread(h: cptr) -> i32
+
+// `CREATE_SUSPENDED`, measured with the rest (`the_windows_job_constants_match_the_real_
+// headers` in `src/proptests.rs`).
+const SPROC_CREATE_SUSPENDED: i32 = 4
+
+// The OS handle as an integer — what a caller needs to hand the child to another Win32
+// object (a Job). 0 on POSIX, where `pid_of` is the identity.
+@no_alloc @no_os pub fn handle_of(read c: Child) -> i64 { return c.h }
+
+// The inherited environment block plus `extra`, as a fresh Windows block: `A=1\0B=2\0` …
+// `extra\0\0`. The caller frees it.
+@cfg(windows) fn env_block_with(read extra: str) -> *mut u8 {
+    let blk: cptr = GetEnvironmentStringsA()
+    // `n` stops on the FIRST NUL of the terminating pair, so `n + 1` bytes are the whole
+    // inherited block including the last string's own terminator. An empty block (`\0\0`)
+    // contributes nothing rather than a leading empty string.
+    var n: usize = 0
+    if blk != null {
+        let p: *mut u8 = blk as *mut u8
+        var going: bool = true
+        for going {
+            var a: u8 = 0
+            unsafe { a = (p + n).* }
+            if (a as i32) == 0 {
+                var b: u8 = 0
+                let k: usize = n + 1
+                unsafe { b = (p + k).* }
+                if (b as i32) == 0 { going = false } else { n = n + 1 }
+            } else {
+                n = n + 1
+            }
+        }
+    }
+    var head: usize = 0
+    if n > 0 { head = n + 1 }
+    var blob: *mut u8 = alloc(u8, head + extra.len + 2)
+    if blk != null {
+        let p: *mut u8 = blk as *mut u8
+        var i: usize = 0
+        for i < head {
+            var b: u8 = 0
+            unsafe { b = (p + i).* }
+            unsafe { (blob + i).* = b }
+            i = i + 1
+        }
+        FreeEnvironmentStringsA(blk)
+    }
+    var j: usize = 0
+    for j < extra.len {
+        let at: usize = head + j
+        unsafe { (blob + at).* = extra[j] }
+        j = j + 1
+    }
+    let t1: usize = head + extra.len
+    let t2: usize = t1 + 1
+    unsafe { (blob + t1).* = 0 }
+    unsafe { (blob + t2).* = 0 }
+    return blob
+}
+
+// The inherited `environ` plus `extra`, as a fresh NULL-terminated array of pointers. The
+// strings are the runtime's own and are not copied; only the array is the caller's to free.
+@cfg(posix) fn env_with(extra: *mut u8) -> *mut i64 {
+    let blk: cptr = env_block()
+    var n: usize = 0
+    if blk != null {
+        let ep: *mut i64 = blk as *mut i64
+        var going: bool = true
+        for going {
+            var v: i64 = 0
+            unsafe { v = (ep + n).* }
+            if v == 0 { going = false } else { n = n + 1 }
+        }
+    }
+    var arr: *mut i64 = alloc(i64, n + 2)
+    if blk != null {
+        let ep: *mut i64 = blk as *mut i64
+        var i: usize = 0
+        for i < n {
+            var v: i64 = 0
+            unsafe { v = (ep + i).* }
+            unsafe { (arr + i).* = v }
+            i = i + 1
+        }
+    }
+    let n1: usize = n + 1
+    unsafe { (arr + n).* = extra as i64 }
+    unsafe { (arr + n1).* = 0 }
+    return arr
+}
+
+// Start `cmd` through the platform shell in `cwd` (empty: inherit), with `env_extra`
+// (empty: nothing) added to the inherited environment, `apart` as described above. The
+// same capability gate and the same `Child` as `start`; no pipes.
+@cfg(windows) pub fn start_at(mut s: Spawner, read cmd: str, read cwd: str, read env_extra: str, apart: bool) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+    if s.allowed == false {
+        s.refused = s.refused + 1
+        return err(SysProcRefused)
+    }
+
+    var line: *mut u8 = nul_join("cmd.exe /c ", cmd)
+    var si: *mut u8 = alloc(u8, SPROC_STARTUPINFO_LEN)
+    var pi: *mut u8 = alloc(u8, SPROC_PROCESS_INFO_LEN)
+    zero_bytes(si, SPROC_STARTUPINFO_LEN)
+    zero_bytes(pi, SPROC_PROCESS_INFO_LEN)
+    let sw: *mut u32 = si as *mut u32
+    unsafe { (sw + 0).* = SPROC_STARTUPINFO_LEN as u32 }
+
+    var dir: *mut u8 = null
+    if cwd.len > 0 { dir = nul_copy(cwd) }
+    var envb: *mut u8 = null
+    if env_extra.len > 0 { envb = env_block_with(env_extra) }
+    var flags: i32 = 0
+    if apart { flags = SPROC_CREATE_SUSPENDED }
+
+    let rc: i32 = CreateProcessA(null, line as cptr, null, null, 0, flags, envb as cptr, dir as cptr, si as cptr, pi as cptr)
+    var code: i32 = 0
+    if rc == 0 { code = syserr.last_raw() }
+
+    var h: i64 = 0
+    var th: i64 = 0
+    var pid: i64 = 0
+    if rc != 0 {
+        let ps: *mut i64 = pi as *mut i64
+        unsafe { h = (ps + SPROC_PI_HPROCESS_SLOT).* }
+        unsafe { th = (ps + SPROC_PI_HTHREAD_SLOT).* }
+        let pw: *mut u32 = pi as *mut u32
+        var raw: u32 = 0
+        unsafe { raw = (pw + SPROC_PI_PID_WORD).* }
+        pid = raw as i64
+    }
+
+    if envb != null { free_ptr(envb) }
+    if dir != null { free_ptr(dir) }
+    free_ptr(pi)
+    free_ptr(si)
+    free_ptr(line)
+
+    if rc == 0 { return err(SysProcFailed(code)) }
+
+    s.started = s.started + 1
+    return ok(Child{ h: h, th: th, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: SPROC_NO_PIPE, outp: SPROC_NO_PIPE })
+}
+
+@cfg(posix) pub fn start_at(mut s: Spawner, read cmd: str, read cwd: str, read env_extra: str, apart: bool) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+    if s.allowed == false {
+        s.refused = s.refused + 1
+        return err(SysProcRefused)
+    }
+
+    // Everything is built BEFORE the fork, for `start_piped`'s reason: nothing between
+    // `fork` and `exec` may allocate.
+    var shp: *mut u8 = nul_copy("/bin/sh")
+    var a0: *mut u8 = nul_copy("sh")
+    var a1: *mut u8 = nul_copy("-c")
+    var a2: *mut u8 = nul_copy(cmd)
+    var argv: *mut i64 = alloc(i64, 4)
+    unsafe { (argv + 0).* = a0 as i64 }
+    unsafe { (argv + 1).* = a1 as i64 }
+    unsafe { (argv + 2).* = a2 as i64 }
+    unsafe { (argv + 3).* = 0 }
+    var dirp: *mut u8 = null
+    if cwd.len > 0 { dirp = nul_copy(cwd) }
+    var extra: *mut u8 = null
+    var envp: *mut i64 = null
+    if env_extra.len > 0 {
+        extra = nul_copy(env_extra)
+        envp = env_with(extra)
+    }
+
+    let pid: i64 = fork()
+    if pid == 0 {
+        // **The child.** `setpgid`, `chdir`, `execve`, `_exit` — all async-signal-safe.
+        if apart { setpgid(0, 0) }
+        if dirp != null {
+            if chdir(dirp as cptr) != 0 { sys_exit(126) }
+        }
+        if envp != null {
+            execve(shp as cptr, argv as cptr, envp as cptr)
+        } else {
+            execv(shp as cptr, argv as cptr)
+        }
+        sys_exit(127)
+    }
+
+    // The parent's half of the group change, so a signal to `-pid` sent immediately after
+    // this returns cannot arrive before the child has moved itself. Harmless after `exec`.
+    if pid > 0 and apart { setpgid(pid, pid) }
+
+    if envp != null { free_ptr(envp) }
+    if extra != null { free_ptr(extra) }
+    if dirp != null { free_ptr(dirp) }
+    free_ptr(argv)
+    free_ptr(a2)
+    free_ptr(a1)
+    free_ptr(a0)
+    free_ptr(shp)
+
+    if pid < 0 {
+        let c1: i32 = syserr.last_raw()
+        return err(SysProcFailed(c1))
+    }
+
+    s.started = s.started + 1
+    return ok(Child{ h: 0, th: 0, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: SPROC_NO_PIPE, outp: SPROC_NO_PIPE })
+}
+
+// Let a child created `apart` on Windows run. True if it is now running (or was never
+// suspended, on POSIX); false for a released child.
+@cfg(windows) pub fn resume(mut c: Child) -> bool {
+    if c.live == false { return false }
+    // `ResumeThread` returns the PREVIOUS suspend count, or -1 on failure.
+    return ResumeThread(c.th as cptr) >= 0
+}
+
+@cfg(posix) pub fn resume(mut c: Child) -> bool {
+    return c.live
 }

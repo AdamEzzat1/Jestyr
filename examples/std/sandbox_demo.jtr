@@ -1,0 +1,347 @@
+// examples/std/sandbox_demo.jtr — `jsandbox`: a child that runs WHERE it was told, dies
+// WITH its own child, and sees only the files it was given.
+//
+// Run:  jestyrc run examples/std/sandbox_demo.jtr
+//
+// ─── What this demonstrates ───────────────────────────────────────────────────
+//
+// A parent makes a scratch directory, puts one file inside it and one beside it, and starts
+// THIS SAME PROGRAM as a child — in that directory, in a group, under a jail that allows
+// read and write inside the scratch directory and nothing outside. The child (silent: it
+// shares the parent's console) writes a relatively named file, probes the jail four ways,
+// writes its findings to a report inside the root, starts a GRANDCHILD (this program once
+// more, which records its pid and sleeps), and exits. The parent then reads the report,
+// proves the grandchild is alive and in the group after the child has gone, terminates the
+// group, and proves the grandchild is gone.
+//
+// **The transcript is deterministic and names no path, pid or time.** Every claim is a
+// `true`, a fixed word, or a line the child wrote from fixed words, so
+// `jsandbox_confines_a_child_and_takes_its_grandchild_down` pins it as one exact string.
+//
+// **Why the child is this program** rather than a shell one-liner: the jail is honoured by
+// the child's JESTYR code (`sandbox.inherited`), so the child has to be a Jestyr program;
+// and self-spawning asks the question in one spelling on both platforms, exactly as
+// `env_inherit_demo` does — including its recorded caveat that the program path is passed
+// UNQUOTED because `cmd.exe /c` strips the outer quotes of a line that begins with one.
+
+import "sandbox"
+import "sysproc"
+import "sysfs"
+import "fs"
+import "env"
+import "mem"
+import "time"
+import "str"
+import "path"
+
+const ROOT_NAME: str = "jestyr_sandbox_demo"
+const OUTSIDE_NAME: str = "jestyr_sandbox_outside.txt"
+const INSIDE_NAME: str = "inside.txt"
+const CWD_NAME: str = "jestyr_sandbox_cwd.txt"
+const REPORT_NAME: str = "jestyr_sandbox_report.txt"
+const PID_NAME: str = "jestyr_sandbox_grandchild.pid"
+
+fn nothing() { }
+
+// `<dir>/<name>`, owned.
+fn under(read dir: str, read name: str) -> String {
+    var p: String = string_new()
+    string_push(p, dir)
+    string_push(p, "/")
+    string_push(p, name)
+    return p
+}
+
+// This program's path, absolute — a child started in another directory must still find
+// it. `argv[0]` is absolute under the harness and under `jestyrc run`; the join is for a
+// hand-run from a relative path.
+fn program_abs() -> String {
+    var s: String = string_new()
+    let p: str = env.program()
+    if path.is_abs(p) == false {
+        var here: String = sandbox.current_dir()
+        string_push(s, string_view(here))
+        string_free(here)
+        string_push(s, "/")
+    }
+    string_push(s, p)
+    return s
+}
+
+fn push_int(mut s: String, v: i64) {
+    if v == 0 {
+        string_push(s, "0")
+        return
+    }
+    var digits: *mut u8 = alloc(u8, 24)
+    var n: usize = 0
+    var x: i64 = v
+    for x > 0 {
+        let d: i64 = x % 10
+        unsafe { (digits + n).* = (48 + d) as u8 }
+        n = n + 1
+        x = x / 10
+    }
+    var ordered: *mut u8 = alloc(u8, 24)
+    var k: usize = 0
+    for k < n {
+        var ch: u8 = 0
+        let src: usize = n - 1 - k
+        unsafe { ch = (digits + src).* }
+        unsafe { (ordered + k).* = ch }
+        k = k + 1
+    }
+    string_push(s, from_utf8(slice(u8, ordered, n)))
+    free_ptr(ordered)
+    free_ptr(digits)
+}
+
+fn parse_int(read s: str) -> i64 {
+    var v: i64 = 0
+    var i: usize = 0
+    for i < s.len {
+        let d: i32 = (s[i] as i32) - 48
+        if d < 0 or d > 9 { break }
+        v = v * 10 + (d as i64)
+        i = i + 1
+    }
+    return v
+}
+
+fn word(b: bool) -> str {
+    if b { return "true" }
+    return "false"
+}
+
+// Wait up to `budget` for `p` to exist with something in it.
+fn wait_for_file(mut h: fs.Fs, mut clk: time.Clock, read p: str, budget: i64) -> bool {
+    var waited: i64 = 0
+    for true {
+        if fs.present(h, p) {
+            var t: String = fs.open_text(h, p)
+            let some: bool = string_view(t).len > 0
+            string_free(t)
+            if some { return true }
+        }
+        if waited >= budget { return false }
+        waited = waited + time.wait(clk, 10000000)
+    }
+    return false
+}
+
+// ---- the grandchild: record the pid, then sleep -------------------------------------------
+
+fn grandchild() -> i32 {
+    var e: env.Env = env.host()
+    var j: sandbox.Jail = sandbox.inherited(e)
+    var line: String = string_new()
+    push_int(line, sandbox.own_pid())
+    // Through the jail, relatively: the cwd was inherited from the child, which is the root.
+    sandbox.put(j, PID_NAME, string_view(line))
+    string_free(line)
+    sandbox.free(j)
+    var clk: time.Clock = time.host()
+    time.wait(clk, 30000000000)
+    return 0
+}
+
+// ---- the child: report where it is and what it may see, then leave a grandchild ---------
+
+fn child() -> i32 {
+    var e: env.Env = env.host()
+    var j: sandbox.Jail = sandbox.inherited(e)
+    var here: String = sandbox.current_dir()
+    var report: String = string_new()
+
+    // 1. Where it ran — a RELATIVELY named file, which lands in the working directory.
+    sandbox.put(j, CWD_NAME, string_view(here))
+
+    // 2. The jail, four ways. The outside file is a sibling of the root: reached absolutely
+    // it is outside the fence; reached through `..` it is refused as a shape.
+    string_push(report, "jailed ")
+    string_push(report, word(sandbox.is_jailed(j)))
+    string_push(report, "\nmode ")
+    var pj: String = sandbox.project(j)
+    string_push(report, str.before(string_view(pj), " "))
+    string_free(pj)
+
+    var tmp: String = sysfs.temp_dir(e)
+    var outside_abs: String = under(string_view(tmp), OUTSIDE_NAME)
+    var outside_up: String = under("..", OUTSIDE_NAME)
+    var inside_abs: String = under(sandbox.root_of(j), INSIDE_NAME)
+
+    var t1: String = sandbox.open_text(j, string_view(outside_abs))
+    string_push(report, "\noutside-absolute ")
+    if sandbox.present(j, string_view(outside_abs)) == false and string_view(t1).len == 0 {
+        string_push(report, "denied")
+    } else {
+        string_push(report, "LEAKED")
+    }
+    var t2: String = sandbox.open_text(j, string_view(outside_up))
+    string_push(report, "\noutside-traversal ")
+    if sandbox.present(j, string_view(outside_up)) == false and string_view(t2).len == 0 {
+        string_push(report, "denied")
+    } else {
+        string_push(report, "LEAKED")
+    }
+    var t3: String = sandbox.open_text(j, INSIDE_NAME)
+    string_push(report, "\ninside-relative ")
+    string_push(report, string_view(t3))
+    var t4: String = sandbox.open_text(j, string_view(inside_abs))
+    string_push(report, "\ninside-absolute ")
+    string_push(report, string_view(t4))
+    string_push(report, "\nrefused ")
+    push_int(report, sandbox.refused(j))
+    string_push(report, "\n")
+
+    // The report goes INSIDE, through the jail — the write the jail allows.
+    sandbox.put(j, REPORT_NAME, string_view(report))
+
+    // 3. A grandchild, left running. Not waited for: the point is that the parent can still
+    // reach it after this process is gone.
+    var sp: sysproc.Spawner = sysproc.host()
+    var prog: String = program_abs()
+    var cmd: String = string_new()
+    string_push(cmd, string_view(prog))
+    string_push(cmd, " grandchild")
+    var gc: sysproc.Child = sysproc.start(sp, string_view(cmd)) catch sysproc.no_child()
+    sysproc.release(gc)
+
+    string_free(cmd)
+    string_free(prog)
+    string_free(t4)
+    string_free(t3)
+    string_free(t2)
+    string_free(t1)
+    string_free(inside_abs)
+    string_free(outside_up)
+    string_free(outside_abs)
+    string_free(tmp)
+    string_free(report)
+    string_free(here)
+    sandbox.free(j)
+    return 0
+}
+
+// ---- the parent ---------------------------------------------------------------------------
+
+fn main() -> i32 {
+    if env.argc() > 1 {
+        if str.eq(env.argv(1), "grandchild") { return grandchild() }
+        return child()
+    }
+
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var e: env.Env = env.host()
+    var clk: time.Clock = time.host()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    print_str("-- jsandbox --")
+
+    // The scratch tree: `<temp>/jestyr_sandbox_demo/inside.txt`, and a sibling OUTSIDE it.
+    var tmp: String = sysfs.temp_dir(e)
+    var root: String = under(string_view(tmp), ROOT_NAME)
+    let r: str = string_view(root)
+    var outside: String = under(string_view(tmp), OUTSIDE_NAME)
+    var inside: String = under(r, INSIDE_NAME)
+    var cwd_file: String = under(r, CWD_NAME)
+    var report_file: String = under(r, REPORT_NAME)
+    var pid_file: String = under(r, PID_NAME)
+    fs.erase(h, string_view(inside))
+    fs.erase(h, string_view(cwd_file))
+    fs.erase(h, string_view(report_file))
+    fs.erase(h, string_view(pid_file))
+    let made: bool = sysfs.make_dir(h, a, r) catch false
+    fs.put(h, string_view(outside), "outside-secret")
+    fs.put(h, string_view(inside), "inside-bytes")
+    print_str("scratch tree ready")
+    print_bool(sysfs.exists(h, a, r) and fs.present(h, string_view(inside)) and fs.present(h, string_view(outside)))
+
+    // The jail: read and write, under the scratch directory only.
+    var j: sandbox.Jail = sandbox.jail(fs.host(), r)
+    print_str("the jail is fenced, read-write")
+    print_bool(sandbox.is_jailed(j) and sandbox.can_write(j))
+
+    // ---- the child ----
+    print_str("-- a child: in the scratch directory, in a group, under the jail --")
+    var prog: String = program_abs()
+    var cmd: String = string_new()
+    string_push(cmd, string_view(prog))
+    string_push(cmd, " child")
+    var g: sandbox.Group = sandbox.no_group()
+    var ch: sysproc.Child = sandbox.start_grouped(sp, string_view(cmd), r, j, g) catch sysproc.no_child()
+    print_str("started")
+    print_bool(sysproc.is_live(ch) and sandbox.is_group_live(g))
+    let st: sysproc.Status = sysproc.wait_timeout(ch, clk, 30000000000)
+    sysproc.release(ch)
+    print_str("and exited on its own, cleanly")
+    print_bool(sysproc.is_exited(st) and sysproc.code_of(st) == 0)
+
+    // ---- where it ran ----
+    print_str("-- where it ran --")
+    print_str("its relatively named file is in the scratch directory")
+    print_bool(fs.present(h, string_view(cwd_file)))
+    var ran_in: String = fs.open_text(h, string_view(cwd_file))
+    print_str("and the directory it reported is that directory")
+    print_bool(str.has_suffix(str.trimmed(string_view(ran_in)), ROOT_NAME))
+    string_free(ran_in)
+
+    // ---- what it saw ----
+    print_str("-- what the jail let it see (the child's own report) --")
+    var report: String = fs.open_text(h, string_view(report_file))
+    print_str(str.trimmed(string_view(report)))
+    string_free(report)
+
+    // ---- the group ----
+    print_str("-- the group --")
+    print_str("the grandchild reported in")
+    let reported: bool = wait_for_file(h, clk, string_view(pid_file), 15000000000)
+    print_bool(reported)
+    var pid_text: String = fs.open_text(h, string_view(pid_file))
+    let gpid: i64 = parse_int(str.trimmed(string_view(pid_text)))
+    string_free(pid_text)
+    print_str("the child is gone but the group is not empty: the grandchild is in it")
+    print_bool(sandbox.group_empty(g) == false)
+    print_str("and the grandchild is alive")
+    print_bool(sandbox.pid_alive(gpid))
+    print_str("terminate the group")
+    print_bool(sandbox.terminate_group(g))
+    print_str("the group emptied within the budget")
+    print_bool(sandbox.wait_group_empty(g, clk, 15000000000))
+    print_str("and the grandchild is gone, within the budget")
+    print_bool(sandbox.wait_pid_gone(gpid, clk, 15000000000))
+    print_str("the grandchild's pid was real")
+    print_bool(gpid > 0)
+    sandbox.release_group(g)
+
+    // ---- scrub ----
+    fs.erase(h, string_view(inside))
+    fs.erase(h, string_view(cwd_file))
+    fs.erase(h, string_view(report_file))
+    fs.erase(h, string_view(pid_file))
+    fs.erase(h, string_view(outside))
+    // A terminated process keeps its working directory open for a few milliseconds after
+    // the group reports it gone, so the directory removal is retried briefly.
+    var waited: i64 = 0
+    var removed: bool = sysfs.remove_dir(h, a, r) catch false
+    for removed == false and sysfs.exists(h, a, r) {
+        if waited >= 2000000000 { break }
+        waited = waited + time.wait(clk, 10000000)
+        removed = sysfs.remove_dir(h, a, r) catch false
+    }
+    print_str("-- scrubbed --")
+    print_bool(sysfs.exists(h, a, r) == false and fs.present(h, string_view(outside)) == false)
+
+    sandbox.free(j)
+    string_free(cmd)
+    string_free(prog)
+    string_free(pid_file)
+    string_free(report_file)
+    string_free(cwd_file)
+    string_free(inside)
+    string_free(outside)
+    string_free(root)
+    string_free(tmp)
+    return 0
+}

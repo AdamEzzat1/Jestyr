@@ -513,9 +513,50 @@ done until its count is in that table.
 | Crypto: HMAC, signing, a hash interface | New modules importing `sha256` read-only. These are BINDINGS, not algorithms to write — `csrand` deliberately invents nothing. |
 | Trace spans | **Pick another word first.** `Span` is taken three times: `http.Header` spans, `diag` source spans, and the `@span` work-span attribute. Use the fn-pointer vtable shape, not a trait — `@no_alloc` passes vacuously through a trait method. |
 | Service supervision / restart policy | The lifecycle is complete; a supervisor over `std/sysproc` is its own module. |
-| Sandbox: cwd, process groups, fs capability projection | `sysproc.jtr:113` names all three. `fs.Fs` gates the parent; nothing projects it onto a child. |
+| ~~Sandbox: cwd, process groups, fs capability projection~~ | **DONE: `std/sandbox`** — see the entry below. |
 | Config: live reload, nesting | `std/syswatch` exists; composing them is the caller's job today. |
 | Rewrite `std/plugin` as a server on the pipe transport | Tier 4 leftover. One-process-per-call only because the transport did not exist; it does now (`start_piped`/`capture`). |
+
+### ~~Sandbox (cwd, process groups, fs capability projection)~~ — **DONE: `std/sandbox`**
+
+A working directory, a group and a jail for a child, over ONE additive `sysproc` primitive.
+Seven tests (four with no process, three with real children through the shell), a pinned
+self-spawning demo (`jsandbox`, `examples/std/sandbox_demo.jtr`), four mutations watched
+failing, no reseed (`fs.jtr` is untouched — see the first bullet). What a successor should
+not re-derive:
+
+* **`fs.jtr` is a closure module and was NOT edited.** The brief's "have the child's
+  `fs.host()` honour the variable" would have forced a reseed. The projection therefore
+  lives in `sandbox.Jail` — `fs.Fs` plus a root, with `open_text`/`put`/`present`/`erase`
+  — and a child honours it by calling `sandbox.inherited(env)` instead of `fs.host()`.
+  Moving it into `fs.host()` later is a one-line change in `fs.jtr` plus a reseed.
+* **The three facts are one primitive: `sysproc.start_at(sp, cmd, cwd, env_extra, apart)`.**
+  Windows: `lpCurrentDirectory`, `GetEnvironmentStringsA` copied with one more entry,
+  `CREATE_SUSPENDED`; POSIX: `chdir`/`setpgid(0,0)`/`execve` between `fork` and `exec`,
+  `environ` copied into an array with one more slot. `apart` is deliberately platform-shaped:
+  POSIX makes a group leader outright, Windows only suspends so the caller can join a Job
+  first — `sysproc.resume` is the other half there and a no-op on POSIX.
+* **A Job is joined while the child is SUSPENDED.** Assigning after the child runs races a
+  grandchild born outside the Job. `start_grouped` refuses to leave an ungroupable child
+  running (terminates it).
+* **`ActiveProcesses == 0` precedes the process objects being signalled** by a few ms, and
+  a terminated process holds its cwd open for a few ms after that. Hence `wait_pid_gone`
+  (bounded) and the retried `remove_dir` in the suite and demo. Kill-on-close was NOT built:
+  it needs `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, a second layout claim.
+* **Killing the shell in the first milliseconds kills nothing else.** The group test's
+  grandchild writes a marker before sleeping and the test waits for it; the first version
+  killed `cmd.exe` before it had spawned `ping` and the group "emptied" for the wrong reason.
+* **The projection is `<mode> <root>` with a SPACE**, because the suite's shell-echo probe
+  re-reads it and `|`/`&` are operators in `cmd.exe`. An unknown mode reads as `denied`.
+  No variable → the unjailed host, exactly today's behaviour.
+* **The fence is lexical**: unified separators, relative paths resolved against `current_dir`,
+  any `..` segment refused as a shape, case-insensitive prefix on Windows. Symlinks are the
+  known hole; `sysfs.canonical` is the fix when a consumer needs it.
+* `kill`, `WaitForSingleObject` and `CloseHandle` are bound by `sysproc` already; a second
+  bare binding in the same program is a duplicate definition, so `sandbox` uses the alias
+  form (`sys_kill`, `sbox_wait`, `sbox_close`).
+* Windows-verified only: everything. The POSIX branches (`chdir`/`setpgid`/`execve`,
+  `kill(-pgid, 0)` as the group probe, `getcwd`) compile and are owed to the Linux ladder.
 
 ### ~~The registry layer~~ — **DONE: `std/manifest` + `std/registry`**
 
@@ -595,7 +636,7 @@ CHANGELOG to find it.
 | **Crypto bindings** | HMAC, signing/verification, a hash interface | Bindings over `sha256`/OpenSSL, not algorithms; `std/tls` shows the `extern "openssl/*.h"` shape and the link rule is already in place |
 | **Trace spans** | a span per unit of work, parent ids, a dump | `Span` is taken three times (`http`, `diag`, `@span`) — pick another word; fn-pointer vtable, not a trait (`@no_alloc` passes vacuously through a trait) |
 | **Service supervision** | restart policy over `std/sysproc`, backoff, a supervision tree | the lifecycle (`std/service`) is complete; this is a supervisor OVER children, its own module |
-| **Sandbox** | cwd, process groups, fs capability projection onto a child | `sysproc.jtr:113` names all three; `fs.Fs` gates the parent and nothing projects it |
+| ~~**Sandbox**~~ | **DONE: `std/sandbox`** (§2 entry above) | `sysproc.start_at` is the one primitive; the jail is a `sandbox.Jail` a child reads with `inherited`, NOT a change to `fs.host()` (closure module) |
 | **Config live reload + nesting** | re-read on change, nested sections | `std/syswatch` + `std/config` exist; composing them is the module |
 | **`std/plugin` on the pipe transport** | a plugin as a server on `sysproc.start_piped` | Tier 4 leftover; one-process-per-call only because the transport did not exist |
 
