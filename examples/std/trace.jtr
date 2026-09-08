@@ -1,0 +1,722 @@
+// std/trace.jtr — timed, nested segments of work, exported to whoever is listening.
+//
+// TIER: `std`. A `Tracer` reaches the operating system through exactly two things it is
+// GIVEN — a `time.Clock` for the timestamps and an `Exporter` for the destination — so a
+// tracer over `time.manual()` and a buffered exporter touches nothing at all, and every
+// duration it reports is exactly what the test chose. That is `std/log`'s discipline, and
+// this module is `std/log`'s shape with nesting and a stopwatch added.
+//
+// ─── The noun is "segment", and the reason is a collision ─────────────────────
+//
+// The word the rest of the world uses is "span", and it is taken three times in this tree:
+// `std/http` has header spans, `std/diag` has source spans, and `@span` is the checked
+// work-span attribute of the cost model. A fourth `Span` would be a type a reader could
+// not grep for and a name that meant something different in every module that imported
+// two of them. So the unit here is a **segment**: a named stretch of one trace with a
+// start, a duration, a parent and attributes. The segment's id is a plain `i64`, and there
+// is no `Segment` struct to hold — the tracer holds the open ones and the exporter is
+// handed the finished ones.
+//
+// ─── No hidden tracer ─────────────────────────────────────────────────────────
+//
+// There is no `trace.begin("x")` free function, no ambient default, and no initialization
+// on first use. A service is HANDED a `Tracer` the way it is handed a `Logger` and a
+// `metrics.Registry`, and the clock and the exporter are visible in the signature that
+// made it. A global tracer is a hidden global with a clock and an output attached, and
+// this tree has spent a lot of effort not having hidden globals.
+//
+// ─── The exporter is a vtable, not a trait ────────────────────────────────────
+//
+// An `Exporter` is a `*mut u8` context plus four function pointers — the `runtime.Task`
+// and `mem.Allocator` shape. Not a trait, for the reason `std/sink`'s header gives:
+// `@no_alloc` passes VACUOUSLY through a trait method, reporting success on code that
+// allocates on every call, and an exporter is exactly the kind of thing that would. A
+// fn pointer is at least honest about being opaque, and the state it carries is explicit.
+//
+// The four calls are a visitor over ONE finished segment:
+//
+//     on_open(ctx, id, parent, name, start, dur)
+//     on_str(ctx, key, value)      ← once per string attribute, in the order they were set
+//     on_i64(ctx, key, value)      ← once per integer attribute, likewise
+//     on_close(ctx)
+//
+// The tracer drives them from `end`, while the segment's bytes are still in its own arena,
+// so the exporter borrows and copies and owns nothing of the tracer's. Two exporters ship
+// here — `to_text` (one logfmt-shaped line per segment) and `to_jsonl` (one JSON object
+// per line) over the same `Out` buffer — plus `to_log`, which hands each finished segment
+// to a `log.Logger` as one record. A test writes a fourth in a dozen lines, which is the
+// property the vtable exists for.
+//
+// **Records arrive in END order, so a child precedes its parent.** A segment is exported
+// when it finishes, and a parent finishes last. A consumer that wants the tree rebuilds it
+// from `id` and `parent`; a consumer that only wants the durations does not have to.
+//
+// ─── Ids are a counter, and that is deliberate ────────────────────────────────
+//
+// Ids start at 1 and count up per tracer; `0` is "no parent". Under a manual clock two
+// tracers running the same code produce the same ids and the same bytes, which is what
+// lets `the_same_run_exports_identically_through_both_renderers` compare renderings
+// rather than patterns. A process-unique or globally-unique id is a property of the
+// SYSTEM the trace is shipped into, not of the code that produced it, so it is the
+// exporter's job to add one if it wants one — the way a log shipper adds a host name.
+//
+// ─── Bounded, and every refusal is counted ────────────────────────────────────
+//
+// A tracer is sized ONCE at `make`: so many open segments, so many attributes, so many
+// bytes of names and values. Nothing is allocated after that, and nothing grows. Opening
+// past the limit is REFUSED — `begin` returns 0, which no real segment has — and counted,
+// never silently truncated. The refusals are distinct because the fixes are:
+//
+//   dropped     `begin` refused: the open stack, the attribute table or the arena is full
+//   truncated   an attribute refused: the table or the arena is full; the segment still
+//               exports with the attributes that fit, and the caller saw `false`
+//   abandoned   a segment still open when an OUTER one ended, or when the tracer was freed;
+//               it is discarded, never exported — the early-`return` bug, made visible
+//   unmatched   `end` named a segment that is not open at all
+//
+// `end(t, id)` names the segment on purpose. An `end` that closed "the innermost one"
+// could never notice the early return between a child's `begin` and its `end`; naming the
+// id is what makes the mis-nesting observable, and the outer segment still ends correctly.
+//
+// Attributes go on the INNERMOST open segment, and only there. A parent may set more after
+// a child has ended — the demo sets `status` after its `db` segment closes — but not while
+// one is open. That is what keeps the arena a stack: a segment's bytes and attributes are
+// released when it ends, in LIFO order, and a tracer's memory is exactly its `make` size
+// for its whole life.
+//
+// ─── What this does NOT do ────────────────────────────────────────────────────
+//
+// No sampling, no cross-process propagation, no trace ids shared between tracers, no
+// batching or asynchronous shipping, no wire protocol. Each is a policy a system chooses;
+// none can be chosen here for every caller. `to_log` is the whole of the integration with
+// `std/log`: a segment becomes one record, and this module does not become a logger.
+//
+// Worked example:  examples/std/trace_demo.jtr
+// Run the tests:   jestyrc test examples/std/trace_test.jtr
+
+import "sink"
+import "json"
+import "log"
+import "time"
+
+// ---- the exporter -----------------------------------------------------------------
+
+// A visitor over one finished segment. `@copy`: a pointer and four function pointers,
+// exactly like an `Allocator`.
+@copy pub struct Exporter {
+    ctx: *mut u8,
+    on_open: fn(*mut u8, i64, i64, str, i64, i64),
+    on_str: fn(*mut u8, str, str),
+    on_i64: fn(*mut u8, str, i64),
+    on_close: fn(*mut u8),
+}
+
+@no_alloc @no_os pub fn exporter(ctx: *mut u8,
+                                 open_fn: fn(*mut u8, i64, i64, str, i64, i64),
+                                 str_fn: fn(*mut u8, str, str),
+                                 i64_fn: fn(*mut u8, str, i64),
+                                 close_fn: fn(*mut u8)) -> Exporter {
+    return Exporter{ ctx: ctx, on_open: open_fn, on_str: str_fn, on_i64: i64_fn, on_close: close_fn }
+}
+
+// The exporter that discards everything. For a tracer whose only job is the accounting,
+// and for a test of the tracer that wants no exporter in the way. It is a real exporter
+// rather than an `Option` so `Tracer` has a total value for the field.
+fn drop_open(ctx: *mut u8, id: i64, parent: i64, name: str, start: i64, dur: i64) {}
+fn drop_str(ctx: *mut u8, key: str, value: str) {}
+fn drop_i64(ctx: *mut u8, key: str, value: i64) {}
+fn drop_close(ctx: *mut u8) {}
+
+@no_alloc @no_os pub fn discard() -> Exporter {
+    return Exporter{ ctx: null, on_open: &drop_open, on_str: &drop_str, on_i64: &drop_i64, on_close: &drop_close }
+}
+
+// ---- the tracer -------------------------------------------------------------------
+
+// One open segment is `SEG_STRIDE` words of the `meta` table:
+//   id, start, name offset, name length, attribute-table index at open.
+const SEG_STRIDE: usize = 5
+// One attribute is `ATTR_STRIDE` words of the `attrs` table:
+//   kind (ATTR_STR | ATTR_I64), key offset, key length, value offset | value, value length.
+const ATTR_STRIDE: usize = 5
+const ATTR_STR: i64 = 0
+const ATTR_I64: i64 = 1
+
+pub struct Tracer {
+    clock: time.Clock,
+    exp: Exporter,
+    meta: *mut i64,
+    cap: usize,          // open segments the stack can hold
+    depth: usize,        // open segments right now
+    attrs: *mut i64,
+    acap: usize,         // attributes the table can hold, across every open segment
+    atop: usize,         // attributes in use right now
+    raw: *mut u8,
+    bcap: usize,         // bytes of names, keys and string values
+    top: usize,          // bytes in use right now
+    next_id: i64,
+    finished: i64,
+    dropped: i64,
+    truncated: i64,
+    abandoned: i64,
+    unmatched: i64,
+}
+
+// The defaults `make` sizes a tracer with. Sixteen levels of nesting is far more than a
+// request has; sixty-four attributes across them and four kilobytes of text is generous
+// for names and values; `make_sized` is there for the caller who knows better.
+pub const TRACE_DEPTH_CAP: usize = 16
+pub const TRACE_ATTR_CAP: usize = 64
+pub const TRACE_ARENA_CAP: usize = 4096
+
+// `take` for the clock, because the tracer STORES it: a Jestyr borrow is second-class and
+// may not outlive the call. The same signature `log.make` and `runtime.make` carry, for
+// the same reason. The exporter is `@copy`, so it is simply copied in.
+pub fn make(take c: time.Clock, read e: Exporter) -> Tracer {
+    return make_sized(c, e, TRACE_DEPTH_CAP, TRACE_ATTR_CAP, TRACE_ARENA_CAP)
+}
+
+pub fn make_sized(take c: time.Clock, read e: Exporter, depth_cap: usize, attr_cap: usize, arena_cap: usize) -> Tracer {
+    var meta: *mut i64 = alloc(i64, depth_cap * SEG_STRIDE)
+    var attrs: *mut i64 = alloc(i64, attr_cap * ATTR_STRIDE)
+    var raw: *mut u8 = alloc(u8, arena_cap)
+    return Tracer{ clock: c, exp: e, meta: meta, cap: depth_cap, depth: 0,
+                   attrs: attrs, acap: attr_cap, atop: 0, raw: raw, bcap: arena_cap, top: 0,
+                   next_id: 1, finished: 0, dropped: 0, truncated: 0, abandoned: 0, unmatched: 0 }
+}
+
+// Release the tables. **Every segment still open is abandoned and counted**, not exported:
+// a segment that never ended has no duration to report, and inventing one at teardown
+// would put a plausible-looking record in the stream for work that did not finish.
+pub fn free(mut t: Tracer) {
+    if t.meta == null { return }
+    t.abandoned = t.abandoned + (t.depth as i64)
+    t.depth = 0
+    t.atop = 0
+    t.top = 0
+    free_ptr(t.meta as *mut u8)
+    free_ptr(t.attrs as *mut u8)
+    free_ptr(t.raw)
+    t.meta = null
+    t.attrs = null
+    t.raw = null
+}
+
+// ---- the accounting ---------------------------------------------------------------
+
+// Segments that ended and reached the exporter.
+@no_alloc @no_os pub fn finished(read t: Tracer) -> i64 { return t.finished }
+// `begin` calls refused because a table was full.
+@no_alloc @no_os pub fn dropped(read t: Tracer) -> i64 { return t.dropped }
+// Attributes refused because a table was full.
+@no_alloc @no_os pub fn truncated(read t: Tracer) -> i64 { return t.truncated }
+// Segments discarded because an outer one ended first, or the tracer was freed.
+@no_alloc @no_os pub fn abandoned(read t: Tracer) -> i64 { return t.abandoned }
+// `end` calls naming a segment that was not open.
+@no_alloc @no_os pub fn unmatched(read t: Tracer) -> i64 { return t.unmatched }
+
+// How many segments are open right now.
+@no_alloc @no_os pub fn open_count(read t: Tracer) -> usize { return t.depth }
+
+// The innermost open segment's id, or 0 when nothing is open — the one the next
+// `attr_*` would land on.
+@no_alloc @no_os pub fn current(read t: Tracer) -> i64 {
+    if t.depth == 0 { return 0 }
+    return seg_word(t, t.depth - 1, 0)
+}
+
+// Is `id` open, at any depth?
+@no_alloc @no_os pub fn is_open(read t: Tracer, id: i64) -> bool {
+    return index_of(t, id) >= 0
+}
+
+// The tracer OWNS its clock, so time is driven through the tracer — `log.advance` and
+// `runtime.advance` make the same argument: a test that advanced its own copy would be
+// advancing a clock nothing reads, and every duration would come out zero.
+pub fn advance(mut t: Tracer, by: i64) -> bool {
+    return time.advance(t.clock, by)
+}
+
+// What the next `begin` would record as its start.
+pub fn now(mut t: Tracer) -> i64 {
+    return time.read_nanos(t.clock)
+}
+
+// ---- the tables, by word ----------------------------------------------------------
+
+@no_alloc @no_os fn seg_word(read t: Tracer, i: usize, k: usize) -> i64 {
+    var v: i64 = 0
+    unsafe { v = (t.meta + (i * SEG_STRIDE + k)).* }
+    return v
+}
+
+@no_alloc @no_os fn set_seg_word(mut t: Tracer, i: usize, k: usize, v: i64) {
+    unsafe { (t.meta + (i * SEG_STRIDE + k)).* = v }
+}
+
+@no_alloc @no_os fn attr_word(read t: Tracer, i: usize, k: usize) -> i64 {
+    var v: i64 = 0
+    unsafe { v = (t.attrs + (i * ATTR_STRIDE + k)).* }
+    return v
+}
+
+@no_alloc @no_os fn set_attr_word(mut t: Tracer, i: usize, k: usize, v: i64) {
+    unsafe { (t.attrs + (i * ATTR_STRIDE + k)).* = v }
+}
+
+// The stack index of open segment `id`, searched from the innermost, or -1.
+@no_alloc @no_os fn index_of(read t: Tracer, id: i64) -> isize {
+    var i: usize = t.depth
+    for i > 0 {
+        i = i - 1
+        if seg_word(t, i, 0) == id { return i as isize }
+    }
+    return 0 - 1
+}
+
+// A view of `len` arena bytes at `off`. The arena is only ever written through `push_text`
+// from a `str`, so it is valid UTF-8 by construction and `from_utf8` cannot trap.
+@no_alloc @no_os fn arena_view(read t: Tracer, off: usize, len: usize) -> str {
+    let all: []u8 = slice(u8, t.raw, t.bcap)
+    let en: usize = off + len
+    return from_utf8(all[off .. en])
+}
+
+// Copy `text` onto the arena's top. The caller has already checked it fits.
+@no_alloc @no_os fn push_text(mut t: Tracer, read text: str) -> usize {
+    let off: usize = t.top
+    var all: []u8 = slice(u8, t.raw, t.bcap)
+    for i in 0..text.len {
+        all[off + i] = text[i] as u8
+    }
+    t.top = t.top + text.len
+    return off
+}
+
+// ---- opening and closing ----------------------------------------------------------
+
+// Open a segment named `name` under the innermost open one. Returns its id, or 0 when the
+// tracer refused — and it refuses, rather than growing, when the open stack or the arena
+// is full. Both refusals are `dropped`, because the fix is the same: size the tracer for
+// the work.
+//
+// **A freed tracer refuses rather than writing through a null table.** Tracing after
+// shutdown is an ordering bug, and the alternative is a crash somewhere far from the
+// `free` that caused it. It is not counted: nothing was full, the tracer is simply gone.
+pub fn begin(mut t: Tracer, read name: str) -> i64 {
+    if t.meta == null { return 0 }
+    if t.depth >= t.cap {
+        t.dropped = t.dropped + 1
+        return 0
+    }
+    if t.top + name.len > t.bcap {
+        t.dropped = t.dropped + 1
+        return 0
+    }
+    let id: i64 = t.next_id
+    t.next_id = t.next_id + 1
+    let start: i64 = time.read_nanos(t.clock)
+    let off: usize = push_text(t, name)
+    let i: usize = t.depth
+    set_seg_word(t, i, 0, id)
+    set_seg_word(t, i, 1, start)
+    set_seg_word(t, i, 2, off as i64)
+    set_seg_word(t, i, 3, name.len as i64)
+    set_seg_word(t, i, 4, t.atop as i64)
+    t.depth = t.depth + 1
+    return id
+}
+
+// Room for one more attribute whose text needs `bytes` of arena? Counts the refusal.
+@no_alloc @no_os fn attr_fits(mut t: Tracer, bytes: usize) -> bool {
+    if t.atop >= t.acap or t.top + bytes > t.bcap {
+        t.truncated = t.truncated + 1
+        return false
+    }
+    return true
+}
+
+// A string attribute on the innermost open segment. False, and nothing recorded, when no
+// segment is open or the tables are full — the latter counted as `truncated`.
+@no_alloc @no_os pub fn attr_str(mut t: Tracer, read key: str, read value: str) -> bool {
+    if t.meta == null or t.depth == 0 { return false }
+    if attr_fits(t, key.len + value.len) == false { return false }
+    let koff: usize = push_text(t, key)
+    let voff: usize = push_text(t, value)
+    let i: usize = t.atop
+    set_attr_word(t, i, 0, ATTR_STR)
+    set_attr_word(t, i, 1, koff as i64)
+    set_attr_word(t, i, 2, key.len as i64)
+    set_attr_word(t, i, 3, voff as i64)
+    set_attr_word(t, i, 4, value.len as i64)
+    t.atop = t.atop + 1
+    return true
+}
+
+// An integer attribute on the innermost open segment. The value lives in the table, so
+// only the key needs arena space.
+@no_alloc @no_os pub fn attr_i64(mut t: Tracer, read key: str, value: i64) -> bool {
+    if t.meta == null or t.depth == 0 { return false }
+    if attr_fits(t, key.len) == false { return false }
+    let koff: usize = push_text(t, key)
+    let i: usize = t.atop
+    set_attr_word(t, i, 0, ATTR_I64)
+    set_attr_word(t, i, 1, koff as i64)
+    set_attr_word(t, i, 2, key.len as i64)
+    set_attr_word(t, i, 3, value)
+    set_attr_word(t, i, 4, 0)
+    t.atop = t.atop + 1
+    return true
+}
+
+// Discard the innermost open segment without exporting it, releasing its bytes.
+@no_alloc @no_os fn pop(mut t: Tracer) {
+    let i: usize = t.depth - 1
+    t.top = seg_word(t, i, 2) as usize
+    t.atop = seg_word(t, i, 4) as usize
+    t.depth = i
+}
+
+// End segment `id`: its duration is the clock's reading now minus its start, and it goes
+// to the exporter with its parent's id and every attribute set on it.
+//
+// **`id` need not be the innermost.** Every segment opened inside it and not yet ended is
+// ABANDONED — discarded unexported and counted — and then `id` ends normally. That is the
+// shape of the realistic bug, an early `return` between a child's `begin` and its `end`,
+// and leaving the child open would corrupt every segment after it: the next `begin` would
+// nest under a child that was supposed to be gone. An `id` that is not open at all is
+// `unmatched`, and nothing changes.
+//
+// Returns whether a segment was exported.
+pub fn end(mut t: Tracer, id: i64) -> bool {
+    if t.meta == null { return false }
+    let ix: isize = index_of(t, id)
+    if ix < 0 {
+        t.unmatched = t.unmatched + 1
+        return false
+    }
+    let i: usize = ix as usize
+    for t.depth > i + 1 {
+        pop(t)
+        t.abandoned = t.abandoned + 1
+    }
+    let now: i64 = time.read_nanos(t.clock)
+    let start: i64 = seg_word(t, i, 1)
+    var parent: i64 = 0
+    if i > 0 { parent = seg_word(t, i - 1, 0) }
+    let e: Exporter = t.exp
+    let name: str = arena_view(t, seg_word(t, i, 2) as usize, seg_word(t, i, 3) as usize)
+    e.on_open(e.ctx, id, parent, name, start, now - start)
+    var a: usize = seg_word(t, i, 4) as usize
+    for a < t.atop {
+        let key: str = arena_view(t, attr_word(t, a, 1) as usize, attr_word(t, a, 2) as usize)
+        if attr_word(t, a, 0) == ATTR_STR {
+            let value: str = arena_view(t, attr_word(t, a, 3) as usize, attr_word(t, a, 4) as usize)
+            e.on_str(e.ctx, key, value)
+        } else {
+            e.on_i64(e.ctx, key, attr_word(t, a, 3))
+        }
+        a = a + 1
+    }
+    e.on_close(e.ctx)
+    pop(t)
+    t.finished = t.finished + 1
+    return true
+}
+
+// ---- a buffered destination, rendered two ways ------------------------------------
+//
+// **The state is behind a pointer because that is what a fn pointer can carry.** An
+// `Out` is the `memprof.Counting` shape: a handle over a heap block, so the exporter's
+// `ctx` and the caller's handle name the same bytes, and `out_view` reads what the
+// callbacks wrote.
+//
+// A record is built in its own scratch sink and copied to the output only when it is
+// complete and fits — `std/log`'s rule that a truncated record is NOT emitted, because a
+// half-written JSON object is unparseable and a half-written logfmt line silently loses
+// its last fields. A record that does not fit is counted in `out_lost` and the output
+// stays a whole number of whole lines.
+
+struct OutState {
+    fmt: i32,
+    rec: Sink,
+    rraw: *mut u8,
+    rcap: usize,
+    jw: json.Writer,
+    s: Sink,
+    raw: *mut u8,
+    cap: usize,
+    records: i64,
+    lost: i64,
+}
+
+@copy pub struct Out {
+    p: *mut OutState,
+}
+
+const OUT_TEXT: i32 = 0
+const OUT_JSONL: i32 = 1
+
+// The scratch a single record is built in. A segment's line is a name, five numbers and
+// its attributes; a kilobyte holds any of them, and one that does not fit is counted.
+pub const TRACE_RECORD_CAP: usize = 1024
+
+// An output buffer of `cap` bytes. Hand it to `to_text` OR `to_jsonl` — one of the two,
+// once — and read it back with `out_view`.
+pub fn buffer(cap: usize) -> Out {
+    var p: *mut OutState = alloc(OutState, 1)
+    var rraw: *mut u8 = alloc(u8, TRACE_RECORD_CAP)
+    var raw: *mut u8 = alloc(u8, cap)
+    unsafe {
+        p.* = OutState{ fmt: OUT_TEXT, rec: sink.new(), rraw: rraw, rcap: TRACE_RECORD_CAP, jw: json.writer(),
+                        s: sink.new(), raw: raw, cap: cap, records: 0, lost: 0 }
+    }
+    return Out{ p: p }
+}
+
+pub fn free_buffer(mut o: Out) {
+    if o.p == null { return }
+    unsafe {
+        free_ptr(o.p.*.rraw)
+        free_ptr(o.p.*.raw)
+    }
+    free_ptr(o.p as *mut u8)
+    o.p = null
+}
+
+// What has been exported so far, one line per record.
+pub fn out_view(read o: Out) -> str {
+    unsafe {
+        let buf: []u8 = slice(u8, o.p.*.raw, o.p.*.cap)
+        return sink.view(o.p.*.s, buf)
+    }
+}
+
+// Records that landed whole.
+@no_alloc @no_os pub fn out_records(read o: Out) -> i64 { unsafe { return o.p.*.records } }
+// Records that did not fit — in the record scratch or in the output — and were withheld.
+@no_alloc @no_os pub fn out_lost(read o: Out) -> i64 { unsafe { return o.p.*.lost } }
+
+// Forget everything exported so far; the next record starts at byte 0.
+pub fn out_reset(mut o: Out) {
+    unsafe {
+        sink.reset(o.p.*.s)
+        o.p.*.records = 0
+        o.p.*.lost = 0
+    }
+}
+
+// One line per segment, logfmt-shaped:
+//
+//     id=2 parent=1 name=parse start=1000 dur=100 bytes=512
+//
+// A value that would break the line — a space, an `=`, a quote, a control byte, an empty
+// string — is quoted by `std/log`'s rule and `std/json`'s escaper, so the tree has ONE
+// answer to "what does a quoted logfmt value look like" and it is the one `log_test`
+// already covers.
+pub fn to_text(read o: Out) -> Exporter {
+    unsafe { o.p.*.fmt = OUT_TEXT }
+    return Exporter{ ctx: o.p as *mut u8, on_open: &out_open, on_str: &out_str, on_i64: &out_i64, on_close: &out_close }
+}
+
+// One JSON object per segment, one per line:
+//
+//     {"id":2,"parent":1,"name":"parse","start":1000,"dur":100,"bytes":512}
+//
+// The same keys in the same order as the text line, so the two renderings carry the same
+// record and `the_same_run_exports_identically_through_both_renderers` can say so.
+pub fn to_jsonl(read o: Out) -> Exporter {
+    unsafe { o.p.*.fmt = OUT_JSONL }
+    return Exporter{ ctx: o.p as *mut u8, on_open: &out_open, on_str: &out_str, on_i64: &out_i64, on_close: &out_close }
+}
+
+// A logfmt value: bare when unambiguous, otherwise a JSON string. `std/log`'s predicate
+// decides, and a fresh `json.Writer` renders, so no separator state leaks in.
+@no_alloc @no_os fn put_text_value(mut s: Sink, mut buf: []u8, read v: str) {
+    if log.needs_quoting(v) == false {
+        sink.put_str(s, buf, v)
+        return
+    }
+    var q: json.Writer = json.writer()
+    json.put_str(q, s, buf, v)
+}
+
+fn out_open(ctx: *mut u8, id: i64, parent: i64, name: str, start: i64, dur: i64) {
+    var o: *mut OutState = ctx as *mut OutState
+    unsafe {
+        var buf: []u8 = slice(u8, o.*.rraw, o.*.rcap)
+        sink.reset(o.*.rec)
+        o.*.jw = json.writer()
+        if o.*.fmt == OUT_JSONL {
+            json.begin_object(o.*.jw, o.*.rec, buf)
+            json.key(o.*.jw, o.*.rec, buf, "id")
+            json.put_i64(o.*.jw, o.*.rec, buf, id)
+            json.key(o.*.jw, o.*.rec, buf, "parent")
+            json.put_i64(o.*.jw, o.*.rec, buf, parent)
+            json.key(o.*.jw, o.*.rec, buf, "name")
+            json.put_str(o.*.jw, o.*.rec, buf, name)
+            json.key(o.*.jw, o.*.rec, buf, "start")
+            json.put_i64(o.*.jw, o.*.rec, buf, start)
+            json.key(o.*.jw, o.*.rec, buf, "dur")
+            json.put_i64(o.*.jw, o.*.rec, buf, dur)
+            return
+        }
+        sink.put_str(o.*.rec, buf, "id=")
+        sink.put_i64(o.*.rec, buf, id)
+        sink.put_str(o.*.rec, buf, " parent=")
+        sink.put_i64(o.*.rec, buf, parent)
+        sink.put_str(o.*.rec, buf, " name=")
+        put_text_value(o.*.rec, buf, name)
+        sink.put_str(o.*.rec, buf, " start=")
+        sink.put_i64(o.*.rec, buf, start)
+        sink.put_str(o.*.rec, buf, " dur=")
+        sink.put_i64(o.*.rec, buf, dur)
+    }
+}
+
+fn out_str(ctx: *mut u8, key: str, value: str) {
+    var o: *mut OutState = ctx as *mut OutState
+    unsafe {
+        var buf: []u8 = slice(u8, o.*.rraw, o.*.rcap)
+        if o.*.fmt == OUT_JSONL {
+            json.key(o.*.jw, o.*.rec, buf, key)
+            json.put_str(o.*.jw, o.*.rec, buf, value)
+            return
+        }
+        sink.put(o.*.rec, buf, 32 as u8)
+        sink.put_str(o.*.rec, buf, key)
+        sink.put(o.*.rec, buf, 61 as u8)          // '='
+        put_text_value(o.*.rec, buf, value)
+    }
+}
+
+fn out_i64(ctx: *mut u8, key: str, value: i64) {
+    var o: *mut OutState = ctx as *mut OutState
+    unsafe {
+        var buf: []u8 = slice(u8, o.*.rraw, o.*.rcap)
+        if o.*.fmt == OUT_JSONL {
+            json.key(o.*.jw, o.*.rec, buf, key)
+            json.put_i64(o.*.jw, o.*.rec, buf, value)
+            return
+        }
+        sink.put(o.*.rec, buf, 32 as u8)
+        sink.put_str(o.*.rec, buf, key)
+        sink.put(o.*.rec, buf, 61 as u8)
+        sink.put_i64(o.*.rec, buf, value)
+    }
+}
+
+// The record is complete: copy it to the output as one line, or withhold it whole.
+fn out_close(ctx: *mut u8) {
+    var o: *mut OutState = ctx as *mut OutState
+    unsafe {
+        var buf: []u8 = slice(u8, o.*.rraw, o.*.rcap)
+        if o.*.fmt == OUT_JSONL { json.end_object(o.*.jw, o.*.rec, buf) }
+        if sink.overflowed(o.*.rec) {
+            o.*.lost = o.*.lost + 1
+            return
+        }
+        let n: usize = sink.written(o.*.rec)
+        var dst: []u8 = slice(u8, o.*.raw, o.*.cap)
+        if sink.written(o.*.s) + n + 1 > dst.len {
+            o.*.lost = o.*.lost + 1
+            return
+        }
+        let line: str = sink.view(o.*.rec, buf)
+        sink.put_str(o.*.s, dst, line)
+        sink.put_nl(o.*.s, dst)
+        o.*.records = o.*.records + 1
+    }
+}
+
+// ---- a segment as a log record ----------------------------------------------------
+//
+// One finished segment becomes ONE `std/log` record: the name is the message, and `id`,
+// `parent` and `dur` are its first three fields, followed by the segment's attributes.
+// The logger renders it in whichever format and to whichever writer it was made with —
+// this module does not choose, and does not become a second logger.
+//
+// **Two clocks, deliberately.** The record's `ts` is the LOGGER's clock and the
+// segment's `dur` is the TRACER's; under `time.host()` both are the wall clock at the
+// moment the segment ended, and under two manual clocks each says what its own test
+// chose. `start` is not repeated in the record: a log is ordered by `ts` already, and a
+// consumer that wants the segment's own timeline uses `to_text` or `to_jsonl`.
+
+struct LogState {
+    lg: log.Logger,
+    level: i32,
+    s: Sink,
+    raw: *mut u8,
+    cap: usize,
+}
+
+@copy pub struct LogOut {
+    p: *mut LogState,
+}
+
+// Take a logger and give every finished segment to it at `level`. `cap` bytes are the
+// DESTINATION for a `writer.to_buffer()` logger — read them with `log_view` — and unused
+// scratch for a stream logger, which is `std/writer`'s convention.
+pub fn to_log(take lg: log.Logger, level: i32, cap: usize) -> LogOut {
+    var p: *mut LogState = alloc(LogState, 1)
+    var raw: *mut u8 = alloc(u8, cap)
+    unsafe { p.* = LogState{ lg: lg, level: level, s: sink.new(), raw: raw, cap: cap } }
+    return LogOut{ p: p }
+}
+
+pub fn log_exporter(read lo: LogOut) -> Exporter {
+    return Exporter{ ctx: lo.p as *mut u8, on_open: &log_open, on_str: &log_str, on_i64: &log_i64, on_close: &log_close }
+}
+
+// The logger's destination buffer, for a buffered logger.
+pub fn log_view(read lo: LogOut) -> str {
+    unsafe {
+        let buf: []u8 = slice(u8, lo.p.*.raw, lo.p.*.cap)
+        return sink.view(lo.p.*.s, buf)
+    }
+}
+
+// Records the logger shipped — `log.emitted` on the logger it holds.
+pub fn log_records(read lo: LogOut) -> i64 {
+    unsafe { return log.emitted(lo.p.*.lg) }
+}
+
+// Frees the logger it took, and the destination.
+pub fn free_log(mut lo: LogOut) {
+    if lo.p == null { return }
+    unsafe {
+        log.free(lo.p.*.lg)
+        free_ptr(lo.p.*.raw)
+    }
+    free_ptr(lo.p as *mut u8)
+    lo.p = null
+}
+
+fn log_open(ctx: *mut u8, id: i64, parent: i64, name: str, start: i64, dur: i64) {
+    var l: *mut LogState = ctx as *mut LogState
+    unsafe {
+        if log.begin(l.*.lg, l.*.level, name) {
+            log.kv_i64(l.*.lg, "id", id)
+            log.kv_i64(l.*.lg, "parent", parent)
+            log.kv_i64(l.*.lg, "dur", dur)
+        }
+    }
+}
+
+fn log_str(ctx: *mut u8, key: str, value: str) {
+    var l: *mut LogState = ctx as *mut LogState
+    unsafe { log.kv_str(l.*.lg, key, value) }
+}
+
+fn log_i64(ctx: *mut u8, key: str, value: i64) {
+    var l: *mut LogState = ctx as *mut LogState
+    unsafe { log.kv_i64(l.*.lg, key, value) }
+}
+
+fn log_close(ctx: *mut u8) {
+    var l: *mut LogState = ctx as *mut LogState
+    unsafe {
+        var buf: []u8 = slice(u8, l.*.raw, l.*.cap)
+        log.end(l.*.lg, l.*.s, buf)
+    }
+}

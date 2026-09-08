@@ -1,0 +1,466 @@
+// std/semver.jtr — semantic versions: parse, validate, and ORDER them.
+//
+// TIER: `std`, and specifically `@no_alloc @no_os` — this module allocates nothing and
+// touches no OS. It is pure computation over a string the caller owns, which is what lets
+// a resolver call it in a loop without an arena and lets `@no_alloc` code call it at all.
+//
+// ─── Why this exists, and where it sits ─────────────────────────────────────────────
+//
+// `std/buildgraph` answers "what depends on what, in what order, and is it acyclic" over
+// the compiler's own content-hash manifest, and its header names what is downstream of it:
+// version solving. This is the layer directly beneath a resolver — the part that says
+// whether `1.0.0-alpha.1` precedes `1.0.0` and whether `^0.2.3` admits `0.3.0`. A resolver
+// that gets those two wrong picks the wrong package and reports success.
+//
+// ─── A Version stores OFFSETS, not borrows, and that is forced ──────────────────────
+//
+// The obvious shape is `struct Version { …, pre: str, build: str }` holding sub-views of
+// the input. Jestyr refuses it: a `str` field is a borrow, and storing one that outlives
+// the call is exactly what the escape checker exists to stop ("a stored value must outlive
+// the call"). So a `Version` carries byte ranges into the source and every function that
+// needs the text takes the source alongside — the same idiom the compiler's own
+// `ExprData`/`src` pairing uses, for the same reason.
+//
+// The practical consequence is in the signatures: `compare` takes TWO sources, because the
+// general case is comparing a version parsed from one string against one parsed from
+// another (a requirement against a candidate). Passing the same `str` twice is fine.
+//
+// ─── What it accepts, exactly ───────────────────────────────────────────────────────
+//
+//   MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]
+//
+// All three numbers are required. Leading zeros are REFUSED (`01.0.0` is invalid, and so is
+// a numeric pre-release identifier `1.0.0-01`) — the spec says so, and accepting them would
+// make `1.0.0-1` and `1.0.0-01` two spellings that compare equal but are not the same
+// string, which is precisely the ambiguity a lockfile cannot tolerate.
+//
+// A pre-release is dot-separated identifiers of `[0-9A-Za-z-]`; an empty identifier
+// (`1.0.0-alpha..1`) is refused. Build metadata has the same character set and the same
+// no-empty rule.
+//
+// ─── The five precedence rules that get implemented wrong ───────────────────────────
+//
+// These are not decoration; each one is a real defect in some shipped resolver, and
+// `semver_test.jtr` pins every one of them:
+//
+//   1. A pre-release sorts BEFORE its release: `1.0.0-alpha` < `1.0.0`. Read naively,
+//      "compare the three numbers, then the pre-release string" makes `1.0.0` < `1.0.0-a`
+//      because the empty string sorts first. It is the reverse.
+//   2. Build metadata is IGNORED entirely: `1.0.0+a` and `1.0.0+b` compare EQUAL. It is not
+//      a tiebreaker, it is not a suffix — it does not participate.
+//   3. Numeric identifiers compare NUMERICALLY: `1.0.0-2` < `1.0.0-10`. Lexically, "10"
+//      precedes "2", which silently inverts the order of a version series.
+//   4. Numeric identifiers rank BELOW alphanumeric ones: `1.0.0-1` < `1.0.0-alpha`.
+//   5. A longer run of identifiers wins when the prefix ties: `1.0.0-a` < `1.0.0-a.1`.
+//
+// ─── `^` on a zero major is not `^` ─────────────────────────────────────────────────
+//
+// Caret means "compatible", which means "up to the next change of the leftmost NON-ZERO
+// component". So `^1.2.3` admits `<2.0.0` but `^0.2.3` admits only `<0.3.0`, and `^0.0.3`
+// only `<0.0.4`. Treating `^` as "same major" uniformly is the single most common range
+// bug, and on 0.x — where most of a young ecosystem lives — it is the difference between
+// a patch bump and an unreviewed breaking change.
+//
+// ─── A bare requirement is EXACT, deliberately ──────────────────────────────────────
+//
+// `1.2.3` as a requirement means exactly `1.2.3`. Cargo reads a bare version as `^1.2.3`,
+// which surprises people who wrote a version and meant it. Here the widening operators are
+// spelled: if you want a range, you type one. This is the same argument `std/ini` makes for
+// refusing to guess — a silent reinterpretation of correct-looking input is worse than
+// requiring one character.
+
+// A parsed version. `ok` is false when the text was not a valid version, and `(err_s, err_e)`
+// is the byte range of the part that made it invalid — the same "every problem is a span"
+// contract `std/ini` keeps, so `std/diag` can point a caret at it.
+//
+// `pre` and `bld` are byte ranges into the SOURCE STRING, empty (`s == e`) when absent.
+// `@copy`: ten scalar fields, no indirection and nothing to release, so duplicating one is
+// free and it may be returned by value. Without it a `Version` read out of a borrowed `Req`
+// is a borrow projection and cannot leave the call.
+@copy pub struct Version {
+    major: i64, minor: i64, patch: i64,
+    pre_s: usize, pre_e: usize,
+    bld_s: usize, bld_e: usize,
+    ok: bool,
+    err_s: usize, err_e: usize,
+}
+
+@no_alloc @no_os pub fn valid(read v: Version) -> bool { return v.ok }
+@no_alloc @no_os pub fn major(read v: Version) -> i64 { return v.major }
+@no_alloc @no_os pub fn minor(read v: Version) -> i64 { return v.minor }
+@no_alloc @no_os pub fn patch(read v: Version) -> i64 { return v.patch }
+
+// The pre-release text (`alpha.1` for `1.0.0-alpha.1`), empty when there is none.
+@no_alloc @no_os pub fn prerelease(read s: str, read v: Version) -> read str {
+    return s[v.pre_s .. v.pre_e]
+}
+
+// The build metadata (`001` for `1.0.0+001`), empty when there is none. Present for
+// display and for round-tripping only — it takes no part in ordering.
+@no_alloc @no_os pub fn build(read s: str, read v: Version) -> read str {
+    return s[v.bld_s .. v.bld_e]
+}
+
+// The byte range of whatever made the text invalid.
+@no_alloc @no_os pub fn error_start(read v: Version) -> usize { return v.err_s }
+@no_alloc @no_os pub fn error_end(read v: Version) -> usize { return v.err_e }
+
+@no_alloc @no_os fn is_digit(c: u8) -> bool {
+    let n: i32 = c as i32
+    return n >= 48 and n <= 57
+}
+
+// The identifier character set: `[0-9A-Za-z-]`.
+@no_alloc @no_os fn is_ident_byte(c: u8) -> bool {
+    let n: i32 = c as i32
+    if n >= 48 and n <= 57 { return true }
+    if n >= 65 and n <= 90 { return true }
+    if n >= 97 and n <= 122 { return true }
+    return n == 45
+}
+
+// A byte legal in the RUN as a whole: an identifier byte or the `.` that separates two of
+// them. Kept separate from `is_ident_byte`, which is the character set of ONE identifier --
+// scanning the run with the narrower predicate rejected every multi-identifier pre-release
+// (`1.0.0-rc.1`), because the separator is not in the identifier alphabet.
+@no_alloc @no_os fn is_run_byte(c: u8) -> bool {
+    if is_ident_byte(c) { return true }
+    return (c as i32) == 46
+}
+
+@no_alloc @no_os fn bad(err_s: usize, err_e: usize) -> Version {
+    return Version{ major: 0, minor: 0, patch: 0, pre_s: 0, pre_e: 0, bld_s: 0, bld_e: 0,
+                    ok: false, err_s: err_s, err_e: err_e }
+}
+
+// Parse `MAJOR.MINOR.PATCH[-PRE][+BUILD]`. Total: never faults, never allocates; an invalid
+// input comes back with `ok == false` and a span.
+@no_alloc @no_os pub fn parse(read s: str) -> Version {
+    var i: usize = 0
+    let n: usize = s.len
+    if n == 0 { return bad(0, 0) }
+
+    var nums: [3]i64 = [0; 3]
+    var f: usize = 0
+    for f < 3 {
+        if f > 0 {
+            if i >= n { return bad(i, n) }
+            if (s[i] as i32) != 46 { return bad(i, i + 1) }      // `.`
+            i = i + 1
+        }
+        let start: usize = i
+        for i < n {
+            if !is_digit(s[i]) { break }
+            i = i + 1
+        }
+        if i == start { return bad(start, i + 1) }               // no digits at all
+        // A leading zero is only legal when the whole field is "0".
+        if i - start > 1 {
+            if (s[start] as i32) == 48 { return bad(start, i) }
+        }
+        var acc: i64 = 0
+        var k: usize = start
+        for k < i {
+            acc = acc * 10 + ((s[k] as i64) - 48)
+            k = k + 1
+        }
+        nums[f] = acc
+        f = f + 1
+    }
+
+    var ps: usize = i
+    var pe: usize = i
+    if i < n {
+        if (s[i] as i32) == 45 {                                 // `-` pre-release
+            i = i + 1
+            ps = i
+            for i < n {
+                if (s[i] as i32) == 43 { break }                 // `+` ends it
+                if !is_run_byte(s[i]) { return bad(i, i + 1) }
+                i = i + 1
+            }
+            pe = i
+            if !idents_well_formed(s, ps, pe) { return bad(ps, pe) }
+        }
+    }
+
+    var bs: usize = i
+    var be: usize = i
+    if i < n {
+        if (s[i] as i32) == 43 {                                 // `+` build metadata
+            i = i + 1
+            bs = i
+            for i < n {
+                if !is_run_byte(s[i]) { return bad(i, i + 1) }
+                i = i + 1
+            }
+            be = i
+            if !idents_well_formed(s, bs, be) { return bad(bs, be) }
+        }
+    }
+    if i != n { return bad(i, n) }
+
+    return Version{ major: nums[0], minor: nums[1], patch: nums[2],
+                    pre_s: ps, pre_e: pe, bld_s: bs, bld_e: be,
+                    ok: true, err_s: 0, err_e: 0 }
+}
+
+// Dot-separated identifiers, none empty, and a NUMERIC one may not carry a leading zero.
+//
+// An EMPTY run is ill formed, and that is not the same question as "no tail at all": this
+// is only ever called after a `-` or a `+` has been consumed, so an empty run means the
+// separator was written with nothing after it (`1.0.0-`). Returning true here accepted
+// both of those.
+@no_alloc @no_os fn idents_well_formed(read s: str, from: usize, to: usize) -> bool {
+    if from == to { return false }
+    var i: usize = from
+    for i <= to {
+        let start: usize = i
+        for i < to {
+            if (s[i] as i32) == 46 { break }
+            i = i + 1
+        }
+        if i == start { return false }                           // empty identifier
+        if all_digits(s, start, i) {
+            if i - start > 1 {
+                if (s[start] as i32) == 48 { return false }       // `01`
+            }
+        }
+        if i >= to { return true }
+        i = i + 1                                                // skip the `.`
+        if i == to { return false }                              // trailing `.`
+    }
+    return true
+}
+
+@no_alloc @no_os fn all_digits(read s: str, from: usize, to: usize) -> bool {
+    if from == to { return false }
+    var i: usize = from
+    for i < to {
+        if !is_digit(s[i]) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+@no_alloc @no_os fn num_of(read s: str, from: usize, to: usize) -> i64 {
+    var acc: i64 = 0
+    var i: usize = from
+    for i < to {
+        acc = acc * 10 + ((s[i] as i64) - 48)
+        i = i + 1
+    }
+    return acc
+}
+
+@no_alloc @no_os fn cmp_i64(a: i64, b: i64) -> i32 {
+    if a < b { return 0 - 1 }
+    if a > b { return 1 }
+    return 0
+}
+
+// Byte-lexical comparison of two spans.
+@no_alloc @no_os fn cmp_span(read a: str, a_s: usize, a_e: usize, read b: str, b_s: usize, b_e: usize) -> i32 {
+    var i: usize = 0
+    let la: usize = a_e - a_s
+    let lb: usize = b_e - b_s
+    var lim: usize = la
+    if lb < lim { lim = lb }
+    for i < lim {
+        let x: i32 = a[a_s + i] as i32
+        let y: i32 = b[b_s + i] as i32
+        if x < y { return 0 - 1 }
+        if x > y { return 1 }
+        i = i + 1
+    }
+    return cmp_i64(la as i64, lb as i64)
+}
+
+// Compare two versions by SemVer 2.0.0 precedence. Returns -1, 0 or 1.
+//
+// Build metadata takes no part: `1.0.0+a` and `1.0.0+b` are equal. A pre-release sorts
+// before its own release. Within a pre-release, identifiers are compared left to right:
+// numeric ones numerically, numeric below alphanumeric, and a longer run wins a tie.
+@no_alloc @no_os pub fn compare(read sa: str, read a: Version, read sb: str, read b: Version) -> i32 {
+    let c0: i32 = cmp_i64(a.major, b.major)
+    if c0 != 0 { return c0 }
+    let c1: i32 = cmp_i64(a.minor, b.minor)
+    if c1 != 0 { return c1 }
+    let c2: i32 = cmp_i64(a.patch, b.patch)
+    if c2 != 0 { return c2 }
+
+    let a_has: bool = a.pre_s != a.pre_e
+    let b_has: bool = b.pre_s != b.pre_e
+    // Rule 1, and the reason it is spelled out rather than folded into a string compare:
+    // ABSENT is GREATER here, the opposite of what comparing "" against "alpha" gives.
+    if !a_has and !b_has { return 0 }
+    if !a_has { return 1 }
+    if !b_has { return 0 - 1 }
+    return cmp_prerelease(sa, a.pre_s, a.pre_e, sb, b.pre_s, b.pre_e)
+}
+
+@no_alloc @no_os fn cmp_prerelease(read sa: str, a_s: usize, a_e: usize, read sb: str, b_s: usize, b_e: usize) -> i32 {
+    var ai: usize = a_s
+    var bi: usize = b_s
+    for true {
+        // A run that has ended is LOWER: `1.0.0-a` < `1.0.0-a.1` (rule 5).
+        if ai >= a_e and bi >= b_e { return 0 }
+        if ai >= a_e { return 0 - 1 }
+        if bi >= b_e { return 1 }
+
+        var ae: usize = ai
+        for ae < a_e {
+            if (sa[ae] as i32) == 46 { break }
+            ae = ae + 1
+        }
+        var be: usize = bi
+        for be < b_e {
+            if (sb[be] as i32) == 46 { break }
+            be = be + 1
+        }
+
+        let an: bool = all_digits(sa, ai, ae)
+        let bn: bool = all_digits(sb, bi, be)
+        if an and bn {
+            let c: i32 = cmp_i64(num_of(sa, ai, ae), num_of(sb, bi, be))   // rule 3
+            if c != 0 { return c }
+        } else {
+            // Rule 4: numeric ranks below alphanumeric.
+            if an { return 0 - 1 }
+            if bn { return 1 }
+            let c: i32 = cmp_span(sa, ai, ae, sb, bi, be)
+            if c != 0 { return c }
+        }
+        ai = ae + 1
+        bi = be + 1
+    }
+    return 0
+}
+
+// True when `a` and `b` denote the same version for ORDERING purposes — build metadata
+// excluded, so this is `compare(...) == 0` and not string equality.
+@no_alloc @no_os pub fn equal(read sa: str, read a: Version, read sb: str, read b: Version) -> bool {
+    return compare(sa, a, sb, b) == 0
+}
+
+// ─── Requirements ───────────────────────────────────────────────────────────────────
+
+// The operator a requirement was written with. A bare `1.2.3` is `REQ_EXACT`.
+pub const REQ_EXACT: i32 = 0
+pub const REQ_GT: i32 = 1
+pub const REQ_GE: i32 = 2
+pub const REQ_LT: i32 = 3
+pub const REQ_LE: i32 = 4
+pub const REQ_CARET: i32 = 5
+pub const REQ_TILDE: i32 = 6
+
+// A parsed requirement: an operator plus the version it names.
+@copy pub struct Req { op: i32, ver: Version, ok: bool, err_s: usize, err_e: usize }
+
+@no_alloc @no_os pub fn req_valid(read r: Req) -> bool { return r.ok }
+@no_alloc @no_os pub fn req_op(read r: Req) -> i32 { return r.op }
+@no_alloc @no_os pub fn req_version(read r: Req) -> Version { return r.ver }
+@no_alloc @no_os pub fn req_error_start(read r: Req) -> usize { return r.err_s }
+@no_alloc @no_os pub fn req_error_end(read r: Req) -> usize { return r.err_e }
+
+// Parse `[op]MAJOR.MINOR.PATCH[-PRE][+BUILD]`, where op is one of `^ ~ = > >= < <=`.
+// Leading spaces after the operator are allowed; a bare version is exact.
+@no_alloc @no_os pub fn parse_req(read s: str) -> Req {
+    let n: usize = s.len
+    if n == 0 {
+        return Req{ op: REQ_EXACT, ver: bad(0, 0), ok: false, err_s: 0, err_e: 0 }
+    }
+    var op: i32 = REQ_EXACT
+    var i: usize = 0
+    let c: i32 = s[0] as i32
+    if c == 94 { op = REQ_CARET  i = 1 }                          // `^`
+    else if c == 126 { op = REQ_TILDE  i = 1 }                    // `~`
+    else if c == 61 { op = REQ_EXACT  i = 1 }                     // `=`
+    else if c == 62 {                                             // `>` / `>=`
+        op = REQ_GT
+        i = 1
+        if i < n { if (s[i] as i32) == 61 { op = REQ_GE  i = 2 } }
+    }
+    else if c == 60 {                                             // `<` / `<=`
+        op = REQ_LT
+        i = 1
+        if i < n { if (s[i] as i32) == 61 { op = REQ_LE  i = 2 } }
+    }
+    for i < n {
+        if (s[i] as i32) != 32 { break }
+        i = i + 1
+    }
+    let v: Version = parse(s[i .. n])
+    if !v.ok {
+        // Re-base the version's own error span onto the requirement string.
+        return Req{ op: op, ver: v, ok: false, err_s: i + v.err_s, err_e: i + v.err_e }
+    }
+    // The sub-view shifted every offset; put them back so callers may pass the WHOLE
+    // requirement string to `prerelease`/`build`.
+    let shifted: Version = Version{ major: v.major, minor: v.minor, patch: v.patch,
+        pre_s: i + v.pre_s, pre_e: i + v.pre_e, bld_s: i + v.bld_s, bld_e: i + v.bld_e,
+        ok: true, err_s: 0, err_e: 0 }
+    return Req{ op: op, ver: shifted, ok: true, err_s: 0, err_e: 0 }
+}
+
+// The exclusive upper bound a `^` requirement admits — "up to the next change of the
+// leftmost NON-ZERO component". Returned as three numbers because the bound is always a
+// plain release (no pre-release can sit on it).
+//
+// `^1.2.3` -> 2.0.0     `^0.2.3` -> 0.3.0     `^0.0.3` -> 0.0.4
+@no_alloc @no_os fn caret_bound(read v: Version, out hi_major: i64, out hi_minor: i64, out hi_patch: i64) {
+    if v.major != 0 { hi_major = v.major + 1  hi_minor = 0  hi_patch = 0  return }
+    if v.minor != 0 { hi_major = 0  hi_minor = v.minor + 1  hi_patch = 0  return }
+    hi_major = 0
+    hi_minor = 0
+    hi_patch = v.patch + 1
+}
+
+@no_alloc @no_os fn cmp_triple(a_major: i64, a_minor: i64, a_patch: i64, b_major: i64, b_minor: i64, b_patch: i64) -> i32 {
+    let c0: i32 = cmp_i64(a_major, b_major)
+    if c0 != 0 { return c0 }
+    let c1: i32 = cmp_i64(a_minor, b_minor)
+    if c1 != 0 { return c1 }
+    return cmp_i64(a_patch, b_patch)
+}
+
+// Does candidate `cv` (from `cs`) satisfy requirement `r` (from `rs`)?
+//
+// **A pre-release candidate only ever satisfies a requirement that names one on the same
+// release.** `^1.2.3` does not admit `2.0.0-rc1`, and `>=1.0.0` does not admit `1.5.0-beta`:
+// a pre-release is by definition not ready, so a range must opt into it explicitly. This is
+// the rule npm and Cargo both settled on after shipping the permissive version, because
+// "my patch range installed a release candidate" is the failure it produces.
+@no_alloc @no_os pub fn matches(read rs: str, read r: Req, read cs: str, read cv: Version) -> bool {
+    if !r.ok { return false }
+    if !cv.ok { return false }
+    let cand_pre: bool = cv.pre_s != cv.pre_e
+    let req_pre: bool = r.ver.pre_s != r.ver.pre_e
+    if cand_pre {
+        if !req_pre { return false }
+        // Same release triple, or the pre-release is on a different version entirely.
+        if cmp_triple(cv.major, cv.minor, cv.patch, r.ver.major, r.ver.minor, r.ver.patch) != 0 {
+            return false
+        }
+    }
+    let c: i32 = compare(cs, cv, rs, r.ver)
+    if r.op == REQ_EXACT { return c == 0 }
+    if r.op == REQ_GT { return c > 0 }
+    if r.op == REQ_GE { return c >= 0 }
+    if r.op == REQ_LT { return c < 0 }
+    if r.op == REQ_LE { return c <= 0 }
+    if r.op == REQ_CARET {
+        if c < 0 { return false }                                 // below the floor
+        var hm: i64 = 0
+        var hn: i64 = 0
+        var hp: i64 = 0
+        caret_bound(r.ver, hm, hn, hp)
+        return cmp_triple(cv.major, cv.minor, cv.patch, hm, hn, hp) < 0
+    }
+    if r.op == REQ_TILDE {
+        // `~1.2.3` is "patch-level within 1.2": >= 1.2.3, < 1.3.0.
+        if c < 0 { return false }
+        return cmp_triple(cv.major, cv.minor, cv.patch, r.ver.major, r.ver.minor + 1, 0) < 0
+    }
+    return false
+}

@@ -1,0 +1,96 @@
+// std/manifest_test.jtr — the format, pinned by what the obvious wrong parser accepts.
+//
+// Run:  jestyrc test examples/std/manifest_test.jtr
+
+import "manifest"
+import "mem"
+import "test"
+import "test_report"
+
+const MF_T_CAP: usize = 8192
+
+@test fn a_manifest_parses_and_renders_back_to_the_same_bytes() -> bool {
+    var raw: *mut u8 = alloc(u8, MF_T_CAP)
+    var rep: []u8 = slice(u8, raw, MF_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    let text: str = "jestyr-package/v1\nname web-kit\nversion 1.4.0\ndep semver ^1.0.0\ndep alog >=2.1.0\n"
+    var m: manifest.Manifest = manifest.parse(a, text)
+    test.is_true(c, rep, "parses", manifest.parsed(m))
+    test.eq_str(c, rep, "name", manifest.name(m), "web-kit")
+    test.eq_str(c, rep, "version", manifest.version(m), "1.4.0")
+    test.eq_usize(c, rep, "two deps", manifest.dep_count(m), 2)
+    test.eq_str(c, rep, "dep 0 name", manifest.dep_name(m, 0), "semver")
+    test.eq_str(c, rep, "dep 0 req", manifest.dep_req(m, 0), "^1.0.0")
+    test.eq_str(c, rep, "dep 1 name", manifest.dep_name(m, 1), "alog")
+    test.eq_str(c, rep, "dep 1 req", manifest.dep_req(m, 1), ">=2.1.0")
+
+    // The one canonical form: rendering what was parsed gives the input back exactly.
+    var again: String = manifest.render_of(a, m)
+    test.eq_str(c, rep, "render(parse(x)) == x", string_view(again), text)
+
+    // A CRLF file parses to the same manifest and renders to LF.
+    var m2: manifest.Manifest = manifest.parse(a, "jestyr-package/v1\r\nname web-kit\r\nversion 1.4.0\r\ndep semver ^1.0.0\r\ndep alog >=2.1.0\r\n")
+    test.is_true(c, rep, "CRLF parses", manifest.parsed(m2))
+    var again2: String = manifest.render_of(a, m2)
+    test.eq_str(c, rep, "and renders canonically", string_view(again2), text)
+
+    // The builder renders the same bytes from parts.
+    var d: manifest.Draft = manifest.draft(a, "web-kit", "1.4.0")
+    manifest.draft_dep(d, "semver", "^1.0.0")
+    manifest.draft_dep(d, "alog", ">=2.1.0")
+    var built: String = manifest.draft_render(a, d)
+    test.eq_str(c, rep, "a draft renders the same text", string_view(built), text)
+
+    // No deps at all is a valid package.
+    var m3: manifest.Manifest = manifest.parse(a, "jestyr-package/v1\nname leaf\nversion 0.1.0\n")
+    test.is_true(c, rep, "a leaf parses", manifest.parsed(m3))
+    test.eq_usize(c, rep, "with no deps", manifest.dep_count(m3), 0)
+
+    string_free(built)  string_free(again2)  string_free(again)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+fn refuses(mut c: test.Check, mut rep: []u8, read a: Allocator, read why: str, read text: str, want: i32) {
+    var m: manifest.Manifest = manifest.parse(a, text)
+    test.is_false(c, rep, why, manifest.parsed(m))
+    test.eq_str(c, rep, why, manifest.problem_name(manifest.problem(m)), manifest.problem_name(want))
+}
+
+@test fn what_the_format_refuses_and_why() -> bool {
+    var raw: *mut u8 = alloc(u8, MF_T_CAP)
+    var rep: []u8 = slice(u8, raw, MF_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    refuses(c, rep, a, "no tag", "name x\nversion 1.0.0\n", manifest.MANIFEST_NO_TAG)
+    refuses(c, rep, a, "wrong tag", "jestyr-package/v2\nname x\nversion 1.0.0\n", manifest.MANIFEST_NO_TAG)
+    refuses(c, rep, a, "empty", "", manifest.MANIFEST_NO_TAG)
+    refuses(c, rep, a, "no name", "jestyr-package/v1\nversion 1.0.0\n", manifest.MANIFEST_NO_NAME)
+    refuses(c, rep, a, "no version", "jestyr-package/v1\nname x\n", manifest.MANIFEST_NO_VERSION)
+    refuses(c, rep, a, "a name with a capital", "jestyr-package/v1\nname Web\nversion 1.0.0\n", manifest.MANIFEST_BAD_NAME)
+    refuses(c, rep, a, "a name starting with a digit", "jestyr-package/v1\nname 9lives\nversion 1.0.0\n", manifest.MANIFEST_BAD_NAME)
+    refuses(c, rep, a, "a version that is not semver", "jestyr-package/v1\nname x\nversion 1.0\n", manifest.MANIFEST_BAD_VERSION)
+    refuses(c, rep, a, "a dep with no requirement", "jestyr-package/v1\nname x\nversion 1.0.0\ndep y\n", manifest.MANIFEST_BAD_DEP)
+    refuses(c, rep, a, "a dep with a bad requirement", "jestyr-package/v1\nname x\nversion 1.0.0\ndep y ^one\n", manifest.MANIFEST_BAD_DEP)
+    refuses(c, rep, a, "a dep named twice", "jestyr-package/v1\nname x\nversion 1.0.0\ndep y ^1.0.0\ndep y ^2.0.0\n", manifest.MANIFEST_DUP_DEP)
+    refuses(c, rep, a, "an unknown key", "jestyr-package/v1\nname x\nversion 1.0.0\nauthor me\n", manifest.MANIFEST_BAD_LINE)
+    refuses(c, rep, a, "a second name", "jestyr-package/v1\nname x\nname z\nversion 1.0.0\n", manifest.MANIFEST_BAD_LINE)
+    refuses(c, rep, a, "a trailing word", "jestyr-package/v1\nname x extra\nversion 1.0.0\n", manifest.MANIFEST_BAD_LINE)
+
+    // The line number points at the offender, which is what makes the message usable.
+    var m: manifest.Manifest = manifest.parse(a, "jestyr-package/v1\nname x\nversion 1.0.0\ndep y ^1.0.0\ndep z nope\n")
+    test.eq_i64(c, rep, "the problem line is the fifth", manifest.problem_line(m) as i64, 5)
+
+    // The pure name rule.
+    test.is_true(c, rep, "hyphen and digits inside", manifest.valid_name("web-kit2"))
+    test.is_false(c, rep, "a dot", manifest.valid_name("web.kit"))
+    test.is_false(c, rep, "empty", manifest.valid_name(""))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

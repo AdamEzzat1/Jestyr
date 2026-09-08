@@ -1,0 +1,209 @@
+// examples/std/trace_demo.jtr — `jtrace`, one request timed three ways.
+//
+// Run:  jestyrc run examples/std/trace_demo.jtr
+//
+// ─── What this demonstrates ───────────────────────────────────────────────────
+//
+// One routine — `handle_request` — traces a small request: a `request` segment with a
+// `parse` and a `db` segment nested inside it, each with a few attributes. It is written
+// ONCE and run three times, on three tracers that differ only in the exporter they were
+// handed: a text exporter for a person at a terminal, a JSON-lines exporter for whatever
+// ingests traces, and `std/log` for a service that already has a log and wants its
+// segments in it. The routine does not know which; the destination is a property of the
+// `Tracer` it was given. That is the separation the module exists to make.
+//
+// Then the program **parses its own JSON output back** and rebuilds the tree from it. The
+// records arrive in END order — `parse`, `db`, then `request` — and each carries only its
+// parent's ID, so a consumer that wants the tree has to look the parent up. The demo does:
+// it finds `db`'s parent by id and prints its name, and it checks that the parent's
+// duration covers both children and the gaps between them. A tracer that reported a
+// child's start against the wrong clock, or an exporter that lost a field, would fail
+// there rather than print a plausible trace.
+//
+// Everything runs on `time.manual()`, so the durations are exact and the transcript is
+// asserted to the line by `jtrace_times_one_request_three_ways_and_rebuilds_the_tree`.
+
+import "trace"
+import "log"
+import "sink"
+import "json"
+import "writer"
+import "time"
+import "mem"
+
+const JTRACE_CAP: usize = 4096
+
+// The request, traced once and shipped by whichever `Tracer` it is given.
+//
+// Note what is NOT here: no format, no destination, no clock, no decision about what to
+// do with a finished segment. All of it belongs to whoever built the tracer. Note also the
+// `status` attribute set on `request` AFTER `db` has ended: attributes land on the
+// innermost OPEN segment, so a parent can record its outcome once its children are done.
+fn handle_request(mut t: trace.Tracer) {
+    let req: i64 = trace.begin(t, "request")
+    trace.attr_str(t, "method", "GET")
+    trace.attr_str(t, "path", "/items")
+
+    let p: i64 = trace.begin(t, "parse")
+    trace.attr_i64(t, "bytes", 512)
+    trace.advance(t, 40)
+    trace.end(t, p)
+
+    trace.advance(t, 10)
+
+    let d: i64 = trace.begin(t, "db")
+    trace.attr_str(t, "query", "select id from items")
+    trace.attr_i64(t, "rows", 3)
+    trace.advance(t, 300)
+    trace.end(t, d)
+
+    trace.attr_i64(t, "status", 200)
+    trace.end(t, req)
+}
+
+// Print a buffer of newline-terminated records, one `print_str` per record — the print
+// intrinsics terminate every write themselves, so a multi-line buffer handed to one
+// `print_str` would gain a line that is not in the output.
+fn print_lines(read t: str) {
+    var start: usize = 0
+    for i in 0..t.len {
+        if (t[i] as i32) == 10 {
+            print_str(t[start .. i])
+            start = i + 1
+        }
+    }
+}
+
+// The `i`th line of `t`, without its terminator; empty when there is no such line.
+fn line_at(read t: str, want: usize) -> read str {
+    var n: usize = 0
+    var start: usize = 0
+    for i in 0..t.len {
+        if (t[i] as i32) == 10 {
+            if n == want { return t[start .. i] }
+            n = n + 1
+            start = i + 1
+        }
+    }
+    return t[t.len .. t.len]
+}
+
+// An integer field of the JSON record on line `ix`, or -1 when the line does not parse or
+// the field is absent. A fresh parse per lookup, because a `Doc` borrows its allocator and
+// three records are not worth an index.
+fn field_i64(read a: Allocator, read jsonl: str, ix: usize, read key: str) -> i64 {
+    var doc: json.Doc = json.parse(a, line_at(jsonl, ix))
+    if json.parsed(doc) == false { return 0 - 1 }
+    let r: isize = json.root(doc)
+    if r < 0 { return 0 - 1 }
+    let n: isize = json.get(doc, r as usize, key)
+    if n < 0 { return 0 - 1 }
+    return json.as_i64(doc, n as usize)
+}
+
+// The `name` of the record on line `ix`, appended to `into`; nothing when absent.
+fn field_name(read a: Allocator, read jsonl: str, ix: usize, mut into: String) {
+    var doc: json.Doc = json.parse(a, line_at(jsonl, ix))
+    if json.parsed(doc) == false { return }
+    let r: isize = json.root(doc)
+    if r < 0 { return }
+    let n: isize = json.get(doc, r as usize, "name")
+    if n >= 0 { string_push(into, json.as_str(doc, n as usize)) }
+}
+
+// The line index of the record whose `id` is `id`, or -1.
+fn line_with_id(read a: Allocator, read jsonl: str, lines: usize, id: i64) -> isize {
+    for i in 0..lines {
+        if field_i64(a, jsonl, i, "id") == id { return i as isize }
+    }
+    return 0 - 1
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+
+    print_str("-- jtrace --")
+
+    // ---- the same request, for a person ----
+    var ot: trace.Out = trace.buffer(JTRACE_CAP)
+    var human: trace.Tracer = trace.make(time.manual(1000), trace.to_text(ot))
+    handle_request(human)
+    print_str("-- as a person reads it --")
+    print_lines(trace.out_view(ot))
+
+    // ---- and for a machine ----
+    var oj: trace.Out = trace.buffer(JTRACE_CAP)
+    var machine: trace.Tracer = trace.make(time.manual(1000), trace.to_jsonl(oj))
+    handle_request(machine)
+    print_str("-- as a machine reads it --")
+    print_lines(trace.out_view(oj))
+
+    // ---- and into a log the service already has ----
+    //
+    // The logger has its OWN clock: `ts` is when the segment ended by the logger's reckoning
+    // and `dur` is how long it ran by the tracer's. Here the logger's clock is not advanced,
+    // so every `ts` is 1000 and the durations still tell the story.
+    var lo: trace.LogOut = trace.to_log(
+        log.make(time.manual(1000), writer.to_buffer(), log.LOG_INFO, log.LOG_LOGFMT),
+        log.LOG_INFO, JTRACE_CAP)
+    var logged: trace.Tracer = trace.make(time.manual(1000), trace.log_exporter(lo))
+    handle_request(logged)
+    print_str("-- as one log record each --")
+    print_lines(trace.log_view(lo))
+
+    // ---- the claim, checked ----
+    //
+    // Three segments were exported, so a reader must parse exactly three back, and the
+    // three ids must agree across the tracers — a counter each, from 1.
+    print_str("-- read back --")
+    let jsonl: str = trace.out_view(oj)
+    var parsed: i64 = 0
+    for i in 0..3 {
+        if field_i64(a, jsonl, i as usize, "id") > 0 { parsed = parsed + 1 }
+    }
+    print_str("records exported")
+    print_int(trace.out_records(oj))
+    print_str("records parsed back")
+    print_int(parsed)
+    print_str("every record parsed")
+    print_bool(parsed == trace.out_records(oj))
+
+    // **The tree, rebuilt from `id` and `parent`.** `db` is the second line; its parent is
+    // an id, and the id names the request. Nothing in the JSON says "request" next to "db".
+    let db_parent: i64 = field_i64(a, jsonl, 1, "parent")
+    let root_line: isize = line_with_id(a, jsonl, 3, db_parent)
+    var parent_name: String = string_new()
+    if root_line >= 0 { field_name(a, jsonl, root_line as usize, parent_name) }
+    print_str("the parent of db is")
+    print_str(string_view(parent_name))
+
+    // And the parent's stopwatch covers the children and the gap: 40 + 10 + 300 = 350,
+    // which is `request`'s `dur` and not the sum of its children's.
+    let child_sum: i64 = field_i64(a, jsonl, 0, "dur") + field_i64(a, jsonl, 1, "dur")
+    let root_dur: i64 = field_i64(a, jsonl, root_line as usize, "dur")
+    print_str("children took")
+    print_int(child_sum)
+    print_str("the request took")
+    print_int(root_dur)
+    print_str("the request covers its children")
+    print_bool(root_dur >= child_sum)
+
+    // The accounting: three finished on every tracer, nothing refused, nothing abandoned.
+    print_str("finished")
+    print_int(trace.finished(human) + trace.finished(machine) + trace.finished(logged))
+    print_str("dropped")
+    print_int(trace.dropped(human) + trace.dropped(machine) + trace.dropped(logged))
+    print_str("abandoned")
+    print_int(trace.abandoned(human) + trace.abandoned(machine) + trace.abandoned(logged))
+    print_str("logged")
+    print_int(trace.log_records(lo))
+
+    string_free(parent_name)
+    trace.free(logged)
+    trace.free_log(lo)
+    trace.free(machine)
+    trace.free(human)
+    trace.free_buffer(oj)
+    trace.free_buffer(ot)
+    return 0
+}

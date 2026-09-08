@@ -40,9 +40,21 @@
 //
 // No file format. `apply` takes a name and a text value, so a TOML/JSON/INI reader sits
 // above this and hands over pairs; building the parser in would tie the precedence rules
-// to one syntax. No nesting or sections — a flat key space, because the precedence
-// argument above is about single keys and a tree needs its own merge rules. No live
-// reload, no watch: `std/syswatch` exists and composing them is the caller's.
+// to one syntax. No nesting — a flat key space, because the precedence argument above is
+// about single keys and a tree needs its own merge rules. A `Section` (below) is a VIEW
+// onto that flat space by dotted prefix, not a tree: `server.tls.port` is still one key
+// with one origin, and a component handed the section `server.tls` asks for `port`
+// without knowing where it sits. No live reload, no watch: that is `std/livecfg`, which
+// composes this with `std/ini` and `std/syswatch`.
+//
+// ─── The accessors `std/livecfg` needed, and why they are shaped this way ──────────
+//
+// `clone`, `same_value`, `render_name` and `render_value` exist so a reload can be built
+// as a CANDIDATE and compared against the current configuration before anything is
+// swapped. None of them hands out a view into a value arena — `render_value` writes into
+// a caller sink for the same reason `value_is` compares instead of returning — and
+// `render_value` redacts by declaration exactly as `render` does, so a change report
+// cannot print a secret by taking a different path to the bytes.
 
 import "mem"
 import "list"
@@ -407,4 +419,180 @@ pub fn render(mut sk: sink.Sink, mut buf: []u8, read c: Config) {
             done = done + 1
         }
     }
+}
+
+// ---- accessors added for `std/livecfg` ------------------------------------------
+//
+// Every function below is additive: nothing above changed shape.
+
+// The declared kind of `id` (CFG_STR | CFG_INT | CFG_BOOL), or -1.
+pub fn kind_of(read c: Config, id: i32) -> i32 {
+    if !live(c, id) { return 0 - 1 }
+    return list.get(i32, c.kind, id as usize)
+}
+
+// Was `id` declared secret?
+pub fn is_secret(read c: Config, id: i32) -> bool {
+    if !live(c, id) { return false }
+    return list.get(i32, c.secret, id as usize) != 0
+}
+
+// Write the declared NAME of `id` into a caller sink. A sink rather than a `-> read str`
+// view, so the shape matches `render_value` and a caller holds neither borrow.
+pub fn render_name(mut sk: sink.Sink, mut buf: []u8, read c: Config, id: i32) {
+    if !live(c, id) { return }
+    put_name(sk, buf, c, id)
+}
+
+// Write the current VALUE of `id` into a caller sink: `****` for a secret whether or not
+// it is set, the text for a set key, nothing for an unset one. Redaction is decided by the
+// declaration here exactly as in `render`, so there is no accessor that can leak a secret.
+pub fn render_value(mut sk: sink.Sink, mut buf: []u8, read c: Config, id: i32) {
+    if !live(c, id) { return }
+    if list.get(i32, c.secret, id as usize) != 0 {
+        sink.put_str(sk, buf, "****")
+        return
+    }
+    if !is_set(c, id) { return }
+    let st: i32 = list.get(i32, c.vs, id as usize)
+    let en: i32 = list.get(i32, c.ve, id as usize)
+    var i: i32 = st
+    for i < en {
+        sink.put(sk, buf, list.get(u8, c.vb, i as usize))
+        i = i + 1
+    }
+}
+
+// Do `x` and `y` hold the same value for `id`? Two unset keys agree; an unset and a set
+// one do not; two set ones agree when their bytes do. Origins are NOT compared — a value
+// that moved from `file` to `default` without changing text is the same setting for
+// anything that reads it. Compared on the real bytes even for a secret, since the answer
+// reveals nothing but equality.
+pub fn same_value(read x: Config, read y: Config, id: i32) -> bool {
+    if !live(x, id) { return false }
+    if !live(y, id) { return false }
+    let xs: bool = is_set(x, id)
+    let ys: bool = is_set(y, id)
+    if xs != ys { return false }
+    if !xs { return true }
+    let xst: i32 = list.get(i32, x.vs, id as usize)
+    let xen: i32 = list.get(i32, x.ve, id as usize)
+    let yst: i32 = list.get(i32, y.vs, id as usize)
+    let yen: i32 = list.get(i32, y.ve, id as usize)
+    if (xen - xst) != (yen - yst) { return false }
+    var i: i32 = 0
+    for xst + i < xen {
+        let a: i32 = list.get(u8, x.vb, (xst + i) as usize) as i32
+        let b: i32 = list.get(u8, y.vb, (yst + i) as usize) as i32
+        if a != b { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn copy_i32(read src: List(i32), read a: Allocator) -> List(i32) {
+    var dst: List(i32) = list.make(i32, a)
+    var i: usize = 0
+    let n: usize = list.len(i32, src)
+    for i < n {
+        list.push(i32, dst, list.get(i32, src, i))
+        i = i + 1
+    }
+    return dst
+}
+
+fn copy_u8(read src: List(u8), read a: Allocator) -> List(u8) {
+    var dst: List(u8) = list.make(u8, a)
+    var i: usize = 0
+    let n: usize = list.len(u8, src)
+    for i < n {
+        list.push(u8, dst, list.get(u8, src, i))
+        i = i + 1
+    }
+    return dst
+}
+
+fn copy_i64(read src: List(i64), read a: Allocator) -> List(i64) {
+    var dst: List(i64) = list.make(i64, a)
+    var i: usize = 0
+    let n: usize = list.len(i64, src)
+    for i < n {
+        list.push(i64, dst, list.get(i64, src, i))
+        i = i + 1
+    }
+    return dst
+}
+
+// An independent copy: the same schema, the same values, the same origins, the same ids.
+// Ids agree by construction, which is what lets `same_value` compare a clone against its
+// source by id rather than by name.
+pub fn clone(read c: Config, read a: Allocator) -> Config {
+    return Config{
+        nb: copy_u8(c.nb, a),
+        ns: copy_i32(c.ns, a),
+        ne: copy_i32(c.ne, a),
+        kind: copy_i32(c.kind, a),
+        secret: copy_i32(c.secret, a),
+        origin: copy_i32(c.origin, a),
+        vb: copy_u8(c.vb, a),
+        vs: copy_i32(c.vs, a),
+        ve: copy_i32(c.ve, a),
+        num: copy_i64(c.num, a),
+        rejected: c.rejected,
+    }
+}
+
+// ---- sections: a VIEW by prefix onto the flat key space --------------------------
+//
+// `std/ini` flattens `[server.tls]` + `port` to `server.tls.port`, and nothing here
+// treats the dots as structure — a key is a key. A `Section` is the dotted prefix a
+// component was handed, so `section_key(c, tls, "port")` finds `server.tls.port` without
+// the component knowing it lives under `server`. It owns its prefix (a struct may not
+// hold a `str` view), which is why it has a `Drop` and is move-only.
+pub struct Section {
+    prefix: String,
+}
+
+impl Drop for Section {
+    fn drop(mut self) {
+        string_free(self.prefix)
+    }
+}
+
+pub fn section(read prefix: str) -> Section {
+    var p: String = string_new()
+    string_push(p, prefix)
+    return Section{ prefix: p }
+}
+
+// The section `leaf` beneath `s`: `sub_section(section("server"), "tls")` names
+// `server.tls`. An empty parent yields the bare leaf, so a component can be handed the
+// root and still compose.
+pub fn sub_section(read s: Section, read leaf: str) -> Section {
+    var p: String = string_new()
+    let pv: str = string_view(s.prefix)
+    if pv.len > 0 {
+        string_push(p, pv)
+        string_push(p, ".")
+    }
+    string_push(p, leaf)
+    return Section{ prefix: p }
+}
+
+pub fn section_name(read s: Section) -> read str {
+    return string_view(s.prefix)
+}
+
+// The id of `leaf` within `s`, or -1 — `by_name` over `<prefix>.<leaf>`.
+pub fn section_key(read c: Config, read s: Section, read leaf: str) -> i32 {
+    var full: String = string_new()
+    let pv: str = string_view(s.prefix)
+    if pv.len > 0 {
+        string_push(full, pv)
+        string_push(full, ".")
+    }
+    string_push(full, leaf)
+    let id: i32 = by_name(c, string_view(full))
+    string_free(full)
+    return id
 }

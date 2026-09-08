@@ -1,0 +1,239 @@
+// std/cache_test.jtr — the unit suite for `std/cache`.
+//
+// These touch the real filesystem, for the reason `std/sysfs`'s suite gives: the module
+// exists to sit on top of the OS, and a mock would prove nothing about it. Everything is
+// created under a scratch root the suite makes itself and removes as it goes, so the tests
+// need no fixture in the repository.
+//
+// Run:  jestyrc test examples/std/cache_test.jtr
+import "cache"
+import "fs"
+import "mem"
+import "sysfs"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 4096
+const CACHE_T_ROOT: str = "jestyr_cache_t"
+
+fn fresh(mut f: fs.Fs, read a: Allocator) -> cache.Cache {
+    let _made: bool = sysfs.make_dir(f, a, CACHE_T_ROOT) catch false
+    return cache.open(a, CACHE_T_ROOT)
+}
+
+// Remove an entry AND the shard it lived in, then the root if it is now empty. The suite
+// leaves nothing behind, which is the same promise `std/sysfs`’s suite makes — an empty
+// scratch directory in the repository root is still litter.
+fn tidy(mut f: fs.Fs, read a: Allocator, read ch: cache.Cache, read key: str) {
+    let _e: bool = cache.evict(f, a, ch, key)
+    if key.len == 64 {
+        var sh: String = string_new()
+        string_push(sh, CACHE_T_ROOT)
+        string_push(sh, "/")
+        string_push(sh, key[0 .. 2])
+        let _d: bool = sysfs.remove_dir(f, a, string_view(sh)) catch false
+        string_free(sh)
+    }
+    let _r: bool = sysfs.remove_dir(f, a, CACHE_T_ROOT) catch false
+}
+
+@test fn a_key_is_the_hash_of_the_content() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    // The key is a pure function of the bytes: same content, same key, no filesystem
+    // involved. That is what makes `store` idempotent and `verify` possible.
+    var k1: String = cache.key_of(a, "hello")
+    var k2: String = cache.key_of(a, "hello")
+    var k3: String = cache.key_of(a, "hellp")
+    test.eq_str(c, rep, "stable", string_view(k1), string_view(k2))
+    test.is_false(c, rep, "differs for different bytes",
+                  test.lines_eq(string_view(k1), string_view(k3)))
+    test.is_true(c, rep, "well formed", cache.key_is_wellformed(string_view(k1)))
+    // The known SHA-256 of "hello" — pins that this is really SHA-256 and not some other
+    // digest that would also be stable and also differ.
+    test.eq_str(c, rep, "known vector", string_view(k1),
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+
+    string_free(k1)  string_free(k2)  string_free(k3)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_malformed_key_is_refused_rather_than_indexed() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // A short key cannot be sharded, so accepting one would index a path outside the layout.
+    test.is_false(c, rep, "too short", cache.key_is_wellformed("abc"))
+    test.is_false(c, rep, "empty", cache.key_is_wellformed(""))
+    test.is_false(c, rep, "not hex", cache.key_is_wellformed(
+        "zzf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"))
+    test.is_false(c, rep, "uppercase is not our spelling", cache.key_is_wellformed(
+        "2CF24DBA5FB0A30E26E83B2AC5B9E29E1B161E5C1FA7425E73043362938B9824"))
+    test.is_true(c, rep, "the valid shape", cache.key_is_wellformed(
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn store_then_load_round_trips() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var ch: cache.Cache = fresh(h, a)
+
+    let body: str = "the quick brown fox\njumps over the lazy dog\n"
+    var key: String = cache.store(h, a, ch, body)
+    let k: str = string_view(key)
+    test.is_true(c, rep, "store returned a key", cache.key_is_wellformed(k))
+    test.is_true(c, rep, "present", cache.has(h, a, ch, k))
+
+    var back: String = cache.load(h, a, ch, k)
+    test.eq_str(c, rep, "round trip", string_view(back), body)
+    test.is_true(c, rep, "verifies", cache.verify(h, a, ch, k))
+
+    tidy(h, a, ch, k)
+    string_free(back)  string_free(key)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn storing_the_same_content_twice_is_a_no_op() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var ch: cache.Cache = fresh(h, a)
+
+    // Idempotence is the property that removes cache invalidation entirely: there is nothing
+    // an entry can become stale relative to, so a second store has nothing to do.
+    let body: str = "idempotent"
+    var k1: String = cache.store(h, a, ch, body)
+    var k2: String = cache.store(h, a, ch, body)
+    test.eq_str(c, rep, "same key", string_view(k1), string_view(k2))
+    test.is_true(c, rep, "still verifies", cache.verify(h, a, ch, string_view(k1)))
+    var back: String = cache.load(h, a, ch, string_view(k1))
+    test.eq_str(c, rep, "content intact", string_view(back), body)
+
+    tidy(h, a, ch, string_view(k1))
+    string_free(back)  string_free(k1)  string_free(k2)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn verify_catches_a_corrupted_entry() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var ch: cache.Cache = fresh(h, a)
+
+    // **The operation a name-keyed cache cannot offer.** Overwrite the bytes under a key
+    // without changing the key, exactly as a truncated write or a bad disk would, and the
+    // store must notice using nothing but the entry and its own name.
+    let body: str = "trustworthy"
+    var key: String = cache.store(h, a, ch, body)
+    let k: str = string_view(key)
+    test.is_true(c, rep, "verifies before", cache.verify(h, a, ch, k))
+
+    // Write different bytes to the same path, behind the module's back.
+    var path: String = string_new()
+    string_push(path, CACHE_T_ROOT)
+    string_push(path, "/")
+    string_push(path, k[0 .. 2])
+    string_push(path, "/")
+    string_push(path, k[2 .. k.len])
+    let _w: bool = fs.put(h, string_view(path), "tampered")
+
+    test.is_true(c, rep, "still looks present", cache.has(h, a, ch, k))
+    test.is_false(c, rep, "but does NOT verify", cache.verify(h, a, ch, k))
+
+    tidy(h, a, ch, k)
+    string_free(path)  string_free(key)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn an_absent_key_loads_empty_and_does_not_verify() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var ch: cache.Cache = fresh(h, a)
+
+    // Fail CLOSED. `verify` false must mean "do not trust this", and absent is a case of
+    // that — a resolver asking "may I use the cached copy" must get no for a missing entry.
+    let absent: str = "0000000000000000000000000000000000000000000000000000000000000000"
+    test.is_false(c, rep, "not present", cache.has(h, a, ch, absent))
+    var back: String = cache.load(h, a, ch, absent)
+    test.eq_usize(c, rep, "loads empty", string_view(back).len, 0)
+    test.is_false(c, rep, "does not verify", cache.verify(h, a, ch, absent))
+
+    string_free(back)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn two_different_values_do_not_collide() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var ch: cache.Cache = fresh(h, a)
+
+    // Distinct content lands in distinct entries and each keeps its own bytes. Without this
+    // the sharding could be wrong — two keys sharing a shard directory is normal and must
+    // not mean sharing a file.
+    var ka: String = cache.store(h, a, ch, "alpha")
+    var kb: String = cache.store(h, a, ch, "beta")
+    var a_back: String = cache.load(h, a, ch, string_view(ka))
+    var b_back: String = cache.load(h, a, ch, string_view(kb))
+    test.eq_str(c, rep, "alpha intact", string_view(a_back), "alpha")
+    test.eq_str(c, rep, "beta intact", string_view(b_back), "beta")
+    test.is_true(c, rep, "alpha verifies", cache.verify(h, a, ch, string_view(ka)))
+    test.is_true(c, rep, "beta verifies", cache.verify(h, a, ch, string_view(kb)))
+
+    tidy(h, a, ch, string_view(ka))
+    tidy(h, a, ch, string_view(kb))
+    string_free(a_back)  string_free(b_back)  string_free(ka)  string_free(kb)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_denied_filesystem_cannot_be_reached_through_the_cache() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var a: Allocator = mem.system_allocator()
+
+    // The capability gate is the module's, not the caller's discipline: every entry point
+    // takes an `fs.Fs`, so a component handed `fs.denied()` cannot reach the disk through
+    // this API at all. Without this test the gate is a convention rather than a check.
+    var denied: fs.Fs = fs.denied()
+    var ch: cache.Cache = cache.open(a, CACHE_T_ROOT)
+    var key: String = cache.store(denied, a, ch, "should not land")
+    test.eq_usize(c, rep, "store refused", string_view(key).len, 0)
+
+    string_free(key)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

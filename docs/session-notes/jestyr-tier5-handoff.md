@@ -953,6 +953,15 @@ Invisible from here because the half that went missing was the POSIX one and the
 only ever compiled on Windows locally. All four now route through one definition
 (`cc_platform_defines()` / its `cgen.jtr` mirror).
 
+**The same duplication had a second instance — the LINK rule — and it is folded too
+(2026-09-06).** `-pthread`/`-lssl -lcrypto`/`-lws2_32` were three hand-kept copies (both
+driver sites and the harness's `link_and_finish`), and `tls_test` linked under the driver
+and failed under the harness until the third copy learned OpenSSL. `main.rs::link_args`
+returns the argument tail in ld's order; a unit test (`link_rule`) pins the order and the
+triggers on the list itself, without a compiler. Every emitted-C link site calls it — which
+turned up that the full fixpoint had carried no `-pthread` at all. The port's driver keeps
+its copy by necessity; `jc_build_matrix` holds it to the same libraries.
+
 **Two guards, and the second exists because the first could not have caught the fourth
 site.** `every_cc_invocation_carries_the_platform_defines` scans `proptests.rs` and demands
 the baseline on the line IMMEDIATELY after `CC_FLAGS` — "a few lines later" is where the
@@ -1026,6 +1035,190 @@ cmd's quote-stripping from inside a string `test_fixture.capture` owns.
 
 ---
 
+## §3q. Storage V2 — `std/kv`, and two compiler facts measured on the way
+
+Area 9 is no longer "log only". `examples/std/kv.jtr` is a key-value store whose only
+durable artefact is an `alog`: KV, atomic batches, compaction, migrations and backup, on
+`std/alog`, `std/strmap`, `std/list`, `std/fs` and `std/sysfs`. Ten tests, a pinned demo
+(`jstate`), no reseed — the drift guard, not the heuristic, says so. Fourth new leaf module
+in a row to need none, which is the §3 property of the next-steps note working.
+
+**The design decision is that the log is durability, not capacity.** Every live key and
+value is memory-resident and the log is replayed at open. That is the shape the brief's
+consumers want (configuration, service state, a build's bookkeeping) and the wrong shape for
+a dataset larger than memory, which the header says. It was not a free choice:
+`file.Reader` has no seek, so a Bitcask-style offset index could not have fetched a value on
+demand. A store that must exceed memory is a different structure, and needs a seek first.
+
+**A batch is atomic because it is one record.** The log already makes one record complete
+or discarded; a begin/commit pair would need recovery to hold half-applied batches back
+until it sees the commit — the state machine that gets written wrong. The price is a
+ceiling (`KV_MAX_RECORD`, 1 MiB) which also bounds the replay buffer; a larger batch is
+refused before anything is written and left intact so the caller can split it.
+
+**Compaction, migration and snapshot are ONE rewrite** into a fresh file beside the store,
+then `sysfs.rename_replace`. The handle is closed BEFORE the rename (Windows cannot replace
+an open file), and a rename that fails reopens the untouched original. After a compaction
+or migration the memory is rebuilt by REPLAYING THE NEW FILE — which costs a pass and
+means what the caller sees is what a reopen would see, because it is what a reopen did.
+Doing that needed `forget`: the index (`strmap`) has no removal, so every live key is
+tombstoned by hand before the entries list is truncated, or the next `mem_put` would
+index past it. Skipping that step was one of the four mutations watched failing.
+
+**Every writer applies its own bytes by parsing them.** `put`, `del` and `commit` frame an
+operation list, append it, then run the SAME bytes through `apply_batch` — the one reader
+of the layout. An encoder that drifted from the parser fails at the write, not at the next
+reopen. The "frame every batch as a batch of one" mutation showed the shape: the store
+refused to REOPEN, because the self-replay had already rejected its own record.
+
+### Two compiler facts, measured, neither fixed here (§3 rule: report, do not reseed)
+
+**`return ok(local)` drops the local it carries out.** For a struct with a `Drop` impl (or
+`Drop`-bearing fields), `return d` moves and `return ok(D{ … })` moves, but `return ok(d)`
+copies `d` into the result and then emits the local's drops — the file is closed and the
+strings freed before the caller sees them. Measured in the emitted C, exit code
+`STATUS_HEAP_CORRUPTION`, and pinned with a three-function probe (plain / `ok(local)` /
+`ok(literal)`). Reference side only; the port was not run. `std/kv` routes around it by
+opening INTO a caller-owned handle (`kv.closed()` then `kv.open(f, a, path, s)`), the shape
+`alog.scan` uses for its out-parameters. **Every existing fallible constructor in the corpus
+returns a literal** (`alog.open` returns `ok(Log{ w: w, … })`), which is why nothing had
+tripped it. Filed in the next-steps note's §1 with the probe.
+
+**`from_utf8` traps on invalid UTF-8; `try_from_utf8` is the checked one.** A `str` is
+UTF-8 by construction, so a record's length fields — bytes above 127 — cannot pass through a
+`String`. The first draft assembled records in one and died on the first value longer than
+127 bytes, with an assertion in the runtime rather than a diagnostic. The framing now lives
+in a plain owned `[]u8` buffer, and the replay converts keys and values with
+`try_from_utf8` so a corrupted byte reads as damage rather than as an abort. Two traps for
+the §7 list: `out` is a keyword (a parameter named `out` is 32 parse errors), and a
+`catch { … }` block may not contain a `return`.
+
+**Also found: four suites gating nothing.** `semver_test`, `resolve_test`, `lockfile_test`
+and `cache_test` had no entry in `io_suites_pass`. Green for their authors, checked by
+nothing on CI. Registered with their counts pinned, alongside `kv_test`.
+
+## §3r. B2 — `extern … var`, and a cost estimate that priced the wrong design
+
+`extern "errno.h" var errno: i32` binds a foreign global as a place: read, assigned and
+`&`-taken by its C symbol. `extern "c" var x: T` declares `extern T x;`; a `.h` abi emits
+nothing, which for `errno` — a macro on glibc and msvcrt alike — is the only thing that can
+work. The alias and `@cfg` forms are the function ones.
+
+**The register said 257 `Item::` sites. The number was right; the design was wrong.** That
+is the price of a new item KIND, and every one of those sites is a compile error until
+visited (a silent fall-through in the port). A global is an extern symbol with a type that
+has no parameter list — same header, alias, `@cfg` and ABI story — so it is a FLAG on the
+existing extern item. `is_global` on the reference; on the port, param count `b == -1`,
+because every reader of an extern already bounds its loops by `b` and the other free-looking
+slots (`(g,h)`, `v`, `e`) are read kind-blind — the alias work found that by segfaulting.
+Nine sites branch: parser, typeck (registers as a const and in a new `globals` set), cgen's
+symbol map, declaration, Name arm and `&name`, `doc::extern_sig` (`var NAME: T`, which
+attest hashes — a swap between `fn` and `var` is a break), the P2 printer, and the reference
+item dump (an explicit `var`/`fn` atom, since a global and a nullary fn otherwise dump
+alike). Every exhaustive match kept compiling untouched.
+
+**Verification.** `examples/extern_global.jtr` (transcript pinned; in the cgen allowlist and
+the attest list), three P2 item snippets (header-declared, aliased+pub, `@cfg`), and the
+corpus-wide P2/P3/P4/doc goldens. Two mirrors watched failing: the port's Name arm off →
+the cgen golden diverges on the corpus file; the port's `var` arm off → the item dump
+diverges on the snippets.
+
+**A gap this first shipped with, closed the same day:** a local shadowing a global read the
+global in the backend — typeck found the local first, but the cgen Name arm decided by
+spelling, so a `var errno` local wrote the real `errno` (watched failing: 2 and 2 for 42 and
+0). The checker now records the resolution on the expression row (`Resolved.global`; the
+port's `c.gref`) and both backends name the symbol from that alone. The corpus file's
+`shadow()` pins it. **A backend that decides by spelling what the checker decided by scope
+is a divergence waiting for the first shadow** — the same shape as `call_sym`, and it was
+fixed the same way.
+
+## §3s. HTTP V2 — `std/httpd` and `std/httpc`
+
+Everything above the message, in one loop. `httpd.jtr`: a router (`:name` segments, a
+trailing `*`, method `*`, first match wins), middleware as a `List(Handler)` run before
+routing (`HTTPD_DONE` skips it), keep-alive with PIPELINING (the parser's `req.total` is the
+boundary; every complete request in a buffer is answered before the kernel is asked for
+more), a READ timeout (408 + close: Slowloris) and an IDLE timeout (silent close) as separate
+knobs because they are separate failures, chunked streaming out, static files under a root
+with `..`/backslash/NUL refused as a 404 (a probing client learns nothing), an access log
+record per exchange through `std/log`. `httpc.jtr`: a blocking client, `fetch` one-shot and
+`Client` kept-alive, reading a response until `std/http` says it is complete.
+
+**Single-threaded, readiness-driven, by design.** `spawn` refuses a `mut` parameter, so a
+worker per connection would be a channel architecture; one poll over `runtime.ask` (the
+poller exposed to a loop with its own fd table) is smaller and is what makes the suite a
+transcript: client and server take turns in one process. Handlers are the `runtime.Task`
+shape — fn pointer plus context — because that is what a `List` can hold.
+
+**`std/http` grew the response half**, sharing the request parser's header loop and
+framing scan (one framing decision, both directions), a `span` constructor (a
+module-qualified struct literal does not parse), and `@copy` on `Request`/`Response` (all
+offsets and flags; without it a borrowed `Request` cannot sit in the exchange). `sysnet`
+grew `adopt(fd)` for a table that stores descriptors.
+
+**Three names moved because an extern's name is a C symbol in every module that links
+it**: `connect`, `close` and `listen` are `sysnet`'s, so the client `dial`s and `hangup`s
+and the server `start`s and `stop`s. The checker's message is "duplicate definition", one
+module away from the cause.
+
+**Found on the way: A13** (§6A) — drop glue under colliding type names, a link error here
+and a wrong-type `fclose` in the case that links.
+
+Eight tests, five mutations watched failing (keep-alive never kept, middleware `DONE`
+ignored, traversal check removed, timeouts never expiring, the pipelined remainder
+discarded), the `jhttpd` demo pinned. **Two of the five FAIL BY HANGING** — a client blocks
+on a response the mutated server never sends — and a probe harness must treat a hang as a
+failure and kill the grandchild, or it waits forever on the pipe. **One probe passed the
+first suite**: with `DONE` ignored the client still saw the middleware's 401, because the
+handler that ran afterwards had its response refused as a duplicate. The status could not
+tell; only a handler that RECORDS that it ran could, and the suite now has one. A test
+that asserts through the wire alone cannot see what happened behind it.
+
+## §3t. TLS — `std/tls`, by binding OpenSSL
+
+Bindings through `extern "openssl/ssl.h"`/`"openssl/err.h"` — header-declared, so no
+prototype is emitted and the library's own signatures are used. A `Context` (client, or
+server loaded with a certificate and its key, checked against each other at load), a
+`Session` over a `sysnet` descriptor (`client_session` with SNI and — whenever the context
+trusts a CA — `SSL_set1_host`, so the hostname is checked; `server_session`), `write_all`,
+`read_into` (0 is a clean close-notify, -1 is everything else, including a peer that
+vanished — the truncation-attack distinction TLS adds over TCP), `shutdown`, and
+`last_error` in OpenSSL's words. Verification has no "continue on failure" mode.
+
+**A handshake needs both ends running at once**, and `sysnet` is blocking, so the suite
+spawns the client (`concurrent { let h = spawn client_roundtrip(port, verify, wrong_host) }`)
+and serves on the main thread. The spawn target takes integers and returns one — the shape
+`spawn` accepts — and encodes what it saw. Four cases: verified (chain AND hostname), wrong
+hostname with the right CA (must fail), trust-nothing (completes, reports unverified),
+refusals at load with the library's reason.
+
+**Linking:** `openssl/ssl.h` in the emitted C → `-lssl -lcrypto` after the source, at both
+of `main.rs`'s link sites and in the port's `jc build` driver (a reseed). Measured first:
+Strawberry's mingw ships OpenSSL 1.1.1i headers and both static libraries. The test
+certificate is a checked-in self-signed `localhost` pair (`examples/std/fixtures/`), minted
+with `openssl req -config …` because that `openssl.exe` cannot find its default config.
+
+Not built: schannel, non-blocking sessions (`sysnet` has none), resumption, client
+certificates, ALPN, a `protocol` accessor (a `cstr` has no view helper in `std/cstring`).
+
+## §3u. The registry layer — `std/manifest` and `std/registry`
+
+The two absences the substrate recorded. `manifest.jtr`: `jestyr-package/v1`, `name`,
+`version`, `dep <name> <req>`, validated with `semver` at parse, refusing what a resolver
+could not consume (a dependency named twice, a name with a capital), rendering in ONE form
+so `render(parse(x)) == x`. `registry.jtr`: a directory — `index` of `pkg <name> <version>
+<sha256>` lines, `<name>-<version>.manifest`, `<name>-<version>.tar` — and the same paths
+under a base URL over HTTP, which is what `httpd`'s static route serves without knowing.
+`load` builds `resolve.Registry` from text alone; `fetch`/`fetch_http` share one admission
+rule (hash, compare to the index's promise, then `cache.store`); `publish` refuses a bad
+manifest and an existing version.
+
+The end-to-end test is the `jc add` shape: publish three versions, load, `resolve` picks
+minimally, fetch the selection through the cache, refuse a tampered archive, then fetch
+the same package over HTTP from `httpd` on a spawned thread. **That thread keeps its
+`Server` in raw memory** (`alloc` + `unsafe { p.* = … }`) because a dropped `Server` local
+in a program that also links `std/file` trips A13.
+
 ## §4. Comparison suites, rerun at this milestone
 
 Run twice this arc — after §3 and again after §3c, since both changed compiler semantics.
@@ -1055,15 +1248,15 @@ twice.
 | 2 | observability | **mostly.** `log.jtr` (structured, injected `Clock`+`Writer`, no globals) + `metrics.jtr` (counters/gauges/histograms, name-ordered dump, saturating counters). Missing: **trace spans** — and `Span` is taken three times already, so pick another word first |
 | 3 | config | **DONE.** `config.jtr` (precedence is a property of the SOURCE, order-independent) + `ini.jtr` as a file format over it. Missing: live reload, nesting |
 | 4 | sandbox | **mostly.** `sysproc` spawn/pipes/`wait_timeout`/kill, and environment inheritance now matches on both platforms **and is finally tested** (§3p). Missing: **cwd, process groups, fs capability projection** |
-| 5 | package | **the big one, barely started.** Content-addressing + DAG ordering exist (`module.rs` manifest, `buildgraph.jtr`, `tar.jtr`, `sha256.jtr`). Missing: **semver, resolver, lockfile, cache** |
-| 6 | HTTP | **parser only.** `http.jtr` refuses request smuggling. Missing: **routing, middleware, streaming bodies, keep-alive, timeouts, static files, access logs, test client/server** |
+| 5 | package | **DONE through the registry layer (§3u).** `semver` → `resolve` → `lockfile` → `cache`, then `manifest.jtr` (the package FORMAT, one canonical rendering) and `registry.jtr` (a directory layout, the same over HTTP; `load` feeds the solver, `fetch` verifies against the index's digest before the cache). Missing: **signatures, yanking, mirrors, publishing over HTTP**, and the `jc add` command itself over these pieces |
+| 6 | HTTP | **DONE (§3s).** `httpd.jtr` (router, middleware, keep-alive + pipelining, read/idle timeouts, chunked streaming, static files, access log) + `httpc.jtr` (test client) above `http.jtr`, which now parses responses too. Missing: request-BODY streaming (a request must fit the connection buffer), TLS |
 | 7 | crypto | **boundary done.** `sha256`, `crc32`, and `csrand.jtr` (platform CSPRNG + constant-time compare). Missing: **HMAC, signing/verification, a hash interface** — bindings, not algorithms to write |
-| 8 | TLS | **absent**, and wants a DECISION before effort — see §6B4 |
-| 9 | storage | **log only.** `alog.jtr` is CRC'd and crash-recoverable. Missing: **KV, compaction, atomic batches, migrations, backup/export** |
+| 8 | TLS | **DONE (§3t).** `tls.jtr` binds OpenSSL: contexts, blocking sessions over a `sysnet` descriptor, verification that includes the hostname, an error surface. Content-triggered `-lssl -lcrypto` on both drivers. Missing: **schannel** (Windows goes through mingw's OpenSSL), non-blocking sessions, resumption, client certs, ALPN |
+| 9 | storage | **DONE (§3q).** `kv.jtr` on `alog.jtr`: KV, atomic batches (one record each), compaction, migrations, snapshot/backup — one rewrite primitive under all three. Memory-resident by design; a store larger than memory needs a seek in `file.Reader` first |
 | 10 | compatibility | **DONE.** `src/attest.rs` emits the ABI manifest and gates breaking-vs-compatible in CI, now including trait/impl records. Missing: `@deprecated` reaches nothing (A8) |
 
-**Scoring it honestly: 4 areas done (1, 3, 7-at-the-boundary, 10), 3 mostly (2, 4, and 10's
-tail), 3 barely or not at all (5, 6, 9), 1 undecided (8).** The tier's own definition of done
+**Scoring it honestly: 6 areas done (1, 3, 5-the-substrate, 7-at-the-boundary, 9, 10), 2
+mostly (2, 4), 1 barely (6), 1 absent but no longer gated (8).** The tier's own definition of done
 — *"a service can start, report health, run background work, shut down gracefully, and be
 tested deterministically"* — **is met**. What is left is breadth, not the headline claim.
 
@@ -1104,6 +1297,129 @@ wrong until some program puts the construct between two spawn sites. Removing th
 means either making the ASTs agree, or deriving spawn symbols from a per-spawn ordinal
 instead of an `ExprId` (small on each side, but churns every spawn-bearing golden and
 attest hash).
+
+#### A11 (decision half). ~~Should a `mut` argument that aliases nothing be refused?~~ — **YES, CLOSED both sides**
+
+`check_mut_value_arg` in `escape.rs` and `escape.jtr`: a `mut`/`out` argument that is not
+a place (name, `self`, field/index/deref chain) and whose INFERRED type transitively holds
+no indirection is an error. The type is the boundary — `add(s as Buf)` stays accepted, a
+struct with a `*mut T` field stays accepted, an `i64` or a `P{ x: 1 }` of plain fields is
+refused. Unknown/opaque/generic types answer "has indirection" so only provable cases are
+refused. One corpus file carried the shape (`mut_arg_value.jtr`) and was rewritten; the
+eight-probe differential `jestyr_mut_value_arg_matches_reference` was watched disagreeing
+before the mirror. **Shared, pre-existing port limitation, now load-bearing for one more
+rule:** the port's call checks resolve a bare-`Name` callee only and defer qualified
+`mod.f(...)` (comment at `escape.jtr` "qualified `mod.f` resolution deferred"), so this
+refusal, give-away and slice-alias all fire on `jestyrc` and not on `jc` for a QUALIFIED
+call. Zero corpus files reach it; a probe through `mod.f(a + b)` would be the first, and
+closing it means one resolution helper shared by three checks.
+
+#### A12. ~~`return ok(local)` drops the local it carries out~~ — **CLOSED, both sides**
+
+Closed the same day it was found. `cgen.rs`: `as_returned_name` feeds `collect_moved` for a
+`return` statement and a block tail; `cgen.jtr`: `mv_mark_returned`. Corpus
+`examples/return_ok_local.jtr`, allowlisted, transcript-tested; the golden was watched
+diverging on that one file before the mirror landed; seed refreshed (+53 lines). The fix
+is in the move ANALYSIS — `emit_value_return` was already right given a right `cur_moved`.
+The original entry follows for the record.
+
+For a struct that owns something (`Drop` impl, or `Drop`-bearing fields), `return d` moves
+the local and `return ok(D{ … })` moves the literal, but **`return ok(d)` copies `d` into
+the result and then emits the local's drops** — the caller receives a struct whose file has
+been closed and whose strings have been freed. Measured in the emitted C (`JestyrResult_D
+j_result = { .ok = j_d }; jestyr_impl_Drop__D__drop(&j_d); return j_result;`), and pinned
+with a three-function probe. Reference side; the port has not been run against the probe.
+
+**Why the corpus never tripped it:** every fallible constructor returns a literal
+(`alog.open`, `file.finish`, `sysnet`, …). `std/kv` was the first to build a value, work on
+it, and then wrap it — and it now opens INTO a caller-owned handle instead.
+
+**The fix lives in `cgen`** (both sides — `cgen.rs` and `cgen.jtr`) where `ok(...)`'s
+argument should be treated as consumed exactly as a bare `return` treats it. That is a
+closure edit and a reseed, so it belongs in the next-steps note's serial §1, and a corpus
+file that RETURNS `ok(local)` must be added so the port mirror can be watched failing.
+
+#### A13. Drop glue under COLLIDING type names calls a function that does not exist — **CLOSED 2026-09-06**
+
+**What it was, measured.** One defect, not two: `typeck::register_impls` iterated the items
+WITHOUT setting `cur_mod` — the only item pass that did not — so `impl Drop for Writer` in
+`file` lowered `Writer` in whatever module the previous pass left behind, missed
+`Writer__m<file>`, degraded to `Opaque("Writer")` and was keyed `("Drop", "Writer")`. From
+that one key: (1) a `file.Writer` local's own key `Writer__m<file>` found no impl, so **it
+was never dropped** — the probe printed `1 2 3` and no `drop`; a leaked handle with no
+diagnostic; (2) `escape`'s `droppable_ty` answered "no" for it, so the consuming rule was
+off for such a program; (3) a `json.Writer` FIELD lowered from the emitting module — which
+had no `json` import to resolve the path through — degraded to the same `Opaque("Writer")`,
+FOUND the bare key, and called the symbol nothing emits. cgen's `aggregate_drop_fields` /
+`enum_drop_variants` were the second site: they matched the decl by BARE spelling (first
+struct named `Writer` wins) and lowered fields via `ast_type_to_ty`, i.e. from `cur_mod`.
+
+**The fix, reference-only.** `register_impls` sets `cur_mod` per item; `ast_type_to_ty`
+gained an explicit-module form `ast_type_to_ty_in(id, subst, m)` (with `path_target_in`),
+and the two drop-field helpers match by `canon_type_in(decl_mod, name) == decl.name` and
+lower from `decl_mod`; `generic_drop_impl`/`has_concrete_drop_impl` lower each impl's target
+from the impl's module. **The port needed nothing**: `ml_rewrite` renames colliding types in
+the token stream, so its typeck/cgen never see a bare `Writer` — it built and ran the probe
+correctly BEFORE the fix, which is what made this a two-compiler divergence. After the fix
+the two agree byte-for-byte (2,938 lines sans `#line`); the drift guard reported no reseed.
+
+**Pinned by:** `examples/std/drop_collide_demo.jtr` (`jdropcollide` — a scope-dropped
+`file.Writer` proven by the file's size read back, `3`, beside a `log.Logger` held from a
+module that never imports `json`; transcript test + the port-vs-reference run comparison +
+`jc_build_matrix`), and `module.rs::drop_glue_under_colliding_type_names_finds_the_right_impl_and_only_that_one`
+(the three-module `Res` fixture: impl keyed `Res__m<a>`, exactly one drop call, none on the
+holder). Both watched failing on the pre-fix binary: the demo with the undefined reference,
+the fixture with `1 2 3` and no drop.
+
+**Lesson, added to §3j's family:** "every spelling-based rule eventually meets a scope" —
+and every per-pass module context is a rule someone can forget to set. The item passes in
+`typeck.rs` and `cgen.rs` each set `cur_mod` themselves; there is no guard that a pass did.
+
+<details>
+<summary>Original entry</summary>
+
+Three modules in one closure each define a `Writer` (`file`, `writer`, one more); only
+`file.Writer` has a `Drop` impl, emitted canonically as `jestyr_impl_Drop__Writer__m21__drop`.
+A scope-exit drop of a struct holding a `writer.Writer` FIELD (`log.Logger.jw`, reached
+through `httpd.Server`) emitted `jestyr_impl_Drop__Writer__drop` — the BARE name, for a
+type that has no `Drop` at all — and the link failed. Found by `httpd_test` importing
+`sysfs` (→ `file`) beside `log` (→ `writer`).
+
+Two things are wrong at once: the field type reached `needs_drop` under its bare name
+(`ty_key` of an `Opaque("Writer")`, so the module-qualified field type did not resolve to
+its index), and the impl index answered that bare name (the impl is registered under the
+bare key while the type's canonical name is suffixed). The visible failure is a link
+error. **The invisible one is worse:** had the names lined up, a `writer.Writer` would have
+been handed to `file.Writer`'s drop — `fclose` on a struct that holds no `FILE*`.
+
+Routed around in `httpd_test` (no `sysfs` import). Needs: a probe program with two
+same-named types, one `Drop`, a field of the other; the fix in typeck's field-type lowering
+and/or `drop_key_of`; both sides; a reseed. **Any program importing `file` and `writer`
+together is exposed today.**
+
+</details>
+
+#### A14. The port's loader renamed LOCALS that share a colliding fn name — **CLOSED**
+
+`ml_rewrite` flattens modules at the TOKEN level and renames a module's own colliding
+top-level names at every bare, non-`.`-preceded, non-binder use. A local's USE is exactly
+that shape: `body.len` inside `httpc.request(…, read body: str)` became `j_body__m4`
+(`httpc` exports `fn body`, and so does `httpd`), and `runtime`'s `let now` + `now + …`
+became `j_now__m16` because `log`, `runtime` and `time` all export a `now`. gcc:
+"`j_body__m4` undeclared". `jestyrc` resolves scope first and was right. Surfaced by
+`jc_build_matrix` moving `httpd_demo` to `FAIL` — the first corpus program whose closure
+holds two exports of one name AND a local spelled like it.
+
+Fixed in the loader: it now collects the current function's binders (parameters via the
+`ident :` shape inside the parens, `let`/`var` names, `for x in` variables), resets at
+each `fn`, and skips the rename for any of them. Over-approximates in one direction: a
+block-local binder is kept until the function ends, so a fn-valued use of that name AFTER
+the block would go unrenamed — no corpus program does it. Port-only, so no reference
+change; a reseed. The port-built demo prints the pinned transcript.
+
+**The lesson is the one §3j already carries:** the loader is a compensation layer that
+works by spelling, and every spelling-based rule eventually meets a scope. `A13`
+(drop glue by bare name) is the same family on the reference side.
 
 #### A2. `environ` on POSIX — **CLOSED: the test exists now (§3p)**
 
@@ -1242,23 +1558,106 @@ a second copy of a list that already exists in fragments, in a module that canno
 original. The honest fix is to hoist the name list into a module both can import — a small
 refactor of cgen.jtr, worth doing before anything else needs to ask "is this an intrinsic".
 
-#### A6. `Self` in a trait parameter — `check` passes, `run` fails
+#### A6. `Self` as a type inside a trait impl — **CLOSED** (both sides)
 
-Pre-existing. Parses, type-checks as `Opaque("Self")`, and cgen refuses. The degrades-to-gcc
-class the tier has otherwise been closing.
+The recorded line — "in a trait parameter; `check` passes, `run` fails" — named one position
+and one of the **two** failures. `Self` failed as a parameter, as a return, as a local's type
+and nested inside `[]Self`; and only when the IMPL spells it (a trait declaration's `Self` was
+always fine, since traits are not emitted, and an impl spelling the concrete type was fine
+too — which is why no corpus file ever tripped it).
 
-#### A7. A range expression may not be a call ARGUMENT
+**Half 1, cgen — `check` passes, `run` fails.** `Self` reached neither of cgen's two type
+doors. `c_ty_ast` refused it outright ("cannot lower the external type `Self`", emitted twice
+because the impl emitter runs for the prototype and again for the definition); `c_type` was
+worse, missing the subst and falling through to **`int`, silently, with no diagnostic at all**.
+Both doors already consult `self.subst`, so the fix is a single binding —
+`subst.insert("Self", target)` in `emit_impl_method_decl` — rather than two special cases, and
+that is also what makes the nested forms work, since the emitters recurse through the map.
+`impl_ok_ty` (which resolved `Self` by hand for a fallible return, at top level only) survives
+as the vestige of the missing general binding; it stays because its consumer wants a `Ty`.
 
-Pre-existing, and **the recorded description was too narrow**: the Tier 4 note calls it a
-`mut` sub-slice problem, but `bounds[0 .. 3]` into a `read []i64` parameter fails
-identically. The boundary is argument position, not mutability. Workaround: `alloc` +
-`slice(T, raw, N)` bound to a named local.
+**Half 2, typeck — `check` FAILS, with a message about escape.** `check_fn` lowered a body's
+`Self` to `Opaque("Self")`. The source comment called that a deliberate deferral costing
+nothing "because `assignable` is lenient on `Opaque`". That justification expired: the escape
+checker's `Unknown`-finalization backstop refuses a *borrow* whose type never resolved, so
+`mut o: Self` was rejected. `read` and `take` slipped through only because the backstop is
+about borrows. `register_impls` already built the `{Self → target}` map for recorded returns;
+`check_fn` now applies it to parameters and the return as well.
 
-#### A8. `attest` accepts `@deprecated` and does nothing with it
+Corpus: `examples/trait_self.jtr` (parameter, return, local, `[]Self`, `mut Self`, and a
+PRIMITIVE receiver where `Self` is `i32`), allowlisted. Each mirror was watched failing
+separately — the `cgen.jtr` half against the cgen golden, the `typeck.jtr` half against the P3
+typeck golden.
 
-`src/attrs.rs` marks it Active; it reaches neither `doc::fn_guarantees` nor the manifest, so
-a deprecation is invisible to the breaking-change gate. Smaller than A1 and in the area the
-tier otherwise completed.
+**A latent port defect closed alongside it:** `jc` had no `Self` refusal of its own, so where
+`jestyrc` errored, `jc` alone emitted `int` and `JestyrSlice_Self`. Unreachable only because
+the reference refused first — it would have become a live miscompile the moment it stopped.
+
+#### A7. A range sub-view may not be a `mut` argument — **CLOSED** (both sides)
+
+**The two descriptions this entry carried were both wrong**, in opposite directions, and the
+correction above was the worse of the two. Kept in full because the failure mode — a recorded
+*diagnosis* outliving the *symptom* it explained — is the one this tree keeps paying for.
+
+* The claim that "`bounds[0 .. 3]` into a `read []i64` parameter fails identically" **does not
+  reproduce**, and could not have: `examples/slice_range.jtr` had shipped
+  `from_utf8(b[0 .. 3])` — a range sub-view in argument position — since the file was written.
+* The Tier 4 note's original `mut` diagnosis was right. The boundary is by-address passing.
+* The inferred consequence — "parser change → the P2 golden has no allowlist" — was therefore
+  also wrong. Nothing in the parser or typeck was involved; `check` passed throughout.
+
+The real defect was one arm of `cgen::emit_place`, which assumed an `Index`'s index is a
+scalar element offset. A range index computes a new `{ ptr, len }` view instead, so the arm
+emitted the `Range` node as if it were an offset and tripped "the C backend does not support
+ranges yet" — a diagnostic pointing at the range, which is precisely what disguised a missing
+*place* case as a missing *range* feature for two tiers.
+
+Fixed by parking the sub-view in a compound literal of array type (`(T[1]){ v }` → `T*` →
+`(*…)` is a place, block lifetime), the same shape `abi_ref_arg` uses. Corpus:
+`examples/slice_range_mut.jtr`, allowlisted in `CGEN_GOLDEN_ALLOWLIST`, so it is covered by
+both `jestyr_cgen_matches_reference` (byte identity) and `selfhost_fixpoint_subset` (gcc-built
+and RUN on both compilers, stdout compared). The port mirror was watched failing without it.
+
+The residual hole is recorded as **A11** in `jestyr-tier5-next-handoff.md` §1.1b: a `mut`
+argument that is a *value* rather than a place (`bump(mk())`) still degrades to a raw gcc
+"lvalue required". That one is a semantics decision, not a lowering bug, and is deliberately
+not folded in here — the obvious shared fix silently discards a callee's writes through a
+checked index.
+
+#### A8. `attest` accepts `@deprecated` and does nothing with it — **CLOSED** (both sides)
+
+The register's description was accurate this time, with one correction worth keeping: it was
+**not** true that `@deprecated` "did nothing". It reached cgen and emitted
+`__attribute__((deprecated("…")))`, so callers already got a C-level warning. What it did not
+reach was the two places that *describe* the API — `doc` and the manifest.
+
+`@deprecated` now gets its **own manifest line**, `  deprecated:` (bare) or
+`  deprecated: <msg>`, and its own `> **Deprecated**` blockquote ahead of the prose in `doc`.
+
+**The design question this turned on, and it is the whole entry:** a deprecation is neither a
+guarantee nor part of the signature, and putting it in either would have been wrong.
+
+* Not a **guarantee** — that block is titled "checked by the compiler". A deprecation is
+  proven nothing; it is a status the author asserts. Folding it in makes "checked" false for
+  one entry.
+* Not the **signature** — `diff_item` classifies any signature change as `Breaking`. A
+  deprecation in `sig:` would therefore report *deprecating an API* as a breaking change,
+  which is backwards: every existing call still compiles and still works. A gate that fires
+  on the one action an author takes to AVOID breaking people is a gate that gets switched off.
+
+So every deprecation verdict is `Compatible` — added, removed, or message changed — and all
+three are still *reported*, because "this is going away" is exactly what a contract diff is
+read for. Pinned by `deprecating_an_api_is_reported_and_is_never_breaking` and
+`a_deprecation_stays_out_of_the_signature_and_the_guarantees`.
+
+The extractor is shared between `doc` and `attest` on both sides (`doc::fn_deprecated`;
+`at_dep_attr`/`at_dep_msg` in the port), for the same reason `at_guarantee_phrases` is: the
+documented deprecation and the attested one cannot drift. Non-fn records are always `None` —
+`attrs.rs` declares the attribute's targets as `Fn` and `Method`, so that is its declared
+surface, not a hole.
+
+`examples/attributes.jtr` already carried a real `@deprecated("use parse_v2")`, so both
+goldens covered the change from the first run without a new corpus file.
 
 #### A9. Smaller pre-existing language gaps, each recorded elsewhere
 
@@ -1296,8 +1695,16 @@ tier otherwise completed.
   caveat A2 carries, and **not** the cheap local win it looks like from the register.
 * `jstatus_serves_a_connection_without_starving_its_timers` is load-sensitive (§3e): a 1ms
   timer with a 500ms budget, so a failure means a half-second deschedule. Failed 1 of ~8
-  full-ladder runs; passes in isolation in 2.8s. **Do not widen the deadline** — a wall-clock
-  test should not run beside a compile farm, which is a harness question.
+  full-ladder runs. **Do not widen the deadline** — a wall-clock test should not run beside a
+  compile farm, which is a harness question.
+
+  **"Passes in isolation" is the WRONG discriminator, and this entry used to give it.** It
+  failed twice for me when run alone — both times immediately after a 12-minute ladder, while
+  the machine was still draining. Run alone on an otherwise IDLE machine it then passed 8/8.
+  So the test that tells you whether a failure is real is *repetition on a quiet box*, not a
+  single isolated run; one isolated failure on a busy one proves nothing either way. Anyone
+  triaging this by the old wording would have concluded it was a genuine regression, which is
+  exactly the wrong call.
 
 ---
 
@@ -1307,41 +1714,40 @@ tier otherwise completed.
 
 | item | size | note |
 |---|---|---|
-| `select` `closed { … }` arm | medium | Sugar over §3g's termination. **No longer blocked behind A1** — that turned out to be a shim gap, not an AST change (§3j). Still its own two-sided AST increment: `ExprKind::Select` across 22 reference sites + the parser + the no-allowlist P2 golden. |
+| ~~`select` `closed { … }` arm~~ | **DONE** | Both sides. `ExprKind::Select` is a struct variant carrying `closed: Option<Block>`; `examples/std/select.jtr` Part 3 uses it and is gated by the cgen golden **and** the build matrix. Three corrections to the estimate: **(1)** `closed` had to be a CONTEXTUAL keyword — `alog.closed()`, `sysnet.closed()`, `syswatch.closed()` plus two `let closed` bindings meant reserving it would break five corpus files, three of them public API; **(2)** the risk was never the parser but the **six cgen walkers** that scan arm bodies (calls, spawns, closures, moves, refs, structs) — each had to learn the closed block, and a miss hides code from the backend rather than rejecting it, plus `ref_expr_id` needed the new block counted, which is the **A1 divergence shape** exactly; **(3)** "the no-allowlist P2 golden" was wrong — the P2 dump goldens are *curated snippet lists*, so the arm had to be added to one by hand or nothing would have compared it. Arm required last (`E0025`; a duplicate is `E0024`) because readiness is tested before the closed condition. |
 | Trace spans | small | **`Span` is taken three times** (`http.Header`, `diag`, the `@span` attribute) — pick another word first. `@no_alloc` passes vacuously through a trait method, so use the fn-pointer vtable shape, not a trait. |
 | Config: live reload, nesting | small | `std/syswatch` exists; composing them is the caller's today. |
 | Service: restart policy, supervision tree | medium | The lifecycle is complete; a supervisor over `std/sysproc` is its own module. |
 | Sandbox: cwd, process groups, fs capability projection | medium | `sysproc.jtr:113` names all three. `fs.Fs` gates the parent; nothing projects it onto a child. |
 | attest: corpus minimizer, benchmark history | medium | `@bench` emits timings; nothing records them across runs. |
 
-#### B2. `extern` binding a C global — the language feature, SIZED
+#### ~~B2. `extern` binding a C global~~ — **DONE (§3r)**, as a flag on the extern item
 
-Still the principled answer for foreign globals, and no longer needed for anything urgent
-(`environ` went through an intrinsic). **Measured before deferring**: a new item kind means
-252 `Item::` match sites across nine reference files plus 42 in the port, and it must also
-reach `attest` (a global is ABI) and `doc`. Larger than the select AST change in A1.
+The 257-site measurement priced a NEW item kind; a global is an extern symbol with a type
+and no parameters, so it rides `ExternFn` under `is_global` and nine sites branch. Both
+sides, both mirrors watched failing, `examples/extern_global.jtr` pinned.
 
 #### B3. The brief's remaining areas — a session each
 
-* **Package substrate** (brief area 5) — semver → resolver → lockfile → content-addressed
-  cache. The largest genuinely-absent area and the one the tier's "distribution" theme
-  names. Content-hashing, `buildgraph`, `tar` and `sha256` are already underneath it.
+* ~~**Package substrate** (brief area 5)~~ — **DONE**: `semver` → `resolve` → `lockfile` →
+  `cache`. What it does not have: a registry protocol and a manifest FORMAT.
 * **HTTP V2** (area 6) — routing, middleware, streaming bodies, keep-alive, timeouts,
   static files, access logs, a test client/server. The parser is hardened and refuses
   request smuggling; everything above the message is absent. `sysproc` timeouts and
   `syspoll` readiness are now in place under it.
-* **Storage V2** (area 9) — KV, compaction, atomic batches, migrations, backup/export on
-  top of `alog`. Note `sysfs` has **no mtime**, deliberately (`struct stat` layout differs
-  per platform).
+* ~~**Storage V2** (area 9)~~ — **DONE** (§3q): `std/kv`. What it does not have: binary
+  (`[]u8`) values, a store larger than memory (needs a seek in `file.Reader` first), and
+  index removal (`strmap` has none, so a deleted key costs a slot until reopen).
 * **Crypto beyond the boundary** (area 7) — HMAC, signing/verification, a hash *interface*.
   `csrand` deliberately invents nothing; these are bindings, not algorithms to write.
 
-#### B4. TLS (area 8) — wants an explicit decision, not just effort
+#### B4. TLS (area 8) — ~~wants an explicit decision~~ — **the blocker below was WRONG**
 
-Absent entirely, and **different in kind**: it means binding OpenSSL or schannel, which is
-a link-flag change — and `cc-flags` is LOCKED and recorded in every attest manifest, so
-adding `-lssl` churns every manifest in the corpus. Worth deciding whether Tier 5 claims
-TLS at all or whether it is its own arc.
+This used to read: *"binding OpenSSL or schannel is a link-flag change — and `cc-flags` is
+LOCKED and recorded in every attest manifest, so adding `-lssl` churns every manifest."*
+Measured false: per-program link libraries are content-triggered in `main.rs` (`-pthread`,
+`-lws2_32`) and never enter `CC_FLAGS`, the constant the manifest prints. The next-steps
+note has the evidence. TLS is ordinary §2 scope, judged on size.
 
 #### B5. Tier 4 leftovers still open
 

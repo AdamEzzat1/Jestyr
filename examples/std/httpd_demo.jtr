@@ -1,0 +1,148 @@
+// examples/std/httpd_demo.jtr — `jhttpd`, a small service on a real socket, one thread.
+//
+// Run:  jestyrc run examples/std/httpd_demo.jtr
+//
+// ─── What this demonstrates ───────────────────────────────────────────────────
+//
+// `std/httpd` above `std/http`: a router with a bound parameter, a middleware that refuses
+// what it does not like, a kept-alive connection carrying three requests, a streamed body,
+// and an access log — all against a real loopback socket, with the client in the same
+// thread. Client and server take turns, so the transcript is exact and
+// `jhttpd_serves_a_session_on_one_connection` pins it to the line.
+
+import "http"
+import "httpc"
+import "httpd"
+import "log"
+import "mem"
+import "sysnet"
+import "time"
+import "writer"
+
+fn h_hello(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    httpd.respond(x, 200, "text/plain", "hello")
+    return 0
+}
+
+fn h_greet(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    var s: String = string_new()
+    string_push(s, "hello, ")
+    string_push(s, httpd.param(x, "name"))
+    httpd.respond(x, 200, "text/plain", string_view(s))
+    string_free(s)
+    return 0
+}
+
+fn h_count(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    httpd.stream_begin(x, 200, "text/plain")
+    httpd.stream_write(x, "one ")
+    httpd.stream_write(x, "two ")
+    httpd.stream_write(x, "three")
+    httpd.stream_end(x)
+    return 0
+}
+
+// Only `/admin` needs the token; everything else passes.
+fn mw_gate(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    if str_eq(httpd.path(x), "/admin") == false { return httpd.HTTPD_NEXT }
+    if str_eq(httpd.header(x, "x-token"), "letmein") { return httpd.HTTPD_NEXT }
+    httpd.respond(x, 401, "text/plain", "token required")
+    return httpd.HTTPD_DONE
+}
+
+fn h_admin(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    httpd.respond(x, 200, "text/plain", "welcome, admin")
+    return 0
+}
+
+fn show(read label: str, read body: str) {
+    var s: String = string_new()
+    string_push(s, label)
+    string_push(s, " -> ")
+    string_push(s, body)
+    print_str(string_view(s))
+    string_free(s)
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = httpd.make(a, time.host(),
+        log.make(time.manual(0), writer.to_buffer(), log.LOG_INFO, log.LOG_LOGFMT), true, 4, 8192)
+    if httpd.start(sv, net, sysnet.loopback(0), 8) == false {
+        print_str("could not listen")
+        return 1
+    }
+    httpd.use_middleware(sv, httpd.handler(null, &mw_gate))
+    httpd.route(sv, "GET", "/hello", httpd.handler(null, &h_hello))
+    httpd.route(sv, "GET", "/greet/:name", httpd.handler(null, &h_greet))
+    httpd.route(sv, "GET", "/count", httpd.handler(null, &h_count))
+    httpd.route(sv, "GET", "/admin", httpd.handler(null, &h_admin))
+    let addr: sysnet.SocketAddr = sysnet.loopback(httpd.port(sv))
+
+    print_str("-- jhttpd --")
+
+    // One connection, three requests.
+    var cl: httpc.Client = httpc.dial(net, addr, 16384)
+    var b: String = string_new()
+    httpc.request(cl, "GET", "/hello", "", "")
+    httpd.serve_for(sv, net, 40)
+    httpc.read_response(cl)
+    httpc.body(cl, b)
+    show("GET /hello", string_view(b))
+
+    string_free(b)  b = string_new()
+    httpc.request(cl, "GET", "/greet/jestyr", "", "")
+    httpd.serve_for(sv, net, 40)
+    httpc.read_response(cl)
+    httpc.body(cl, b)
+    show("GET /greet/jestyr", string_view(b))
+
+    string_free(b)  b = string_new()
+    httpc.request(cl, "GET", "/count", "", "")
+    httpd.serve_for(sv, net, 40)
+    httpc.read_response(cl)
+    httpc.body(cl, b)
+    show("GET /count (streamed)", string_view(b))
+    print_str("chunked")
+    print_bool(httpc.is_chunked(cl))
+    print_str("connections accepted for three requests")
+    print_int(httpd.accepted(sv))
+    httpc.hangup(cl)
+    httpd.serve_for(sv, net, 5)
+
+    // The gate. (Not `httpc.fetch`: a one-shot fetch blocks on the answer, and in one thread
+    // the only thing that could produce the answer is the caller. Turn-taking, always.)
+    print_str("-- the middleware --")
+    string_free(b)  b = string_new()
+    var c1: httpc.Client = httpc.dial(net, addr, 16384)
+    httpc.request(c1, "GET", "/admin", "", "")
+    httpd.serve_for(sv, net, 40)
+    httpc.read_response(c1)
+    httpc.body(c1, b)
+    print_int(httpc.status(c1) as i64)
+    show("GET /admin without a token", string_view(b))
+    httpc.hangup(c1)
+    httpd.serve_for(sv, net, 5)
+    string_free(b)  b = string_new()
+    var c2: httpc.Client = httpc.dial(net, addr, 16384)
+    httpc.request(c2, "GET", "/admin", "X-Token: letmein\r\n", "")
+    httpd.serve_for(sv, net, 40)
+    httpc.read_response(c2)
+    httpc.body(c2, b)
+    print_int(httpc.status(c2) as i64)
+    show("GET /admin with the token", string_view(b))
+    httpc.hangup(c2)
+    httpd.serve_for(sv, net, 5)
+
+    print_str("-- the access log's last record names the status --")
+    print_bool(contains(httpd.last_log(sv), "status=200"))
+    print_str("requests served")
+    print_int(httpd.served(sv))
+
+    string_free(b)
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    return 0
+}

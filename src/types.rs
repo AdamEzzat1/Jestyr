@@ -348,6 +348,11 @@ pub struct GlobalTable {
     pub type_index: HashMap<String, usize>,
     pub fns: HashMap<String, FnSig>,
     pub consts: HashMap<String, Ty>,
+    /// The names that are `extern … var` GLOBALS (B2). Each is also in `consts`
+    /// under the same key, which is what makes a bare read of it type-check; this set
+    /// is what tells the backend to name the C SYMBOL rather than a `j_`-prefixed
+    /// static, and what lets an assignment to one through.
+    pub globals: HashSet<String>,
     /// enum-variant name → its enum's index in `types`.
     pub variants: HashMap<String, usize>,
     /// trait name → its method set (for coherence + method resolution).
@@ -510,6 +515,11 @@ pub struct Resolved {
     /// For a `dyn Trait` call: the method name, dispatched through the vtable slot
     /// (the trait is implicit in the receiver's fat-pointer type).
     pub dyn_call: Option<String>,
+    /// A bare `Name` that resolved to an `extern … var` GLOBAL (B2) — set only when
+    /// no local shadowed it. The backend names the C symbol on this row and nothing
+    /// else: deciding by the SPELLING made a local `errno` write the real one, because
+    /// the checker had resolved the local and cgen had not asked.
+    pub global: bool,
 }
 
 /// The result of type checking: the global table plus a type for every
@@ -614,6 +624,12 @@ impl TypeInfo {
     /// modules — `None` for every non-colliding call.
     pub fn call_sym(&self, id: ExprId) -> Option<&str> {
         self.row(id)?.call_sym.as_deref()
+    }
+
+    /// Did this bare `Name` resolve to an `extern … var` global (and not to a local
+    /// shadowing it)? False for every other expression.
+    pub fn global_ref(&self, id: ExprId) -> bool {
+        self.row(id).map(|r| r.global).unwrap_or(false)
     }
 
     /// How a `base.name(args)` call resolved.

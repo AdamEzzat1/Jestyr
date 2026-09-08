@@ -1,0 +1,683 @@
+// std/crypto.jtr — hashing, HMAC and signatures, by binding OpenSSL. Bindings, not algorithms.
+//
+// TIER: `sys`. **This module invents no cryptography** — the rule `std/csrand` set and
+// `std/tls` followed. Every digest, every MAC and every signature here is computed by
+// OpenSSL's libcrypto (1.1.1 or later) through `extern "openssl/ssl.h"` declarations; the
+// one in-language hash in the tree, `std/sha256`, is reached through the same interface so
+// the two can be held to each other. A library that rolled its own HMAC or its own RSA
+// padding would be the single most dangerous file in the tree, and this one is not it.
+//
+// ─── What a caller gets ───────────────────────────────────────────────────────────────
+//
+//   * A `Hasher`: one hash function behind three fn pointers (`init`, `update`, `finish`)
+//     and an opaque context, with two families of implementation — `evp_hasher(alg)` over
+//     OpenSSL's `EVP_MD` (SHA-256, SHA-512) and `jestyr_hasher()` over `std/sha256`. A
+//     digest is BYTES into a caller's buffer; `push_hex` renders one when a log wants text.
+//   * `hmac` / `hmac_verify`: HMAC-SHA256 and HMAC-SHA512 over a byte key, and a
+//     verification that compares in constant time through `csrand.ct_eq` — the comparison a
+//     MAC must never be given to `==`.
+//   * `sign` / `verify`: a signature over bytes with a PEM-loaded private key, verified with
+//     the matching public key (`EVP_DigestSign` / `EVP_DigestVerify`, so the padding, the
+//     encoding and the key-type dispatch are all the library's). Public keys load from a
+//     PUBLIC KEY PEM or straight out of a certificate.
+//   * An error surface: `CRYPTO_*` outcomes in the error sets, and `last_error` rendering
+//     OpenSSL's own words, so "the key did not load" always says why.
+//
+// ─── A fn-pointer vtable, not a trait ─────────────────────────────────────────────────
+//
+// `Hasher` is a record of fn pointers plus a `*mut u8` context — the `mem.Allocator` and
+// `runtime.Poller` shape — rather than a trait with two impls, because a trait would let
+// `@no_alloc` pass VACUOUSLY through it: the contract is checked at the call, and a call
+// through a trait has no body to check. With a vtable every implementation is a plain
+// function whose contracts are its own, and a `Hasher` can be handed across a module
+// boundary and stored in a struct, which a trait object cannot be.
+//
+// ─── Two SHA-256s, held to each other ─────────────────────────────────────────────────
+//
+// `std/sha256` is what `jestyr attest` commits to, and it was written from the standard,
+// not from OpenSSL. Running it and `EVP_sha256` through the same `Hasher` interface on the
+// same input and demanding identical bytes is the cheapest independent check either of
+// them will ever get — and the suite does it on the NIST vectors AND on a multi-block
+// message fed in uneven pieces.
+//
+// **The in-language hasher accepts UTF-8 only.** `sha256.push_sha256_hex` takes a `str`,
+// and `std/sha256` is in the compiler's own closure, so it cannot grow a `[]u8` entry
+// point without a reseed. The hasher buffers what it is given and validates at `finish`;
+// bytes that are not UTF-8 make `finish` answer false rather than hash something else.
+// The OpenSSL hashers take any bytes. A `[]u8` entry point on `std/sha256` is the fix,
+// and it is a seed change, so it is recorded rather than made here.
+//
+// ─── verify answers false, never "error" ──────────────────────────────────────────────
+//
+// `verify` and `hmac_verify` answer `ok(false)` for a signature or MAC that does not
+// check out — a flipped byte, the wrong key, the wrong length — and refuse (`err`) only
+// when THIS module could not even ask: a closed key, a public key handed to `sign`, an
+// algorithm this module does not name. OpenSSL distinguishes "did not verify" from "could
+// not verify"; collapsing the second into the first is the safe direction, because a
+// caller that treats "error" as anything but "not verified" has written the bug this
+// module exists to prevent.
+//
+// ─── What is deliberately absent ──────────────────────────────────────────────────────
+//
+// **No key generation** — `openssl genrsa` made the fixtures, and a program that mints
+// keys is a program that stores them, which is a different module's problem. **No
+// encryption** (symmetric or public-key), **no key exchange, no PBKDF, no EdDSA
+// constructor** — each is a binding away and none was asked for. **No streaming
+// signatures**: a message is signed whole, which is what `EVP_DigestSign` does and what
+// every caller this tier has wants. **No timing test** for `hmac_verify`: `csrand`'s
+// header explains why a wall-clock test would measure the scheduler; the property is the
+// code shape of `ct_eq`, and this module adds no comparison of its own.
+//
+// ─── Linking ──────────────────────────────────────────────────────────────────────────
+//
+// The externs are declared against `openssl/ssl.h`, which in OpenSSL 1.1.1 includes
+// `evp.h`, `hmac.h`, `pem.h`, `x509.h` and `bio.h`, so one header names everything here
+// AND it is the header the driver's link rule watches for: a program whose emitted C
+// names `openssl/ssl.h` gets `-lssl -lcrypto` after its source, the same content-triggered
+// rule as `-pthread` and `-lws2_32`. `CC_FLAGS` and the attest manifests do not move.
+// `ERR_get_error` and `ERR_error_string_n` are bound under ALIASES, because `std/tls`
+// binds them by name and a program may import both — an extern's name is taken in every
+// module that links it.
+//
+// Worked example:  examples/std/crypto_demo.jtr
+// Run the tests:   jestyrc test examples/std/crypto_test.jtr
+
+import "csrand"
+import "fs"
+import "sha256"
+
+// ---- the bindings ----------------------------------------------------------------------
+//
+// Header-declared, so no prototype is emitted and the header's own signatures are used.
+// `cptr` for every OpenSSL handle: opaque, not dereferenceable, not arithmetic. Every
+// OpenSSL struct is reached by pointer only — no layout is ever assumed.
+
+extern "openssl/ssl.h" fn EVP_sha256() -> cptr
+extern "openssl/ssl.h" fn EVP_sha512() -> cptr
+extern "openssl/ssl.h" fn EVP_MD_CTX_new() -> cptr
+extern "openssl/ssl.h" fn EVP_MD_CTX_free(ctx: cptr)
+extern "openssl/ssl.h" fn EVP_DigestInit_ex(ctx: cptr, md: cptr, engine: cptr) -> i32
+extern "openssl/ssl.h" fn EVP_DigestUpdate(ctx: cptr, data: cptr, n: usize) -> i32
+extern "openssl/ssl.h" fn EVP_DigestFinal_ex(ctx: cptr, md: cptr, len: cptr) -> i32
+extern "openssl/ssl.h" fn HMAC(md: cptr, key: cptr, key_len: i32, data: cptr, n: usize, mac: cptr, mac_len: cptr) -> cptr
+extern "openssl/ssl.h" fn BIO_new_mem_buf(buf: cptr, len: i32) -> cptr
+extern "openssl/ssl.h" fn BIO_free(bio: cptr) -> i32
+extern "openssl/ssl.h" fn PEM_read_bio_PrivateKey(bio: cptr, x: cptr, cb: cptr, u: cptr) -> cptr
+extern "openssl/ssl.h" fn PEM_read_bio_PUBKEY(bio: cptr, x: cptr, cb: cptr, u: cptr) -> cptr
+extern "openssl/ssl.h" fn PEM_read_bio_X509(bio: cptr, x: cptr, cb: cptr, u: cptr) -> cptr
+extern "openssl/ssl.h" fn X509_get_pubkey(x: cptr) -> cptr
+extern "openssl/ssl.h" fn X509_free(x: cptr)
+extern "openssl/ssl.h" fn EVP_PKEY_free(k: cptr)
+extern "openssl/ssl.h" fn EVP_PKEY_size(k: cptr) -> i32
+extern "openssl/ssl.h" fn EVP_DigestSignInit(ctx: cptr, pctx: cptr, md: cptr, engine: cptr, k: cptr) -> i32
+extern "openssl/ssl.h" fn EVP_DigestSign(ctx: cptr, sig: cptr, sig_len: cptr, msg: cptr, n: usize) -> i32
+extern "openssl/ssl.h" fn EVP_DigestVerifyInit(ctx: cptr, pctx: cptr, md: cptr, engine: cptr, k: cptr) -> i32
+extern "openssl/ssl.h" fn EVP_DigestVerify(ctx: cptr, sig: cptr, sig_len: usize, msg: cptr, n: usize) -> i32
+extern "openssl/err.h" fn err_get_error = "ERR_get_error"() -> u64
+extern "openssl/err.h" fn err_error_string_n = "ERR_error_string_n"(e: u64, buf: cptr, len: usize)
+
+// ---- algorithms ---------------------------------------------------------------------------
+
+pub const SHA256: i32 = 1
+pub const SHA512: i32 = 2
+
+// The digest length of `alg` in bytes; 0 for an algorithm this module does not name.
+@no_alloc @no_os pub fn digest_size(alg: i32) -> usize {
+    if alg == SHA256 { return 32 }
+    if alg == SHA512 { return 64 }
+    return 0
+}
+
+@no_alloc @no_os pub fn alg_name(alg: i32) -> str {
+    if alg == SHA256 { return "sha256" }
+    if alg == SHA512 { return "sha512" }
+    return "unknown"
+}
+
+// **The `EVP_MD` is never held in a Jestyr value.** `EVP_sha256()` returns a `const` pointer,
+// and a `cptr` is `void*`: binding one to the other discards the qualifier, which the
+// emitted-C warning gate refuses (`-Werror=discarded-qualifiers`, and rightly). So every
+// operation that needs the digest chooses it AT THE CALL, in one of these four
+// dispatchers, and the `EVP_MD` goes straight from the constructor into the parameter
+// whose type it already has. An algorithm this module does not name answers 0.
+
+fn digest_init(ctx: cptr, alg: i32) -> i32 {
+    if alg == SHA256 { return EVP_DigestInit_ex(ctx, EVP_sha256(), null) }
+    if alg == SHA512 { return EVP_DigestInit_ex(ctx, EVP_sha512(), null) }
+    return 0
+}
+
+fn hmac_raw(alg: i32, key: cptr, key_len: i32, data: cptr, n: usize, mac: cptr, mac_len: cptr) -> bool {
+    if alg == SHA256 { return HMAC(EVP_sha256(), key, key_len, data, n, mac, mac_len) != null }
+    if alg == SHA512 { return HMAC(EVP_sha512(), key, key_len, data, n, mac, mac_len) != null }
+    return false
+}
+
+fn sign_init(ctx: cptr, alg: i32, k: cptr) -> i32 {
+    if alg == SHA256 { return EVP_DigestSignInit(ctx, null, EVP_sha256(), null, k) }
+    if alg == SHA512 { return EVP_DigestSignInit(ctx, null, EVP_sha512(), null, k) }
+    return 0
+}
+
+fn verify_init(ctx: cptr, alg: i32, k: cptr) -> i32 {
+    if alg == SHA256 { return EVP_DigestVerifyInit(ctx, null, EVP_sha256(), null, k) }
+    if alg == SHA512 { return EVP_DigestVerifyInit(ctx, null, EVP_sha512(), null, k) }
+    return 0
+}
+
+// ---- the error surface ---------------------------------------------------------------------
+//
+// The sets name three things. `CryptoRefused`: this module declined before touching the
+// library — a closed key, the wrong kind of key, an unknown algorithm. `CryptoFailed`:
+// OpenSSL said no, and `last_error` says why. `CryptoTooSmall`: the caller's buffer cannot
+// hold the result, which is reported BEFORE anything is written into it.
+
+// OpenSSL's own words for the most recent errors on this thread, appended to `dst`. Empty
+// when the queue is empty. The queue is DRAINED, so a second call after one failure
+// answers nothing — read it at the failure, not later.
+pub fn last_error(mut dst: String) {
+    var raw: *mut u8 = alloc(u8, 256)
+    var any: bool = false
+    for true {
+        let e: u64 = err_get_error()
+        if e == 0 { break }
+        err_error_string_n(e, raw as cptr, 256)
+        var n: usize = 0
+        for n < 256 {
+            var b: u8 = 0
+            unsafe { b = (raw + n).* }
+            if (b as i32) == 0 { break }
+            n = n + 1
+        }
+        let s: []u8 = slice(u8, raw, n)
+        let r = try_from_utf8(s)
+        if is_err(r) == false {
+            if any { string_push(dst, "; ") }
+            string_push(dst, unwrap(r))
+            any = true
+        }
+    }
+    free_ptr(raw)
+}
+
+// ---- bytes and hex ------------------------------------------------------------------------
+
+// A byte view of `s`. A `str` IS bytes; this is the spelling that lets a text message go
+// where a `[]u8` is expected without a copy.
+@no_alloc @no_os pub fn as_bytes(read s: str) -> []u8 {
+    return slice(u8, s.ptr as *mut u8, s.len)
+}
+
+// Lowercase hex of `data`, appended to `dst` — for a digest or a MAC on its way to a log.
+pub fn push_hex(mut dst: String, read data: []u8) {
+    let digits: str = "0123456789abcdef"
+    var i: usize = 0
+    for i < data.len {
+        let hi: usize = (data[i] >> 4) as usize
+        let lo: usize = (data[i] & 15) as usize
+        string_push(dst, digits[hi .. hi + 1])
+        string_push(dst, digits[lo .. lo + 1])
+        i = i + 1
+    }
+}
+
+@no_alloc @no_os fn hex_val(c: u8) -> i32 {
+    let v: i32 = c as i32
+    if v >= 48 and v <= 57 { return v - 48 }
+    if v >= 97 and v <= 102 { return v - 87 }
+    if v >= 65 and v <= 70 { return v - 55 }
+    return 0 - 1
+}
+
+// ---- the hash interface -----------------------------------------------------------------------
+//
+// `init(ctx)` puts the context in its starting state, `update(ctx, bytes)` absorbs,
+// `finish(ctx, dst)` writes `size` bytes into `dst` and leaves the context ready for a new
+// message. `free(ctx)` releases whatever the implementation allocated. A `Hasher` is
+// `@move` because the context is one owned thing; `free_hasher` releases it.
+
+@move pub struct Hasher {
+    ctx: *mut u8,
+    size: usize,
+    init_fn: fn(*mut u8) -> bool,
+    update_fn: fn(*mut u8, read []u8) -> bool,
+    finish_fn: fn(*mut u8, mut []u8) -> bool,
+    free_fn: fn(*mut u8),
+    open: bool,
+    ready: bool,
+}
+
+@no_alloc @no_os pub fn hasher_is_open(read h: Hasher) -> bool { return h.open }
+@no_alloc @no_os pub fn digest_len(read h: Hasher) -> usize { return h.size }
+
+fn no_init(ctx: *mut u8) -> bool { return false }
+fn no_update(ctx: *mut u8, read data: []u8) -> bool { return false }
+fn no_finish(ctx: *mut u8, mut dst: []u8) -> bool { return false }
+fn no_free(ctx: *mut u8) { }
+
+// A closed hasher: what a failed constructor hands back, and what a slot holds before it
+// is filled. Every operation on it answers false.
+@no_alloc @no_os pub fn no_hasher() -> Hasher {
+    return Hasher{ ctx: null, size: 0, init_fn: &no_init, update_fn: &no_update,
+                   finish_fn: &no_finish, free_fn: &no_free, open: false, ready: false }
+}
+
+// Start a new message. Not needed after `finish`, which leaves the hasher fresh; needed
+// to abandon a message half-absorbed.
+pub fn reset(mut h: Hasher) -> bool {
+    if h.open == false { return false }
+    h.ready = h.init_fn(h.ctx)
+    return h.ready
+}
+
+// Absorb `data`. False when the hasher is closed, was not successfully initialised, or
+// the implementation refused.
+pub fn update(mut h: Hasher, read data: []u8) -> bool {
+    if h.open == false or h.ready == false { return false }
+    if data.len == 0 { return true }
+    let fine: bool = h.update_fn(h.ctx, data)
+    if fine == false { h.ready = false }
+    return fine
+}
+
+pub fn update_str(mut h: Hasher, read s: str) -> bool {
+    return update(h, as_bytes(s))
+}
+
+// Write the digest of everything absorbed since the last `init`/`finish` into the first
+// `digest_len` bytes of `dst`, then start afresh. False — and `dst` untouched — when `dst`
+// is too short, the hasher is not ready, or the implementation refused.
+pub fn finish(mut h: Hasher, mut dst: []u8) -> bool {
+    if h.open == false or h.ready == false { return false }
+    if dst.len < h.size { return false }
+    let fine: bool = h.finish_fn(h.ctx, dst[0 .. h.size])
+    h.ready = h.init_fn(h.ctx)
+    return fine
+}
+
+// One message, one digest: `reset`, `update`, `finish`.
+pub fn hash(mut h: Hasher, read data: []u8, mut dst: []u8) -> bool {
+    if reset(h) == false { return false }
+    if update(h, data) == false { return false }
+    return finish(h, dst)
+}
+
+pub fn free_hasher(mut h: Hasher) {
+    if h.open == false { return }
+    h.free_fn(h.ctx)
+    h.ctx = null
+    h.open = false
+    h.ready = false
+}
+
+// ---- implementation 1: OpenSSL's EVP_MD -------------------------------------------------------
+//
+// The context is the `EVP_MD_CTX` itself; which digest it runs is chosen at every `init`
+// from the algorithm the constructor recorded beside it (not the `EVP_MD` — see above).
+
+struct Evp { md_ctx: cptr, alg: i32 }
+
+fn evp_init(ctx: *mut u8) -> bool {
+    var e: *mut Evp = ctx as *mut Evp
+    var rc: i32 = 0
+    unsafe { rc = digest_init(e.*.md_ctx, e.*.alg) }
+    return rc == 1
+}
+
+fn evp_update(ctx: *mut u8, read data: []u8) -> bool {
+    var e: *mut Evp = ctx as *mut Evp
+    var rc: i32 = 0
+    unsafe { rc = EVP_DigestUpdate(e.*.md_ctx, data.ptr as cptr, data.len) }
+    return rc == 1
+}
+
+fn evp_finish(ctx: *mut u8, mut dst: []u8) -> bool {
+    var e: *mut Evp = ctx as *mut Evp
+    var got: *mut u32 = alloc(u32, 1)
+    var rc: i32 = 0
+    var n: u32 = 0
+    unsafe {
+        rc = EVP_DigestFinal_ex(e.*.md_ctx, dst.ptr as cptr, got as cptr)
+        n = got.*
+    }
+    free_ptr(got)
+    if rc != 1 { return false }
+    return (n as usize) == dst.len
+}
+
+fn evp_free(ctx: *mut u8) {
+    var e: *mut Evp = ctx as *mut Evp
+    unsafe { EVP_MD_CTX_free(e.*.md_ctx) }
+    free_ptr(e)
+}
+
+// A hasher over OpenSSL's implementation of `alg`. Closed when `alg` is not one this
+// module names or the library refused; `last_error` says which.
+pub fn evp_hasher(alg: i32) -> Hasher {
+    if digest_size(alg) == 0 { return no_hasher() }
+    let mc: cptr = EVP_MD_CTX_new()
+    if mc == null { return no_hasher() }
+    var e: *mut Evp = alloc(Evp, 1)
+    unsafe {
+        e.*.md_ctx = mc
+        e.*.alg = alg
+    }
+    var ctx: *mut u8 = null
+    unsafe { ctx = e as *mut u8 }
+    var h: Hasher = Hasher{ ctx: ctx, size: digest_size(alg), init_fn: &evp_init,
+                            update_fn: &evp_update, finish_fn: &evp_finish, free_fn: &evp_free,
+                            open: true, ready: false }
+    h.ready = evp_init(ctx)
+    if h.ready == false {
+        free_hasher(h)
+        return no_hasher()
+    }
+    return h
+}
+
+// ---- implementation 2: std/sha256, the one written in Jestyr -----------------------------------
+//
+// `std/sha256` is one-shot over a `str`, so this context is a growable byte buffer: `update`
+// appends, `finish` validates the whole as UTF-8 (see the header for why), hashes it, and
+// decodes the hex the module renders back into bytes.
+
+struct Native { p: *mut u8, len: usize, cap: usize }
+
+fn native_init(ctx: *mut u8) -> bool {
+    var n: *mut Native = ctx as *mut Native
+    unsafe { n.*.len = 0 }
+    return true
+}
+
+fn native_update(ctx: *mut u8, read data: []u8) -> bool {
+    var n: *mut Native = ctx as *mut Native
+    var len: usize = 0
+    var cap: usize = 0
+    var p: *mut u8 = null
+    unsafe {
+        len = n.*.len
+        cap = n.*.cap
+        p = n.*.p
+    }
+    if len + data.len > cap {
+        var newcap: usize = 256
+        if cap != 0 { newcap = cap * 2 }
+        for newcap < len + data.len { newcap = newcap * 2 }
+        var np: *mut u8 = alloc(u8, newcap)
+        if cap != 0 {
+            var dst: []u8 = slice(u8, np, newcap)
+            var src: []u8 = slice(u8, p, len)
+            var i: usize = 0
+            for i < len {
+                dst[i] = src[i]
+                i = i + 1
+            }
+            free_ptr(p)
+        }
+        p = np
+        cap = newcap
+        unsafe {
+            n.*.p = np
+            n.*.cap = newcap
+        }
+    }
+    var d: []u8 = slice(u8, p, cap)
+    var j: usize = 0
+    for j < data.len {
+        d[len + j] = data[j]
+        j = j + 1
+    }
+    unsafe { n.*.len = len + data.len }
+    return true
+}
+
+fn native_finish(ctx: *mut u8, mut dst: []u8) -> bool {
+    var n: *mut Native = ctx as *mut Native
+    var len: usize = 0
+    var p: *mut u8 = null
+    unsafe {
+        len = n.*.len
+        p = n.*.p
+    }
+    if dst.len != 32 { return false }
+    var text: str = ""
+    if len > 0 {
+        let r = try_from_utf8(slice(u8, p, len))
+        if is_err(r) { return false }
+        text = unwrap(r)
+    }
+    var hex: String = string_new()
+    sha256.push_sha256_hex(hex, text)
+    let hv: str = string_view(hex)
+    var fine: bool = hv.len == 64
+    var i: usize = 0
+    for i < 32 {
+        if fine {
+            let hi: i32 = hex_val(hv[2 * i])
+            let lo: i32 = hex_val(hv[2 * i + 1])
+            if hi < 0 or lo < 0 { fine = false } else { dst[i] = ((hi << 4) | lo) as u8 }
+        }
+        i = i + 1
+    }
+    string_free(hex)
+    return fine
+}
+
+fn native_free(ctx: *mut u8) {
+    var n: *mut Native = ctx as *mut Native
+    var cap: usize = 0
+    var p: *mut u8 = null
+    unsafe {
+        cap = n.*.cap
+        p = n.*.p
+    }
+    if cap != 0 { free_ptr(p) }
+    free_ptr(n)
+}
+
+// A SHA-256 hasher over `std/sha256`. Never closed: it needs nothing from the library.
+pub fn jestyr_hasher() -> Hasher {
+    var n: *mut Native = alloc(Native, 1)
+    unsafe {
+        n.*.p = null
+        n.*.len = 0
+        n.*.cap = 0
+    }
+    var ctx: *mut u8 = null
+    unsafe { ctx = n as *mut u8 }
+    return Hasher{ ctx: ctx, size: 32, init_fn: &native_init, update_fn: &native_update,
+                   finish_fn: &native_finish, free_fn: &native_free, open: true, ready: true }
+}
+
+// ---- HMAC ----------------------------------------------------------------------------------
+
+// HMAC of `msg` under `key` with `alg`, into the first `digest_size(alg)` bytes of `mac`.
+// Returns how many bytes were written. A key of any length is accepted — HMAC hashes a
+// long one and pads a short one, which is the library's job and the RFC 4231 long-key case
+// in the suite.
+pub fn hmac(alg: i32, read key: []u8, read msg: []u8, mut mac: []u8) -> usize !{ CryptoRefused, CryptoFailed, CryptoTooSmall } {
+    let want: usize = digest_size(alg)
+    if want == 0 { return err(CryptoRefused) }
+    if mac.len < want { return err(CryptoTooSmall) }
+    var got: *mut u32 = alloc(u32, 1)
+    var n: u32 = 0
+    var fine: bool = false
+    unsafe {
+        got.* = 0
+        fine = hmac_raw(alg, key.ptr as cptr, key.len as i32, msg.ptr as cptr, msg.len, mac.ptr as cptr, got as cptr)
+        n = got.*
+    }
+    free_ptr(got)
+    if fine == false { return err(CryptoFailed) }
+    if (n as usize) != want { return err(CryptoFailed) }
+    return ok(want)
+}
+
+// Does `mac` equal the HMAC of `msg` under `key`? Compared with `csrand.ct_eq`, so the
+// answer's timing does not say how many leading bytes matched. A `mac` of the wrong length
+// is `false`, not an error — see the header.
+pub fn hmac_verify(alg: i32, read key: []u8, read msg: []u8, read mac: []u8) -> bool !{ CryptoRefused, CryptoFailed } {
+    let want: usize = digest_size(alg)
+    if want == 0 { return err(CryptoRefused) }
+    var raw: *mut u8 = alloc(u8, want)
+    var mine: []u8 = slice(u8, raw, want)
+    var failed: bool = false
+    hmac(alg, key, msg, mine) catch { failed = true }
+    var same: bool = false
+    if failed == false { same = csrand.ct_eq(mine, mac) }
+    free_ptr(raw)
+    if failed { return err(CryptoFailed) }
+    return ok(same)
+}
+
+// ---- keys ------------------------------------------------------------------------------------
+
+// One `EVP_PKEY`. `private` says whether it can sign; a public key can only verify.
+@move pub struct Key {
+    pkey: cptr,
+    private: bool,
+    open: bool,
+}
+
+@no_alloc @no_os pub fn key_is_open(read k: Key) -> bool { return k.open }
+@no_alloc @no_os pub fn is_private(read k: Key) -> bool { return k.private }
+
+// The value for a slot not yet filled, and what a failed loader hands back.
+@no_alloc @no_os pub fn no_key() -> Key {
+    return Key{ pkey: null, private: false, open: false }
+}
+
+// The largest signature this key produces, in bytes — what to size a buffer for `sign`.
+// 0 for a closed key.
+pub fn signature_len(read k: Key) -> usize {
+    if k.open == false { return 0 }
+    let n: i32 = EVP_PKEY_size(k.pkey)
+    if n <= 0 { return 0 }
+    return n as usize
+}
+
+// A private key from PEM text (PKCS#8 `PRIVATE KEY` or the traditional `RSA PRIVATE KEY`,
+// unencrypted — a passphrase callback is not bound). Closed on failure; `last_error` says why.
+pub fn private_key_from_pem(read pem: str) -> Key {
+    if pem.len == 0 { return no_key() }
+    let bio: cptr = BIO_new_mem_buf(pem.ptr as cptr, pem.len as i32)
+    if bio == null { return no_key() }
+    let pk: cptr = PEM_read_bio_PrivateKey(bio, null, null, null)
+    BIO_free(bio)
+    if pk == null { return no_key() }
+    return Key{ pkey: pk, private: true, open: true }
+}
+
+// A public key from a `PUBLIC KEY` PEM (SubjectPublicKeyInfo — what `openssl rsa -pubout`
+// writes).
+pub fn public_key_from_pem(read pem: str) -> Key {
+    if pem.len == 0 { return no_key() }
+    let bio: cptr = BIO_new_mem_buf(pem.ptr as cptr, pem.len as i32)
+    if bio == null { return no_key() }
+    let pk: cptr = PEM_read_bio_PUBKEY(bio, null, null, null)
+    BIO_free(bio)
+    if pk == null { return no_key() }
+    return Key{ pkey: pk, private: false, open: true }
+}
+
+// The public key INSIDE a `CERTIFICATE` PEM — the shape a verifier usually holds, since
+// what it was given is the peer's certificate, not a bare key.
+pub fn public_key_from_cert_pem(read pem: str) -> Key {
+    if pem.len == 0 { return no_key() }
+    let bio: cptr = BIO_new_mem_buf(pem.ptr as cptr, pem.len as i32)
+    if bio == null { return no_key() }
+    let x: cptr = PEM_read_bio_X509(bio, null, null, null)
+    BIO_free(bio)
+    if x == null { return no_key() }
+    let pk: cptr = X509_get_pubkey(x)
+    X509_free(x)
+    if pk == null { return no_key() }
+    return Key{ pkey: pk, private: false, open: true }
+}
+
+// The three loaders again, through the filesystem capability: a caller that has not been
+// given `fs` cannot reach a key file through this module. A denied handle counts its
+// refusal and yields a closed key, exactly as a missing file does.
+pub fn load_private_key(mut f: fs.Fs, read path: str) -> Key {
+    var text: String = fs.open_text(f, path)
+    let k: Key = private_key_from_pem(string_view(text))
+    string_free(text)
+    return k
+}
+
+pub fn load_public_key(mut f: fs.Fs, read path: str) -> Key {
+    var text: String = fs.open_text(f, path)
+    let k: Key = public_key_from_pem(string_view(text))
+    string_free(text)
+    return k
+}
+
+pub fn load_cert_public_key(mut f: fs.Fs, read path: str) -> Key {
+    var text: String = fs.open_text(f, path)
+    let k: Key = public_key_from_cert_pem(string_view(text))
+    string_free(text)
+    return k
+}
+
+pub fn free_key(mut k: Key) {
+    if k.open == false { return }
+    EVP_PKEY_free(k.pkey)
+    k.pkey = null
+    k.open = false
+    k.private = false
+}
+
+// ---- signing ----------------------------------------------------------------------------------
+
+// Sign `msg` with the private key `k`, digesting with `alg`, into `sig`. Returns the
+// signature's length. `sig` must hold `signature_len(k)` bytes, and that is checked before
+// anything is written. Which scheme runs is the KEY's: an RSA key signs PKCS#1 v1.5 over
+// the digest (deterministic — the same message signs to the same bytes), which is what
+// `EVP_DigestSign` does by default in 1.1.1.
+pub fn sign(read k: Key, alg: i32, read msg: []u8, mut sig: []u8) -> usize !{ CryptoRefused, CryptoFailed, CryptoTooSmall } {
+    if k.open == false or k.private == false { return err(CryptoRefused) }
+    if digest_size(alg) == 0 { return err(CryptoRefused) }
+    let need: usize = signature_len(k)
+    if sig.len < need { return err(CryptoTooSmall) }
+    let mc: cptr = EVP_MD_CTX_new()
+    if mc == null { return err(CryptoFailed) }
+    var fine: bool = sign_init(mc, alg, k.pkey) == 1
+    var got: usize = 0
+    if fine {
+        var sl: *mut usize = alloc(usize, 1)
+        unsafe {
+            sl.* = sig.len
+            fine = EVP_DigestSign(mc, sig.ptr as cptr, sl as cptr, msg.ptr as cptr, msg.len) == 1
+            got = sl.*
+        }
+        free_ptr(sl)
+    }
+    EVP_MD_CTX_free(mc)
+    if fine == false { return err(CryptoFailed) }
+    return ok(got)
+}
+
+// Does `sig` verify as a signature over `msg` by the private half of `k`? A public OR a
+// private key verifies (a private key carries its public half). `false` for any signature
+// the library does not accept — tampered, truncated, made by another key; see the header.
+pub fn verify(read k: Key, alg: i32, read msg: []u8, read sig: []u8) -> bool !{ CryptoRefused, CryptoFailed } {
+    if k.open == false { return err(CryptoRefused) }
+    if digest_size(alg) == 0 { return err(CryptoRefused) }
+    if sig.len == 0 { return ok(false) }
+    let mc: cptr = EVP_MD_CTX_new()
+    if mc == null { return err(CryptoFailed) }
+    if verify_init(mc, alg, k.pkey) != 1 {
+        EVP_MD_CTX_free(mc)
+        return err(CryptoFailed)
+    }
+    let rc: i32 = EVP_DigestVerify(mc, sig.ptr as cptr, sig.len, msg.ptr as cptr, msg.len)
+    EVP_MD_CTX_free(mc)
+    if rc != 1 {
+        // A rejected signature leaves OpenSSL's reason on the error queue; it is not this
+        // caller's failure, and it must not surface as the NEXT caller's `last_error`.
+        var scratch: String = string_new()
+        last_error(scratch)
+        string_free(scratch)
+    }
+    return ok(rc == 1)
+}

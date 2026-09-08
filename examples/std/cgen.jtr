@@ -1352,6 +1352,34 @@ fn emit_place(mut sb: String, read p: parser.Parser, read src: str, read c: type
         return
     }
     if e.kind == 6 {                                  // Index
+        // A RANGE index is not an element access. `xs[a .. b]` computes a *new* `{ ptr, len }`
+        // view, so there is no element whose address could be taken -- the arms below would emit
+        // the Range node as if it were a scalar offset and hit the backend's "no ranges yet"
+        // refusal, pointing at the range rather than at anything wrong.
+        //
+        // The sub-view is a value, and `emit_place` owes its callers an lvalue, so it is parked in
+        // a COMPOUND LITERAL OF ARRAY TYPE: `(T[1]){ v }` decays to `T*` and `(*...)` reads back as
+        // a place. Its lifetime is the enclosing block -- not the statement expression that
+        // computed it -- so `&` of it comfortably outlives the call.
+        //
+        // The view is a copy of `{ ptr, len }`, but `ptr` still names the caller's buffer, so a
+        // `mut` callee's element writes land where they should. Only a whole-view reassignment
+        // would be lost, and a temporary sub-view has no home to write one back to.
+        //
+        // Restricted to the two bases `emit_expr` actually lowers a range over; a fixed-size array
+        // keeps its existing refusal untouched.
+        let rix: parser.ExprData = list.get(parser.ExprData, p.ex, e.b as usize)
+        if rix.kind == 13 and (repr_is_slice(c, e.a) or repr_is_str(c, e.a)) {
+            var vb: String = string_new()
+            emit_expr(vb, p, src, c, g, eid)
+            string_push(sb, "(*(")
+            emit_su_tyid(sb, p, src, c, g, repr_tyid(c, e.a))
+            string_push(sb, "[1]){ ")
+            string_push(sb, string_view(vb))
+            string_push(sb, " })")
+            string_free(vb)
+            return
+        }
         let bt: i32 = repr_tyid(c, e.a)
         if bt >= 0 {
             let bd: typeck.TyData = list.get(typeck.TyData, c.tys, bt as usize)
@@ -1457,7 +1485,60 @@ fn emit_place(mut sb: String, read p: parser.Parser, read src: str, read c: type
         emit_expr(sb, p, src, c, g, eid)
         return
     }
-    emit_expr(sb, p, src, c, g, eid)
+    // `Name` -- already an lvalue (`j_x`, or `(*j_x)` for a pointer parameter) -- and every
+    // form that is NOT A PLACE in the source language: a call, a cast, an arithmetic
+    // expression, a struct literal.
+    //
+    // `emit_place` owes its callers an lvalue and C will not give one for a value, so a value
+    // is parked in a COMPOUND LITERAL OF ARRAY TYPE: `(T[1]){ v }` decays to `T*` and `(*…)`
+    // reads back as a place, with the enclosing block's lifetime rather than the expression's.
+    //
+    // Without this, any `mut` argument that is not a place leaked gcc's own "lvalue required"
+    // with no span -- `f(mut mk())`, `f(mut a + b)`, and `f(mut s as Buf)`, which is the
+    // ordinary `distinct` newtype idiom. The callee gets a copy whose INDIRECTION IS SHARED,
+    // so writes through a slice's `ptr` reach the caller's buffer exactly as a sub-view's do.
+    //
+    // THE GUARD MUST BE EXACT, and "conservative" is not a defence. `is_c_lvalue` also serves
+    // the `read` path, where answering "no" to something that IS an lvalue costs one copy. Here
+    // it costs a WRONG ANSWER, because the copy is what a `mut` callee then writes into.
+    //
+    // The first version of this arm reasoned that Field, Index and Deref each return above, so
+    // the only lvalue reaching here is a Name -- and missed that the Field arm RECURSES into
+    // `emit_place` on its base, which for a method's `self` is a SelfValue. `self.seen` in a
+    // `mut self` method then parked `(*j_self)` and freed a copy's list. Index genuinely cannot
+    // reach this arm; every other kind can, and the guard has to be right about all of them.
+    if is_c_lvalue(p, eid) {
+        emit_expr(sb, p, src, c, g, eid)
+        return
+    }
+    var vbuf: String = string_new()                   // value emits BEFORE the type (counter lockstep)
+    emit_expr(vbuf, p, src, c, g, eid)
+    string_push(sb, "(*(")
+    emit_su_tyid(sb, p, src, c, g, list.get(i32, c.et, eid as usize))
+    string_push(sb, "[1]){ ")
+    string_push(sb, string_view(vbuf))
+    string_push(sb, " })")
+    string_free(vbuf)
+}
+
+// Does `eid` lower to a C LVALUE under `emit_expr` -- something `&` may be applied to?
+//
+// A Jestyr place is NOT automatically a C lvalue: `xs[1]` is a place, but cgen lowers a
+// bounds-checked index to a GNU statement expression, which yields a value. So lvalue-ness
+// follows the EMISSION, not the source form: a Name is one, a Deref always is (dereferencing
+// any pointer value produces an lvalue), a Field is one exactly when its base is, and an Index
+// never is. Mirrors the reference's `is_c_lvalue`.
+fn is_c_lvalue(read p: parser.Parser, eid: i32) -> bool {
+    if eid < 0 { return false }
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    if e.kind == 2 { return true }                    // Name
+    // SelfValue renders `j_self`, or `(*j_self)` for a `mut`/`out` receiver -- both lvalues,
+    // exactly as a Name is. Omitting it made `self.seen` in a `mut self` method resolve to a
+    // field of a COPY, so `free(&copy.seen)` freed the wrong list; `census_cli` caught it.
+    if e.kind == 19 { return true }                   // SelfValue
+    if e.kind == 7 { return true }                    // Deref
+    if e.kind == 5 { return is_c_lvalue(p, e.a) }     // Field: iff its base is
+    return false
 }
 
 // Emit `eid` as an argument passed BY ADDRESS — a `mut`/`out` parameter, or a `mut`/`out self`
@@ -1642,6 +1723,19 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, src[e.start .. e.end])
             string_push(sb, ")")
             return
+        }
+        // An `extern … var` GLOBAL (B2): the C symbol, bare — no `j_`, no canon — because
+        // the symbol belongs to the linker, as an extern fn's does. Decided by the CHECKER's
+        // record (`c.gref`, the reference's `Resolved.global`), never by the spelling: a
+        // local `errno` shadows the global, and this arm has no scope of its own.
+        if is_global_ref(c, eid) {
+            let gx: i32 = find_extern_item(p, src, src[e.start .. e.end])
+            if gx >= 0 {
+                let git: parser.ItemData = list.get(parser.ItemData, p.it, gx as usize)
+                if git.cns >= 0 { string_push(sb, src[git.cns as usize .. git.cne as usize]) }
+                else { string_push(sb, src[e.start .. e.end]) }
+                return
+            }
         }
         string_push(sb, "j_")
         string_push(sb, src[e.start .. e.end])
@@ -4056,6 +4150,19 @@ fn emit_extern_protos(mut sb: String, read p: parser.Parser, read src: str) {
                 var xns: i32 = it.x  var xne: i32 = it.y
                 if it.cns >= 0 { xns = it.cns  xne = it.cne }
                 let eg: bool = cfg_open_for(sb, p, src, xns, xne, cfg_word(p, src, it.xat, it.xac))
+                if it.b < 0 {
+                    // An `extern "c"` GLOBAL (B2) is declared, not defined: `extern T sym;`.
+                    // A `.h` abi was skipped above, as for a header-declared fn — and for
+                    // `errno` that is the only thing that works, a macro being undeclarable.
+                    string_push(sb, "extern ")
+                    emit_c_ty(sb, p, src, it.z)
+                    string_push(sb, " ")
+                    string_push(sb, src[xns as usize .. xne as usize])
+                    string_push(sb, ";\n")
+                    cfg_close(sb, eg)
+                    r = r + 1
+                    continue
+                }
                 emit_c_ty(sb, p, src, it.z)               // ret type (-1 = void)
                 string_push(sb, " ")
                 string_push(sb, src[xns as usize .. xne as usize])
@@ -4083,6 +4190,17 @@ fn emit_extern_protos(mut sb: String, read p: parser.Parser, read src: str) {
         r = r + 1
     }
     if any { string_push(sb, "\n") }
+}
+
+// Did the checker resolve Name `eid` to an `extern … var` global? (`c.gref` membership —
+// the reference's `info.global_ref(id)`.)
+fn is_global_ref(read c: typeck.Checker, eid: i32) -> bool {
+    var i: usize = 0
+    for i < list.len(i32, c.gref) {
+        if list.get(i32, c.gref, i) == eid { return true }
+        i = i + 1
+    }
+    return false
 }
 
 // The item id of an `extern "c"` fn named `src[ns..ne]`… by name, or -1.
@@ -5919,8 +6037,31 @@ fn collect_moved_expr(mut g: Cg, read p: parser.Parser, read src: str, eid: i32)
     }
 }
 
-// The statement walk: a `let`'s bare-name init, a `return`'s bare-name value, and the block's
-// bare-name tail expression all move; every subexpression is walked for take-args and captures.
+// Mark the bare local a `return` carries out: `return d`, or `return ok(d)` / `return err(d)`,
+// whose one argument lands in the result struct by value exactly as a bare returned local does
+// (mirrors `as_returned_name`). A12: without this the port copied `d` into the result and then
+// ran its drops — the same silent miscompile the reference had, and the cgen golden on
+// `examples/return_ok_local.jtr` is what watched it fail. `ok`/`err` are intrinsics and cannot
+// be shadowed, so matching the spelling is matching the meaning.
+fn mv_mark_returned(mut g: Cg, read p: parser.Parser, read src: str, eid: i32) {
+    if eid < 0 { return }
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    if e.kind == 10 and e.y == 1 {
+        let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+        if callee.kind == 2 {
+            let nm: str = src[callee.start .. callee.end]
+            if str_eq(nm, "ok") or str_eq(nm, "err") {
+                mv_mark(g, p, list.get(i32, p.ar, e.x as usize))
+                return
+            }
+        }
+    }
+    mv_mark(g, p, eid)
+}
+
+// The statement walk: a `let`'s bare-name init, a `return`'s bare-name value (or the local an
+// `ok(...)`/`err(...)` wraps), and the block's bare-name tail expression all move; every
+// subexpression is walked for take-args and captures.
 fn collect_moved_block(mut g: Cg, read p: parser.Parser, read src: str, beid: i32) {
     let blk: parser.ExprData = list.get(parser.ExprData, p.ex, beid as usize)
     let n: i32 = blk.y
@@ -5933,11 +6074,11 @@ fn collect_moved_block(mut g: Cg, read p: parser.Parser, read src: str, beid: i3
             collect_moved_expr(g, p, src, s.a)
         }
         if s.kind == 1 and s.a >= 0 {
-            mv_mark(g, p, s.a)
+            mv_mark_returned(g, p, src, s.a)
             collect_moved_expr(g, p, src, s.a)
         }
         if s.kind == 2 {
-            if i + 1 == n { mv_mark(g, p, s.a) }
+            if i + 1 == n { mv_mark_returned(g, p, src, s.a) }
             collect_moved_expr(g, p, src, s.a)
         }
         i = i + 1
@@ -8801,7 +8942,45 @@ fn impl_ok_tid(read p: parser.Parser, read src: str, read im: parser.ItemData, r
     return fd.z
 }
 
-fn emit_impl_sig(mut sb: String, read p: parser.Parser, read src: str, read im: parser.ItemData, read fd: parser.ItemData) {
+// A TypeId whose Name text is `Self`, or -1 when the file has none.
+//
+// Used only as the substitution KEY: `su_slot` matches by TEXT, not by span identity, so ANY
+// occurrence of `Self` names every other one. This is how a `Self` binding is expressed in a
+// map whose keys are source spans -- the span is a way to name the string "Self" without
+// allocating one. A file with no `Self` anywhere needs no binding at all.
+fn self_key_tid(read p: parser.Parser, read src: str) -> i32 {
+    var i: usize = 0
+    for i < list.len(parser.TypeData, p.ty) {
+        let t: parser.TypeData = list.get(parser.TypeData, p.ty, i)
+        if t.kind == 0 {
+            if str_eq(src[t.start .. t.end], "Self") { return i as i32 }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Arm `Self` -> impl target `it.a` in the active substitution, returning the `g.su` length to
+// truncate back to. Binding it in the SUBSTITUTION rather than special-casing the name at each
+// use is what makes `Self` work in every position -- a parameter, a return, and NESTED
+// (`[]Self` -> `JestyrSlice_P`), because the su-aware emitters already recurse through it.
+// The target is stored as a kind-0 (name-span) arg triple, which renders `Jestyr_P` for a
+// struct target and `int32_t` for a primitive one -- the same two cases the type key handles.
+fn arm_self_subst(read p: parser.Parser, read src: str, mut g: Cg, read it: parser.ItemData) -> usize {
+    let n: usize = list.len(i32, g.su)
+    let skt: i32 = self_key_tid(p, src)
+    if skt < 0 { return n }
+    let st: parser.TypeData = list.get(parser.TypeData, p.ty, skt as usize)
+    let tt: parser.TypeData = list.get(parser.TypeData, p.ty, it.a as usize)
+    list.push(i32, g.su, st.start as i32)
+    list.push(i32, g.su, st.end as i32)
+    list.push(i32, g.su, 0)                           // kind 0 = a name span
+    list.push(i32, g.su, tt.start as i32)
+    list.push(i32, g.su, tt.end as i32)
+    return n
+}
+
+fn emit_impl_sig(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, read g: Cg, read im: parser.ItemData, read fd: parser.ItemData) {
     // A fallible impl method returns its tagged result struct (trait-errors T2)
     // -- the trait's signature is the ABI, exactly as a fallible struct method.
     if fn_is_fallible(p, fd) {
@@ -8809,7 +8988,7 @@ fn emit_impl_sig(mut sb: String, read p: parser.Parser, read src: str, read im: 
         let iok: i32 = impl_ok_tid(p, src, im, fd)
         if iok < 0 { string_push(sb, "unit") } else { push_ast_mangle(sb, p, src, iok) }
     } else {
-        emit_c_ty(sb, p, src, fd.z)
+        emit_su_ty(sb, p, src, c, g, fd.z)            // `-> Self` resolves through the subst
     }
     string_push(sb, " jestyr_impl_")
     string_push(sb, src[im.x .. im.y])                // trait name
@@ -8831,7 +9010,7 @@ fn emit_impl_sig(mut sb: String, read p: parser.Parser, read src: str, read im: 
                 if conv == 2 or conv == 4 { string_push(sb, "* restrict") }
                 string_push(sb, " j_self")
             } else {
-                emit_c_ty(sb, p, src, list.get(i32, p.iar, (base + 5) as usize))
+                emit_su_ty(sb, p, src, c, g, list.get(i32, p.iar, (base + 5) as usize))
                 if conv == 2 or conv == 4 { string_push(sb, "* restrict") }
                 string_push(sb, " j_")
                 string_push(sb, src[list.get(i32, p.iar, (base + 2) as usize) as usize .. list.get(i32, p.iar, (base + 3) as usize) as usize])
@@ -8938,15 +9117,17 @@ fn emit_impl_protos(mut sb: String, read p: parser.Parser, read src: str, read c
         let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 7 and it.h <= 0 {
+            let su0: usize = arm_self_subst(p, src, g, it)
             var k: i32 = 0
             for k < it.z {                            // (b,z) = method fn-ItemId slice in mar
                 let mid: i32 = list.get(i32, p.mar, (it.b + k) as usize)
                 let fd: parser.ItemData = list.get(parser.ItemData, p.it, mid as usize)
-                emit_impl_sig(sb, p, src, it, fd)
+                emit_impl_sig(sb, p, src, c, g, it, fd)
                 string_push(sb, ";\n")
                 any = true
                 k = k + 1
             }
+            list.truncate(i32, g.su, su0)
         }
         r = r + 1
     }
@@ -8977,12 +9158,16 @@ fn emit_impl_defs(mut sb: String, read p: parser.Parser, read src: str, read c: 
         let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 7 and it.h <= 0 {
+            // `Self` -> the impl target, for the whole of this impl's methods: the signature
+            // AND the body, since a body's `let x: Self` renders through the same su-aware
+            // emitters. Truncated back at the end of the impl.
+            let su0: usize = arm_self_subst(p, src, g, it)
             var k: i32 = 0
             for k < it.z {
                 let mid: i32 = list.get(i32, p.mar, (it.b + k) as usize)
                 let fd: parser.ItemData = list.get(parser.ItemData, p.it, mid as usize)
                 if true {
-                    emit_impl_sig(sb, p, src, it, fd)
+                    emit_impl_sig(sb, p, src, c, g, it, fd)
                     string_push(sb, "\n")
                     list.truncate(i32, g.pp, 0)
                     var pi: i32 = 0
@@ -9021,6 +9206,7 @@ fn emit_impl_defs(mut sb: String, read p: parser.Parser, read src: str, read c: 
                 }
                 k = k + 1
             }
+            list.truncate(i32, g.su, su0)
         }
         r = r + 1
     }
@@ -12649,6 +12835,12 @@ fn ref_expr_id(read p: parser.Parser, eid: i32) -> i32 {
                 if ab >= 0 and ab < eid { off = off + 1 }
                 q = q + 1
             }
+            // The `closed` arm is `Option<Block>` in the reference -- a Block struct, not an
+            // expression -- so its node here has no counterpart either. Missing this is the
+            // A1 shape exactly: an unmatched block node shifts every later ExprId, and an
+            // ExprId only reaches the output through a `spawn` trampoline's C symbol, so it
+            // stays invisible until a select sits between two spawn sites in one function.
+            if e.a >= 0 and e.a < eid { off = off + 1 }
         } else if e.kind == 16 {                      // struct-lit path: an Ident in Rust, a Name node
             if e.a >= 0 and e.a < eid { off = off + 1 }   // here. (A GenStructLit's ctor is NOT counted:
         }                                             // the Rust parser reaches `Name(args){` through the
@@ -13482,6 +13674,17 @@ fn emit_select(mut sb: String, read p: parser.Parser, read src: str, read c: typ
             q = q + 1
         }
         string_push(sb, ") {\n")
+        // A `closed { … }` arm's body runs here. That is the entire feature: the condition
+        // was already computed and already the exit, so the arm is a place to put a
+        // statement, not a new capability.
+        if e.a >= 0 {
+            let cblk: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+            var cs: i32 = 0
+            for cs < cblk.y {
+                emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (cblk.x + cs) as usize), depth + 3)
+                cs = cs + 1
+            }
+        }
         line_at(sb, depth + 3, "_seldone = 1;")
         line_at(sb, depth + 2, "}")
     }
@@ -14296,6 +14499,16 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
     }
     let stem: str = string_view(stemb)
     let src_s: usize = list.get(i32, m.mods, b + 4) as usize
+    // The names bound LOCALLY in the function being rewritten: its parameters, its `let`/
+    // `var` binders, its `for x in` variables. A bare use of one of these is the local, not
+    // the module-level name it happens to share, and must not be renamed — `std/httpc`'s
+    // `request(…, read body: str)` reads `body.len` while `httpc` also exports `fn body`,
+    // and `std/runtime`'s `let now` sits beside `pub fn now` in three modules of one
+    // closure. Both emitted `j_body__m4`/`j_now__m16` for a LOCAL and died in gcc, while
+    // `jestyrc` (which resolves scope before it canonicalizes) built the same programs.
+    // Reset at every `fn`; a binder in an inner block is kept until the function ends,
+    // which over-approximates only where a fn-valued use follows a same-named block local.
+    var locals: String = string_new()
     var cur: usize = 0                                // source cursor: copy gaps, apply edits
     // (merged_pos, allsrc_pos) checkpoints: between edits the text is copied verbatim, so a
     // merged span maps back EXACTLY to its original file offset — the `#line` analogue.
@@ -14331,6 +14544,45 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
             list.push(i32, m.map, (src_s + cur) as i32)
             i = last + 1
             continue
+        }
+        if str_eq(tx, "fn") {
+            // A new function: collect its parameter names (`ident :` inside the parens).
+            string_free(locals)
+            locals = string_new()
+            var q: usize = i + 1
+            var depth: i32 = 0
+            var seen_open: bool = false
+            for q < n {
+                let qt: tokens.Token = list.get(tokens.Token, tk, q)
+                let qx: str = src[qt.start .. qt.end]
+                if str_eq(qx, "{") { break }
+                if str_eq(qx, "(") { depth = depth + 1  seen_open = true }
+                if str_eq(qx, ")") {
+                    depth = depth - 1
+                    if depth == 0 and seen_open { break }
+                }
+                if seen_open and depth > 0 and q + 1 < n {
+                    let nq: tokens.Token = list.get(tokens.Token, tk, q + 1)
+                    if str_eq(src[nq.start .. nq.end], ":") {
+                        if ml_ident_head(qx) { ml_add_local(locals, qx) }
+                    }
+                }
+                q = q + 1
+            }
+        }
+        if str_eq(tx, "let") or str_eq(tx, "var") {
+            if i + 1 < n {
+                let bt: tokens.Token = list.get(tokens.Token, tk, i + 1)
+                let bx: str = src[bt.start .. bt.end]
+                if ml_ident_head(bx) { ml_add_local(locals, bx) }
+            }
+        }
+        if str_eq(tx, "for") {
+            if i + 2 < n {
+                let ft: tokens.Token = list.get(tokens.Token, tk, i + 1)
+                let it2: tokens.Token = list.get(tokens.Token, tk, i + 2)
+                if str_eq(src[it2.start .. it2.end], "in") { ml_add_local(locals, src[ft.start .. ft.end]) }
+            }
         }
         if ml_ident_head(tx) {
             var prev_dot: bool = false
@@ -14415,7 +14667,7 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
             // before, 46 after -- and `test_demo` moved from BUILD_OK to FAIL in the same
             // run, which is why `jc_build_matrix` is a two-directional expectations file
             // rather than a count.
-            if !prev_dot and (!next_colon or prev_const) {
+            if !prev_dot and (!next_colon or prev_const) and !ml_is_local(string_view(locals), tx) {
                 if ml_is_collision(ren, stem, tx) {   // an own colliding name at a bare use
                     string_push(sb2, src[cur .. t.start])
                     string_push(sb2, tx)
@@ -14432,10 +14684,28 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
     string_push(sb2, src[cur .. src.len])
     string_push(sb2, "\n")
     list.free(tokens.Token, tk)
+    string_free(locals)
     string_free(binds)
     string_free(stemb)
     string_free(srcb)
     string_free(renb)
+}
+
+// The local-name set of `ml_rewrite`: `|name|` entries, probed with `find`.
+fn ml_add_local(mut set: String, read name: str) {
+    string_push(set, "|")
+    string_push(set, name)
+    string_push(set, "|")
+}
+
+fn ml_is_local(read set: str, read name: str) -> bool {
+    var probe: String = string_new()
+    string_push(probe, "|")
+    string_push(probe, name)
+    string_push(probe, "|")
+    let at: isize = find(set, string_view(probe))
+    string_free(probe)
+    return at >= 0
 }
 
 // Load + flatten the import closure rooted at `root` into one single-file program. Returns
@@ -14792,6 +15062,9 @@ fn driver_build(mut m: Ml, read p: parser.Parser, read c: typeck.Checker, read s
     // before the source resolves nothing and the link fails exactly as if the flag were
     // absent. Content-triggered like `-pthread`, and host-gated because both `@cfg` branches
     // are always emitted -- the source names `winsock2.h` on Linux too.
+    // OpenSSL, the same content-triggered shape, not host-gated (mirrors the reference's
+    // `openssl/ssl.h` rule at both of its link sites).
+    if contains(string_view(sb), "openssl/ssl.h") { string_push(cmd, " -lssl -lcrypto") }
     if !posix {
         if contains(string_view(sb), "winsock2.h") { string_push(cmd, " -lws2_32") }
     }
@@ -14928,7 +15201,9 @@ fn at_extern_sig(mut sb: String, read p: parser.Parser, read src: str, read it: 
     if it.is_pub != 0 { string_push(sb, "pub ") }
     string_push(sb, "extern \"")
     if it.w >= 0 { string_push(sb, src[it.w as usize .. it.u as usize]) } else { string_push(sb, "c") }
-    string_push(sb, "\" fn ")
+    // A GLOBAL (B2, `b == -1`) renders `var NAME[ = "sym"]: T` — its contract is the symbol
+    // and the type, and the keyword is what keeps it apart from a nullary fn in the manifest.
+    if it.b < 0 { string_push(sb, "\" var ") } else { string_push(sb, "\" fn ") }
     string_push(sb, src[it.x as usize .. it.y as usize])
     // The declared alias is part of the ABI contract attest hashes: `fn sys_read = "read"`
     // and `fn sys_read = "_read"` bind different C symbols and must not render alike.
@@ -14936,6 +15211,10 @@ fn at_extern_sig(mut sb: String, read p: parser.Parser, read src: str, read it: 
         string_push(sb, " = \"")
         string_push(sb, src[it.cns as usize .. it.cne as usize])
         string_push(sb, "\"")
+    }
+    if it.b < 0 {
+        if it.z >= 0 { string_push(sb, ": ")  at_ty(sb, p, src, it.z) }
+        return
     }
     string_push(sb, "(")
     at_params(sb, p, src, it.a, it.b)
@@ -15028,6 +15307,64 @@ fn at_guarantee_phrases(mut gb: String, mut gs: List(i32), read p: parser.Parser
 }
 
 // The manifest's rendering of those phrases: one `  guarantee: <phrase>\n` line each.
+// The `@deprecated` marker on fn item `it`, as its manifest line: `  deprecated:` bare, or
+// `  deprecated: <msg>` with the message's OUTER QUOTES stripped (a string literal's source
+// text keeps them, which is exactly what makes it a ready-made C clause in `fn_attr_prefix`).
+//
+// Deliberately NOT a guarantee and NOT part of the sig. The guarantee block is described as
+// machine-checked and a deprecation is proven nothing; and `attest --diff` calls any signature
+// change breaking, which would classify DEPRECATING an API as a breaking change -- backwards,
+// since every existing call still compiles and still works. Mirrors `doc::fn_deprecated`.
+// The `@deprecated` attribute's base index in `p.aar` for item `it`, or -1 when absent.
+fn at_dep_attr(read p: parser.Parser, read src: str, read it: parser.ItemData) -> i32 {
+    var i: i32 = 0
+    for i < it.v {
+        let ab: i32 = it.u + i * 4
+        let ns: i32 = list.get(i32, p.aar, ab as usize)
+        let ne: i32 = list.get(i32, p.aar, (ab + 1) as usize)
+        if str_eq(src[ns as usize .. ne as usize], "deprecated") { return ab }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn at_has_deprecated(read p: parser.Parser, read src: str, read it: parser.ItemData) -> bool {
+    return at_dep_attr(p, src, it) >= 0
+}
+
+// The deprecation MESSAGE, with its outer quotes stripped -- a string literal's source text
+// keeps them, which is exactly what makes it a ready-made C clause in `fn_attr_prefix`.
+// Pushes nothing for a bare `@deprecated`, and nothing for `@deprecated("")`, which lose
+// nothing a caller could act on.
+fn at_dep_msg(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    let ab: i32 = at_dep_attr(p, src, it)
+    if ab < 0 { return }
+    let ac: i32 = list.get(i32, p.aar, (ab + 3) as usize)
+    if ac <= 0 { return }
+    let a0: i32 = list.get(i32, p.aar, list.get(i32, p.aar, (ab + 2) as usize) as usize)
+    let ax: parser.ExprData = list.get(parser.ExprData, p.ex, a0 as usize)
+    if ax.kind != 29 { return }                       // a string literal
+    var s: usize = ax.start
+    var e: usize = ax.end
+    if e > s + 1 { s = s + 1  e = e - 1 }
+    if e > s { string_push(sb, src[s .. e]) }
+}
+
+// The manifest's rendering: `  deprecated:` bare, or `  deprecated: <msg>` with one.
+fn at_deprecated(mut ob: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    if !at_has_deprecated(p, src, it) { return }
+    var mb: String = string_new()
+    at_dep_msg(mb, p, src, it)
+    string_push(ob, "  deprecated:")
+    let mv: str = string_view(mb)
+    if mv.len > 0 {
+        string_push(ob, " ")
+        string_push(ob, mv)
+    }
+    string_push(ob, "\n")
+    string_free(mb)
+}
+
 fn at_guarantees(mut ob: String, read p: parser.Parser, read src: str, read it: parser.ItemData, read a: Allocator) {
     var gb: String = string_new()
     var gs: List(i32) = list.make(i32, a)
@@ -15247,6 +15584,9 @@ fn at_records(mut ob: String, read p: parser.Parser, read src: str, read a: Allo
             string_push(ob, src[it.x as usize .. it.y as usize])
         }
         string_push(ob, "\n")
+        // Ahead of the guarantees, so a reader meets "do not call this" before the proven
+        // facts about what calling it would do.
+        if it.kind == 3 { at_deprecated(ob, p, src, it) }
         if it.kind == 3 { at_guarantees(ob, p, src, it, a) }
         i = i + 1
     }
@@ -15511,7 +15851,11 @@ fn db_group(mut d: Db, read src: str, read docs: List(tokens.RawDoc), want: i32,
 // (-1 for none); `g_*` slice `gsp`, whose pairs span `gbuf`.
 struct Tg { sigbuf: String, gbuf: String, tg: List(i32), gsp: List(i32) }
 
-fn tg_push(mut t: Tg, start: i32, kind: i32, ns: i32, ne: i32, ss: i32, se: i32, ps: i32, pe: i32, g0: i32, gc: i32) {
+// Slots 11/12 are the `@deprecated` message span into `sigbuf`, with 11 == -1 for "absent"
+// and an EMPTY span for a bare `@deprecated`. Only a fn/method target can carry one
+// (`attrs.rs` declares the attribute's targets as Fn and Method), so every other `tg_push`
+// caller passes -1, -1 -- that is the attribute's declared surface, not a hole.
+fn tg_push(mut t: Tg, start: i32, kind: i32, ns: i32, ne: i32, ss: i32, se: i32, ps: i32, pe: i32, g0: i32, gc: i32, ds: i32, de: i32) {
     list.push(i32, t.tg, start)
     list.push(i32, t.tg, kind)
     list.push(i32, t.tg, ns)
@@ -15523,6 +15867,8 @@ fn tg_push(mut t: Tg, start: i32, kind: i32, ns: i32, ne: i32, ss: i32, se: i32,
     list.push(i32, t.tg, 0 - 1)                                // docblk, filled by the attach pass
     list.push(i32, t.tg, g0)
     list.push(i32, t.tg, gc)
+    list.push(i32, t.tg, ds)
+    list.push(i32, t.tg, de)
 }
 
 // A fn or struct-method target: the reconstructed signature plus the proven guarantees.
@@ -15533,7 +15879,17 @@ fn tg_add_fn(mut t: Tg, read p: parser.Parser, read src: str, read it: parser.It
     let g0: i32 = (list.len(i32, t.gsp) / 2) as i32
     at_guarantee_phrases(t.gbuf, t.gsp, p, src, it)
     let g1: i32 = (list.len(i32, t.gsp) / 2) as i32
-    tg_push(t, it.start as i32, kind, it.x, it.y, s0, s1, ps, pe, g0, g1 - g0)
+    // The deprecation message parks in `sigbuf` beside the signature: -1 for absent, an
+    // empty span for a bare `@deprecated`. Shares `at_dep_msg` with the manifest, so the
+    // documented deprecation and the attested one cannot drift.
+    var ds: i32 = 0 - 1
+    var de: i32 = 0 - 1
+    if at_has_deprecated(p, src, it) {
+        ds = sb_len(t.sigbuf)
+        at_dep_msg(t.sigbuf, p, src, it)
+        de = sb_len(t.sigbuf)
+    }
+    tg_push(t, it.start as i32, kind, it.x, it.y, s0, s1, ps, pe, g0, g1 - g0, ds, de)
 }
 
 fn dc_targets(mut t: Tg, read p: parser.Parser, read src: str) {
@@ -15546,19 +15902,19 @@ fn dc_targets(mut t: Tg, read p: parser.Parser, read src: str) {
         } else if it.kind == 8 {
             let s0: i32 = sb_len(t.sigbuf)
             at_extern_sig(t.sigbuf, p, src, it)
-            tg_push(t, it.start as i32, 1, it.x, it.y, s0, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+            tg_push(t, it.start as i32, 1, it.x, it.y, s0, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0, 0 - 1, 0 - 1)
         } else if it.kind == 5 {
             let s1: i32 = sb_len(t.sigbuf)
             at_enum_sig(t.sigbuf, p, src, it)
-            tg_push(t, it.start as i32, 2, it.x, it.y, s1, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+            tg_push(t, it.start as i32, 2, it.x, it.y, s1, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0, 0 - 1, 0 - 1)
         } else if it.kind == 2 {
             let s2: i32 = sb_len(t.sigbuf)
             at_const_sig(t.sigbuf, p, src, it)
-            tg_push(t, it.start as i32, 3, it.x, it.y, s2, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+            tg_push(t, it.start as i32, 3, it.x, it.y, s2, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0, 0 - 1, 0 - 1)
         } else if it.kind == 4 {
             let s3: i32 = sb_len(t.sigbuf)
             at_struct_sig(t.sigbuf, p, src, it)
-            tg_push(t, it.start as i32, 4, it.x, it.y, s3, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+            tg_push(t, it.start as i32, 4, it.x, it.y, s3, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0, 0 - 1, 0 - 1)
             var m: i32 = 0
             for m < it.b {
                 let base: i32 = it.a + m * 10
@@ -15576,13 +15932,13 @@ fn dc_targets(mut t: Tg, read p: parser.Parser, read src: str) {
             string_push(t.sigbuf, src[it.x as usize .. it.y as usize])
             string_push(t.sigbuf, " = ")
             at_ty(t.sigbuf, p, src, it.a)
-            tg_push(t, it.start as i32, 6, it.x, it.y, s4, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+            tg_push(t, it.start as i32, 6, it.x, it.y, s4, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0, 0 - 1, 0 - 1)
         } else if it.kind == 6 {
             let s5: i32 = sb_len(t.sigbuf)
             if it.is_pub != 0 { string_push(t.sigbuf, "pub ") }
             string_push(t.sigbuf, "trait ")
             string_push(t.sigbuf, src[it.x as usize .. it.y as usize])
-            tg_push(t, it.start as i32, 7, it.x, it.y, s5, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+            tg_push(t, it.start as i32, 7, it.x, it.y, s5, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0, 0 - 1, 0 - 1)
         }
         r = r + 1
     }
@@ -15757,6 +16113,19 @@ fn dc_emit_target(mut sb: String, read t: Tg, tb: i32, level: i32, read src: str
     let sv: str = string_view(t.sigbuf)
     string_push(sb, sv[list.get(i32, t.tg, (tb + 4) as usize) as usize .. list.get(i32, t.tg, (tb + 5) as usize) as usize])
     string_push(sb, "\n```\n\n")
+    // Before the prose: a reader deciding whether to CALL this needs the deprecation first,
+    // not after a paragraph explaining what it does.
+    let dps: i32 = list.get(i32, t.tg, (tb + 11) as usize)
+    if dps >= 0 {
+        let dpe: i32 = list.get(i32, t.tg, (tb + 12) as usize)
+        if dpe > dps {
+            string_push(sb, "> **Deprecated** — ")
+            string_push(sb, sv[dps as usize .. dpe as usize])
+            string_push(sb, "\n\n")
+        } else {
+            string_push(sb, "> **Deprecated.**\n\n")
+        }
+    }
     let blk: i32 = list.get(i32, t.tg, (tb + 8) as usize)
     if blk >= 0 {
         var pd: Pd = Pd{ sum: list.make(i32, a), hbuf: string_new(), sec: list.make(i32, a), sln: list.make(i32, a) }
@@ -15791,19 +16160,19 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
 
     var t: Tg = Tg{ sigbuf: string_new(), gbuf: string_new(), tg: list.make(i32, a), gsp: list.make(i32, a) }
     dc_targets(t, p, src)
-    let tn: usize = list.len(i32, t.tg) / 11
+    let tn: usize = list.len(i32, t.tg) / 13
     // Targets in source order (`sort_by_key(span.start)`); collection is already ascending, so
     // this insertion sort is normally a no-op — it keeps the order guaranteed, not assumed.
     var i: usize = 1
     for i < tn {
         var j: usize = i
         for j > 0 {
-            if list.get(i32, t.tg, (j * 11) as usize) >= list.get(i32, t.tg, ((j - 1) * 11) as usize) { break }
+            if list.get(i32, t.tg, (j * 13) as usize) >= list.get(i32, t.tg, ((j - 1) * 13) as usize) { break }
             var f: usize = 0
-            for f < 11 {
-                let tmp: i32 = list.get(i32, t.tg, j * 11 + f)
-                list.set(i32, t.tg, j * 11 + f, list.get(i32, t.tg, (j - 1) * 11 + f))
-                list.set(i32, t.tg, (j - 1) * 11 + f, tmp)
+            for f < 13 {
+                let tmp: i32 = list.get(i32, t.tg, j * 13 + f)
+                list.set(i32, t.tg, j * 13 + f, list.get(i32, t.tg, (j - 1) * 13 + f))
+                list.set(i32, t.tg, (j - 1) * 13 + f, tmp)
                 f = f + 1
             }
             j = j - 1
@@ -15821,7 +16190,7 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
         var hit: i32 = 0 - 1
         var k: usize = 0
         for k < tn {
-            if list.get(i32, t.tg, (k * 11) as usize) >= bend {
+            if list.get(i32, t.tg, (k * 13) as usize) >= bend {
                 hit = k as i32
                 break
             }
@@ -15830,9 +16199,9 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
         if hit < 0 {
             list.push(i32, dangle, bi as i32)
         } else {
-            let prev: i32 = list.get(i32, t.tg, (hit * 11 + 8) as usize)
+            let prev: i32 = list.get(i32, t.tg, (hit * 13 + 8) as usize)
             if prev >= 0 { list.push(i32, dangle, prev) }
-            list.set(i32, t.tg, (hit * 11 + 8) as usize, bi as i32)
+            list.set(i32, t.tg, (hit * 13 + 8) as usize, bi as i32)
         }
         bi = bi + 1
     }
@@ -15871,7 +16240,7 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
     var tops: i32 = 0
     var c0: usize = 0
     for c0 < tn {
-        if list.get(i32, t.tg, (c0 * 11 + 6) as usize) < 0 { tops = tops + 1 }
+        if list.get(i32, t.tg, (c0 * 13 + 6) as usize) < 0 { tops = tops + 1 }
         c0 = c0 + 1
     }
     if tops == 0 {
@@ -15882,7 +16251,7 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
     string_push(sb, "## API\n\n")
     var r: usize = 0
     for r < tn {
-        let tb: i32 = (r * 11) as i32
+        let tb: i32 = (r * 13) as i32
         if list.get(i32, t.tg, (tb + 6) as usize) < 0 {
             dc_emit_target(sb, t, tb, 3, src, outer, a)
             if list.get(i32, t.tg, (tb + 1) as usize) == 4 {   // a struct: gather its methods
@@ -15890,7 +16259,7 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
                 var any: bool = false
                 var m2: usize = 0
                 for m2 < tn {
-                    let mb: i32 = (m2 * 11) as i32
+                    let mb: i32 = (m2 * 13) as i32
                     let ps: i32 = list.get(i32, t.tg, (mb + 6) as usize)
                     if ps >= 0 {
                         if str_eq(src[ps as usize .. list.get(i32, t.tg, (mb + 7) as usize) as usize], nm) { any = true }
@@ -15903,7 +16272,7 @@ fn dc_generate(mut sb: String, read p: parser.Parser, read src: str, read docs: 
                     string_push(sb, "`\n\n")
                     var m3: usize = 0
                     for m3 < tn {
-                        let mb2: i32 = (m3 * 11) as i32
+                        let mb2: i32 = (m3 * 13) as i32
                         let ps2: i32 = list.get(i32, t.tg, (mb2 + 6) as usize)
                         if ps2 >= 0 {
                             if str_eq(src[ps2 as usize .. list.get(i32, t.tg, (mb2 + 7) as usize) as usize], nm) {
@@ -16038,6 +16407,14 @@ fn am_parse(read t: str, read a: Allocator) -> Am {
                     list.push(i32, m.gs, (ls + 13) as i32)
                     list.push(i32, m.gs, ce as i32)
                     list.set(i32, m.items, (cur + 6) as usize, list.get(i32, m.items, (cur + 6) as usize) + 1)
+                } else if starts_with(body, "deprecated:") {
+                    // `deprecated:` bare, `deprecated: <msg>` with one. A manifest written
+                    // before this line existed has none, so slot 7 stays -1 and it reads as
+                    // "not deprecated then" -- an old manifest still diffs against a new one.
+                    var ds: usize = ls + 13                // past "  deprecated:"
+                    if ce > ds { ds = ds + 1 }             // the single space the renderer emits
+                    list.set(i32, m.items, (cur + 7) as usize, ds as i32)
+                    list.set(i32, m.items, (cur + 8) as usize, ce as i32)
                 }
             }
         } else {
@@ -16049,6 +16426,8 @@ fn am_parse(read t: str, read a: Allocator) -> Am {
             list.push(i32, m.items, 0)
             list.push(i32, m.items, (list.len(i32, m.gs) / 2) as i32)
             list.push(i32, m.items, 0)                 // guarantee count
+            list.push(i32, m.items, 0 - 1)             // deprecated msg span start (-1 = absent)
+            list.push(i32, m.items, 0 - 1)             // deprecated msg span end
         }
         ls = le + 1
     }
@@ -16060,13 +16439,20 @@ fn am_parse(read t: str, read a: Allocator) -> Am {
 fn am_find(read m: Am, read t: str, read key: str) -> i32 {
     var found: i32 = 0 - 1
     var i: usize = 0
-    for i < list.len(i32, m.items) / 7 {
-        let ib: i32 = (i * 7) as i32
+    for i < list.len(i32, m.items) / 9 {
+        let ib: i32 = (i * 9) as i32
         if str_eq(t[list.get(i32, m.items, ib as usize) as usize .. list.get(i32, m.items, (ib + 1) as usize) as usize], key) { found = ib }
         i = i + 1
     }
     return found
 }
+
+// `@deprecated`: slot 7 is -1 when absent, else the message span (empty for a bare one).
+// Spans, not a `str`: a sub-view of a `read` borrow may not outlive its call, so the caller
+// slices its own buffer -- the same shape `am_g_s`/`am_g_e` use.
+fn am_has_dep(read m: Am, ib: i32) -> bool { return list.get(i32, m.items, (ib + 7) as usize) >= 0 }
+fn am_dep_s(read m: Am, ib: i32) -> usize { return list.get(i32, m.items, (ib + 7) as usize) as usize }
+fn am_dep_e(read m: Am, ib: i32) -> usize { return list.get(i32, m.items, (ib + 8) as usize) as usize }
 
 fn am_g_count(read m: Am, ib: i32) -> i32 { return list.get(i32, m.items, (ib + 6) as usize) }
 fn am_g_s(read m: Am, ib: i32, k: i32) -> usize {
@@ -16425,6 +16811,44 @@ fn am_diff_item(mut cb: String, mut cl: List(i32), read ot: str, read o: Am, ob:
         string_free(d)
     }
 
+    // Deprecation. EVERY verdict here is compatible, and that is the point: a deprecated
+    // function still compiles, still links, and still returns what it always did, so nothing
+    // a caller wrote stops working. Calling it breaking would fire the CI gate on the one
+    // action a library author takes to AVOID breaking people. It still has to be REPORTED --
+    // "this is going away" is exactly what a contract diff is read for.
+    let odep: bool = am_has_dep(o, ob)
+    let ndep: bool = am_has_dep(n, nbs)
+    if !odep and ndep {
+        let nms: usize = am_dep_s(n, nbs)
+        let nme: usize = am_dep_e(n, nbs)
+        if nme <= nms {
+            am_change(cb, cl, key, false, "now `@deprecated`")
+        } else {
+            var d: String = string_new()
+            string_push(d, "now `@deprecated`: ")
+            string_push(d, nt[nms .. nme])
+            am_change(cb, cl, key, false, string_view(d))
+            string_free(d)
+        }
+    }
+    if odep and !ndep { am_change(cb, cl, key, false, "no longer `@deprecated`") }
+    if odep and ndep {
+        let oms: usize = am_dep_s(o, ob)
+        let ome: usize = am_dep_e(o, ob)
+        let nms2: usize = am_dep_s(n, nbs)
+        let nme2: usize = am_dep_e(n, nbs)
+        if !str_eq(ot[oms .. ome], nt[nms2 .. nme2]) {
+            var d2: String = string_new()
+            string_push(d2, "deprecation message changed: `")
+            string_push(d2, ot[oms .. ome])
+            string_push(d2, "` → `")
+            string_push(d2, nt[nms2 .. nme2])
+            string_push(d2, "`")
+            am_change(cb, cl, key, false, string_view(d2))
+            string_free(d2)
+        }
+    }
+
     // `@no_panic` is a postcondition: losing it is breaking, gaining it compatible.
     let onp: bool = am_np(ot, o, ob)
     let nnp: bool = am_np(nt, n, nbs)
@@ -16546,8 +16970,8 @@ fn am_diff(mut rep: String, read ot: str, read o: Am, read nt: str, read n: Am, 
     var cl: List(i32) = list.make(i32, a)
     // Old items: matched (classified) or removed (only a public item's removal breaks).
     var i: usize = 0
-    for i < list.len(i32, o.items) / 7 {
-        let ib: i32 = (i * 7) as i32
+    for i < list.len(i32, o.items) / 9 {
+        let ib: i32 = (i * 9) as i32
         let key: str = ot[list.get(i32, o.items, ib as usize) as usize .. list.get(i32, o.items, (ib + 1) as usize) as usize]
         if am_find(o, ot, key) == ib {
             let mb: i32 = am_find(n, nt, key)
@@ -16565,8 +16989,8 @@ fn am_diff(mut rep: String, read ot: str, read o: Am, read nt: str, read n: Am, 
     }
     // New items with no old counterpart: an addition never breaks an existing caller.
     var j: usize = 0
-    for j < list.len(i32, n.items) / 7 {
-        let jb: i32 = (j * 7) as i32
+    for j < list.len(i32, n.items) / 9 {
+        let jb: i32 = (j * 9) as i32
         let key: str = nt[list.get(i32, n.items, jb as usize) as usize .. list.get(i32, n.items, (jb + 1) as usize) as usize]
         if am_find(n, nt, key) == jb {
             if am_find(o, ot, key) < 0 { am_change(cb, cl, key, false, "added") }

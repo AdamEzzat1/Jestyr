@@ -1,0 +1,330 @@
+// std/tls.jtr — TLS over a socket, by binding OpenSSL. Bindings, not an implementation.
+//
+// TIER: `sys`. This module invents nothing: the handshake, the cipher suites, the certificate
+// chain walk and the hostname match are OpenSSL's (1.1.1 or later), reached through
+// `extern "openssl/ssl.h"` declarations. `std/csrand` made the same choice for the same
+// reason — a home-grown TLS is a home-grown vulnerability, and the one job here is to expose
+// the library's decisions faithfully and to make its refusals visible.
+//
+// ─── What a caller gets ───────────────────────────────────────────────────────────────
+//
+//   * A `Context`: a client context (`client_context`) that trusts nothing until `trust`
+//     hands it a CA file, or a server context (`server_context`) loaded with a certificate
+//     and its private key, checked against each other at load time.
+//   * A `Session` over a `std/sysnet` descriptor: `client_session` performs the handshake
+//     as a client (with SNI and, when the context verifies, a hostname check against the
+//     certificate — the check every "just trust the CA" integration forgets), and
+//     `server_session` as a server. Both BLOCK, exactly as `sysnet`'s operations do.
+//   * `write_all` / `read_into` / `shutdown` on an established session.
+//   * An error surface: every failure carries a `TLS_*` code, and `last_error` renders
+//     OpenSSL's own error string, so "the handshake failed" always says why.
+//
+// ─── Verification is on by default for a client that trusts something ─────────────────
+//
+// A client context that has been given a CA verifies the peer's chain AND its hostname;
+// a session on such a context that does not verify is a FAILED handshake, not a warning
+// (`TLS_VERIFY_FAILED`). A client context that trusts nothing (`client_context` alone)
+// verifies nothing — the shape a test uses against a self-signed peer — and says so
+// through `verifies`. There is no "verify but continue on failure" mode, because that is
+// the mode every deployment ends up in when it exists.
+//
+// ─── What is deliberately absent ──────────────────────────────────────────────────────
+//
+// **No schannel.** Windows is served through the same OpenSSL (mingw's), so a program that
+// binds this links `libssl`/`libcrypto` on every platform. A schannel implementation is a
+// second module behind the same surface, if a Windows build without OpenSSL is ever
+// wanted. **No non-blocking mode** — `sysnet` has none, and OpenSSL's `WANT_READ` retry
+// protocol is the day that changes. **No session resumption, no client certificates, no
+// ALPN**, each a binding away.
+//
+// ─── Linking ──────────────────────────────────────────────────────────────────────────
+//
+// The driver adds `-lssl -lcrypto` to any program whose emitted C names `openssl/ssl.h`,
+// after the source file, the same content-triggered rule as `-pthread` and `-lws2_32`. The
+// attest manifest does not move: link libraries never enter `CC_FLAGS`.
+//
+// Run the tests:  jestyrc test examples/std/tls_test.jtr
+
+import "cstring"
+import "mem"
+
+// ---- the bindings ----------------------------------------------------------------------
+//
+// Header-declared, so no prototype is emitted and the header's own signatures are used.
+// `cptr` for every OpenSSL handle: opaque, not dereferenceable, not arithmetic.
+
+extern "openssl/ssl.h" fn OPENSSL_init_ssl(opts: u64, settings: cptr) -> i32
+extern "openssl/ssl.h" fn TLS_client_method() -> cptr
+extern "openssl/ssl.h" fn TLS_server_method() -> cptr
+extern "openssl/ssl.h" fn SSL_CTX_new(m: cptr) -> cptr
+extern "openssl/ssl.h" fn SSL_CTX_free(ctx: cptr)
+extern "openssl/ssl.h" fn SSL_CTX_use_certificate_file(ctx: cptr, file: cstr, kind: i32) -> i32
+extern "openssl/ssl.h" fn SSL_CTX_use_PrivateKey_file(ctx: cptr, file: cstr, kind: i32) -> i32
+extern "openssl/ssl.h" fn SSL_CTX_check_private_key(ctx: cptr) -> i32
+extern "openssl/ssl.h" fn SSL_CTX_load_verify_locations(ctx: cptr, cafile: cstr, capath: cstr) -> i32
+extern "openssl/ssl.h" fn SSL_CTX_set_verify(ctx: cptr, mode: i32, cb: cptr)
+extern "openssl/ssl.h" fn SSL_new(ctx: cptr) -> cptr
+extern "openssl/ssl.h" fn SSL_free(ssl: cptr)
+extern "openssl/ssl.h" fn SSL_set_fd(ssl: cptr, fd: i32) -> i32
+extern "openssl/ssl.h" fn SSL_connect(ssl: cptr) -> i32
+extern "openssl/ssl.h" fn SSL_accept(ssl: cptr) -> i32
+extern "openssl/ssl.h" fn SSL_read(ssl: cptr, buf: cptr, n: i32) -> i32
+extern "openssl/ssl.h" fn SSL_write(ssl: cptr, buf: cptr, n: i32) -> i32
+extern "openssl/ssl.h" fn SSL_shutdown(ssl: cptr) -> i32
+extern "openssl/ssl.h" fn SSL_get_error(ssl: cptr, ret: i32) -> i32
+extern "openssl/ssl.h" fn SSL_get_verify_result(ssl: cptr) -> i64
+extern "openssl/ssl.h" fn SSL_set1_host(ssl: cptr, host: cstr) -> i32
+extern "openssl/ssl.h" fn SSL_ctrl(ssl: cptr, cmd: i32, larg: i64, parg: cptr) -> i64
+extern "openssl/err.h" fn ERR_get_error() -> u64
+extern "openssl/err.h" fn ERR_error_string_n(e: u64, buf: cptr, len: usize)
+
+const SSL_FILETYPE_PEM: i32 = 1
+const SSL_VERIFY_NONE: i32 = 0
+const SSL_VERIFY_PEER: i32 = 1
+const SSL_CTRL_SET_TLSEXT_HOSTNAME: i32 = 55
+const TLSEXT_NAMETYPE_host_name: i64 = 0
+const X509_V_OK: i64 = 0
+
+// ---- outcomes ---------------------------------------------------------------------------
+
+pub const TLS_OK: i32 = 0
+pub const TLS_CLOSED: i32 = 1          // the peer shut the session down cleanly
+pub const TLS_FAILED: i32 = 2          // OpenSSL refused; `last_error` says why
+pub const TLS_VERIFY_FAILED: i32 = 3   // the handshake completed but the peer did not verify
+pub const TLS_REFUSED: i32 = 4         // this module refused: a closed context, a bad argument
+
+@no_alloc @no_os pub fn outcome_name(o: i32) -> str {
+    if o == TLS_OK { return "ok" }
+    if o == TLS_CLOSED { return "closed" }
+    if o == TLS_FAILED { return "failed" }
+    if o == TLS_VERIFY_FAILED { return "verify-failed" }
+    return "refused"
+}
+
+// OpenSSL's own words for the most recent error on this thread, appended to `dst`. Empty
+// when the queue is empty. The queue is DRAINED, so a second call after one failure answers
+// nothing — read it at the failure, not later.
+pub fn last_error(mut dst: String) {
+    var raw: *mut u8 = alloc(u8, 256)
+    var any: bool = false
+    for true {
+        let e: u64 = ERR_get_error()
+        if e == 0 { break }
+        ERR_error_string_n(e, raw as cptr, 256)
+        var n: usize = 0
+        for n < 256 {
+            var b: u8 = 0
+            unsafe { b = (raw + n).* }
+            if (b as i32) == 0 { break }
+            n = n + 1
+        }
+        let s: []u8 = slice(u8, raw, n)
+        let r = try_from_utf8(s)
+        if is_err(r) == false {
+            if any { string_push(dst, "; ") }
+            string_push(dst, unwrap(r))
+            any = true
+        }
+    }
+    free_ptr(raw)
+}
+
+// ---- contexts ---------------------------------------------------------------------------
+
+// One initialisation per process; every call after the first is free.
+fn init_once() {
+    OPENSSL_init_ssl(0, null)
+}
+
+@move pub struct Context {
+    ctx: cptr,
+    server: bool,
+    verifying: bool,
+    open: bool,
+}
+
+@no_alloc @no_os pub fn context_is_open(read c: Context) -> bool { return c.open }
+@no_alloc @no_os pub fn is_server(read c: Context) -> bool { return c.server }
+
+// Does a client session on this context verify the peer? True once `trust` has succeeded.
+@no_alloc @no_os pub fn verifies(read c: Context) -> bool { return c.verifying }
+
+// The value for a slot not yet filled, and what a failed constructor hands back.
+@no_alloc @no_os pub fn no_context() -> Context {
+    return Context{ ctx: null, server: false, verifying: false, open: false }
+}
+
+// A client context. Trusts nothing until `trust` is called; a session on it completes a
+// handshake with any peer and reports `peer_verified` false.
+pub fn client_context() -> Context {
+    init_once()
+    let ctx: cptr = SSL_CTX_new(TLS_client_method())
+    if ctx == null { return no_context() }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, null)
+    return Context{ ctx: ctx, server: false, verifying: false, open: true }
+}
+
+// A server context loaded with `cert_pem` and `key_pem`. The key is checked against the
+// certificate at load, so a mismatched pair fails HERE, not at the first client's handshake.
+pub fn server_context(read a: Allocator, read cert_pem: str, read key_pem: str) -> Context {
+    init_once()
+    let ctx: cptr = SSL_CTX_new(TLS_server_method())
+    if ctx == null { return no_context() }
+    var cf: cstring.CString = cstring.from_str(a, cert_pem)
+    var kf: cstring.CString = cstring.from_str(a, key_pem)
+    var fine: bool = true
+    if SSL_CTX_use_certificate_file(ctx, cstring.as_cstr(cf), SSL_FILETYPE_PEM) != 1 { fine = false }
+    if fine {
+        if SSL_CTX_use_PrivateKey_file(ctx, cstring.as_cstr(kf), SSL_FILETYPE_PEM) != 1 { fine = false }
+    }
+    if fine {
+        if SSL_CTX_check_private_key(ctx) != 1 { fine = false }
+    }
+    cstring.free(cf)
+    cstring.free(kf)
+    if fine == false {
+        SSL_CTX_free(ctx)
+        return no_context()
+    }
+    return Context{ ctx: ctx, server: true, verifying: false, open: true }
+}
+
+// Give a CLIENT context a CA file to trust and turn verification on. From here every session
+// on it must present a chain to this CA AND a certificate for the hostname it was dialed
+// with, or the handshake is `TLS_VERIFY_FAILED`.
+pub fn trust(mut c: Context, read a: Allocator, read ca_pem: str) -> bool {
+    if c.open == false or c.server { return false }
+    var cf: cstring.CString = cstring.from_str(a, ca_pem)
+    let rc: i32 = SSL_CTX_load_verify_locations(c.ctx, cstring.as_cstr(cf), null)
+    cstring.free(cf)
+    if rc != 1 { return false }
+    SSL_CTX_set_verify(c.ctx, SSL_VERIFY_PEER, null)
+    c.verifying = true
+    return true
+}
+
+pub fn free_context(mut c: Context) {
+    if c.open == false { return }
+    SSL_CTX_free(c.ctx)
+    c.ctx = null
+    c.open = false
+}
+
+// ---- sessions ----------------------------------------------------------------------------
+
+@move pub struct Session {
+    ssl: cptr,
+    open: bool,
+    established: bool,
+    verified: bool,
+    outcome: i32,
+}
+
+@no_alloc @no_os pub fn is_established(read s: Session) -> bool { return s.established }
+@no_alloc @no_os pub fn peer_verified(read s: Session) -> bool { return s.verified }
+
+// Why the constructor stopped, when `is_established` is false.
+@no_alloc @no_os pub fn outcome(read s: Session) -> i32 { return s.outcome }
+
+@no_alloc @no_os pub fn no_session() -> Session {
+    return Session{ ssl: null, open: false, established: false, verified: false, outcome: TLS_REFUSED }
+}
+
+fn failed_session(ssl: cptr, o: i32) -> Session {
+    if ssl != null { SSL_free(ssl) }
+    return Session{ ssl: null, open: false, established: false, verified: false, outcome: o }
+}
+
+// Handshake as a CLIENT over the connected descriptor `fd`, naming `hostname` for SNI and —
+// when the context verifies — for the certificate's hostname check. Blocks until the
+// handshake completes or fails.
+pub fn client_session(read c: Context, read a: Allocator, fd: i64, read hostname: str) -> Session {
+    if c.open == false or c.server { return no_session() }
+    if fd < 0 { return no_session() }
+    let ssl: cptr = SSL_new(c.ctx)
+    if ssl == null { return failed_session(null, TLS_FAILED) }
+    if SSL_set_fd(ssl, fd as i32) != 1 { return failed_session(ssl, TLS_FAILED) }
+    if hostname.len > 0 {
+        var hn: cstring.CString = cstring.from_str(a, hostname)
+        SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, cstring.as_cstr(hn) as cptr)
+        if c.verifying {
+            // The hostname check. Without it a chain to the right CA for the WRONG name
+            // passes, which is the mistake this line exists to make impossible to omit.
+            SSL_set1_host(ssl, cstring.as_cstr(hn))
+        }
+        cstring.free(hn)
+    }
+    if SSL_connect(ssl) != 1 {
+        var o: i32 = TLS_FAILED
+        if c.verifying {
+            if SSL_get_verify_result(ssl) != X509_V_OK { o = TLS_VERIFY_FAILED }
+        }
+        return failed_session(ssl, o)
+    }
+    var verified: bool = false
+    if c.verifying {
+        if SSL_get_verify_result(ssl) == X509_V_OK { verified = true }
+    }
+    return Session{ ssl: ssl, open: true, established: true, verified: verified, outcome: TLS_OK }
+}
+
+// Handshake as a SERVER over the accepted descriptor `fd`. Blocks.
+pub fn server_session(read c: Context, fd: i64) -> Session {
+    if c.open == false or c.server == false { return no_session() }
+    if fd < 0 { return no_session() }
+    let ssl: cptr = SSL_new(c.ctx)
+    if ssl == null { return failed_session(null, TLS_FAILED) }
+    if SSL_set_fd(ssl, fd as i32) != 1 { return failed_session(ssl, TLS_FAILED) }
+    if SSL_accept(ssl) != 1 { return failed_session(ssl, TLS_FAILED) }
+    return Session{ ssl: ssl, open: true, established: true, verified: false, outcome: TLS_OK }
+}
+
+// Write all of `data`. False on any failure; the session is then not to be trusted.
+pub fn write_all(read s: Session, read data: str) -> bool {
+    if s.established == false { return false }
+    var off: usize = 0
+    for off < data.len {
+        let chunk: str = data[off .. data.len]
+        let n: i32 = SSL_write(s.ssl, chunk.ptr as cptr, chunk.len as i32)
+        if n <= 0 { return false }
+        off = off + (n as usize)
+    }
+    return true
+}
+
+// Read into `buf`. Returns the byte count, 0 when the peer shut the session down cleanly,
+// -1 on any failure (a peer that vanished without a close-notify is a failure, not a close —
+// the distinction TLS adds over TCP, and the reason truncation attacks fail).
+pub fn read_into(read s: Session, mut buf: []u8) -> isize {
+    if s.established == false { return 0 - 1 }
+    if buf.len == 0 { return 0 }
+    var scratch: *mut u8 = alloc(u8, buf.len)
+    let n: i32 = SSL_read(s.ssl, scratch as cptr, buf.len as i32)
+    var got: isize = 0 - 1
+    if n > 0 {
+        var i: usize = 0
+        for i < n as usize {
+            var b: u8 = 0
+            unsafe { b = (scratch + i).* }
+            buf[i] = b
+            i = i + 1
+        }
+        got = n as isize
+    } else {
+        // SSL_ERROR_ZERO_RETURN (6) is the clean close; everything else is a failure.
+        if SSL_get_error(s.ssl, n) == 6 { got = 0 }
+    }
+    free_ptr(scratch)
+    return got
+}
+
+// Send close-notify and release the session. The socket is NOT closed — it belongs to
+// whoever opened it, exactly as with `sysnet.adopt`.
+pub fn shutdown(mut s: Session) {
+    if s.open == false { return }
+    if s.established { SSL_shutdown(s.ssl) }
+    SSL_free(s.ssl)
+    s.ssl = null
+    s.open = false
+    s.established = false
+}

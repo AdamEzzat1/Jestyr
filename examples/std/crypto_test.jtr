@@ -1,0 +1,493 @@
+// std/crypto_test.jtr — two hashes held to each other, published vectors, and every way a
+// signature must fail.
+//
+// The module claims four things. Both SHA-256 implementations behind the `Hasher` interface
+// produce the same bytes, and those bytes are the standard's (NIST vectors). `hmac` matches
+// RFC 4231 — including the long-key case, where HMAC hashes the key first and a library
+// that padded instead would still produce SOMETHING. A signature verifies under the right
+// public key from either source and under nothing else: not a message with a flipped byte,
+// not a signature with a flipped byte, not a truncated one, not another key. And every
+// refusal happens before anything is written into a caller's buffer, with OpenSSL's reason
+// attached where the library was the one refusing.
+//
+// The keys come from `fixtures/`: the TLS pair (its private key and its certificate, whose
+// public key is extracted), a `PUBLIC KEY` PEM written from that same key, and a second RSA
+// key minted for the wrong-key case.
+//
+// Run:  jestyrc test examples/std/crypto_test.jtr
+
+import "crypto"
+import "fs"
+import "test"
+import "test_report"
+
+const CR_T_CAP: usize = 16384
+const CR_T_KEY: str = "examples/std/fixtures/tls_test_key.pem"
+const CR_T_CERT: str = "examples/std/fixtures/tls_test_cert.pem"
+const CR_T_PUB: str = "examples/std/fixtures/crypto_test_pub.pem"
+const CR_T_OTHER: str = "examples/std/fixtures/crypto_test_other_key.pem"
+
+// ---- helpers ------------------------------------------------------------------------
+
+fn same_bytes(read a: []u8, read b: []u8) -> bool {
+    if a.len != b.len { return false }
+    var i: usize = 0
+    for i < a.len {
+        if a[i] != b[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Hash `msg` through `h` into `dst`, and render it as hex into `hex`. False if the hasher
+// refused.
+fn hash_hex(mut h: crypto.Hasher, read msg: []u8, mut dst: []u8, mut hex: String) -> bool {
+    if crypto.hash(h, msg, dst) == false { return false }
+    crypto.push_hex(hex, dst[0 .. crypto.digest_len(h)])
+    return true
+}
+
+// `n` bytes of `v`, for the RFC 4231 keys.
+fn fill(mut b: []u8, n: usize, v: u8) {
+    var i: usize = 0
+    for i < n {
+        b[i] = v
+        i = i + 1
+    }
+}
+
+// The HMAC of `msg` under `key` with `alg`, as hex. Empty when the module refused.
+fn hmac_hex(alg: i32, read key: []u8, read msg: []u8, mut hex: String) {
+    var raw: *mut u8 = alloc(u8, 64)
+    var mac: []u8 = slice(u8, raw, 64)
+    let n: usize = crypto.hmac(alg, key, msg, mac) catch 0
+    crypto.push_hex(hex, mac[0 .. n])
+    free_ptr(raw)
+}
+
+// ---- the hash interface -----------------------------------------------------------------
+
+@test fn both_sha256s_agree_and_match_the_standard() -> bool {
+    var raw: *mut u8 = alloc(u8, CR_T_CAP)
+    var rep: []u8 = slice(u8, raw, CR_T_CAP)
+    var c: test.Check = test.new()
+
+    var evp: crypto.Hasher = crypto.evp_hasher(crypto.SHA256)
+    var own: crypto.Hasher = crypto.jestyr_hasher()
+    test.is_true(c, rep, "the OpenSSL hasher opens", crypto.hasher_is_open(evp))
+    test.is_true(c, rep, "the in-language hasher opens", crypto.hasher_is_open(own))
+    test.eq_usize(c, rep, "both are 32-byte digests", crypto.digest_len(evp), crypto.digest_len(own))
+    test.eq_usize(c, rep, "and 32 is 32", crypto.digest_len(evp), 32)
+
+    var r1: *mut u8 = alloc(u8, 64)
+    var d1: []u8 = slice(u8, r1, 64)
+    var r2: *mut u8 = alloc(u8, 64)
+    var d2: []u8 = slice(u8, r2, 64)
+
+    // **NIST: "abc" and the empty message.** Each implementation against the standard, and
+    // then against each other, so a shared mistake would show as a wrong vector and a
+    // divergence would show as a disagreement.
+    var h1: String = string_new()
+    var h2: String = string_new()
+    test.is_true(c, rep, "openssl hashes abc", hash_hex(evp, crypto.as_bytes("abc"), d1, h1))
+    test.is_true(c, rep, "std/sha256 hashes abc", hash_hex(own, crypto.as_bytes("abc"), d2, h2))
+    test.eq_str(c, rep, "openssl: the NIST vector for abc", string_view(h1),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    test.eq_str(c, rep, "std/sha256: the same vector", string_view(h2),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    test.is_true(c, rep, "and the same bytes", same_bytes(d1[0 .. 32], d2[0 .. 32]))
+    string_free(h1)
+    string_free(h2)
+
+    var e1: String = string_new()
+    var e2: String = string_new()
+    let empty: []u8 = crypto.as_bytes("")
+    hash_hex(evp, empty, d1, e1)
+    hash_hex(own, empty, d2, e2)
+    test.eq_str(c, rep, "openssl: the empty message", string_view(e1),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    test.eq_str(c, rep, "std/sha256: the empty message", string_view(e2),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    string_free(e1)
+    string_free(e2)
+
+    // **A multi-block message, fed in uneven pieces to one and whole to the other.** The
+    // padding logic and the block boundary are where a hand-written SHA-256 goes wrong,
+    // and the streaming path is where a binding does.
+    var long: String = string_new()
+    var i: i64 = 0
+    for i < 40 {
+        string_push(long, "the quick brown fox ")
+        i = i + 1
+    }
+    let lb: []u8 = crypto.as_bytes(string_view(long))
+    test.eq_usize(c, rep, "800 bytes: twelve and a half blocks", lb.len, 800)
+    crypto.reset(evp)
+    crypto.update(evp, lb[0 .. 1])
+    crypto.update(evp, lb[1 .. 63])
+    crypto.update(evp, lb[63 .. 64])
+    crypto.update(evp, lb[64 .. 500])
+    crypto.update(evp, lb[500 .. 800])
+    test.is_true(c, rep, "openssl finishes the streamed message", crypto.finish(evp, d1))
+    test.is_true(c, rep, "std/sha256 hashes it whole", crypto.hash(own, lb, d2))
+    test.is_true(c, rep, "streamed and whole agree across implementations", same_bytes(d1[0 .. 32], d2[0 .. 32]))
+    // The other way round too: std/sha256 streamed, openssl whole.
+    crypto.reset(own)
+    crypto.update(own, lb[0 .. 7])
+    crypto.update(own, lb[7 .. 800])
+    test.is_true(c, rep, "std/sha256 finishes the streamed message", crypto.finish(own, d2))
+    crypto.hash(evp, lb, d1)
+    test.is_true(c, rep, "and agrees with openssl whole", same_bytes(d1[0 .. 32], d2[0 .. 32]))
+    string_free(long)
+
+    // SHA-512 through the same interface: the NIST vector, and a 64-byte digest.
+    var h512: crypto.Hasher = crypto.evp_hasher(crypto.SHA512)
+    test.eq_usize(c, rep, "sha512 is 64 bytes", crypto.digest_len(h512), 64)
+    var s5: String = string_new()
+    test.is_true(c, rep, "sha512 hashes abc", hash_hex(h512, crypto.as_bytes("abc"), d1, s5))
+    test.eq_str(c, rep, "the NIST vector for sha512(abc)", string_view(s5),
+        "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+    string_free(s5)
+    crypto.free_hasher(h512)
+
+    crypto.free_hasher(evp)
+    crypto.free_hasher(own)
+    free_ptr(r1)
+    free_ptr(r2)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_hasher_is_fresh_after_finish_and_refuses_what_it_cannot_do() -> bool {
+    var raw: *mut u8 = alloc(u8, CR_T_CAP)
+    var rep: []u8 = slice(u8, raw, CR_T_CAP)
+    var c: test.Check = test.new()
+    var r1: *mut u8 = alloc(u8, 64)
+    var d1: []u8 = slice(u8, r1, 64)
+    var r2: *mut u8 = alloc(u8, 64)
+    var d2: []u8 = slice(u8, r2, 64)
+
+    // **`finish` leaves the hasher fresh**: a second message after it hashes as if the
+    // first never happened, on both implementations.
+    var evp: crypto.Hasher = crypto.evp_hasher(crypto.SHA256)
+    var own: crypto.Hasher = crypto.jestyr_hasher()
+    crypto.hash(evp, crypto.as_bytes("first"), d1)
+    crypto.update_str(evp, "abc")
+    crypto.finish(evp, d1)
+    crypto.hash(own, crypto.as_bytes("abc"), d2)
+    test.is_true(c, rep, "openssl: abc after another message is still abc", same_bytes(d1[0 .. 32], d2[0 .. 32]))
+    crypto.hash(own, crypto.as_bytes("first"), d2)
+    crypto.update_str(own, "abc")
+    crypto.finish(own, d2)
+    crypto.hash(evp, crypto.as_bytes("abc"), d1)
+    test.is_true(c, rep, "std/sha256: the same", same_bytes(d1[0 .. 32], d2[0 .. 32]))
+
+    // **`reset` abandons a half-absorbed message.**
+    crypto.update_str(evp, "garbage")
+    crypto.reset(evp)
+    crypto.update_str(evp, "abc")
+    crypto.finish(evp, d1)
+    test.is_true(c, rep, "reset discards what was absorbed", same_bytes(d1[0 .. 32], d2[0 .. 32]))
+
+    // **A short buffer is refused and left alone.** The digest is 32 bytes; 31 will not do.
+    fill(d1, 64, 170 as u8)
+    crypto.update_str(evp, "abc")
+    test.is_false(c, rep, "finish into 31 bytes refuses", crypto.finish(evp, d1[0 .. 31]))
+    test.eq_i64(c, rep, "and wrote nothing", d1[0] as i64, 170)
+    test.eq_i64(c, rep, "not even at the end", d1[30] as i64, 170)
+    test.is_true(c, rep, "the message is still absorbed: 32 bytes now succeed", crypto.finish(evp, d1))
+    test.is_true(c, rep, "and it is abc", same_bytes(d1[0 .. 32], d2[0 .. 32]))
+
+    // **The in-language hasher is UTF-8 only — the header says so, and it refuses rather
+    // than hashing something else.** OpenSSL's takes any bytes.
+    var rb: *mut u8 = alloc(u8, 4)
+    var bin: []u8 = slice(u8, rb, 4)
+    bin[0] = 255 as u8
+    bin[1] = 254 as u8
+    bin[2] = 0 as u8
+    bin[3] = 1 as u8
+    test.is_true(c, rep, "openssl hashes arbitrary bytes", crypto.hash(evp, bin, d1))
+    test.is_false(c, rep, "std/sha256 refuses bytes that are not UTF-8", crypto.hash(own, bin, d2))
+    test.is_true(c, rep, "and is usable again afterwards", crypto.hash(own, crypto.as_bytes("abc"), d2))
+    free_ptr(rb)
+
+    // **Closed hashers answer false to everything** — what `evp_hasher` of an unknown
+    // algorithm hands back, and what `no_hasher` is.
+    var bad: crypto.Hasher = crypto.evp_hasher(99)
+    test.is_false(c, rep, "an unknown algorithm is a closed hasher", crypto.hasher_is_open(bad))
+    test.eq_usize(c, rep, "with no digest length", crypto.digest_len(bad), 0)
+    test.is_false(c, rep, "update refuses", crypto.update_str(bad, "abc"))
+    test.is_false(c, rep, "finish refuses", crypto.finish(bad, d1))
+    test.is_false(c, rep, "reset refuses", crypto.reset(bad))
+    crypto.free_hasher(evp)
+    test.is_false(c, rep, "a freed hasher is closed", crypto.hasher_is_open(evp))
+    test.is_false(c, rep, "and refuses", crypto.hash(evp, crypto.as_bytes("abc"), d1))
+    test.eq_str(c, rep, "algorithm names", crypto.alg_name(crypto.SHA512), "sha512")
+    test.eq_usize(c, rep, "digest sizes", crypto.digest_size(crypto.SHA512), 64)
+    test.eq_usize(c, rep, "an unknown one is 0", crypto.digest_size(0), 0)
+
+    crypto.free_hasher(own)
+    crypto.free_hasher(bad)
+    free_ptr(r1)
+    free_ptr(r2)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- HMAC ---------------------------------------------------------------------------------
+
+@test fn hmac_matches_rfc_4231_and_verifies_only_the_right_mac() -> bool {
+    var raw: *mut u8 = alloc(u8, CR_T_CAP)
+    var rep: []u8 = slice(u8, raw, CR_T_CAP)
+    var c: test.Check = test.new()
+    var kr: *mut u8 = alloc(u8, 256)
+    var key: []u8 = slice(u8, kr, 256)
+
+    // Case 1: a 20-byte key of 0x0b, "Hi There". SHA-256 and SHA-512.
+    fill(key, 20, 11 as u8)
+    var h1: String = string_new()
+    hmac_hex(crypto.SHA256, key[0 .. 20], crypto.as_bytes("Hi There"), h1)
+    test.eq_str(c, rep, "RFC 4231 case 1, HMAC-SHA256", string_view(h1),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+    string_free(h1)
+    var h1b: String = string_new()
+    hmac_hex(crypto.SHA512, key[0 .. 20], crypto.as_bytes("Hi There"), h1b)
+    test.eq_str(c, rep, "RFC 4231 case 1, HMAC-SHA512", string_view(h1b),
+        "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854")
+    string_free(h1b)
+
+    // Case 2: the key "Jefe" — shorter than the block, so it is padded.
+    var h2: String = string_new()
+    hmac_hex(crypto.SHA256, crypto.as_bytes("Jefe"), crypto.as_bytes("what do ya want for nothing?"), h2)
+    test.eq_str(c, rep, "RFC 4231 case 2", string_view(h2),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+    string_free(h2)
+
+    // **Case 6: a 131-byte key of 0xaa — LONGER than the 64-byte block, so HMAC must hash
+    // it first.** An implementation that truncated or padded would still produce a MAC.
+    fill(key, 131, 170 as u8)
+    var h6: String = string_new()
+    hmac_hex(crypto.SHA256, key[0 .. 131], crypto.as_bytes("Test Using Larger Than Block-Size Key - Hash Key First"), h6)
+    test.eq_str(c, rep, "RFC 4231 case 6, the long key", string_view(h6),
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54")
+    string_free(h6)
+
+    // **Verification.** The right MAC, then one byte flipped at the front, one at the
+    // back, a truncated one, and one under a different key.
+    let msg: []u8 = crypto.as_bytes("what do ya want for nothing?")
+    var mr: *mut u8 = alloc(u8, 64)
+    var mac: []u8 = slice(u8, mr, 64)
+    let n: usize = crypto.hmac(crypto.SHA256, crypto.as_bytes("Jefe"), msg, mac) catch 0
+    test.eq_usize(c, rep, "32 bytes written", n, 32)
+    test.is_true(c, rep, "the right MAC verifies",
+        crypto.hmac_verify(crypto.SHA256, crypto.as_bytes("Jefe"), msg, mac[0 .. 32]) catch false)
+    mac[0] = mac[0] ^ (1 as u8)
+    test.is_false(c, rep, "a bit flipped in the first byte does not",
+        crypto.hmac_verify(crypto.SHA256, crypto.as_bytes("Jefe"), msg, mac[0 .. 32]) catch true)
+    mac[0] = mac[0] ^ (1 as u8)
+    mac[31] = mac[31] ^ (128 as u8)
+    test.is_false(c, rep, "nor in the last byte",
+        crypto.hmac_verify(crypto.SHA256, crypto.as_bytes("Jefe"), msg, mac[0 .. 32]) catch true)
+    mac[31] = mac[31] ^ (128 as u8)
+    test.is_false(c, rep, "a truncated MAC is false, not an error",
+        crypto.hmac_verify(crypto.SHA256, crypto.as_bytes("Jefe"), msg, mac[0 .. 31]) catch true)
+    test.is_false(c, rep, "the wrong key is false",
+        crypto.hmac_verify(crypto.SHA256, crypto.as_bytes("jefe"), msg, mac[0 .. 32]) catch true)
+    test.is_false(c, rep, "the wrong algorithm is false",
+        crypto.hmac_verify(crypto.SHA512, crypto.as_bytes("Jefe"), msg, mac[0 .. 32]) catch true)
+    test.is_true(c, rep, "restored, it verifies again",
+        crypto.hmac_verify(crypto.SHA256, crypto.as_bytes("Jefe"), msg, mac[0 .. 32]) catch false)
+
+    // **Refusals happen before the buffer is touched.** The error is read back through the
+    // extractor (`catch |e| match e`); the sentinels are above any real length.
+    fill(mac, 64, 170 as u8)
+    let small: usize = crypto.hmac(crypto.SHA256, crypto.as_bytes("Jefe"), msg, mac[0 .. 31])
+        catch |e| match e { CryptoTooSmall => 1001, CryptoRefused => 1002, _ => 1003 }
+    test.eq_usize(c, rep, "31 bytes for a 32-byte MAC is too small, and named as such", small, 1001)
+    test.eq_i64(c, rep, "nothing was written", mac[0] as i64, 170)
+    let unknown: usize = crypto.hmac(7, crypto.as_bytes("Jefe"), msg, mac)
+        catch |e| match e { CryptoTooSmall => 1001, CryptoRefused => 1002, _ => 1003 }
+    test.eq_usize(c, rep, "an unknown algorithm is refused", unknown, 1002)
+    test.eq_i64(c, rep, "and wrote nothing either", mac[0] as i64, 170)
+    // `verify` of an unknown algorithm REFUSES rather than answering false: `true` below can
+    // only come from the `CryptoRefused` arm, never from the ok branch.
+    test.is_true(c, rep, "and refused by verify too, rather than answering false",
+        crypto.hmac_verify(7, crypto.as_bytes("Jefe"), msg, mac[0 .. 32]) catch |e| match e { CryptoRefused => true, _ => false })
+
+    free_ptr(mr)
+    free_ptr(kr)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- signatures ------------------------------------------------------------------------------
+
+@test fn a_signature_verifies_under_the_matching_public_key_and_nothing_else() -> bool {
+    var raw: *mut u8 = alloc(u8, CR_T_CAP)
+    var rep: []u8 = slice(u8, raw, CR_T_CAP)
+    var c: test.Check = test.new()
+    var h: fs.Fs = fs.host()
+
+    var priv: crypto.Key = crypto.load_private_key(h, CR_T_KEY)
+    var from_cert: crypto.Key = crypto.load_cert_public_key(h, CR_T_CERT)
+    var from_pem: crypto.Key = crypto.load_public_key(h, CR_T_PUB)
+    var other: crypto.Key = crypto.load_private_key(h, CR_T_OTHER)
+    test.is_true(c, rep, "the private key loads", crypto.key_is_open(priv))
+    test.is_true(c, rep, "and is private", crypto.is_private(priv))
+    test.is_true(c, rep, "the certificate's public key loads", crypto.key_is_open(from_cert))
+    test.is_false(c, rep, "and is not private", crypto.is_private(from_cert))
+    test.is_true(c, rep, "the PUBLIC KEY pem loads", crypto.key_is_open(from_pem))
+    test.is_true(c, rep, "the other private key loads", crypto.key_is_open(other))
+    test.eq_usize(c, rep, "a 2048-bit RSA key signs in 256 bytes", crypto.signature_len(priv), 256)
+    test.eq_usize(c, rep, "the public half says the same", crypto.signature_len(from_cert), 256)
+
+    let msg: []u8 = crypto.as_bytes("sign me, then try to change me")
+    var sr: *mut u8 = alloc(u8, 256)
+    var sig: []u8 = slice(u8, sr, 256)
+    let n: usize = crypto.sign(priv, crypto.SHA256, msg, sig) catch 0
+    test.eq_usize(c, rep, "the signature is 256 bytes", n, 256)
+
+    // **Deterministic**: PKCS#1 v1.5 signs the same message to the same bytes. What lets
+    // the demo's transcript be pinned, and a claim the header makes.
+    var s2r: *mut u8 = alloc(u8, 256)
+    var sig2: []u8 = slice(u8, s2r, 256)
+    crypto.sign(priv, crypto.SHA256, msg, sig2) catch 0
+    test.is_true(c, rep, "signing twice gives the same bytes", same_bytes(sig, sig2))
+
+    // **Verifies under the public key from either source, and under the private key's own
+    // public half.**
+    test.is_true(c, rep, "verifies under the certificate's key",
+        crypto.verify(from_cert, crypto.SHA256, msg, sig) catch false)
+    test.is_true(c, rep, "verifies under the PUBLIC KEY pem",
+        crypto.verify(from_pem, crypto.SHA256, msg, sig) catch false)
+    test.is_true(c, rep, "verifies under the private key itself",
+        crypto.verify(priv, crypto.SHA256, msg, sig) catch false)
+
+    // **And under nothing else.** Each case is one change from the passing one.
+    var tm: String = string_new()
+    string_push(tm, "sign me, then try to change mE")
+    test.is_false(c, rep, "one byte changed in the message",
+        crypto.verify(from_cert, crypto.SHA256, crypto.as_bytes(string_view(tm)), sig) catch true)
+    string_free(tm)
+    sig[100] = sig[100] ^ (1 as u8)
+    test.is_false(c, rep, "one bit flipped in the signature",
+        crypto.verify(from_cert, crypto.SHA256, msg, sig) catch true)
+    sig[100] = sig[100] ^ (1 as u8)
+    test.is_true(c, rep, "restored, it verifies",
+        crypto.verify(from_cert, crypto.SHA256, msg, sig) catch false)
+    test.is_false(c, rep, "a truncated signature",
+        crypto.verify(from_cert, crypto.SHA256, msg, sig[0 .. 255]) catch true)
+    test.is_false(c, rep, "an empty signature",
+        crypto.verify(from_cert, crypto.SHA256, msg, sig[0 .. 0]) catch true)
+    test.is_false(c, rep, "a key that did not sign it",
+        crypto.verify(other, crypto.SHA256, msg, sig) catch true)
+    test.is_false(c, rep, "the right key, the wrong digest",
+        crypto.verify(from_cert, crypto.SHA512, msg, sig) catch true)
+    // A rejected signature must not leave OpenSSL's reason behind for the next caller.
+    var stale: String = string_new()
+    crypto.last_error(stale)
+    test.eq_str(c, rep, "a refused verify leaves no stale error behind", string_view(stale), "")
+    string_free(stale)
+
+    // SHA-512 signs and verifies through the same calls.
+    let n5: usize = crypto.sign(priv, crypto.SHA512, msg, sig) catch 0
+    test.eq_usize(c, rep, "sha512 signs", n5, 256)
+    test.is_true(c, rep, "and verifies", crypto.verify(from_pem, crypto.SHA512, msg, sig) catch false)
+    test.is_false(c, rep, "but not as sha256", crypto.verify(from_pem, crypto.SHA256, msg, sig) catch true)
+
+    crypto.free_key(priv)
+    crypto.free_key(from_cert)
+    crypto.free_key(from_pem)
+    crypto.free_key(other)
+    free_ptr(sr)
+    free_ptr(s2r)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn refusals_come_first_and_the_library_says_why() -> bool {
+    var raw: *mut u8 = alloc(u8, CR_T_CAP)
+    var rep: []u8 = slice(u8, raw, CR_T_CAP)
+    var c: test.Check = test.new()
+    var h: fs.Fs = fs.host()
+
+    // **A file that is not a key fails at LOAD, with OpenSSL's reason attached.**
+    var scratch: String = string_new()
+    crypto.last_error(scratch)
+    string_free(scratch)
+    var bad: crypto.Key = crypto.private_key_from_pem("-----BEGIN PRIVATE KEY-----\nnot a key\n-----END PRIVATE KEY-----\n")
+    test.is_false(c, rep, "garbage in a PEM wrapper is a closed key", crypto.key_is_open(bad))
+    var why: String = string_new()
+    crypto.last_error(why)
+    test.is_true(c, rep, "and the library said why", string_view(why).len > 0)
+    string_free(why)
+    var missing: crypto.Key = crypto.load_private_key(h, "examples/std/fixtures/zz_no_such_key.pem")
+    test.is_false(c, rep, "a missing file is a closed key", crypto.key_is_open(missing))
+    var wrong_kind: crypto.Key = crypto.load_public_key(h, CR_T_KEY)
+    test.is_false(c, rep, "a private key is not a PUBLIC KEY", crypto.key_is_open(wrong_kind))
+    var not_cert: crypto.Key = crypto.load_cert_public_key(h, CR_T_PUB)
+    test.is_false(c, rep, "a PUBLIC KEY is not a CERTIFICATE", crypto.key_is_open(not_cert))
+    var empty: crypto.Key = crypto.private_key_from_pem("")
+    test.is_false(c, rep, "empty text is a closed key", crypto.key_is_open(empty))
+    test.eq_usize(c, rep, "with no signature length", crypto.signature_len(empty), 0)
+
+    // **A capability that cannot read reaches no file**, and counts the attempt.
+    var d: fs.Fs = fs.denied()
+    var denied: crypto.Key = crypto.load_private_key(d, CR_T_KEY)
+    test.is_false(c, rep, "a denied handle yields a closed key", crypto.key_is_open(denied))
+    test.eq_i64(c, rep, "and the refusal was counted", fs.refused(d), 1)
+    test.eq_i64(c, rep, "with no read", fs.reads(d), 0)
+
+    // **The wrong kind of key, the wrong buffer, the wrong algorithm — each refused by
+    // name, before anything is written.**
+    var priv: crypto.Key = crypto.load_private_key(h, CR_T_KEY)
+    var pubk: crypto.Key = crypto.load_cert_public_key(h, CR_T_CERT)
+    let msg: []u8 = crypto.as_bytes("x")
+    var sr: *mut u8 = alloc(u8, 256)
+    var sig: []u8 = slice(u8, sr, 256)
+    fill(sig, 256, 170 as u8)
+    // Sentinels above any real signature length, one per error, read through the extractor.
+    test.eq_usize(c, rep, "a public key cannot sign",
+        crypto.sign(pubk, crypto.SHA256, msg, sig) catch |e| match e { CryptoRefused => 1002, CryptoTooSmall => 1001, _ => 1003 }, 1002)
+    test.eq_usize(c, rep, "nor can a closed key",
+        crypto.sign(empty, crypto.SHA256, msg, sig) catch |e| match e { CryptoRefused => 1002, CryptoTooSmall => 1001, _ => 1003 }, 1002)
+    test.eq_usize(c, rep, "nor with an unknown algorithm",
+        crypto.sign(priv, 7, msg, sig) catch |e| match e { CryptoRefused => 1002, CryptoTooSmall => 1001, _ => 1003 }, 1002)
+    test.eq_usize(c, rep, "255 bytes for a 256-byte signature is too small",
+        crypto.sign(priv, crypto.SHA256, msg, sig[0 .. 255]) catch |e| match e { CryptoRefused => 1002, CryptoTooSmall => 1001, _ => 1003 }, 1001)
+    test.eq_i64(c, rep, "and nothing was written", sig[0] as i64, 170)
+    test.eq_i64(c, rep, "anywhere", sig[254] as i64, 170)
+    // `true` below can only come from the `CryptoRefused` arm: a verify that ran answers
+    // false for this garbage, and a refusal is what the closed key and the unknown
+    // algorithm must produce instead.
+    test.is_true(c, rep, "verify with a closed key is refused, not false",
+        crypto.verify(empty, crypto.SHA256, msg, sig) catch |e| match e { CryptoRefused => true, _ => false })
+    test.is_true(c, rep, "verify with an unknown algorithm is refused",
+        crypto.verify(pubk, 7, msg, sig) catch |e| match e { CryptoRefused => true, _ => false })
+    test.is_false(c, rep, "the control: a verify that RUNS on this garbage answers false",
+        crypto.verify(pubk, crypto.SHA256, msg, sig) catch |e| match e { CryptoRefused => true, _ => true })
+    // The control: the same buffer, the right key, the right size — accepted.
+    let n: usize = crypto.sign(priv, crypto.SHA256, msg, sig) catch 0
+    test.eq_usize(c, rep, "the control signs", n, 256)
+    test.is_true(c, rep, "and verifies", crypto.verify(pubk, crypto.SHA256, msg, sig) catch false)
+
+    // Freeing is idempotent and leaves a closed key.
+    crypto.free_key(priv)
+    test.is_false(c, rep, "a freed key is closed", crypto.key_is_open(priv))
+    crypto.free_key(priv)
+    crypto.free_key(pubk)
+    crypto.free_key(bad)
+    crypto.free_key(missing)
+    crypto.free_key(wrong_kind)
+    crypto.free_key(not_cert)
+    crypto.free_key(empty)
+    crypto.free_key(denied)
+    free_ptr(sr)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

@@ -1,0 +1,628 @@
+// std/kv_test.jtr — the crash and rewrite claims, checked rather than described.
+//
+// The module claims three things: a reopened store holds exactly the completed writes; a
+// batch is whole or absent; and a compaction, migration or snapshot cannot damage the store
+// it reads. So this suite CUTS a store file mid-record, hands the module files that are not
+// stores, and compares every value across each rewrite — because a recovery path that is
+// never exercised is a recovery path that does not work, and a rewrite whose output is never
+// compared to its input is a rewrite that can lose a key silently.
+//
+// Everything runs against real files in the working directory, scrubbed at both ends, for
+// `std/alog`'s reason: the module exists to sit on a filesystem and a mock proves nothing.
+//
+// Run:  jestyrc test examples/std/kv_test.jtr
+
+import "alog"
+import "file"
+import "fs"
+import "kv"
+import "mem"
+import "test"
+import "test_report"
+
+const KV_T_CAP: usize = 16384
+const KV_T_PATH: str = "zz_kv_scratch.db"
+const KV_T_SNAP: str = "zz_kv_snapshot.db"
+
+// ---- helpers ------------------------------------------------------------------
+
+fn nothing() { }
+
+fn scrub(mut h: fs.Fs) {
+    fs.erase(h, KV_T_PATH)
+    fs.erase(h, "zz_kv_scratch.db.compact")
+    fs.erase(h, "zz_kv_scratch.db.migrate")
+    fs.erase(h, KV_T_SNAP)
+    fs.erase(h, "zz_kv_snapshot.db.part")
+}
+
+fn file_size(read a: Allocator, read p: str) -> i64 {
+    var r: file.Reader = file.open_path(a, p)
+    if file.is_open(r) == false { return 0 - 1 }
+    let n: i64 = file.size(r)
+    file.close(r)
+    return n
+}
+
+// Cut `n` bytes off the end of the file — what a crash mid-record leaves behind.
+fn cut_tail(read a: Allocator, read p: str, n: i64) -> bool {
+    let sz: i64 = file_size(a, p)
+    if sz < n { return false }
+    return file.truncate_path(a, p, sz - n)
+}
+
+// Append `n` bytes of `v` outside the module — a torn write.
+fn append_raw(read a: Allocator, read p: str, n: usize, v: u8) {
+    var b: *mut u8 = alloc(u8, n)
+    var bs: []u8 = slice(u8, b, n)
+    var i: usize = 0
+    for i < n {
+        bs[i] = v
+        i = i + 1
+    }
+    var w: file.Writer = file.append_path(a, p)
+    file.write_from(w, bs)
+    let k: usize = file.finish(w) catch 0
+    free_ptr(b)
+}
+
+// The migration step used below: drop one key, shout the rest.
+fn shout(read key: str, read val: str, mut dst: String) -> i32 {
+    if str_eq(key, "drop-me") { return kv.MIGRATE_DROP }
+    if str_eq(key, "as-is") { return kv.MIGRATE_KEEP }
+    string_push(dst, val)
+    string_push(dst, "!")
+    return kv.MIGRATE_REPLACE
+}
+
+// A step that keeps everything, for a migration whose only effect is the schema number.
+fn keep_all(read key: str, read val: str, mut dst: String) -> i32 {
+    return kv.MIGRATE_KEEP
+}
+
+// ---- the round trip -------------------------------------------------------------
+
+@test fn puts_deletes_and_overwrites_survive_a_reopen() -> bool {
+    var raw: *mut u8 = alloc(u8, KV_T_CAP)
+    var rep: []u8 = slice(u8, raw, KV_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h)
+
+    var s: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s) catch nothing()
+    test.is_true(c, rep, "a fresh store opens", kv.is_open(s))
+    test.eq_i64(c, rep, "and is empty", kv.len(s), 0)
+    test.eq_i64(c, rep, "at schema 0", kv.schema(s), 0)
+    test.eq_i64(c, rep, "holding only its HEAD record", kv.records(s), 1)
+    test.is_false(c, rep, "an absent key is absent", kv.has(s, "none"))
+    test.eq_str(c, rep, "and reads as empty", kv.get(s, "none"), "")
+
+    kv.put(s, "alpha", "1") catch nothing()
+    kv.put(s, "beta", "two") catch nothing()
+    kv.put(s, "gamma", "") catch nothing()
+    test.eq_i64(c, rep, "three keys", kv.len(s), 3)
+    test.eq_str(c, rep, "alpha reads back", kv.get(s, "alpha"), "1")
+    test.eq_str(c, rep, "beta reads back", kv.get(s, "beta"), "two")
+    // **An empty value is a value.** `has` is what separates it from absence, and a store
+    // that used the empty string as its absent marker could not hold one.
+    test.is_true(c, rep, "an empty value is present", kv.has(s, "gamma"))
+    test.eq_str(c, rep, "and reads as empty", kv.get(s, "gamma"), "")
+
+    // An overwrite keeps the count and grows the dead byte figure by exactly what it
+    // superseded — key and value of the OLD entry.
+    kv.put(s, "alpha", "one") catch nothing()
+    test.eq_i64(c, rep, "an overwrite keeps the count", kv.len(s), 3)
+    test.eq_str(c, rep, "and the new value wins", kv.get(s, "alpha"), "one")
+    test.eq_i64(c, rep, "the old entry is now dead weight", kv.dead_bytes(s), 6)
+    test.eq_i64(c, rep, "live bytes count the survivors", kv.live_bytes(s), 8 + 7 + 5)
+
+    test.is_true(c, rep, "deleting a present key answers true", kv.del(s, "beta") catch false)
+    test.is_false(c, rep, "deleting it again answers false", kv.del(s, "beta") catch true)
+    test.is_false(c, rep, "and it is gone", kv.has(s, "beta"))
+    test.eq_i64(c, rep, "two keys remain", kv.len(s), 2)
+    // The absent delete wrote nothing: HEAD + 4 puts + 1 del.
+    test.eq_i64(c, rep, "an absent delete is not a record", kv.records(s), 6)
+
+    kv.sync(s) catch nothing()
+    kv.close(s)
+    test.is_false(c, rep, "closed", kv.is_open(s))
+    test.eq_i64(c, rep, "a closed store is an empty one", kv.len(s), 0)
+
+    // **The reopen is the assertion.** Everything above could be true of a map that never
+    // touched the disk; this is what says the log holds it.
+    var s2: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s2) catch nothing()
+    test.is_true(c, rep, "reopens", kv.is_open(s2))
+    test.eq_i64(c, rep, "with the two keys", kv.len(s2), 2)
+    test.eq_str(c, rep, "alpha is the overwritten value", kv.get(s2, "alpha"), "one")
+    test.is_false(c, rep, "beta stayed deleted", kv.has(s2, "beta"))
+    test.is_true(c, rep, "gamma's empty value survived", kv.has(s2, "gamma"))
+    test.eq_i64(c, rep, "the replay counted the same dead bytes", kv.dead_bytes(s2), 6 + 7)
+    test.eq_i64(c, rep, "and the same records", kv.records(s2), 6)
+    kv.close(s2)
+
+    scrub(h)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- atomicity --------------------------------------------------------------------
+
+@test fn a_batch_lands_whole_or_not_at_all() -> bool {
+    var raw: *mut u8 = alloc(u8, KV_T_CAP)
+    var rep: []u8 = slice(u8, raw, KV_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h)
+
+    var s: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s) catch nothing()
+    kv.put(s, "a", "old") catch nothing()
+
+    // Order within a batch: the later operation wins. Put-then-delete leaves nothing;
+    // delete-then-put leaves the put.
+    var b: kv.Batch = kv.batch()
+    test.is_true(c, rep, "a put joins the batch", kv.batch_put(b, "b", "B"))
+    test.is_true(c, rep, "a delete joins the batch", kv.batch_del(b, "a"))
+    test.is_true(c, rep, "so does a put of the same key", kv.batch_put(b, "a", "new"))
+    test.is_true(c, rep, "and a key that is put then deleted", kv.batch_put(b, "tmp", "x"))
+    kv.batch_del(b, "tmp")
+    test.is_false(c, rep, "an empty key is refused", kv.batch_put(b, "", "x"))
+    test.eq_i64(c, rep, "five operations", kv.batch_len(b), 5)
+    kv.commit(s, b) catch nothing()
+    test.eq_i64(c, rep, "the batch is empty after commit", kv.batch_len(b), 0)
+    test.eq_str(c, rep, "b landed", kv.get(s, "b"), "B")
+    test.eq_str(c, rep, "delete-then-put leaves the put", kv.get(s, "a"), "new")
+    test.is_false(c, rep, "put-then-delete leaves nothing", kv.has(s, "tmp"))
+    test.eq_i64(c, rep, "two keys", kv.len(s), 2)
+    test.eq_i64(c, rep, "one record for the whole batch", kv.records(s), 3)
+
+    // An empty batch is not a record.
+    kv.commit(s, b) catch nothing()
+    test.eq_i64(c, rep, "an empty commit writes nothing", kv.records(s), 3)
+
+    // **The crash.** A batch of three, then the file loses its last three bytes — a process
+    // killed with the record's tail still in a buffer. The log's frame refuses the torn
+    // record, and because the batch IS the record, all three keys are gone together.
+    kv.batch_put(b, "x", "1")
+    kv.batch_put(b, "y", "2")
+    kv.batch_put(b, "z", "3")
+    kv.commit(s, b) catch nothing()
+    test.eq_str(c, rep, "before the crash, z is there", kv.get(s, "z"), "3")
+    kv.close(s)
+    test.is_true(c, rep, "the tail is cut", cut_tail(a, KV_T_PATH, 3))
+
+    var s2: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s2) catch nothing()
+    test.is_true(c, rep, "the store reopens after the crash", kv.is_open(s2))
+    test.is_false(c, rep, "x is not there", kv.has(s2, "x"))
+    test.is_false(c, rep, "y is not there", kv.has(s2, "y"))
+    test.is_false(c, rep, "z is not there", kv.has(s2, "z"))
+    test.eq_str(c, rep, "the earlier batch is untouched", kv.get(s2, "a"), "new")
+    test.eq_i64(c, rep, "two keys", kv.len(s2), 2)
+    // **The control.** The same batch, uncut, reopens with all three — so the assertions
+    // above are about the cut and not about batches failing to persist.
+    kv.batch_put(b, "x", "1")
+    kv.batch_put(b, "y", "2")
+    kv.batch_put(b, "z", "3")
+    kv.commit(s2, b) catch nothing()
+    kv.close(s2)
+    var s3: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s3) catch nothing()
+    test.eq_i64(c, rep, "uncut, all three land", kv.len(s3), 5)
+    test.eq_str(c, rep, "and z reads", kv.get(s3, "z"), "3")
+    kv.close(s3)
+
+    scrub(h)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_torn_single_write_loses_only_itself() -> bool {
+    var raw: *mut u8 = alloc(u8, KV_T_CAP)
+    var rep: []u8 = slice(u8, raw, KV_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h)
+
+    var s: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s) catch nothing()
+    kv.put(s, "keep", "me") catch nothing()
+    kv.put(s, "also", "me") catch nothing()
+    kv.close(s)
+    // Seven bytes of a frame that promised sixteen.
+    append_raw(a, KV_T_PATH, 7, 255 as u8)
+
+    var s2: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s2) catch nothing()
+    test.is_true(c, rep, "opens", kv.is_open(s2))
+    test.eq_i64(c, rep, "both complete writes survive", kv.len(s2), 2)
+    test.eq_str(c, rep, "keep", kv.get(s2, "keep"), "me")
+    // Writing after recovery must produce a readable store — the truncation is what makes
+    // the next record land where the torn bytes were rather than after them.
+    kv.put(s2, "after", "recovery") catch nothing()
+    kv.close(s2)
+    var s3: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s3) catch nothing()
+    test.eq_i64(c, rep, "three keys after a post-recovery write", kv.len(s3), 3)
+    test.eq_str(c, rep, "and the new one reads", kv.get(s3, "after"), "recovery")
+    kv.close(s3)
+
+    scrub(h)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- the rewrites -------------------------------------------------------------------
+
+@test fn compaction_keeps_every_live_value_and_reclaims_the_rest() -> bool {
+    var raw: *mut u8 = alloc(u8, KV_T_CAP)
+    var rep: []u8 = slice(u8, raw, KV_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h)
+
+    var s: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s) catch nothing()
+    // Twenty overwrites of one key, two other keys, one deletion: a log with far more
+    // records than live entries.
+    var i: i64 = 0
+    for i < 20 {
+        kv.put(s, "counter", "tick") catch nothing()
+        i = i + 1
+    }
+    kv.put(s, "counter", "final") catch nothing()
+    kv.put(s, "name", "jestyr") catch nothing()
+    kv.put(s, "doomed", "x") catch nothing()
+    kv.del(s, "doomed") catch false
+    test.eq_i64(c, rep, "two live keys", kv.len(s), 2)
+    test.eq_i64(c, rep, "twenty-five records", kv.records(s), 25)
+    test.is_true(c, rep, "with dead bytes to reclaim", kv.dead_bytes(s) > 0)
+    // Synced first: appends sit in the C library's buffer until a sync or a close, so the
+    // size on disk lags the log until then, and "before" would otherwise be measured small.
+    kv.sync(s) catch nothing()
+    let before: i64 = file_size(a, KV_T_PATH)
+
+    let n: i64 = kv.compact(h, a, s) catch 0 - 1
+    test.eq_i64(c, rep, "the compaction wrote the two live entries", n, 2)
+    test.is_true(c, rep, "the store is still open", kv.is_open(s))
+    test.eq_i64(c, rep, "no dead bytes remain", kv.dead_bytes(s), 0)
+    test.eq_i64(c, rep, "records are HEAD plus one per key", kv.records(s), 3)
+    test.eq_i64(c, rep, "the schema is unchanged", kv.schema(s), 0)
+    test.eq_str(c, rep, "counter is its last value", kv.get(s, "counter"), "final")
+    test.eq_str(c, rep, "name is intact", kv.get(s, "name"), "jestyr")
+    test.is_false(c, rep, "the deleted key did not come back", kv.has(s, "doomed"))
+    test.is_true(c, rep, "the file shrank", file_size(a, KV_T_PATH) < before)
+    test.is_false(c, rep, "no temporary was left behind", fs.present(h, "zz_kv_scratch.db.compact"))
+
+    // Writes after a compaction go into the NEW file, and a reopen sees both halves.
+    kv.put(s, "later", "yes") catch nothing()
+    kv.close(s)
+    var s2: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s2) catch nothing()
+    test.eq_i64(c, rep, "reopened with three keys", kv.len(s2), 3)
+    test.eq_str(c, rep, "counter", kv.get(s2, "counter"), "final")
+    test.eq_str(c, rep, "later", kv.get(s2, "later"), "yes")
+    test.eq_i64(c, rep, "four records", kv.records(s2), 4)
+    kv.close(s2)
+
+    scrub(h)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_migration_moves_the_values_and_the_schema_together() -> bool {
+    var raw: *mut u8 = alloc(u8, KV_T_CAP)
+    var rep: []u8 = slice(u8, raw, KV_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h)
+
+    var s: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s) catch nothing()
+    kv.put(s, "greet", "hello") catch nothing()
+    kv.put(s, "as-is", "untouched") catch nothing()
+    kv.put(s, "drop-me", "gone") catch nothing()
+
+    // **Backwards and sideways are refused.** A migration that re-ran at its own target
+    // would shout twice; the check is what makes "migrate on every start-up" safe.
+    test.eq_i64(c, rep, "migrating to the current schema is refused",
+        kv.migrate(h, a, s, 0, &shout) catch 0 - 1, 0 - 1)
+    test.eq_str(c, rep, "and changed nothing", kv.get(s, "greet"), "hello")
+
+    let n: i64 = kv.migrate(h, a, s, 3, &shout) catch 0 - 1
+    test.eq_i64(c, rep, "two entries written (one dropped)", n, 2)
+    test.eq_i64(c, rep, "the schema moved", kv.schema(s), 3)
+    test.eq_str(c, rep, "a replaced value", kv.get(s, "greet"), "hello!")
+    test.eq_str(c, rep, "a kept value", kv.get(s, "as-is"), "untouched")
+    test.is_false(c, rep, "a dropped key", kv.has(s, "drop-me"))
+    test.eq_i64(c, rep, "two keys", kv.len(s), 2)
+    test.is_false(c, rep, "no temporary left", fs.present(h, "zz_kv_scratch.db.migrate"))
+
+    // The schema is in the file, not in the handle: a reopen reports it.
+    kv.close(s)
+    var s2: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s2) catch nothing()
+    test.eq_i64(c, rep, "the reopened store is at schema 3", kv.schema(s2), 3)
+    test.eq_str(c, rep, "with the migrated value", kv.get(s2, "greet"), "hello!")
+    test.eq_i64(c, rep, "now 3 is the floor", kv.migrate(h, a, s2, 2, &keep_all) catch 0 - 1, 0 - 1)
+    test.eq_i64(c, rep, "and 4 is a step", kv.migrate(h, a, s2, 4, &keep_all) catch 0 - 1, 2)
+    test.eq_i64(c, rep, "at 4", kv.schema(s2), 4)
+    kv.close(s2)
+
+    scrub(h)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_snapshot_is_a_store_of_its_own_and_leaves_the_original_alone() -> bool {
+    var raw: *mut u8 = alloc(u8, KV_T_CAP)
+    var rep: []u8 = slice(u8, raw, KV_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h)
+
+    var s: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s) catch nothing()
+    kv.put(s, "k1", "v1") catch nothing()
+    kv.put(s, "k1", "v1b") catch nothing()
+    kv.put(s, "k2", "v2") catch nothing()
+    kv.migrate(h, a, s, 7, &keep_all) catch 0 - 1
+    kv.put(s, "k3", "v3") catch nothing()
+    kv.put(s, "k3", "v3b") catch nothing()
+    let records_before: i64 = kv.records(s)
+    let dead_before: i64 = kv.dead_bytes(s)
+
+    let n: i64 = kv.snapshot(h, a, s, KV_T_SNAP) catch 0 - 1
+    test.eq_i64(c, rep, "three entries in the snapshot", n, 3)
+    test.is_false(c, rep, "no .part left", fs.present(h, "zz_kv_snapshot.db.part"))
+    test.eq_i64(c, rep, "the original's records are untouched", kv.records(s), records_before)
+    test.eq_i64(c, rep, "and its dead bytes", kv.dead_bytes(s), dead_before)
+
+    // The snapshot opens as a store: same keys, same values, same schema, no dead bytes.
+    var b: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_SNAP, b) catch nothing()
+    test.is_true(c, rep, "the snapshot opens", kv.is_open(b))
+    test.eq_i64(c, rep, "at the same schema", kv.schema(b), 7)
+    test.eq_i64(c, rep, "with three keys", kv.len(b), 3)
+    test.eq_str(c, rep, "k1", kv.get(b, "k1"), "v1b")
+    test.eq_str(c, rep, "k3", kv.get(b, "k3"), "v3b")
+    test.eq_i64(c, rep, "compact by construction", kv.dead_bytes(b), 0)
+    test.eq_i64(c, rep, "HEAD plus three", kv.records(b), 4)
+
+    // The two are independent files: writing to one does not reach the other.
+    kv.put(b, "only-in-backup", "yes") catch nothing()
+    test.is_false(c, rep, "the original does not see it", kv.has(s, "only-in-backup"))
+    kv.close(b)
+    kv.close(s)
+
+    scrub(h)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn iteration_visits_live_entries_in_write_order() -> bool {
+    var raw: *mut u8 = alloc(u8, KV_T_CAP)
+    var rep: []u8 = slice(u8, raw, KV_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h)
+
+    var s: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s) catch nothing()
+    kv.put(s, "a", "1") catch nothing()
+    kv.put(s, "b", "2") catch nothing()
+    kv.put(s, "c", "3") catch nothing()
+    kv.put(s, "a", "4") catch nothing()          // a moves to the end
+    kv.del(s, "b") catch false                    // b leaves
+    test.eq_usize(c, rep, "four slots were written", kv.slots(s), 4)
+    var seen: String = string_new()
+    var i: usize = 0
+    for i < kv.slots(s) {
+        if kv.slot_live(s, i) {
+            string_push(seen, kv.slot_key(s, i))
+            string_push(seen, "=")
+            string_push(seen, kv.slot_val(s, i))
+            string_push(seen, ";")
+        }
+        i = i + 1
+    }
+    test.eq_str(c, rep, "live entries in order of last write", string_view(seen), "c=3;a=4;")
+
+    // After a compaction the dead slots are gone and the order is preserved.
+    kv.compact(h, a, s) catch 0 - 1
+    test.eq_usize(c, rep, "two slots after compaction", kv.slots(s), 2)
+    test.eq_str(c, rep, "first", kv.slot_key(s, 0), "c")
+    test.eq_str(c, rep, "second", kv.slot_key(s, 1), "a")
+    test.eq_str(c, rep, "with its value", kv.slot_val(s, 1), "4")
+    kv.close(s)
+
+    string_free(seen)
+    scrub(h)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- refusals -------------------------------------------------------------------------
+
+@test fn a_file_that_is_not_a_store_is_refused_and_left_alone() -> bool {
+    var raw: *mut u8 = alloc(u8, KV_T_CAP)
+    var rep: []u8 = slice(u8, raw, KV_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h)
+
+    // A perfectly good LOG whose first record is not a HEAD: someone else's file.
+    var l: alog.Log = alog.open(h, a, KV_T_PATH) catch alog.closed()
+    var pb: *mut u8 = alloc(u8, 16)
+    var pbuf: []u8 = slice(u8, pb, 16)
+    pbuf[0] = 104 as u8
+    pbuf[1] = 105 as u8
+    alog.append(l, pbuf[0 .. 2]) catch 0 - 1
+    alog.close(l) catch nothing()
+    let before: i64 = file_size(a, KV_T_PATH)
+
+    var s: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s) catch nothing()
+    test.is_false(c, rep, "a stranger's log is not adopted", kv.is_open(s))
+    // **Refused means untouched.** Appending a HEAD would have made the file claim to be
+    // a store while still starting with a record no store wrote.
+    test.eq_i64(c, rep, "and not written to", file_size(a, KV_T_PATH), before)
+
+    // A HEAD from a future format: the same refusal, for a different reason.
+    scrub(h)
+    var l2: alog.Log = alog.open(h, a, KV_T_PATH) catch alog.closed()
+    pbuf[0] = 1 as u8
+    pbuf[1] = 74 as u8
+    pbuf[2] = 75 as u8
+    pbuf[3] = 86 as u8
+    pbuf[4] = 2 as u8                              // format 2 — this module writes 1
+    pbuf[5] = 0 as u8
+    pbuf[6] = 0 as u8
+    pbuf[7] = 0 as u8
+    pbuf[8] = 0 as u8
+    alog.append(l2, pbuf[0 .. 9]) catch 0 - 1
+    alog.close(l2) catch nothing()
+    let before2: i64 = file_size(a, KV_T_PATH)
+    var s2: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s2) catch nothing()
+    test.is_false(c, rep, "a newer format is refused", kv.is_open(s2))
+    test.eq_i64(c, rep, "and left alone", file_size(a, KV_T_PATH), before2)
+
+    // The control: the same HEAD at format 1 with schema 5 opens, at schema 5.
+    scrub(h)
+    var l3: alog.Log = alog.open(h, a, KV_T_PATH) catch alog.closed()
+    pbuf[4] = 1 as u8
+    pbuf[5] = 5 as u8
+    alog.append(l3, pbuf[0 .. 9]) catch 0 - 1
+    alog.close(l3) catch nothing()
+    var s3: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s3) catch nothing()
+    test.is_true(c, rep, "the current format opens", kv.is_open(s3))
+    test.eq_i64(c, rep, "and the schema is read from the HEAD", kv.schema(s3), 5)
+    kv.close(s3)
+
+    free_ptr(pb)
+    scrub(h)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_capability_that_cannot_write_reaches_no_disk() -> bool {
+    var raw: *mut u8 = alloc(u8, KV_T_CAP)
+    var rep: []u8 = slice(u8, raw, KV_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h)
+
+    // `open` recovers, and recovery can truncate, so it needs write permission even for a
+    // caller who means only to read — the position `alog` takes.
+    var ro: fs.Fs = fs.read_only()
+    var s0: kv.Store = kv.closed()
+    kv.open(ro, a, KV_T_PATH, s0) catch nothing()
+    test.is_false(c, rep, "read-only opens nothing", kv.is_open(s0))
+    test.is_false(c, rep, "and created nothing", fs.present(h, KV_T_PATH))
+
+    // A closed store refuses every write by type rather than crashing through a dead
+    // handle — what makes `open(...) catch closed()` survivable.
+    var put_refused: bool = false
+    kv.put(s0, "k", "v") catch { put_refused = true }
+    test.is_true(c, rep, "put on a closed store refuses", put_refused)
+    var b: kv.Batch = kv.batch()
+    kv.batch_put(b, "k", "v")
+    var commit_refused: bool = false
+    kv.commit(s0, b) catch { commit_refused = true }
+    test.is_true(c, rep, "commit on a closed store refuses", commit_refused)
+    test.eq_i64(c, rep, "compact on a closed store refuses", kv.compact(h, a, s0) catch 0 - 9, 0 - 9)
+
+    // A snapshot through a denied handle from an OPEN store: the store is fine, the handle
+    // is not, and nothing lands.
+    var s: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s) catch nothing()
+    kv.put(s, "k", "v") catch nothing()
+    var d: fs.Fs = fs.denied()
+    test.eq_i64(c, rep, "a denied snapshot refuses", kv.snapshot(d, a, s, KV_T_SNAP) catch 0 - 9, 0 - 9)
+    test.is_false(c, rep, "and wrote no backup", fs.present(h, KV_T_SNAP))
+    test.is_false(c, rep, "nor a .part", fs.present(h, "zz_kv_snapshot.db.part"))
+    test.is_true(c, rep, "the store itself is unharmed", kv.has(s, "k"))
+    kv.close(s)
+
+    scrub(h)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_record_over_the_ceiling_is_refused_before_it_is_written() -> bool {
+    var raw: *mut u8 = alloc(u8, KV_T_CAP)
+    var rep: []u8 = slice(u8, raw, KV_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h)
+
+    var s: kv.Store = kv.closed()
+    kv.open(h, a, KV_T_PATH, s) catch nothing()
+    // A value exactly the size of the ceiling cannot fit once framed.
+    var big: *mut u8 = alloc(u8, kv.KV_MAX_RECORD)
+    var bb: []u8 = slice(u8, big, kv.KV_MAX_RECORD)
+    var i: usize = 0
+    for i < kv.KV_MAX_RECORD {
+        bb[i] = 65 as u8
+        i = i + 1
+    }
+    let huge: str = from_utf8(bb)
+    var put_refused: bool = false
+    kv.put(s, "big", huge) catch { put_refused = true }
+    test.is_true(c, rep, "a put over the ceiling refuses", put_refused)
+    test.is_false(c, rep, "and stored nothing", kv.has(s, "big"))
+    test.eq_i64(c, rep, "and wrote nothing", kv.records(s), 1)
+
+    // A batch over the ceiling is refused AND LEFT INTACT, so the caller can split it.
+    var b: kv.Batch = kv.batch()
+    kv.batch_put(b, "big", huge)
+    kv.batch_put(b, "small", "s")
+    var commit_refused: bool = false
+    kv.commit(s, b) catch { commit_refused = true }
+    test.is_true(c, rep, "a batch over the ceiling refuses", commit_refused)
+    test.eq_i64(c, rep, "and keeps its operations", kv.batch_len(b), 2)
+    test.is_false(c, rep, "nothing from it landed", kv.has(s, "small"))
+    test.eq_i64(c, rep, "still one record", kv.records(s), 1)
+
+    // The control: a value that fits exactly — the frame's five bytes and the operation's
+    // nine plus a three-byte key — is accepted, so the refusal is the ceiling and not the
+    // size class.
+    let room: usize = kv.KV_MAX_RECORD - 5 - 9 - 3
+    let fits: str = from_utf8(bb[0 .. room])
+    var fit_refused: bool = false
+    kv.put(s, "big", fits) catch { fit_refused = true }
+    test.is_false(c, rep, "one that fits exactly is accepted", fit_refused)
+    let got: str = kv.get(s, "big")
+    test.eq_usize(c, rep, "and reads back whole", got.len, room)
+    test.eq_i64(c, rep, "as the second record", kv.records(s), 2)
+    kv.close(s)
+
+    free_ptr(big)
+    scrub(h)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

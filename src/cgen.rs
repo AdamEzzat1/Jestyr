@@ -292,7 +292,18 @@ fn emit_program(
                 // (`fn sys_read = "read"(…)`) separates the two; without one they are
                 // the same string, which is every extern written before the alias existed
                 // and is why nothing else in this file had to care.
-                Item::Extern(e) => Some((
+                Item::Extern(e) if !e.is_global => Some((
+                    e.name.name.clone(),
+                    e.c_name.clone().unwrap_or_else(|| e.name.name.clone()),
+                )),
+                _ => None,
+            })
+            .collect(),
+        extern_globals: ast
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Extern(e) if e.is_global => Some((
                     e.name.name.clone(),
                     e.c_name.clone().unwrap_or_else(|| e.name.name.clone()),
                 )),
@@ -792,6 +803,10 @@ struct Cgen<'a> {
     /// declared alias; different for `extern "unistd.h" fn sys_read = "read"(…)`, which
     /// exists because `read` is a Jestyr KEYWORD and cannot be an extern's name at all.
     extern_fns: HashMap<String, String>,
+    /// `extern … var` globals (B2): Jestyr name → C symbol. A read or a write of one
+    /// names the symbol bare — no `j_` prefix, no module canon — because the symbol
+    /// belongs to the linker, exactly as an extern fn's does.
+    extern_globals: HashMap<String, String>,
     /// trait names used as `dyn Trait` anywhere — each gets a synthesized vtable
     /// struct + fat-pointer typedef, and a static vtable per `impl` (Stage F).
     dyn_traits: HashSet<String>,
@@ -1040,7 +1055,13 @@ impl<'a> Cgen<'a> {
     /// The module an import `binding` refers to, from the module being emitted —
     /// so a `mod.Type` path resolves to that module's (possibly colliding) type.
     fn path_target(&self, binding: &str) -> Option<ModId> {
-        self.info.imports.get(self.cur_mod).and_then(|m| m.get(binding)).copied()
+        self.path_target_in(self.cur_mod, binding)
+    }
+
+    /// [`path_target`] from an explicit module — the import map of the module
+    /// that WROTE a type annotation, when it is not the one being emitted.
+    fn path_target_in(&self, m: ModId, binding: &str) -> Option<ModId> {
+        self.info.imports.get(m).and_then(|im| im.get(binding)).copied()
     }
 
     fn raw(&mut self, s: impl AsRef<str>) {
@@ -1855,24 +1876,35 @@ impl<'a> Cgen<'a> {
 
     /// Lower an AST type to a `Ty`, applying the given type-parameter substitution.
     fn ast_type_to_ty(&self, id: TypeId, subst: &HashMap<String, Ty>) -> Ty {
+        self.ast_type_to_ty_in(id, subst, self.cur_mod)
+    }
+
+    /// [`ast_type_to_ty`] resolved from an explicit module `m` — the module that
+    /// WROTE the annotation. The emitted item's module (`cur_mod`) is the right
+    /// context for its own signatures and bodies; it is the wrong one for a
+    /// struct's field types read while walking a value declared elsewhere (the
+    /// drop walker), where a bare `Writer` must canon to the declaring module's
+    /// `Writer__m<decl>` and a `json.Writer` path must go through the DECLARING
+    /// module's import map — the emitting module may not import `json` at all.
+    fn ast_type_to_ty_in(&self, id: TypeId, subst: &HashMap<String, Ty>, m: ModId) -> Ty {
         match &self.ast.type_at(id).kind {
             TypeKind::Name(n) => {
                 if let Some(t) = subst.get(&n.name) {
                     t.clone()
                 } else if let Some(p) = prim_ty(&n.name) {
                     Ty::Prim(p)
-                } else if let Some(&i) = self.info.table.type_index.get(&self.canon_type(&n.name)) {
+                } else if let Some(&i) = self.info.table.type_index.get(&self.canon_type_in(m, &n.name)) {
                     Ty::Named(i)
                 } else {
                     Ty::Opaque(n.name.clone())
                 }
             }
             TypeKind::Ptr { mutbl, inner } => {
-                Ty::Ptr { mutbl: *mutbl, inner: Box::new(self.ast_type_to_ty(*inner, subst)) }
+                Ty::Ptr { mutbl: *mutbl, inner: Box::new(self.ast_type_to_ty_in(*inner, subst, m)) }
             }
             TypeKind::App { ctor, args } => {
-                let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty(*a, subst)).collect();
-                let key = self.canon_type(&ctor.name);
+                let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty_in(*a, subst, m)).collect();
+                let key = self.canon_type_in(m, &ctor.name);
                 if self.enum_is_generic(&key) {
                     Ty::GenEnum { ctor: key, args: aty }
                 } else {
@@ -1880,25 +1912,25 @@ impl<'a> Cgen<'a> {
                     // namespace — two modules' `Box(T)` instances stay distinct
                     // (`Jestyr_Box__m<a>__i32` vs `__m<b>__i32`), mirroring
                     // typeck's resolution. Bare unless the name collides.
-                    Ty::GenStruct { ctor: self.canon_fn(&ctor.name), args: aty }
+                    Ty::GenStruct { ctor: self.canon_fn_in(m, &ctor.name), args: aty }
                 }
             }
-            TypeKind::Slice(inner) => Ty::Slice(Box::new(self.ast_type_to_ty(*inner, subst))),
+            TypeKind::Slice(inner) => Ty::Slice(Box::new(self.ast_type_to_ty_in(*inner, subst, m))),
             TypeKind::Array { len, elem } => Ty::Array {
-                elem: Box::new(self.ast_type_to_ty(*elem, subst)),
+                elem: Box::new(self.ast_type_to_ty_in(*elem, subst, m)),
                 len: self.array_len(*len),
             },
-            TypeKind::GenRef(inner) => Ty::GenRef(Box::new(self.ast_type_to_ty(*inner, subst))),
+            TypeKind::GenRef(inner) => Ty::GenRef(Box::new(self.ast_type_to_ty_in(*inner, subst, m))),
             TypeKind::RegionRef { inner, .. } => {
-                Ty::RegionRef(Box::new(self.ast_type_to_ty(*inner, subst)))
+                Ty::RegionRef(Box::new(self.ast_type_to_ty_in(*inner, subst, m)))
             }
             TypeKind::Fn { params, ret_conv, ret } => {
                 let ps: Vec<(Conv, Box<Ty>)> = params
                     .iter()
-                    .map(|p| (p.conv, Box::new(self.ast_type_to_ty(p.ty, subst))))
+                    .map(|p| (p.conv, Box::new(self.ast_type_to_ty_in(p.ty, subst, m))))
                     .collect();
                 let r = match ret {
-                    Some(t) => self.ast_type_to_ty(*t, subst),
+                    Some(t) => self.ast_type_to_ty_in(*t, subst, m),
                     None => Ty::Unit,
                 };
                 Ty::Fn { params: ps, ret: Box::new(r), ret_conv: *ret_conv }
@@ -1914,9 +1946,9 @@ impl<'a> Cgen<'a> {
                     } else if let Some(p) = prim_ty(&name.name) {
                         Ty::Prim(p)
                     } else {
-                        let key = match self.path_target(&module.name) {
+                        let key = match self.path_target_in(m, &module.name) {
                             Some(t) => self.canon_type_in(t, &name.name),
-                            None => self.canon_type(&name.name),
+                            None => self.canon_type_in(m, &name.name),
                         };
                         match self.info.table.type_index.get(&key) {
                             Some(&i) => Ty::Named(i),
@@ -1924,17 +1956,17 @@ impl<'a> Cgen<'a> {
                         }
                     }
                 } else {
-                    let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty(*a, subst)).collect();
-                    let key = match self.path_target(&module.name) {
+                    let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty_in(*a, subst, m)).collect();
+                    let key = match self.path_target_in(m, &module.name) {
                         Some(t) => self.canon_type_in(t, &name.name),
-                        None => self.canon_type(&name.name),
+                        None => self.canon_type_in(m, &name.name),
                     };
                     if self.enum_is_generic(&key) {
                         Ty::GenEnum { ctor: key, args: aty }
                     } else {
-                        let fkey = match self.path_target(&module.name) {
+                        let fkey = match self.path_target_in(m, &module.name) {
                             Some(t) => self.canon_fn_in(t, &name.name),
-                            None => self.canon_fn(&name.name),
+                            None => self.canon_fn_in(m, &name.name),
                         };
                         Ty::GenStruct { ctor: fkey, args: aty }
                     }
@@ -2184,10 +2216,16 @@ impl<'a> Cgen<'a> {
                 self.collect_structs_in_expr(*reduction, subst, seen, order);
                 self.collect_structs_in_expr(*body, subst, seen, order);
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 for arm in arms {
                     self.collect_structs_in_expr(arm.chan, subst, seen, order);
                     self.collect_structs_in_block(&arm.body, subst, seen, order);
+                }
+                // The `closed` arm holds ordinary code, so it is walked exactly as an
+                // arm body is. Skipping it would hide a call, spawn or closure from the
+                // backend rather than reject it.
+                if let Some(c) = closed {
+                    self.collect_structs_in_block(c, subst, seen, order);
                 }
             }
             _ => {}
@@ -2779,6 +2817,18 @@ impl<'a> Cgen<'a> {
                     Some(t) => self.c_ty_ast(t),
                     None => "void".to_string(),
                 };
+                if e.is_global {
+                    // A global under `extern "c"` is declared, not defined: the symbol
+                    // lives in whatever the program links against. A `.h` abi was
+                    // `continue`d above, for the same reason a header-declared fn gets
+                    // no prototype — and for `errno` it is the only thing that works,
+                    // since a macro cannot be redeclared.
+                    let key = e.c_name.clone().unwrap_or_else(|| e.name.name.clone());
+                    let g = self.cfg_open(cfg, &key);
+                    self.raw(format!("extern {ret} {key};\n"));
+                    self.cfg_close(g);
+                    continue;
+                }
                 let params = self.extern_params_str(e);
                 // The prototype declares the C SYMBOL. Under a declared alias the Jestyr
                 // name never reaches the emitted C at all — it exists so the source can
@@ -3163,10 +3213,20 @@ impl<'a> Cgen<'a> {
         // Read field names + types from the AST decl (the type table's struct
         // fields carry the same data, but the AST is the source of truth for the
         // `j_<name>` C accessor and is what the enum path must use anyway).
+        //
+        // The decl is matched by its CANONICAL name (the table's `Writer__m<decl>`
+        // for a colliding type, the bare spelling otherwise), and its field types
+        // are lowered FROM THE DECLARING MODULE: a bare `Writer` field canons to
+        // that module's `Writer`, and a `json.Writer` path goes through that
+        // module's import map. Lowering them from `cur_mod` — the module whose
+        // function is being emitted — matched the first struct spelled `Writer`
+        // and degraded any field type the emitting module could not see to an
+        // `Opaque` keyed by its bare name (A13).
         let name = &decl.name;
-        for item in &self.ast.items {
+        for (i, item) in self.ast.items.iter().enumerate() {
             if let Item::Struct { name: sname, body, is_union, .. } = item {
-                if &sname.name != name {
+                let decl_mod = self.item_module(i);
+                if self.canon_type_in(decl_mod, &sname.name) != *name {
                     continue;
                 }
                 // An untagged `union` has no single live field — never auto-drop it.
@@ -3179,7 +3239,7 @@ impl<'a> Cgen<'a> {
                     .iter()
                     .filter_map(|m| match m {
                         StructMember::Field { name: fname, ty: fty, .. } => {
-                            Some((fname.name.clone(), self.ast_type_to_ty(*fty, &empty)))
+                            Some((fname.name.clone(), self.ast_type_to_ty_in(*fty, &empty, decl_mod)))
                         }
                         _ => None,
                     })
@@ -3206,10 +3266,13 @@ impl<'a> Cgen<'a> {
         if self.niche_enum_at(*i).is_some() {
             return Some(Vec::new());
         }
+        // Matched by canonical name and lowered from the declaring module, for the
+        // same reason as `aggregate_drop_fields` (A13).
         let name = decl.name.clone();
-        for item in &self.ast.items {
+        for (i, item) in self.ast.items.iter().enumerate() {
             if let Item::Enum(e) = item {
-                if e.name.name != name || e.is_generic() {
+                let decl_mod = self.item_module(i);
+                if e.is_generic() || self.canon_type_in(decl_mod, &e.name.name) != name {
                     continue;
                 }
                 let empty = HashMap::new();
@@ -3220,7 +3283,7 @@ impl<'a> Cgen<'a> {
                         let payload = v
                             .fields
                             .iter()
-                            .map(|(fname, fty)| (fname.name.clone(), self.ast_type_to_ty(*fty, &empty)))
+                            .map(|(fname, fty)| (fname.name.clone(), self.ast_type_to_ty_in(*fty, &empty, decl_mod)))
                             .filter(|(_, t)| !Self::is_indirect_ty(t))
                             .collect();
                         (v.name.name.clone(), payload)
@@ -3388,7 +3451,7 @@ impl<'a> Cgen<'a> {
                 }
                 Stmt::Let { init: None, .. } => {}
                 Stmt::Return { value: Some(e), .. } => {
-                    if let Some(name) = self.as_name(*e) {
+                    if let Some(name) = self.as_returned_name(*e) {
                         out.insert(name);
                     }
                     self.collect_moved_expr(*e, out);
@@ -3397,7 +3460,7 @@ impl<'a> Cgen<'a> {
                 Stmt::Expr(e) => {
                     // The block's tail expression may be an implicit return value.
                     if i + 1 == n {
-                        if let Some(name) = self.as_name(*e) {
+                        if let Some(name) = self.as_returned_name(*e) {
                             out.insert(name);
                         }
                     }
@@ -3413,6 +3476,33 @@ impl<'a> Cgen<'a> {
             ExprKind::Name(n) => Some(n.name.clone()),
             _ => None,
         }
+    }
+
+    /// The bare local a `return` carries out: `return d`, or `return ok(d)` /
+    /// `return err(d)`, whose argument lands in the result struct by value exactly as
+    /// a bare returned local does.
+    ///
+    /// **A12.** Until this existed, `return ok(d)` copied `d` into the result and then
+    /// ran the local's drops — the caller received a closed file and freed strings,
+    /// with no diagnostic. Every fallible constructor in the corpus returned a
+    /// literal (`ok(Log{ w: w, … })`), whose captured locals `collect_moved_expr`
+    /// already marks through the struct-literal arm, which is why it hid. `ok`/`err`
+    /// are intrinsics and cannot be shadowed (that is a hard error), so matching the
+    /// spelling is matching the meaning.
+    fn as_returned_name(&self, id: ExprId) -> Option<String> {
+        if let Some(name) = self.as_name(id) {
+            return Some(name);
+        }
+        if let ExprKind::Call { callee, args } = &self.ast.expr_at(id).kind {
+            if args.len() == 1 {
+                if let ExprKind::Name(n) = &self.ast.expr_at(*callee).kind {
+                    if n.name == "ok" || n.name == "err" {
+                        return self.as_name(args[0]);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// The receiver-parameter convention of a resolved method/impl/operator call,
@@ -3620,10 +3710,16 @@ impl<'a> Cgen<'a> {
                 self.collect_moved_expr(*reduction, out);
                 self.collect_moved_expr(*body, out);
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 for arm in arms {
                     self.collect_moved_expr(arm.chan, out);
                     self.collect_moved(&arm.body, out);
+                }
+                // The `closed` arm holds ordinary code, so it is walked exactly as an
+                // arm body is. Skipping it would hide a call, spawn or closure from the
+                // backend rather than reject it.
+                if let Some(c) = closed {
+                    self.collect_moved(c, out);
                 }
             }
             ExprKind::For { head, body, els, .. } => {
@@ -4115,7 +4211,7 @@ impl<'a> Cgen<'a> {
                     ExprKind::Block(b) => self.emit_body(b, false),
                     ExprKind::Unsafe(b) => self.emit_body(b, false),
                     ExprKind::Concurrent(b) => self.emit_concurrent(b),
-                    ExprKind::Select(arms) => self.emit_select(arms),
+                    ExprKind::Select { arms, closed } => self.emit_select(arms, closed.as_ref()),
                     ExprKind::Region { name, body } => self.emit_region(&name.name, body),
                     ExprKind::WithAlive { genref, name, body, els } => {
                         self.emit_with_alive(*genref, &name.name, body, els.as_ref())
@@ -5362,6 +5458,12 @@ impl<'a> Cgen<'a> {
                 } else if self.no_mangle_consts.contains(&n.name) {
                     // A `@no_mangle` const is referenced by its bare exported name.
                     n.name.clone()
+                } else if self.info.global_ref(id) {
+                    // An `extern … var` global (B2): the C symbol, bare — but only when
+                    // the CHECKER resolved this name to the global. The backend has no
+                    // scope at this arm, and deciding by the spelling made a local
+                    // `errno` write the real one (`examples/extern_global.jtr`, `shadow`).
+                    self.extern_globals.get(&n.name).cloned().unwrap_or_else(|| n.name.clone())
                 } else {
                     // `call_sym` carries typeck's resolution for a bare name that
                     // COLLIDES across modules — set only for a const or function the
@@ -5402,6 +5504,13 @@ impl<'a> Cgen<'a> {
                     if let ExprKind::Name(n) = &self.ast.expr_at(*rhs).kind {
                         if let Some(sym) = self.extern_fns.get(&n.name) {
                             return format!("(&{sym})");
+                        }
+                        // The address of an `extern … var` global is the symbol's (B2) —
+                        // by the checker's resolution, not the spelling (see the Name arm).
+                        if self.info.global_ref(*rhs) {
+                            if let Some(sym) = self.extern_globals.get(&n.name) {
+                                return format!("(&{sym})");
+                            }
                         }
                         // Canonical name for a colliding function referenced by
                         // address (the checker recorded it on the name expr);
@@ -6020,7 +6129,7 @@ impl<'a> Cgen<'a> {
             ExprKind::ParFor { var, iter, reduction, body } => {
                 self.emit_par_for(id, var, *iter, *reduction, *body)
             }
-            ExprKind::Select(_) => {
+            ExprKind::Select { .. } => {
                 self.diag(span, "`select` is only supported in statement position");
                 "0".to_string()
             }
@@ -6993,10 +7102,16 @@ impl<'a> Cgen<'a> {
                 self.find_closures_expr(*reduction, found, seen);
                 self.find_closures_expr(*body, found, seen);
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 for arm in arms {
                     self.find_closures_expr(arm.chan, found, seen);
                     self.find_closures_block(&arm.body, found, seen);
+                }
+                // The `closed` arm holds ordinary code, so it is walked exactly as an
+                // arm body is. Skipping it would hide a call, spawn or closure from the
+                // backend rather than reject it.
+                if let Some(c) = closed {
+                    self.find_closures_block(c, found, seen);
                 }
             }
             _ => {}
@@ -7131,10 +7246,16 @@ impl<'a> Cgen<'a> {
                 self.collect_refs(*reduction, out);
                 self.collect_refs(*body, out);
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 for arm in arms {
                     self.collect_refs(arm.chan, out);
                     self.collect_refs_block(&arm.body, out);
+                }
+                // The `closed` arm holds ordinary code, so it is walked exactly as an
+                // arm body is. Skipping it would hide a call, spawn or closure from the
+                // backend rather than reject it.
+                if let Some(c) = closed {
+                    self.collect_refs_block(c, out);
                 }
             }
             _ => {}
@@ -7626,6 +7747,22 @@ impl<'a> Cgen<'a> {
         let type_key = self.info.table.ty_key(&target);
 
         self.subst.clear();
+        // `Self` inside an impl method IS the impl's target, in every position —
+        // a parameter, a return, a local, and nested (`*Self`, `[]Self`, `Self!E`).
+        //
+        // Binding it in the SUBSTITUTION rather than special-casing the name is what
+        // makes that "every position" true, and it is the only shape that covers both
+        // of cgen's type doors: `c_ty_ast` (a written-down source type) consults
+        // `subst` before it looks a name up in `type_index`, and `c_type` (an inferred
+        // `Ty`) resolves `Ty::Opaque` through the same map. Fixing only the first left
+        // the second lowering `Self` to a silent `int` — no diagnostic at all, which is
+        // strictly worse than the refusal it replaced.
+        //
+        // `impl_ok_ty` is the vestige of this: it resolves `Self` by hand, for a
+        // fallible return only, at the top level only. It stays because the mangle it
+        // feeds wants a `Ty` rather than a C spelling, but it is no longer the only
+        // place that knows what `Self` means.
+        self.subst.insert("Self".to_string(), target.clone());
         self.self_cty = self.c_ty_ast(im.ty);
         let self_conv =
             f.params.iter().find(|p| p.is_self).map(|p| p.conv).unwrap_or(Conv::Default);
@@ -7841,12 +7978,15 @@ impl<'a> Cgen<'a> {
     /// parameter, so a concrete instance can substitute it.
     fn generic_drop_impl(&self, ctor: &str) -> Option<(&'a ImplDecl, String)> {
         let empty = HashMap::new();
-        for item in &self.ast.items {
+        for (i, item) in self.ast.items.iter().enumerate() {
             let Item::Impl(im) = item else { continue };
             if im.generics.is_empty() || im.trait_name.name != "Drop" {
                 continue;
             }
-            if let Ty::GenStruct { ctor: c, .. } = self.ast_type_to_ty(im.ty, &empty) {
+            // The impl's target is lowered from the impl's OWN module, so a
+            // colliding ctor canons to the right `Box__m<impl>` (A13's family).
+            let im_mod = self.item_module(i);
+            if let Ty::GenStruct { ctor: c, .. } = self.ast_type_to_ty_in(im.ty, &empty, im_mod) {
                 if c == ctor {
                     let g = im.generics.first().map(|g| g.name.name.clone()).unwrap_or_default();
                     return Some((im, g));
@@ -7865,11 +8005,11 @@ impl<'a> Cgen<'a> {
         let empty = HashMap::new();
         let key = self.info.table.ty_key(ty);
         let ast = self.ast;
-        ast.items.iter().any(|it| {
+        ast.items.iter().enumerate().any(|(i, it)| {
             matches!(it, Item::Impl(im)
                 if im.generics.is_empty()
                     && im.trait_name.name == "Drop"
-                    && self.info.table.ty_key(&self.ast_type_to_ty(im.ty, &empty)) == key)
+                    && self.info.table.ty_key(&self.ast_type_to_ty_in(im.ty, &empty, self.item_module(i))) == key)
         })
     }
 
@@ -8109,10 +8249,16 @@ impl<'a> Cgen<'a> {
                     self.find_spawns_block(els, out);
                 }
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 for arm in arms {
                     self.find_spawns_expr(arm.chan, out);
                     self.find_spawns_block(&arm.body, out);
+                }
+                // The `closed` arm holds ordinary code, so it is walked exactly as an
+                // arm body is. Skipping it would hide a call, spawn or closure from the
+                // backend rather than reject it.
+                if let Some(c) = closed {
+                    self.find_spawns_block(c, out);
                 }
             }
             _ => {}
@@ -8451,7 +8597,7 @@ impl<'a> Cgen<'a> {
     /// (an `else if` chain so exactly one arm fires per pass). Single-consumer (the
     /// `len > 0` then `recv` is race-free when this is the only receiver). Reuses the
     /// non-generic `channel_len_i64`/`channel_recv_i64` wrappers from `std/sync.jtr`.
-    fn emit_select(&mut self, arms: &[SelectArm]) {
+    fn emit_select(&mut self, arms: &[SelectArm], closed: Option<&Block>) {
         self.line("{");
         self.depth += 1;
         // Hoist each channel to a local so it is evaluated once, not per spin.
@@ -8490,10 +8636,15 @@ impl<'a> Cgen<'a> {
         // it first would discard exactly the work a graceful shutdown is trying to
         // finish — the same ordering rule `channel_recv_open` records.
         //
-        // No arm runs and nothing binds: the `select` simply completes. Distinguishing
-        // "took a value" from "everything closed" is the caller's, via
-        // `channel_is_closed`, and a dedicated `closed { … }` ARM is sugar on top of this
-        // — a syntax change that crosses both parsers, where this is one lowering site.
+        // With no `closed` arm: no arm runs and nothing binds, and the `select` simply
+        // completes — the caller distinguishes "took a value" from "everything closed"
+        // itself, which in practice meant a sentinel read before and after the `select`.
+        //
+        // With one, its body runs here. That is the entire feature: the condition was
+        // already computed and already the exit, so the arm is a place to put a statement,
+        // not a new capability. It stays LAST for the same reason the condition is tested
+        // last — a channel closed but still holding buffered values is served by its own
+        // readiness arm first, so closing never discards work.
         if !arms.is_empty() {
             let all_done: Vec<String> = (0..arms.len())
                 .map(|i| {
@@ -8502,6 +8653,11 @@ impl<'a> Cgen<'a> {
                 .collect();
             self.line(format!("else if ({}) {{", all_done.join(" && ")));
             self.depth += 1;
+            if let Some(c) = closed {
+                for stmt in &c.stmts {
+                    self.emit_stmt(stmt);
+                }
+            }
             self.line("_seldone = 1;");
             self.depth -= 1;
             self.line("}");
@@ -10206,6 +10362,33 @@ impl<'a> Cgen<'a> {
             ExprKind::Index { base, index } => {
                 let (base, index) = (*base, *index);
                 let bt = self.repr_of(base);
+                // A RANGE index is not an element access. `xs[a .. b]` computes a
+                // *new* `{ ptr, len }` view, so there is no element whose address
+                // could be taken — the arms below would emit the `Range` node as if
+                // it were a scalar offset and hit the backend's "no ranges yet"
+                // refusal, pointing at the range rather than at anything wrong.
+                //
+                // The sub-view is a value, and `emit_place` owes its callers an
+                // lvalue, so it is parked in a **compound literal of array type**:
+                // `(T[1]){ v }` decays to `T*` and `(*…)` reads back as a place.
+                // Its lifetime is the enclosing block — not the statement expression
+                // that computed it — so `&` of it comfortably outlives the call,
+                // which is the same reason `abi_ref_arg` reaches for this shape.
+                //
+                // The view is a copy of `{ ptr, len }`, but `ptr` still names the
+                // caller's buffer, so a `mut` callee's element writes land where
+                // they should. Only a whole-view reassignment (`xs = …`) would be
+                // lost, and a temporary sub-view has no home to write one back to.
+                //
+                // Restricted to the two bases `emit_expr` actually lowers a range
+                // over; a fixed-size array keeps its existing refusal untouched.
+                if matches!(self.ast.expr_at(index).kind, ExprKind::Range { .. })
+                    && matches!(bt, Ty::Slice(_) | Ty::Prim("str"))
+                {
+                    let sty = self.c_type(&bt);
+                    let v = self.emit_expr(id);
+                    return format!("(*({sty}[1]){{ {v} }})");
+                }
                 if let Ty::Array { len, .. } = &bt {
                     let nlen = *len;
                     let aty = self.c_type(&bt);
@@ -10253,16 +10436,57 @@ impl<'a> Cgen<'a> {
                 }
                 self.emit_expr(id)
             }
-            _ => self.emit_expr(id),
+            // `Name` — already an lvalue (`j_x`, or `(*j_x)` for a pointer parameter)
+            // — and every form that is **not a place in the source language**: a call,
+            // a cast, an arithmetic expression, a struct literal.
+            //
+            // `emit_place` owes its callers an lvalue and C will not give one for a
+            // value, so a value is parked in a **compound literal of array type**:
+            // `(T[1]){ v }` decays to `T*` and `(*…)` reads back as a place, with the
+            // enclosing block's lifetime rather than the expression's. Same shape, same
+            // reason, as the range sub-view above and as `abi_ref_arg`.
+            //
+            // Without this, any `mut` argument that is not a place leaked gcc's own
+            // "lvalue required as unary '&' operand" — no span, no Jestyr message — for
+            // `f(mut mk())`, `f(mut a + b)` and, importantly, `f(mut s as Buf)`, which
+            // is the ordinary `distinct` newtype idiom. What the callee receives is a
+            // copy whose *indirection is shared*, so writes through a slice's `ptr`
+            // reach the caller's buffer exactly as they do for a sub-view; only a
+            // whole-value reassignment is lost, and a temporary has nowhere to put one.
+            //
+            // ## The guard must be EXACT here, and "conservative" is not a defence
+            // `is_c_lvalue` is shared with `abi_ref_arg`, which serves a `read`
+            // parameter — there, answering "no" to something that *is* an lvalue costs
+            // one copy. **On this path it costs a wrong answer**, because the copy is
+            // what a `mut` callee then writes into.
+            //
+            // That is not hypothetical and it is not confined to the obvious forms. The
+            // first version of this arm reasoned that `Field`, `Index` and `Deref` each
+            // return from their own arm above, so the only lvalue reaching here is a
+            // `Name` — and missed that the `Field` arm *recurses* into `emit_place` on
+            // its base, which for a method's `self` is a `SelfValue`. `is_c_lvalue` did
+            // not list it, so `self.seen` in a `mut self` method parked `(*j_self)` and
+            // `free(&copy.seen)` freed a copy's list. `census_cli` caught it; nothing in
+            // the reasoning did.
+            //
+            // So: `Index` genuinely cannot reach this arm, but the reachable set is
+            // every *other* kind, and the guard has to be right about all of them.
+            _ => {
+                let v = self.emit_expr(id);
+                if is_c_lvalue(self.ast, id) {
+                    return v;
+                }
+                let cty = self.c_type(&self.info.type_of(id).clone());
+                format!("(*({cty}[1]){{ {v} }})")
+            }
         }
     }
 
     /// Emit `id` as an argument passed **by address** — a `mut`/`out` parameter, or
     /// a `mut`/`out self` receiver. Such an argument is a *place*, not a value, so
-    /// it goes through [`Self::emit_place`]: `cs[i].bump()` otherwise takes the
-    /// address of a bounds-checked statement expression and gcc reports "lvalue
-    /// required as unary '&' operand". Every argument that is not reached through a
-    /// checked index emits exactly as `&({expr})` always did.
+    /// it goes through [`Self::emit_place`], whose contract is that it always yields
+    /// a C lvalue: `cs[i].bump()` otherwise takes the address of a bounds-checked
+    /// statement expression and gcc reports "lvalue required as unary '&' operand".
     fn emit_addr_arg(&mut self, id: ExprId) -> String {
         let p = self.emit_place(id, true);
         format!("&({p})")
@@ -10873,10 +11097,16 @@ impl<'a> Cgen<'a> {
                 self.find_calls_expr(*reduction, subst, work);
                 self.find_calls_expr(*body, subst, work);
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 for arm in arms {
                     self.find_calls_expr(arm.chan, subst, work);
                     self.find_calls_block(&arm.body, subst, work);
+                }
+                // The `closed` arm holds ordinary code, so it is walked exactly as an
+                // arm body is. Skipping it would hide a call, spawn or closure from the
+                // backend rather than reject it.
+                if let Some(c) = closed {
+                    self.find_calls_block(c, subst, work);
                 }
             }
             ExprKind::For { head, body, els, .. } => {
@@ -10921,7 +11151,13 @@ impl<'a> Cgen<'a> {
 /// worth the few lines.
 fn is_c_lvalue(ast: &Ast, id: ExprId) -> bool {
     match &ast.expr_at(id).kind {
-        ExprKind::Name(_) | ExprKind::Deref { .. } => true,
+        // `SelfValue` renders `j_self`, or `(*j_self)` for a `mut`/`out` receiver — both
+        // lvalues, exactly as `Name` is. **Omitting it was harmless until it wasn't.** On
+        // the `read` path (`abi_ref_arg`) a wrong "no" costs one copy; once `emit_place`'s
+        // catch-all began parking non-lvalues, the same wrong "no" made `self.seen` in a
+        // `mut self` method resolve to a field of a COPY, so `free(&copy.seen)` freed the
+        // wrong list and the caller's was never released. `census_cli` caught it.
+        ExprKind::Name(_) | ExprKind::SelfValue | ExprKind::Deref { .. } => true,
         ExprKind::Field { base, .. } => is_c_lvalue(ast, *base),
         _ => false,
     }

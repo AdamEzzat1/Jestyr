@@ -640,6 +640,28 @@ impl<'a> TypeChecker<'a> {
                     let t = c.ty.map(|t| self.lower_type(&empty, t)).unwrap_or(Ty::Unknown);
                     self.table.consts.insert(self.canon_in(item_m, &c.name.name), t);
                 }
+                Item::Extern(e) if e.is_global => {
+                    // A foreign GLOBAL is a typed NAME, not a callable: it registers as a
+                    // const so a bare read resolves to its type through the ordinary
+                    // `Name` arm, and in `globals` so the backend and the assignment rule
+                    // know it is a symbol rather than a `static const`. Keyed by the bare
+                    // name, never canonicalized — an extern's name IS a C symbol (the
+                    // owners pass puts it in `extern_owned` for the same reason).
+                    let t = e.ret_ty.map(|t| self.lower_type(&empty, t)).unwrap_or(Ty::Unknown);
+                    let cfg = crate::attrs::cfg_of(ast, &e.attrs);
+                    if (self.table.consts.contains_key(&e.name.name)
+                        || self.table.fns.contains_key(&e.name.name))
+                        && !crate::attrs::cfgs_may_share_a_name(
+                            fn_cfg.get(&e.name.name).unwrap_or(&None),
+                            &cfg,
+                        )
+                    {
+                        self.error(e.name.span, format!("duplicate definition of `{}`", e.name.name));
+                    }
+                    fn_cfg.insert(e.name.name.clone(), cfg);
+                    self.table.consts.insert(e.name.name.clone(), t);
+                    self.table.globals.insert(e.name.name.clone());
+                }
                 Item::Extern(e) => {
                     let params: Vec<ParamSig> = e
                         .params
@@ -751,8 +773,17 @@ impl<'a> TypeChecker<'a> {
     fn register_impls(&mut self) {
         let ast = self.ast;
         let empty = HashSet::new();
-        for item in &ast.items {
+        for (i, item) in ast.items.iter().enumerate() {
             let Item::Impl(im) = item else { continue };
+            // Lower the target FROM THE IMPL'S OWN MODULE. Every other item pass
+            // sets `cur_mod` per item; this one did not, so `impl Drop for Writer`
+            // in `file` lowered `Writer` in whatever module the previous pass left
+            // behind, missed the colliding `Writer__m<file>`, degraded to
+            // `Opaque("Writer")` and was keyed under the BARE name. Its own type
+            // then found no impl (a `file.Writer` local was never dropped), while a
+            // field of ANOTHER module's `Writer` that degraded the same way found it
+            // and called `jestyr_impl_Drop__Writer__drop` — a symbol no one emits (A13).
+            self.cur_mod = *self.modules.item_mod.get(i).unwrap_or(&0);
             if !self.table.traits.contains_key(&im.trait_name.name) {
                 self.error(
                     im.trait_name.span,
@@ -2819,12 +2850,30 @@ impl<'a> TypeChecker<'a> {
                 .map(|g| (g.name.name.clone(), g.bound.as_ref().map(|b| b.name.clone())))
                 .collect(),
         );
+        // `Self` in a TYPE position inside a method body's signature is the receiver.
+        // Free functions are checked with `Ty::Unit` as `self_ty`, and a `Self` there is
+        // meaningless, so the substitution is empty for them and the name stays opaque.
+        //
+        // This used to be a deliberate deferral, justified as costing nothing because
+        // `assignable` is lenient on `Opaque`. **That justification expired.** Leniency
+        // is not the only consumer: a borrow whose type never resolved trips the escape
+        // checker's `Unknown`-finalization backstop, so `fn f(read self, mut o: Self)`
+        // was refused outright with "cannot decide whether borrow `o` escapes". The
+        // `take` and `read` forms slipped through only because that backstop is about
+        // borrows, which is why the hole looked empty for as long as it did.
+        let self_subst: HashMap<String, Ty> =
+            if matches!(self_ty, Ty::Unit | Ty::Unknown | Ty::Error) {
+                HashMap::new()
+            } else {
+                std::iter::once(("Self".to_string(), self_ty.clone())).collect()
+            };
         let mut scope: Scope = vec![HashMap::new()];
         for p in &f.params {
             let pty = if p.is_self {
                 self_ty.clone()
             } else if let Some(t) = p.ty {
-                self.lower_type(&typ, t)
+                let t = self.lower_type(&typ, t);
+                subst_ty(&t, &self_subst)
             } else {
                 Ty::Unknown
             };
@@ -2838,7 +2887,13 @@ impl<'a> TypeChecker<'a> {
         // { none => none } }`. Non-tail `let`/`return` statements save/restore
         // `cur_expected`, so by the tail it is back to this seeded value.
         let prev_ret = self.cur_ret.take();
-        self.cur_ret = f.ret_ty.map(|t| self.lower_type(&typ, t));
+        // `-> Self` too, for the same reason: `register_impls` already substitutes it
+        // into the RECORDED return type every caller is typed by, so leaving the body's
+        // own view opaque made a method's inside and outside disagree about its return.
+        self.cur_ret = f.ret_ty.map(|t| {
+            let t = self.lower_type(&typ, t);
+            subst_ty(&t, &self_subst)
+        });
         let prev_errs = self.cur_errs.take();
         self.cur_errs = errs_of(&f.errors);
         let prev_exp = self.cur_expected.take();
@@ -3092,6 +3147,12 @@ impl<'a> TypeChecker<'a> {
                     let key = self.canon_cur(&n.name);
                     if key != n.name {
                         self.record_call_sym(id, key);
+                    }
+                    // An `extern … var` global, reached because no local shadowed it:
+                    // say so on the row, which is the only thing the backend may name
+                    // the C symbol from (B2).
+                    if self.table.globals.contains(&n.name) {
+                        self.row(id).global = true;
                     }
                     t
                 } else if let Some(&i) = self.table.variants.get(&self.canon_variant_in(self.cur_mod, &n.name)) {
@@ -4152,7 +4213,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 Ty::Prim("i64")
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 // Each arm waits on a `Channel(i64)` and binds the received `i64`.
                 for arm in arms {
                     let cht = self.infer(scope, typ, self_ty, arm.chan);
@@ -4171,6 +4232,13 @@ impl<'a> TypeChecker<'a> {
                     scope.push(HashMap::new());
                     scope.last_mut().unwrap().insert(arm.bind.name.clone(), Ty::Prim("i64"));
                     self.infer_block(scope, typ, self_ty, &arm.body);
+                    scope.pop();
+                }
+                // The `closed` arm binds nothing — there is no value to receive, which
+                // is the whole condition it fires on — so it gets a plain scope.
+                if let Some(c) = closed {
+                    scope.push(HashMap::new());
+                    self.infer_block(scope, typ, self_ty, c);
                     scope.pop();
                 }
                 Ty::Unit

@@ -78,7 +78,10 @@ import "ctfe"
 // row) and `icalls` each impl-dispatched call (5-tuples: call ExprId, trait name span, method
 // name span) — the downstream passes' `method_calls`/`impl_calls` (the escape checker's
 // give-away and manual-drop rules read them).
-pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), pub bcalls: List(i32), pub dcalls: List(i32), pub dcoerce: List(i32), pub epay: List(i32), pub tferr: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, ctsv: i32, alloc: Allocator }
+// `gref` lists the ExprIds of bare Names that resolved to an `extern … var` GLOBAL with no
+// local shadowing them — the reference's `Resolved.global` (B2). The backend names the C
+// symbol from this list and from nothing else.
+pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), pub bcalls: List(i32), pub dcalls: List(i32), pub dcoerce: List(i32), pub epay: List(i32), pub tferr: List(i32), pub gref: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, ctsv: i32, alloc: Allocator }
 
 // One `Ty` arena node - kinds in the header comment. `a`/`b` are child TyIds or slice fields;
 // `x`/`y` are aux ints (prim code, name span, ret TyId/conv).
@@ -106,7 +109,7 @@ fn mk_ty(mut c: Checker, kind: i32, a: i32, b: i32, x: i32, y: i32) -> i32 {
 // The checker with the well-known instances pre-created (ids 0..7) and `et` sized to the
 // expression arena, all-Unknown.
 fn make_checker(read p: parser.Parser, read a: Allocator) -> Checker {
-    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), tra: list.make(i32, a), imp: list.make(i32, a), mcalls: list.make(i32, a), icalls: list.make(i32, a), bcalls: list.make(i32, a), dcalls: list.make(i32, a), dcoerce: list.make(i32, a), epay: list.make(i32, a), tferr: list.make(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, ctsv: 0 - 1, alloc: a }
+    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), tra: list.make(i32, a), imp: list.make(i32, a), mcalls: list.make(i32, a), icalls: list.make(i32, a), bcalls: list.make(i32, a), dcalls: list.make(i32, a), dcoerce: list.make(i32, a), epay: list.make(i32, a), tferr: list.make(i32, a), gref: list.make(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, ctsv: 0 - 1, alloc: a }
     mk_ty(c, 0, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 0 Unknown
     mk_ty(c, 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 1 Unit
     mk_ty(c, 2, 0 - 1, 0 - 1, 2, 0 - 1)            // 2 Prim i32   (code 2)
@@ -412,6 +415,21 @@ fn find_fn(read c: Checker, read src: str, ns: usize, ne: usize) -> i32 {
     return 0 - 1
 }
 
+// Is `src[ns..ne]` the name of an `extern … var` GLOBAL (an extern item with `b == -1`)? The
+// reference's `globals` set, answered by a scan since the port keeps no such set.
+fn is_global_name(read p: parser.Parser, read src: str, ns: usize, ne: usize) -> bool {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r as usize)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 8 and it.b < 0 {
+            if str_eq(src[it.x as usize .. it.y as usize], src[ns .. ne]) { return true }
+        }
+        r = r + 1
+    }
+    return false
+}
+
 // The const's declared type for `src[ns..ne]`, or -1 (the reference's `consts` map).
 fn find_const(read c: Checker, read src: str, ns: usize, ne: usize) -> i32 {
     let n: i32 = (list.len(i32, c.cst) / 3) as i32
@@ -655,6 +673,12 @@ fn build_table(mut c: Checker, read p: parser.Parser, read src: str) {
             var t: i32 = t_unknown()
             if it.a >= 0 { t = lower_type(c, p, src, it.a) }
             list.push(i32, c.cst, it.x)
+            list.push(i32, c.cst, it.y)
+            list.push(i32, c.cst, t)
+        } else if it.kind == 8 and it.b < 0 {      // extern GLOBAL (B2): a typed name, registered
+            var t: i32 = t_unknown()               // as a const so a bare read types through the
+            if it.z >= 0 { t = lower_type(c, p, src, it.z) }   // ordinary Name path (mirrors the
+            list.push(i32, c.cst, it.x)            // `is_global` arm of `build_table`)
             list.push(i32, c.cst, it.y)
             list.push(i32, c.cst, t)
         } else if it.kind == 8 {                   // extern fn signature
@@ -2083,7 +2107,12 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         if hit >= 0 { r = hit }
         else {
             let ct: i32 = find_const(c, src, d.start, d.end)
-            if ct >= 0 { r = ct }
+            if ct >= 0 {
+                r = ct
+                // Reached the const table with no local in the way: if the name is an
+                // `extern … var` global, record the ExprId (mirrors `Resolved.global`).
+                if is_global_name(p, src, d.start, d.end) { list.push(i32, c.gref, id) }
+            }
             else {
                 let erow: i32 = find_variant(c, src, d.start, d.end)
                 if erow >= 0 {                     // a bare nullary variant, e.g. `none`
@@ -2502,6 +2531,13 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
             pop_scope(c)
             i = i + 1
         }
+        // The `closed` arm binds nothing -- there is no value to receive, which is the
+        // condition it fires on -- so it gets a plain scope.
+        if d.a >= 0 {
+            push_scope(c)
+            infer(c, p, src, d.a)
+            pop_scope(c)
+        }
         r = t_unit()
     }
     // else: a leaf with no children (self/Self/attr/fstring/...) - Unknown for now.
@@ -2782,6 +2818,17 @@ fn check_fn_item(mut c: Checker, read p: parser.Parser, read src: str, read f: p
     // raise the lookup floor so a nested fn can't see the enclosing fn's bindings.
     let saved_floor: i32 = c.scfloor
     c.scfloor = (list.len(i32, c.scn) / 3) as i32
+    // `Self` in a TYPE position inside a method body's signature is the receiver. A free fn
+    // is checked with `selfty = Unit` and a `Self` there is meaningless, so the substitution
+    // is skipped for it and the name stays Opaque.
+    //
+    // This used to be a deliberate deferral on BOTH sides, justified as costing nothing
+    // because assignability is lenient on an Opaque. That justification expired: leniency is
+    // not the only consumer. A borrow whose type never resolved trips the escape checker's
+    // Unknown-finalization backstop, so `fn f(read self, mut o: Self)` was refused outright.
+    // The `read` and `take` forms slipped through only because that backstop is about
+    // BORROWS, which is why the hole looked empty for as long as it did.
+    let has_self: bool = selfty != t_unknown() and selfty != t_unit()
     var i: i32 = 0
     for i < f.b {
         let base: i32 = f.a + i * 7
@@ -2790,7 +2837,10 @@ fn check_fn_item(mut c: Checker, read p: parser.Parser, read src: str, read f: p
             let ne: i32 = list.get(i32, p.iar, (base + 3) as usize)
             let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
             var t: i32 = t_unknown()
-            if pty >= 0 { t = lower_type(c, p, src, pty) }
+            if pty >= 0 {
+                t = lower_type(c, p, src, pty)
+                if has_self { t = subst_self(c, src, t, selfty) }
+            }
             scope_insert(c, ns, ne, t)
         }
         i = i + 1
@@ -2801,7 +2851,13 @@ fn check_fn_item(mut c: Checker, read p: parser.Parser, read src: str, read f: p
     let saved_ret: i32 = c.curret
     let saved_exp: i32 = c.expected
     var rt: i32 = 0 - 1
-    if f.z >= 0 { rt = lower_type(c, p, src, f.z) }
+    // `-> Self` too: the impl-registration pass already substitutes it into the RECORDED
+    // return every caller is typed by, so leaving the body's own view Opaque made a
+    // method's inside and outside disagree about its return type.
+    if f.z >= 0 {
+        rt = lower_type(c, p, src, f.z)
+        if has_self { rt = subst_self(c, src, rt, selfty) }
+    }
     c.curret = rt
     c.expected = rt
     // The fn's bracket generics `[T: Bound]` (gar 4-tuples at (g,h)) are in force for the
@@ -2983,13 +3039,14 @@ fn dump_types(read src: str, read c: Checker, read p: parser.Parser, read a: All
         } else if d.kind == 46 {                   // with alive: body AND else are Block structs
             if d.b >= 0 { list.set(bool, skip, d.b as usize, true) }
             if d.op >= 0 { list.set(bool, skip, d.op as usize, true) }
-        } else if d.kind == 42 {                   // select: each arm's body block
+        } else if d.kind == 42 {                   // select: each arm's body block, and `closed`
             var ai: i32 = 0
             for ai < d.y {
                 let body: i32 = list.get(i32, p.par, (d.x + ai * 4 + 3) as usize)
                 if body >= 0 { list.set(bool, skip, body as usize, true) }
                 ai = ai + 1
             }
+            if d.a >= 0 { list.set(bool, skip, d.a as usize, true) }
         }
         m = m + 1
     }

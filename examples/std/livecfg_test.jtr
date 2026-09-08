@@ -1,0 +1,648 @@
+// std/livecfg_test.jtr — the whole-or-nothing claim, checked against a real file.
+//
+// The module claims one thing above all: a reload that fails validation leaves the
+// previous configuration WHOLE. So the centre of this suite writes a file with one good
+// change beside one bad value and asserts the good change did not land — a test that
+// applied key by key and stopped at the fault would pass every other assertion here and
+// fail that one. Around it: the generation moves only when an effective value does, a key
+// that leaves the file reverts to its default, a file value cannot outrank the environment,
+// a secret reports that it changed and never what to, `[server.tls]` flattens to
+// `server.tls.port` and a `Section` finds it, and the real watcher triggers a real reload.
+//
+// Everything runs against a scratch directory of the suite's own, scrubbed at the START of
+// every test for `syswatch_test`'s reason: a test that fails midway must not leave the next
+// run looking at its debris, and end-of-test cleanup is exactly the code that does not run
+// when something goes wrong.
+//
+// Run:  jestyrc test examples/std/livecfg_test.jtr
+
+import "livecfg"
+import "config"
+import "syswatch"
+import "runtime"
+import "fs"
+import "sysfs"
+import "mem"
+import "time"
+import "sink"
+import "str"
+import "test"
+import "test_report"
+
+const LC_T_CAP: usize = 8192
+const LC_T_ROOT: str = "zz_livecfg_scratch"
+const LC_T_FILE: str = "zz_livecfg_scratch/app.ini"
+
+// ---- helpers ------------------------------------------------------------------
+
+fn nothing() { }
+
+fn no_watch() -> syswatch.Watcher {
+    return syswatch.closed()
+}
+
+// Remove the scratch tree, best effort, then recreate the directory.
+fn prepare(mut f: fs.Fs, read a: Allocator) {
+    fs.erase(f, LC_T_FILE)
+    let dead: bool = sysfs.remove_dir(f, a, LC_T_ROOT) catch false
+    let made: bool = sysfs.make_dir(f, a, LC_T_ROOT) catch false
+}
+
+fn scrub(mut f: fs.Fs, read a: Allocator) {
+    fs.erase(f, LC_T_FILE)
+    let dead: bool = sysfs.remove_dir(f, a, LC_T_ROOT) catch false
+}
+
+// The schema every test shares: two nested sections, one secret, one key with no default.
+fn schema(mut l: livecfg.Live) {
+    livecfg.declare(l, "server.port", config.CFG_INT, false)
+    livecfg.declare(l, "server.tls.port", config.CFG_INT, false)
+    livecfg.declare(l, "workers", config.CFG_INT, false)
+    livecfg.declare(l, "region", config.CFG_STR, false)
+    livecfg.declare(l, "verbose", config.CFG_BOOL, false)
+    livecfg.declare(l, "api_token", config.CFG_STR, true)
+    livecfg.apply(l, "server.port", "8080", config.CFG_DEFAULT)
+    livecfg.apply(l, "server.tls.port", "8443", config.CFG_DEFAULT)
+    livecfg.apply(l, "workers", "4", config.CFG_DEFAULT)
+    livecfg.apply(l, "region", "us-east", config.CFG_DEFAULT)
+    livecfg.apply(l, "verbose", "false", config.CFG_DEFAULT)
+}
+
+// A `Live` over the scratch file with no watcher, driven by `reload_now`, on a manual clock
+// reading 1000 so `applied_at` is an exact number.
+fn fresh(read a: Allocator) -> livecfg.Live {
+    var l: livecfg.Live = livecfg.make(a, time.manual(1000), fs.host(), syswatch.closed(), LC_T_FILE)
+    schema(l)
+    return l
+}
+
+fn port_of(read l: livecfg.Live) -> i64 {
+    return livecfg.get_int(l, livecfg.by_name(l, "server.port"))
+}
+
+fn workers_of(read l: livecfg.Live) -> i64 {
+    return livecfg.get_int(l, livecfg.by_name(l, "workers"))
+}
+
+fn origin_of(read l: livecfg.Live, read name: str) -> i32 {
+    return livecfg.origin_of(l, livecfg.by_name(l, name))
+}
+
+// What the change callback saw, accumulated as `key: old -> new` lines. Reached through a
+// `*mut u8` context — the `mem.Allocator` shape, the only way a fn pointer carries state.
+struct Seen {
+    n: i64,
+    used: usize,
+    buf: *mut u8,
+}
+
+const SEEN_CAP: usize = 2048
+
+fn seen_new() -> *mut Seen {
+    var s: *mut Seen = alloc(Seen, 1)
+    unsafe {
+        s.*.n = 0
+        s.*.used = 0
+        s.*.buf = alloc(u8, SEEN_CAP)
+    }
+    return s
+}
+
+fn seen_free(s: *mut Seen) {
+    var b: *mut u8 = null
+    unsafe { b = s.*.buf }
+    free_ptr(b)
+    free_ptr(s as *mut u8)
+}
+
+fn seen_reset(s: *mut Seen) {
+    unsafe {
+        s.*.n = 0
+        s.*.used = 0
+    }
+}
+
+fn seen_count(s: *mut Seen) -> i64 {
+    var n: i64 = 0
+    unsafe { n = s.*.n }
+    return n
+}
+
+fn seen_put(s: *mut Seen, read t: str) {
+    var i: usize = 0
+    for i < t.len {
+        unsafe {
+            if s.*.used < SEEN_CAP {
+                (s.*.buf + s.*.used).* = t[i]
+                s.*.used = s.*.used + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Does the accumulated text contain `needle`? Answered here so no view of the heap buffer
+// leaves the helper.
+fn seen_has(s: *mut Seen, read needle: str) -> bool {
+    var p: *mut u8 = null
+    var n: usize = 0
+    unsafe {
+        p = s.*.buf
+        n = s.*.used
+    }
+    let text: str = from_utf8(slice(u8, p, n))
+    return str.has(text, needle)
+}
+
+fn note_change(ctx: *mut u8, key: str, old: str, new: str) {
+    var s: *mut Seen = ctx as *mut Seen
+    seen_put(s, key)
+    seen_put(s, ": ")
+    seen_put(s, old)
+    seen_put(s, " -> ")
+    seen_put(s, new)
+    seen_put(s, "\n")
+    unsafe { s.*.n = s.*.n + 1 }
+}
+
+// A watch task that marks its slot — what `runtime.watch` runs when the handle is ready.
+fn bump(ctx: *mut u8, id: i64, now: i64) {
+    var p: *mut i64 = ctx as *mut i64
+    var v: i64 = 0
+    unsafe { v = (p + 0).* }
+    unsafe { (p + 0).* = v + 1 }
+}
+
+// ---- the generation --------------------------------------------------------------
+
+@test fn a_first_load_applies_the_file_and_the_generation_moves_only_when_a_value_does() -> bool {
+    var raw: *mut u8 = alloc(u8, LC_T_CAP)
+    var rep: []u8 = slice(u8, raw, LC_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    prepare(h, a)
+
+    var l: livecfg.Live = fresh(a)
+    test.eq_i64(c, rep, "before any load the generation is 0", livecfg.generation(l), 0)
+    test.eq_i64(c, rep, "and nothing has been applied", livecfg.applied_at(l), 0)
+    test.eq_i64(c, rep, "the default holds", port_of(l), 8080)
+    test.eq_i64(c, rep, "at origin default", origin_of(l, "server.port") as i64, config.CFG_DEFAULT as i64)
+    test.is_false(c, rep, "a key with no default is unset", livecfg.is_set(l, livecfg.by_name(l, "api_token")))
+
+    fs.put(h, LC_T_FILE, "region = eu-west\n[server]\nport = 9090\n")
+    test.eq_i64(c, rep, "the first load is a change", livecfg.reload_now(l) as i64, livecfg.LIVE_CHANGED as i64)
+    test.eq_i64(c, rep, "generation 1", livecfg.generation(l), 1)
+    test.eq_i64(c, rep, "applied at the clock's reading", livecfg.applied_at(l), 1000)
+    test.eq_i64(c, rep, "the file's port", port_of(l), 9090)
+    test.eq_i64(c, rep, "from the file", origin_of(l, "server.port") as i64, config.CFG_FILE as i64)
+    test.is_true(c, rep, "the file's region", livecfg.value_is(l, livecfg.by_name(l, "region"), "eu-west"))
+    test.eq_i64(c, rep, "a key the file does not name keeps its default", workers_of(l), 4)
+    test.eq_i64(c, rep, "one reload", livecfg.reloads(l), 1)
+    test.eq_i64(c, rep, "no rejection", livecfg.rejections(l), 0)
+    test.eq_usize(c, rep, "no problem", livecfg.problem_count(l), 0)
+
+    // **The generation says whether anything MOVED, not whether the file was read.** The
+    // same file again, and then the same settings with a comment added, are both re-read
+    // and both leave the generation alone — so a caller that caches something derived from
+    // the configuration compares one integer.
+    test.eq_i64(c, rep, "the same file again is `same`", livecfg.reload_now(l) as i64, livecfg.LIVE_SAME as i64)
+    test.eq_i64(c, rep, "and the generation did not move", livecfg.generation(l), 1)
+    test.eq_i64(c, rep, "though the file was read", livecfg.reloads(l), 2)
+    fs.put(h, LC_T_FILE, "# a comment is not a change\nregion = eu-west\n[server]\nport = 9090\n")
+    test.eq_i64(c, rep, "a comment-only edit is `same`", livecfg.reload_now(l) as i64, livecfg.LIVE_SAME as i64)
+    test.eq_i64(c, rep, "generation still 1", livecfg.generation(l), 1)
+
+    // A real edit moves it.
+    fs.put(h, LC_T_FILE, "region = eu-west\n[server]\nport = 9091\n")
+    test.eq_i64(c, rep, "a changed value is `changed`", livecfg.reload_now(l) as i64, livecfg.LIVE_CHANGED as i64)
+    test.eq_i64(c, rep, "generation 2", livecfg.generation(l), 2)
+    test.eq_i64(c, rep, "and the value is the new one", port_of(l), 9091)
+
+    // The schema is closed by the first load: a key declared afterwards would exist in the
+    // configuration but not in the base the next candidate is built from.
+    test.eq_i64(c, rep, "a declaration after the first load is refused", livecfg.declare(l, "late", config.CFG_INT, false) as i64, 0 - 1)
+    test.eq_i64(c, rep, "and does not exist", livecfg.by_name(l, "late") as i64, 0 - 1)
+
+    livecfg.free(l)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- the claim ---------------------------------------------------------------------
+
+@test fn a_reload_that_fails_validation_keeps_the_previous_configuration_whole() -> bool {
+    var raw: *mut u8 = alloc(u8, LC_T_CAP)
+    var rep: []u8 = slice(u8, raw, LC_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    prepare(h, a)
+    var braw: *mut u8 = alloc(u8, LC_T_CAP)
+    var buf: []u8 = slice(u8, braw, LC_T_CAP)
+    var sk: sink.Sink = sink.new()
+
+    var l: livecfg.Live = fresh(a)
+    fs.put(h, LC_T_FILE, "workers = 8\n[server]\nport = 9090\n")
+    test.eq_i64(c, rep, "a good file loads", livecfg.reload_now(l) as i64, livecfg.LIVE_CHANGED as i64)
+    test.eq_i64(c, rep, "port 9090", port_of(l), 9090)
+    test.eq_i64(c, rep, "workers 8", workers_of(l), 8)
+
+    // **One good change beside one bad value.** The port moves to 7000 — a perfectly valid
+    // edit — and `workers` becomes a word. A reload that applied key by key would land the
+    // port and then stop; this one must land NEITHER.
+    fs.put(h, LC_T_FILE, "workers = many\n[server]\nport = 7000\n")
+    test.eq_i64(c, rep, "the file is rejected", livecfg.reload_now(l) as i64, livecfg.LIVE_REJECTED as i64)
+    test.eq_i64(c, rep, "the GOOD change did not land either", port_of(l), 9090)
+    test.eq_i64(c, rep, "the bad one certainly did not", workers_of(l), 8)
+    test.eq_i64(c, rep, "the generation did not move", livecfg.generation(l), 1)
+    test.eq_i64(c, rep, "one rejection", livecfg.rejections(l), 1)
+    test.eq_i64(c, rep, "and no reload", livecfg.reloads(l), 1)
+    test.eq_usize(c, rep, "one problem", livecfg.problem_count(l), 1)
+
+    // The problem is reported with `file:line:col` through `std/diag`, against the file's
+    // own text: the caret sits under the KEY and carries the schema's verdict.
+    sink.reset(sk)
+    livecfg.render_problems(sk, buf, l)
+    let r1: str = sink.view(sk, buf)
+    test.is_true(c, rep, "the report names the file, line and column", str.has(r1, "zz_livecfg_scratch/app.ini:1:1"))
+    test.is_true(c, rep, "and carries the schema's verdict", str.has(r1, "not an integer"))
+    test.is_true(c, rep, "quoting the line back", str.has(r1, "workers = many"))
+    test.is_false(c, rep, "the report is complete", sink.overflowed(sk))
+
+    // Two faults in one file are two reports from one read — fixing a config one run at a
+    // time is the experience `std/ini` exists to remove, and this module must not undo it.
+    fs.put(h, LC_T_FILE, "workers = many\nverbos = true\n[server]\nport = 7000\n")
+    test.eq_i64(c, rep, "two faults: rejected", livecfg.reload_now(l) as i64, livecfg.LIVE_REJECTED as i64)
+    test.eq_usize(c, rep, "both counted", livecfg.problem_count(l), 2)
+    sink.reset(sk)
+    livecfg.render_problems(sk, buf, l)
+    let r2: str = sink.view(sk, buf)
+    test.is_true(c, rep, "the bad value is on line 1", str.has(r2, "app.ini:1:1"))
+    test.is_true(c, rep, "the unknown key is on line 2", str.has(r2, "app.ini:2:1"))
+    test.is_true(c, rep, "and is called an unknown key", str.has(r2, "unknown key"))
+    test.eq_i64(c, rep, "still 9090", port_of(l), 9090)
+    test.eq_i64(c, rep, "two rejections", livecfg.rejections(l), 2)
+
+    // A half-written file — what a step between an editor's two writes sees — is the same
+    // case: a line with no `=` is a fault, and the previous configuration stands.
+    fs.put(h, LC_T_FILE, "workers = 16\n[server]\nport = 70")
+    test.eq_i64(c, rep, "a truncated file loads — `port = 70` is valid INI", livecfg.reload_now(l) as i64, livecfg.LIVE_CHANGED as i64)
+    test.eq_i64(c, rep, "so the truncated number is the value", port_of(l), 70)
+    fs.put(h, LC_T_FILE, "workers = 16\n[server]\npo")
+    test.eq_i64(c, rep, "a line cut before its `=` is a fault", livecfg.reload_now(l) as i64, livecfg.LIVE_REJECTED as i64)
+    test.eq_i64(c, rep, "and the earlier configuration stands whole", port_of(l), 70)
+    test.eq_i64(c, rep, "including the key the cut file still named", workers_of(l), 16)
+
+    // Fixed, it applies — the control that says the rejections above were about the faults.
+    fs.put(h, LC_T_FILE, "workers = 16\n[server]\nport = 7000\n")
+    test.eq_i64(c, rep, "the fixed file is applied", livecfg.reload_now(l) as i64, livecfg.LIVE_CHANGED as i64)
+    test.eq_i64(c, rep, "port 7000", port_of(l), 7000)
+    test.eq_i64(c, rep, "workers 16", workers_of(l), 16)
+    test.eq_usize(c, rep, "no problem remains", livecfg.problem_count(l), 0)
+    sink.reset(sk)
+    livecfg.render_problems(sk, buf, l)
+    test.eq_usize(c, rep, "and a clean reload renders no report", sink.written(sk), 0)
+
+    // A file that vanishes is `unreadable`, not `rejected`, and the configuration stands.
+    fs.erase(h, LC_T_FILE)
+    test.eq_i64(c, rep, "a missing file is unreadable", livecfg.reload_now(l) as i64, livecfg.LIVE_UNREADABLE as i64)
+    test.is_true(c, rep, "and says so", livecfg.unreadable(l))
+    test.eq_i64(c, rep, "the configuration stands", port_of(l), 7000)
+    test.eq_i64(c, rep, "the generation did not move", livecfg.generation(l), 3)
+    sink.reset(sk)
+    livecfg.render_problems(sk, buf, l)
+    test.is_true(c, rep, "the report says it could not read", str.has(sink.view(sk, buf), "cannot read"))
+    fs.put(h, LC_T_FILE, "workers = 16\n[server]\nport = 7000\n")
+    test.eq_i64(c, rep, "back, and unchanged", livecfg.reload_now(l) as i64, livecfg.LIVE_SAME as i64)
+    test.is_false(c, rep, "readable again", livecfg.unreadable(l))
+
+    livecfg.free(l)
+    free_ptr(braw)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_key_removed_from_the_file_reverts_to_its_default() -> bool {
+    var raw: *mut u8 = alloc(u8, LC_T_CAP)
+    var rep: []u8 = slice(u8, raw, LC_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    prepare(h, a)
+
+    var l: livecfg.Live = fresh(a)
+    fs.put(h, LC_T_FILE, "region = eu-west\napi_token = tok-1\n")
+    livecfg.reload_now(l)
+    let reg: i32 = livecfg.by_name(l, "region")
+    let token: i32 = livecfg.by_name(l, "api_token")
+    test.is_true(c, rep, "the file's region", livecfg.value_is(l, reg, "eu-west"))
+    test.is_true(c, rep, "the file's token", livecfg.value_is(l, token, "tok-1"))
+
+    // **`config.apply` can set a value but never unset one**, so a merge in place would
+    // keep every stale file value forever. The candidate is built from the base instead,
+    // and a key that left the file is back at whatever the base says: its default, or
+    // nothing.
+    fs.put(h, LC_T_FILE, "# both keys gone\n")
+    test.eq_i64(c, rep, "removing keys is a change", livecfg.reload_now(l) as i64, livecfg.LIVE_CHANGED as i64)
+    test.is_true(c, rep, "the region is its default again", livecfg.value_is(l, reg, "us-east"))
+    test.eq_i64(c, rep, "at origin default", livecfg.origin_of(l, reg) as i64, config.CFG_DEFAULT as i64)
+    test.is_false(c, rep, "the token, which had no default, is unset", livecfg.is_set(l, token))
+    test.eq_i64(c, rep, "generation 2", livecfg.generation(l), 2)
+
+    // The control: with the keys back, the values return — so the assertions above are
+    // about the file and not about the keys never having applied.
+    fs.put(h, LC_T_FILE, "region = eu-west\napi_token = tok-1\n")
+    livecfg.reload_now(l)
+    test.is_true(c, rep, "the region returns with the file", livecfg.value_is(l, reg, "eu-west"))
+    test.is_true(c, rep, "so does the token", livecfg.is_set(l, token))
+
+    livecfg.free(l)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- precedence -----------------------------------------------------------------
+
+@test fn a_file_reload_cannot_outrank_the_environment_or_the_command_line() -> bool {
+    var raw: *mut u8 = alloc(u8, LC_T_CAP)
+    var rep: []u8 = slice(u8, raw, LC_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    prepare(h, a)
+
+    var l: livecfg.Live = fresh(a)
+    test.eq_i64(c, rep, "an env value is taken", livecfg.apply(l, "server.port", "9", config.CFG_ENV) as i64, config.CFG_OK as i64)
+    test.eq_i64(c, rep, "a cli value is taken", livecfg.apply(l, "region", "cli-land", config.CFG_CLI) as i64, config.CFG_OK as i64)
+    // A hand-applied FILE value is refused: the file is this module's source, and a value
+    // applied by hand would outlive the file that no longer says it.
+    test.eq_i64(c, rep, "a hand-applied file value is refused", livecfg.apply(l, "workers", "2", config.CFG_FILE) as i64, config.CFG_SHADOWED as i64)
+    test.eq_i64(c, rep, "and changed nothing", workers_of(l), 4)
+
+    // **The file names every one of them.** `std/config`'s rule applied unchanged: the
+    // candidate starts as a clone of the base, which holds the env and cli values at their
+    // own origins, so the file's port and region arrive as shadowed and change nothing —
+    // while its `workers`, which only a default held, applies.
+    fs.put(h, LC_T_FILE, "region = eu-west\nworkers = 8\n[server]\nport = 8080\n")
+    test.eq_i64(c, rep, "the reload applies (workers moved)", livecfg.reload_now(l) as i64, livecfg.LIVE_CHANGED as i64)
+    test.eq_i64(c, rep, "the env port stands", port_of(l), 9)
+    test.eq_i64(c, rep, "at origin env", origin_of(l, "server.port") as i64, config.CFG_ENV as i64)
+    test.is_true(c, rep, "the cli region stands", livecfg.value_is(l, livecfg.by_name(l, "region"), "cli-land"))
+    test.eq_i64(c, rep, "at origin cli", origin_of(l, "region") as i64, config.CFG_CLI as i64)
+    test.eq_i64(c, rep, "the file's workers applied", workers_of(l), 8)
+    test.eq_i64(c, rep, "at origin file", origin_of(l, "workers") as i64, config.CFG_FILE as i64)
+    test.eq_usize(c, rep, "a shadowed file value is not a problem", livecfg.problem_count(l), 0)
+
+    // A file edit that touches only shadowed keys moves nothing effective: `same`, and the
+    // generation stays. This is what keeps a service from rebuilding its derived state
+    // because an operator edited a line the environment overrides anyway.
+    fs.put(h, LC_T_FILE, "region = somewhere-else\nworkers = 8\n[server]\nport = 1\n")
+    test.eq_i64(c, rep, "editing only shadowed keys is `same`", livecfg.reload_now(l) as i64, livecfg.LIVE_SAME as i64)
+    test.eq_i64(c, rep, "generation still 1", livecfg.generation(l), 1)
+    test.eq_i64(c, rep, "port still 9", port_of(l), 9)
+
+    // **The stated decision: a shadowed file value is not validated.** `config.apply`
+    // answers shadowed before it parses, so a bad value for a key the environment overrides
+    // reloads clean today and is reported the day the override goes away. Pinned so the
+    // decision cannot drift silently — a caller who wants the other behaviour must change
+    // this assertion on purpose.
+    fs.put(h, LC_T_FILE, "workers = 8\n[server]\nport = not-a-number\n")
+    test.eq_i64(c, rep, "a bad value under an env override reloads clean", livecfg.reload_now(l) as i64, livecfg.LIVE_SAME as i64)
+    test.eq_usize(c, rep, "with no problem recorded", livecfg.problem_count(l), 0)
+
+    // A default applied after the load lands beneath the file and holds when the file lets
+    // go — the base is the durable layer, the file sits on top of it.
+    test.eq_i64(c, rep, "a later default is accepted into the base", livecfg.apply(l, "workers", "3", config.CFG_DEFAULT) as i64, config.CFG_OK as i64)
+    test.eq_i64(c, rep, "but the file's value stands over it", workers_of(l), 8)
+    fs.put(h, LC_T_FILE, "[server]\nport = 8080\n")
+    test.eq_i64(c, rep, "the file lets go of workers", livecfg.reload_now(l) as i64, livecfg.LIVE_CHANGED as i64)
+    test.eq_i64(c, rep, "and the later default shows", workers_of(l), 3)
+
+    // A stronger source applied after a load moves the effective value at once, ahead of
+    // any file: a cli flag arriving late is still a cli flag.
+    test.eq_i64(c, rep, "a late cli port is taken", livecfg.apply(l, "server.port", "77", config.CFG_CLI) as i64, config.CFG_OK as i64)
+    test.eq_i64(c, rep, "over the env", port_of(l), 77)
+    fs.put(h, LC_T_FILE, "[server]\nport = 1234\n")
+    livecfg.reload_now(l)
+    test.eq_i64(c, rep, "and a file reload does not disturb it", port_of(l), 77)
+
+    livecfg.free(l)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- change notification ---------------------------------------------------------
+
+@test fn a_change_is_reported_per_key_and_a_secret_reports_only_that_it_changed() -> bool {
+    var raw: *mut u8 = alloc(u8, LC_T_CAP)
+    var rep: []u8 = slice(u8, raw, LC_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    prepare(h, a)
+
+    var l: livecfg.Live = fresh(a)
+    var s: *mut Seen = seen_new()
+    livecfg.on_change(l, livecfg.change(s as *mut u8, &note_change))
+
+    // Two keys move on the first load: the port, rendered old and new, and the secret,
+    // rendered `**** -> ****`. The token's TEXT must be absent from everything the callback
+    // saw — the same assertion `config`'s own demo makes about its render.
+    fs.put(h, LC_T_FILE, "api_token = hunter2-s3cr3t\n[server]\nport = 9090\n")
+    test.eq_i64(c, rep, "the first load changes", livecfg.reload_now(l) as i64, livecfg.LIVE_CHANGED as i64)
+    test.eq_i64(c, rep, "one callback per moved key", seen_count(s), 2)
+    test.is_true(c, rep, "the port reports old and new", seen_has(s, "server.port: 8080 -> 9090\n"))
+    test.is_true(c, rep, "the secret reports that it changed", seen_has(s, "api_token: **** -> ****\n"))
+    test.is_false(c, rep, "and never its text", seen_has(s, "hunter2"))
+    test.is_false(c, rep, "a key that did not move is not reported", seen_has(s, "workers"))
+
+    // No callback when nothing moved, and none on a rejected reload — the values of a file
+    // that was refused are not a change anyone should react to.
+    seen_reset(s)
+    test.eq_i64(c, rep, "the same file is `same`", livecfg.reload_now(l) as i64, livecfg.LIVE_SAME as i64)
+    test.eq_i64(c, rep, "and reports nothing", seen_count(s), 0)
+    fs.put(h, LC_T_FILE, "api_token = other-s3cr3t\nworkers = many\n[server]\nport = 1\n")
+    test.eq_i64(c, rep, "a rejected file", livecfg.reload_now(l) as i64, livecfg.LIVE_REJECTED as i64)
+    test.eq_i64(c, rep, "reports nothing", seen_count(s), 0)
+    test.is_false(c, rep, "and leaked nothing", seen_has(s, "other-s3cr3t"))
+
+    // Only the secret moves: one callback, still redacted, and neither the old nor the new
+    // text reaches it.
+    fs.put(h, LC_T_FILE, "api_token = new-s3cr3t\n[server]\nport = 9090\n")
+    test.eq_i64(c, rep, "the secret changes", livecfg.reload_now(l) as i64, livecfg.LIVE_CHANGED as i64)
+    test.eq_i64(c, rep, "exactly one callback", seen_count(s), 1)
+    test.is_true(c, rep, "redacted both sides", seen_has(s, "api_token: **** -> ****\n"))
+    test.is_false(c, rep, "the old text is absent", seen_has(s, "hunter2"))
+    test.is_false(c, rep, "the new text is absent", seen_has(s, "new-s3cr3t"))
+    test.is_true(c, rep, "and the value really did move", livecfg.value_is(l, livecfg.by_name(l, "api_token"), "new-s3cr3t"))
+
+    // A non-secret that leaves the file reports its old value and an empty new one — the
+    // report is about the key moving; `origin_of` says the rest.
+    seen_reset(s)
+    fs.put(h, LC_T_FILE, "api_token = new-s3cr3t\n")
+    livecfg.reload_now(l)
+    test.eq_i64(c, rep, "one key moved", seen_count(s), 1)
+    test.is_true(c, rep, "back to its default, rendered", seen_has(s, "server.port: 9090 -> 8080\n"))
+
+    // Installing the callback AFTER a load is fine; it just sees later changes.
+    var l2: livecfg.Live = fresh(a)
+    livecfg.reload_now(l2)
+    seen_reset(s)
+    livecfg.on_change(l2, livecfg.change(s as *mut u8, &note_change))
+    fs.put(h, LC_T_FILE, "api_token = new-s3cr3t\nverbose = true\n")
+    livecfg.reload_now(l2)
+    test.eq_i64(c, rep, "a callback installed later sees the next change", seen_count(s), 1)
+    test.is_true(c, rep, "a boolean renders as its text", seen_has(s, "verbose: false -> true\n"))
+    livecfg.free(l2)
+
+    seen_free(s)
+    livecfg.free(l)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- nesting ---------------------------------------------------------------------
+
+@test fn a_nested_section_flattens_to_a_dotted_key_and_a_section_view_finds_it() -> bool {
+    var raw: *mut u8 = alloc(u8, LC_T_CAP)
+    var rep: []u8 = slice(u8, raw, LC_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    prepare(h, a)
+
+    var l: livecfg.Live = fresh(a)
+    // `[server.tls]` is a section header like any other: `std/ini` copies its name
+    // verbatim, so the key is `server.tls.port` — and `[server]`'s own `port` is a
+    // different key that the nested header does not disturb.
+    fs.put(h, LC_T_FILE, "[server]\nport = 9090\n[server.tls]\nport = 8444\n")
+    test.eq_i64(c, rep, "the file loads", livecfg.reload_now(l) as i64, livecfg.LIVE_CHANGED as i64)
+    let tls_port: i32 = livecfg.by_name(l, "server.tls.port")
+    test.is_true(c, rep, "server.tls.port exists", tls_port >= 0)
+    test.eq_i64(c, rep, "and holds the nested section's value", livecfg.get_int(l, tls_port), 8444)
+    test.eq_i64(c, rep, "server.port holds its own", port_of(l), 9090)
+
+    // A component handed the section `server.tls` asks for `port` and never learns where
+    // it sits. The view is a PREFIX onto the flat space, not a tree: `server.tls.port` is
+    // still one key with one origin.
+    var server: config.Section = config.section("server")
+    var tls: config.Section = config.sub_section(server, "tls")
+    test.eq_str(c, rep, "a sub-section names its full prefix", config.section_name(tls), "server.tls")
+    test.eq_i64(c, rep, "the section finds the nested key", livecfg.section_key(l, tls, "port") as i64, tls_port as i64)
+    test.eq_i64(c, rep, "and the parent section finds its own", livecfg.section_key(l, server, "port") as i64, livecfg.by_name(l, "server.port") as i64)
+    test.eq_i64(c, rep, "a leaf that is not declared is -1", livecfg.section_key(l, tls, "cert") as i64, 0 - 1)
+    test.eq_i64(c, rep, "the two ports are different keys", livecfg.get_int(l, livecfg.section_key(l, server, "port")), 9090)
+
+    // The empty prefix is the root, so a component can be handed the root and still
+    // compose: `sub_section(root, "server")` is `server`, not `.server`.
+    var root: config.Section = config.section("")
+    test.eq_i64(c, rep, "the root section finds a top-level key", livecfg.section_key(l, root, "workers") as i64, livecfg.by_name(l, "workers") as i64)
+    var server2: config.Section = config.sub_section(root, "server")
+    test.eq_str(c, rep, "a sub-section of the root has no leading dot", config.section_name(server2), "server")
+    test.eq_i64(c, rep, "and resolves like the direct one", livecfg.section_key(l, server2, "port") as i64, livecfg.by_name(l, "server.port") as i64)
+
+    // The same view over a plain `config.Config`, since that is where it lives.
+    var plain: config.Config = config.make(a)
+    config.declare(plain, "a.b.c", config.CFG_STR, false)
+    var ab: config.Section = config.sub_section(config.section("a"), "b")
+    test.eq_i64(c, rep, "config.section_key over a plain Config", config.section_key(plain, ab, "c") as i64, 0)
+    test.eq_i64(c, rep, "and -1 for a leaf it lacks", config.section_key(plain, ab, "d") as i64, 0 - 1)
+    config.free(plain)
+
+    // A section view reads through a reload: the id is stable, the value follows the file.
+    fs.put(h, LC_T_FILE, "[server]\nport = 9090\n[server.tls]\nport = 8445\n")
+    livecfg.reload_now(l)
+    test.eq_i64(c, rep, "after a reload the section reads the new value", livecfg.get_int(l, livecfg.section_key(l, tls, "port")), 8445)
+
+    livecfg.free(l)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- the real watcher ------------------------------------------------------------
+
+@test fn a_real_edit_wakes_the_watcher_and_a_step_reloads_it() -> bool {
+    var raw: *mut u8 = alloc(u8, LC_T_CAP)
+    var rep: []u8 = slice(u8, raw, LC_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    prepare(h, a)
+
+    // The file exists BEFORE the watcher opens, so the first step has nothing to report.
+    fs.put(h, LC_T_FILE, "[server]\nport = 9090\n")
+    var w: syswatch.Watcher = syswatch.open_dir(h, a, LC_T_ROOT) catch no_watch()
+    test.is_true(c, rep, "a watcher opens on the scratch directory", syswatch.is_open(w))
+    var l: livecfg.Live = livecfg.make(a, time.manual(1000), fs.host(), w, LC_T_FILE)
+    schema(l)
+    test.is_true(c, rep, "the config is watching", livecfg.watching(l))
+    test.eq_i64(c, rep, "the first load is explicit", livecfg.reload_now(l) as i64, livecfg.LIVE_CHANGED as i64)
+    test.eq_i64(c, rep, "an untouched directory is `quiet`", livecfg.step(l) as i64, livecfg.LIVE_QUIET as i64)
+    test.eq_i64(c, rep, "and quiet means the file was not read", livecfg.reloads(l), 1)
+
+    // **The wait is the watcher's own**, through the loop, exactly as `syswatch_test`
+    // waits: the handle and the poller come from the same watcher, and a 2s budget bounds
+    // a platform that never fires without making a working one slow. A step that follows
+    // a wake drains the watcher and re-reads the file.
+    var hits: *mut i64 = alloc(i64, 1)
+    unsafe { (hits + 0).* = 0 }
+    var rt: runtime.Runtime = runtime.make(a, time.manual(0))
+    runtime.set_poller(rt, livecfg.poller(l))
+    let tok: runtime.CancelToken = runtime.token(rt)
+    runtime.watch(rt, livecfg.handle(l), tok, runtime.task(hits as *mut u8, &bump))
+
+    fs.put(h, LC_T_FILE, "[server]\nport = 9091\n")
+    let e: runtime.Event = runtime.poll_for(rt, 2000000000)
+    test.eq_i64(c, rep, "a real edit wakes the loop", e.kind as i64, RT_READY as i64)
+    test.eq_i64(c, rep, "a step after the wake reloads", livecfg.step(l) as i64, livecfg.LIVE_CHANGED as i64)
+    test.eq_i64(c, rep, "with the new value", port_of(l), 9091)
+    test.eq_i64(c, rep, "generation 2", livecfg.generation(l), 2)
+
+    // A step drains the watcher until it converges, so the next step is quiet again — the
+    // property that keeps a level-triggered watch from re-reading the file forever.
+    test.eq_i64(c, rep, "the next step is quiet", livecfg.step(l) as i64, livecfg.LIVE_QUIET as i64)
+    let after: runtime.Event = runtime.poll_for(rt, 30000000)
+    test.eq_i64(c, rep, "and the loop goes quiet too", after.kind as i64, RT_TIMEOUT as i64)
+
+    // A rejected edit through the watcher path is the same rejection: the previous
+    // configuration stands, and the next good edit applies.
+    fs.put(h, LC_T_FILE, "[server]\nport = nine\n")
+    runtime.poll_for(rt, 2000000000)
+    test.eq_i64(c, rep, "a bad edit through the watcher is rejected", livecfg.step(l) as i64, livecfg.LIVE_REJECTED as i64)
+    test.eq_i64(c, rep, "and the configuration stands", port_of(l), 9091)
+    livecfg.step(l)
+
+    // A closed watcher never reads: `step` is `quiet` whatever the file does, and
+    // `reload_now` is the caller's own trigger.
+    var l2: livecfg.Live = fresh(a)
+    test.is_false(c, rep, "a closed watcher is not watching", livecfg.watching(l2))
+    fs.put(h, LC_T_FILE, "[server]\nport = 5\n")
+    test.eq_i64(c, rep, "a step on a closed watcher is quiet", livecfg.step(l2) as i64, livecfg.LIVE_QUIET as i64)
+    test.eq_i64(c, rep, "and read nothing", livecfg.reloads(l2), 0)
+    test.eq_i64(c, rep, "reload_now reads regardless", livecfg.reload_now(l2) as i64, livecfg.LIVE_CHANGED as i64)
+    test.eq_i64(c, rep, "port 5", port_of(l2), 5)
+    livecfg.free(l2)
+
+    runtime.cancel_all(rt, tok)
+    runtime.free(rt)
+    free_ptr(hits)
+    livecfg.free(l)
+    test.is_false(c, rep, "free closes the watcher", livecfg.watching(l))
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

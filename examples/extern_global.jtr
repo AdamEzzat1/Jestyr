@@ -1,0 +1,57 @@
+// examples/extern_global.jtr — `extern … var`: a foreign GLOBAL, bound like a foreign function.
+//
+// `errno` is the global every C program reads and almost none can bind cleanly: on every
+// libc that matters it is a MACRO (`(*__errno_location())` on glibc, `(*_errno())` on
+// msvcrt), so a redeclaration is a compile error and only a use-by-name works. That is
+// exactly what a header-abi global gives: `extern "errno.h" var errno: i32` emits no
+// declaration of its own and names the symbol where it is read or written, so the macro
+// expands where it should.
+//
+// A global is a PLACE — readable and assignable — which is what the three steps below
+// check: a failed `fopen` sets it to ENOENT (2 on every platform this backend targets),
+// an assignment clears it, and a read afterwards sees the cleared value. The `fopen` is
+// bound the same way `std/file` binds it, through the header, so this file needs no import.
+//
+// Run:  jestyrc run examples/extern_global.jtr
+//   →  before  0  after-open  2  cleared  0  addr-agrees  true
+
+extern "errno.h" var errno: i32
+extern "stdio.h" fn fopen(path: cstr, mode: cstr) -> cptr
+
+fn main() -> i32 {
+    errno = 0
+    print_str("before")
+    print_int(errno as i64)
+
+    // A path that cannot exist: an interior directory nobody creates.
+    let h: cptr = fopen("zz_no_such_dir_kv/zz_missing.txt".cstr, "rb".cstr)
+    print_str("after-open")
+    print_bool(h == null)
+    print_int(errno as i64)                  // ENOENT = 2
+
+    errno = 0
+    print_str("cleared")
+    print_int(errno as i64)
+
+    // The address of a global is the symbol's address: writing through it is the same
+    // write, which is what says the name above is the real `errno` and not a shadow.
+    var p: *mut i32 = &errno
+    unsafe { p.* = 7 }
+    print_str("addr-agrees")
+    print_bool(errno == 7)
+    errno = 0
+
+    // A LOCAL of the same name shadows the global, exactly as it shadows a const: the
+    // checker resolves the name to the binding, and the backend must follow the checker
+    // rather than the spelling. The global stays 0 underneath — read again after.
+    print_str("shadowed")
+    print_int(shadow())
+    print_int(errno as i64)
+    return 0
+}
+
+fn shadow() -> i64 {
+    var errno: i64 = 40
+    errno = errno + 2
+    return errno
+}

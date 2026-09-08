@@ -5,6 +5,570 @@ versions are snapshots, not stability promises.
 
 ## Unreleased
 
+### Added
+
+- **`std/trace`** — timed, nested segments of work with attributes, exported to whoever is
+  listening. A `Tracer` is GIVEN a `time.Clock` and an `Exporter` (`std/log`'s design: no
+  ambient tracer, no global), so under `time.manual()` every duration and every id is
+  exact. The unit is a **segment**, because `Span` is taken three times in this tree
+  (`http`, `diag`, `@span`). The exporter is a fn-pointer vtable — `on_open`/`on_str`/
+  `on_i64`/`on_close`, a visitor over one finished segment — and not a trait, because
+  `@no_alloc` passes vacuously through a trait method; three ship: `to_text` (a logfmt
+  line), `to_jsonl` (one JSON object per line, same keys in the same order) and `to_log`
+  (one `std/log` record per segment, the logger's clock for `ts`, the tracer's for `dur`).
+  Records arrive in END order carrying a parent id; a consumer that wants the tree rebuilds
+  it. Bounded at `make` and every refusal is counted by name: `dropped` (a `begin` past the
+  stack or arena), `truncated` (an attribute that did not fit — the segment still exports
+  what it had), `abandoned` (a child still open when an outer segment ended, or at `free`;
+  discarded, never exported), `unmatched` (`end` of an id that is not open). `end(t, id)`
+  names the segment on purpose: that is what makes the early-`return` mis-nesting
+  observable. 7 tests, none touching the OS; the centre parses the JSON rendering back
+  with `std/json` and compares fifteen fields against the text line. Four mutations watched
+  failing: `dur` reported as `now` instead of `now - start`; the JSON exporter dropping
+  `parent`; the abandoned count not incremented; a refused attribute not counted. Demo
+  `jtrace` (`examples/std/trace_demo.jtr`) traces one request three ways and rebuilds the
+  tree from its own JSON; transcript pinned. Not built: sampling, propagation, shared trace
+  ids, batching, a wire protocol.
+
+- **`std/livecfg`** — a configuration that follows its file, and never half-way: live reload
+  plus nesting, composed from `std/config` (precedence by source, redaction by declaration),
+  `std/ini` (byte-span problems) and `std/syswatch`. A `Live` is GIVEN its clock, its `fs.Fs`,
+  its watcher and its schema; `step` is one pass of the caller's own loop (drain the watcher,
+  re-read only if it fired — no thread, no debounce) and `reload_now` is the same reload
+  without the watcher, for a caller with its own trigger.
+
+  **A reload that fails validation keeps the previous configuration WHOLE.** A reload never
+  touches the live configuration: it builds a CANDIDATE — a clone of the base (schema + every
+  non-file source) with the file applied on top — and swaps it in only when the file validated
+  completely. A file with one good change beside one bad value applies NEITHER; every problem
+  is kept with its byte span and `render_problems` turns them into `file:line:col` with a
+  caret under the key through `std/diag`. Building from the base rather than merging in place
+  is what makes a key REMOVED from the file revert to its default, and it is what keeps
+  precedence a property of the source: an env or cli value survives every reload as a
+  shadowed file value, and a shadowed value is NOT validated (`config.apply` answers shadowed
+  before it parses — stated in the header, pinned by a test). A `generation` counter moves
+  only when an effective value does — re-saving a file unchanged or editing a comment is
+  `same` — and a change callback (fn pointer + context) fires once per moved key with old and
+  new RENDERED through `config.render_value`, so a secret reports `**** -> ****` and never its
+  text. Nesting is additive to `config`: `[server.tls]` flattens to `server.tls.port`, and a
+  `config.Section` is a prefix VIEW onto the flat key space, not a tree. `std/config` gained
+  `clone`, `same_value`, `render_name`, `render_value`, `kind_of`, `is_secret` and the
+  `Section` family; nothing existing changed shape.
+
+  7 tests over a real scratch file, including a real `syswatch` edit waited for through the
+  runtime loop with a 2s bound; the pinned demo `jlivecfg` drives its four edits with
+  `reload_now` so the transcript is exact, and asks the loop afterwards whether the watcher
+  saw them. **Four mutations watched failing** (swap the candidate in despite faults; build
+  the candidate from the current configuration instead of the base; skip redaction in
+  `render_value`; advance the generation on every reload) — each caught by the test that
+  names it.
+
+- **`std/supervise`** — a supervisor over `std/sysproc` child PROCESSES (the second-wave
+  "service supervision" module; `std/service` is the lifecycle of the program you are in,
+  this keeps OTHER programs running). A bounded child table with a per-child `Policy`:
+  restart `never`/`on_failure`/`always`, a budget of N restarts within a window of M ns
+  (the budget counts RESTARTS — N = 3 restarts the third crash and gives up on the fourth;
+  N = 0 gives up at the first; negative is unlimited), a fixed or doubling-with-cap backoff
+  that resets to its base when a run outlasted the window. `tick` is one step with no
+  thread of its own — reap via `try_wait`, decide, schedule by deadline on the injected
+  `time.Clock`, start what is due — and a child changes phase at most once per tick, so an
+  exit and its restart are two observable steps even at zero delay. Per-child state
+  (`phase_of`, `outcome_of`, `last_code_of`, `restarts_of`, `gave_up`, `due_of`),
+  `next_deadline` for a driver's sleep, `stop_all` (`terminate` + `wait_or_kill`, cancels
+  scheduled restarts, reports the kill count), and an event callback (ctx + fn pointer:
+  started/exited/restarted/gave-up/stopped, each carrying a detail).
+
+  **Two clocks, on purpose.** The supervisor's own clock is POLICY time; `poll_for` takes
+  a second clock that is the time a caller can afford to SPEND blocking. In a test the
+  first is `time.manual()` while the children are real processes exiting in real time,
+  which the second waits on — one clock could not be both, and a supervisor that reached
+  for `time.host()` itself would touch the OS behind the caller's back. **A start the
+  platform refuses is final** (`SUP_OUT_START_FAILED`, not a crash the budget retries).
+  `sysproc` grew `start_exec(path, args)` — a program started DIRECTLY, no shell — because
+  killing `cmd.exe /c prog` ends `cmd.exe` and orphans `prog`, the very process a
+  supervisor is in charge of. 10 tests, every one over real children on a manual policy
+  clock; watched failing: the budget off by one (`>` for `>=`), a backoff that never
+  doubles, a window that never closes, and a `stop_all` that leaves a waiting child.
+  Demo `jsupervise` (the demo re-invokes itself as its three children) pinned exactly.
+  Not built: a supervision tree, graceful (signal-then-kill) shutdown, dependency order,
+  logging (events go to the callback). **Finding:** importing `core` beside any module
+  with a fallible function breaks type-checking — `core.Result`'s variants `ok`/`err`
+  shadow the intrinsics — so the demo renders its numbers itself.
+
+- **`std/crypto`** — hashing, HMAC and signatures by binding OpenSSL's libcrypto (the
+  second-wave crypto bindings). A `Hasher` is a fn-pointer vtable (`init`/`update`/`finish`
+  plus an opaque context — the `mem.Allocator` shape, not a trait, because `@no_alloc`
+  passes vacuously through a trait) with two implementations: `evp_hasher(SHA256|SHA512)`
+  over `EVP_MD` and `jestyr_hasher()` over `std/sha256`, the hash `attest` commits to. `hmac`
+  / `hmac_verify` (SHA-256, SHA-512; the comparison is `csrand.ct_eq`), `sign` / `verify` over
+  `EVP_DigestSign`/`EVP_DigestVerify` with keys loaded from PEM text or through an `fs.Fs`
+  (a private key, a `PUBLIC KEY`, or the public key inside a certificate), and an error
+  surface (`CryptoRefused`/`CryptoFailed`/`CryptoTooSmall` plus `last_error` in OpenSSL's
+  words). **`verify` answers `false` for anything the library does not accept and refuses
+  only when it could not ask** — a closed key, a public key handed to `sign`, an unknown
+  algorithm — because collapsing "could not verify" into "did not" is the safe direction.
+  5 tests: both SHA-256s on the NIST vectors and on an 800-byte message streamed in uneven
+  pieces (identical bytes demanded), RFC 4231 cases 1, 2 and 6 (the long key), sign → verify
+  under the certificate's key and the `PUBLIC KEY` PEM, then a flipped message byte, a flipped
+  signature bit, a truncation, the wrong digest and the wrong key all refused; refusals
+  before a byte of the caller's buffer moves. Four mutations watched failing (`ct_eq` → always
+  true; `verify` accepting everything; the in-language hasher's hex decode dropping a nibble;
+  `finish` skipping its length check). The `jcrypto` demo transcript is pinned.
+
+  Bindings, not algorithms — `std/csrand`'s rule. The `EVP_MD` is never held in a Jestyr
+  value: `EVP_sha256()` returns a `const` pointer and `cptr` is `void*`, so binding one to the
+  other trips `-Werror=discarded-qualifiers` in the emitted-C gate; four dispatchers choose
+  the digest at the call instead. `ERR_get_error`/`ERR_error_string_n` are bound under
+  aliases because `std/tls` binds them by name and one program may import both (a duplicate
+  extern is refused — measured). The in-language hasher accepts UTF-8 only, because
+  `sha256.push_sha256_hex` takes a `str` and `std/sha256` is in the seed closure; it refuses
+  other bytes at `finish` rather than hashing something else. Two fixtures added:
+  `crypto_test_pub.pem` (the TLS key's public half) and `crypto_test_other_key.pem` (a second
+  RSA key for the wrong-key case), both from `openssl` with no config needed.
+
+- **`std/sandbox`** — what a child is allowed to BE: where it runs, whom it dies with, and
+  which files its own code may touch. `std/sysproc`'s header listed "no environment control,
+  no working directory, no process groups" as what was missing and `fs.Fs` gated only the
+  parent; all four are facts the platform will set only at the instant a process comes into
+  being, so `sysproc.start_at(sp, cmd, cwd, env_extra, apart)` is that instant exposed once
+  (`lpCurrentDirectory` and a copied `GetEnvironmentStringsA` block on Windows;
+  `chdir`/`setpgid(0,0)`/`execve` between `fork` and `exec` on POSIX) and is the only
+  addition to `sysproc`. Above it: `start` (a cwd and a projection), `start_grouped` (a Job
+  object / process group), `terminate_group` + a bounded `wait_group_empty`, and a `Jail`.
+
+  **A Job is joined while the child is still SUSPENDED**, because assigning after it runs
+  races a grandchild born outside the Job — the one outcome a group exists to rule out — so
+  `apart` is deliberately platform-shaped (POSIX makes a group leader outright; Windows
+  creates suspended and `sysproc.resume` is the other half) and `start_grouped` terminates a
+  child it could not group rather than leave it running ungrouped.
+
+  **The jail is a capability the child's own Jestyr code honours, not an OS sandbox** — said
+  in the header, because the word invites the other reading. A `Jail` is an `fs.Fs` plus a
+  root, projected into `JESTYR_FS_JAIL` as `<mode> <root>` and read back with
+  `sandbox.inherited(env)`; no variable means the unjailed host, exactly today's behaviour.
+  The fence is lexical, and a `..` segment is refused as a SHAPE rather than folded, because
+  a resolver that folds `a/../../etc` is a second `realpath` that agrees with the platform's
+  until a symlink — symlinks are the stated hole. `narrow` is the meet of two policies under
+  a root inside the parent's, so a jailed process can hand its child only less.
+  `fs.jtr` is untouched: it is a self-hosting closure module, and putting the projection in
+  `fs.host()` would force a reseed.
+
+  8 tests — five that start nothing that runs (the projection round trip with an unknown
+  mode failing closed, the fence with real files on both sides, `..` refused, `narrow` never
+  widening, and a platform failure told from a capability refusal), three with real children
+  through the platform shell, every one bounded — plus the `jsandbox` demo, which starts
+  itself in a scratch directory, in a group, under a jail, and shows the grandchild the child
+  left behind reached by a `terminate_group` that a `terminate` of the child alone missed.
+  Six mutations watched failing: the fence's separator check dropped (a prefix-sharing
+  sibling reads as inside, in two tests), `mode_fs`'s fallback turned to `fs.host()` (a
+  corrupt projection would fail OPEN), `start_at`'s `lpCurrentDirectory` never passed (the
+  child's relatively named file lands in the parent's directory), the environment block never
+  extended (the child echoes back the unexpanded variable name),
+  `AssignProcessToJobObject` skipped (the grandchild is never in the group), and
+  `TerminateJobObject` made a no-op — that last one failing after its ten-second budget
+  rather than hanging, which is the property a bounded group wait exists for. The Windows
+  Job/accounting constants are measured against `<windows.h>` by a C probe, the way
+  `sysproc`'s are.
+
+  **A port finding came out of the allowlist gate**: with imports unresolved, the
+  self-hosted `cgen.jtr` types a `catch |e| match e { … }`'s result temp from the match
+  (`void` for a type it cannot resolve) while its own `_ct` temp for the same type is `int`,
+  which is what the reference emits throughout. `catch |e| <expr>` and the bare
+  `catch <expr>` agree. Nothing real miscompiles — with imports resolved the type is known —
+  but a corpus file that is both `@cfg`-bearing and matches over an imported error set cannot
+  satisfy `every_cfg_bearing_corpus_file_is_byte_identity_verified`. `std/sandbox` does not
+  use the construct on a reason of its own: a `match` over an IMPORTED error set is
+  exhaustive over a set the importing module does not own.
+
+- **`std/plugin` server mode, and `std/sysstdio`** — a plugin is now a LONG-LIVED process on
+  `sysproc`'s pipe transport instead of one process per call over two files. `connect` starts
+  it with `start_piped` and keeps it, `call` writes one framed request and reads one framed
+  response, `hangup` does close-input → drain → wait (the only deadlock-free order); on the
+  plugin's side `serve(handler)` is the loop a `main` runs until EOF. The old file mode
+  survives as `call_once` because it is a different trade — a hook invoked once per event —
+  not an older version of the same one, and both share the frame, the CRC and the outcome
+  names. Two failures that `system()` could not express are now expressible: a plugin that
+  stops answering is killed inside a budget (`PLUGIN_TIMED_OUT`, `wait_or_kill`), and a
+  server-mode plugin can fail without dying by answering with an ERROR frame carrying its own
+  code (`PLUGIN_FAILED`, connection still up).
+
+  **The budget is `set_budget`-able, and that is the design decision worth arguing with.** A
+  first call pays for the child's start — measured at 75–120ms through `cmd.exe`, with a
+  485ms outlier over 120 starts — while a warm call answers in under a millisecond, so one
+  number cannot be both a tolerance for the first and a timeout for the rest. A host connects
+  roomy, hears from the plugin once, then tightens; a timeout that can only trip after the
+  plugin has been heard from is evidence about the plugin rather than about the machine. The
+  earlier single-budget draft lost about one run in fifteen on an idle machine.
+
+  Framing is binary on RAW HANDLES, against trap A4: Windows text-mode stdout turns `\n` into
+  `\r\n`, so `std/sysstdio` bypasses the C runtime entirely (`GetStdHandle` +
+  `ReadFile`/`WriteFile`, `read(0)`/`write(1)` on POSIX) rather than escaping the payload or
+  flipping `_setmode` on a stream the runtime also writes to. Nothing is escaped because
+  nothing needs to be, and the deciding case is exercised: `\r`, `\n`, a NUL and two non-UTF-8
+  bytes make the round trip host → plugin → host byte for byte, as `[]u8` throughout
+  (`from_utf8` traps on exactly those bytes). `sysproc` gained `output_ready` — `PeekNamedPipe`
+  on Windows, `poll` on POSIX under `std/syspoll`'s signature — which is what lets a bounded
+  read exist at all.
+
+  Suite 4 → 10 tests: six new ones drive the server-mode host against real children that are
+  NOT plugins, since every failure it must tell apart is a way of not answering and a shell
+  spells all of them (`exit 3` → failed with its code, `exit 0` silent → bad-response, prose →
+  bad-response, NTSTATUS exit → crashed, never-writes → timed-out and killed, denied spawner →
+  refused). Five mutations watched failing: the version judged before the checksum (a corrupt
+  future-version frame then reads as a deployment mismatch), a clean exit-0 EOF trusted as the
+  plugin's own failure, a budget kill reported as a crash, the stream header's length believed
+  without its magic, and `output_ready` never reporting a readable pipe. `plugin_server_demo`
+  (`jplugin`) pins the whole thing: several calls proven to be one process by a counter in the
+  replies, the hostile payload back in hex, and a plugin killed mid-nap with the host
+  continuing.
+
+- **`std/tls`** — TLS over a `sysnet` socket by binding OpenSSL (area 8). A client context
+  that trusts nothing until `trust` gives it a CA, a server context that checks its key
+  against its certificate at load, blocking `client_session`/`server_session` handshakes
+  with SNI, `write_all`/`read_into`/`shutdown`, and an error surface (`TLS_*` plus
+  `last_error` in OpenSSL's own words). **A client that trusts a CA also checks the
+  hostname**, and a session that does not verify on a verifying context is a FAILED
+  handshake, not a warning — there is no "verify but continue" mode. 4 tests over a real
+  loopback handshake with the client on a spawned thread: verified, wrong hostname (right
+  CA, must fail), trust-nothing (completes and says so), refusals at load.
+
+  Bindings, not an implementation — `std/csrand`'s rule. Linking is the content-triggered
+  shape `-pthread` and `-lws2_32` use: a program whose C names `openssl/ssl.h` gets
+  `-lssl -lcrypto` after its source, on both drivers; `CC_FLAGS` and every attest manifest
+  are untouched. No schannel: Windows is served through mingw's OpenSSL.
+
+- **`std/manifest` and `std/registry`** — the layer above the package substrate. A package
+  manifest FORMAT (`jestyr-package/v1`, `name`, `version`, `dep <name> <req>`; one canonical
+  rendering, so `render(parse(x)) == x`), and a registry that is a DIRECTORY LAYOUT —
+  `index`, `<name>-<version>.manifest`, `<name>-<version>.tar` — or the same directory
+  served over HTTP through `std/httpd`'s static route and fetched with `std/httpc`. `load`
+  builds the solver's `resolve.Registry` from the index and the manifests; `fetch` re-hashes
+  an archive against the digest the index promised BEFORE it reaches the cache, and a
+  tampered archive is refused, not stored; a published version is immutable. 2 + 2 tests:
+  publish → load → resolve minimally → fetch through the cache, then the same fetch over
+  HTTP — the `jc add` shape, end to end.
+
+- **`std/httpd` and `std/httpc`** — HTTP V2 (area 6): everything above the message. A
+  router (`/users/:id`, a trailing `*`), middleware in a list (`HTTPD_NEXT`/`HTTPD_DONE`),
+  keep-alive with PIPELINING, a read timeout (408, Slowloris) and an idle timeout (silent
+  close), streamed chunked responses, static files with traversal refused as a 404, an
+  access log through `std/log`, and a blocking test client with `fetch` and a kept-alive
+  `Client`. 8 tests on real loopback sockets, the `jhttpd` demo transcript pinned, five
+  mutations watched failing.
+
+  **One thread, one poll, a table of connections.** `spawn` refuses a `mut` parameter, so a
+  worker per connection would have to be built from channels; a readiness-driven loop over
+  `std/syspoll` is smaller, and it is what makes the suite EXACT — client and server take
+  turns in one process, so every case but the timeout is a transcript. Handlers are the
+  `runtime.Task` shape (a fn pointer plus a context pointer), which is what a `List` can hold.
+
+  `std/http` gained `parse_response` sharing the request parser's header loop and framing
+  scan — the client is the other end of the smuggling conversation, and a response framed
+  differently from the server would be the same hole from the other side — plus a `span`
+  constructor (a module-qualified struct literal does not parse) and `@copy` on `Request`.
+  `runtime.ask` exposes the poller to a loop that owns its own handle table; `sysnet.adopt`
+  gives a stored descriptor its typed operations back.
+
+  Three names moved on the way and the reason is recorded in each: `connect`, `close` and
+  `listen` are `sysnet`'s C symbols, and an extern's name is taken in every module that
+  links it — so the client dials and hangs up, and the server starts and stops.
+
+- **`extern … var` binds a foreign GLOBAL** (B2), on both compilers. `extern "errno.h" var
+  errno: i32` is a readable, assignable place named by its C symbol; `extern "c" var x: T`
+  emits `extern T x;`, a `.h` abi emits nothing (the header's declaration is the truth, and
+  `errno` is a macro on every libc this backend meets, so nothing else could have worked).
+  The declared alias (`var counter = "g_counter": i64`) and `@cfg` work as for functions.
+  `examples/extern_global.jtr` reads `errno`, has a failed `fopen` set it, clears it, and
+  writes through `&errno`; its transcript is pinned and both cgen backends agree on its C.
+
+  **The recorded cost was wrong by an order of magnitude, and the reason is the lesson.** The
+  register sized this as a NEW item kind: 257 exhaustive `Item::` matches across seventeen
+  files, plus 42 in the port, plus attest and doc. A global IS an extern symbol with a type —
+  the same header, alias, `@cfg` and ABI story — that happens to have no parameter list, so
+  it is carried on the existing extern item under an `is_global` flag (the port marks it
+  with a `-1` parameter count, the one slot every reader already bounds-checks). Every
+  exhaustive match kept compiling; nine sites branch, and each is one the change genuinely
+  concerns. It reaches `attest` (`var NAME: T`, never `fn`, so a swap between the two is a
+  break) and `doc`, and the P2 item dump prints `var`/`fn` so a global and a nullary fn
+  never dump alike. Both port mirrors were watched failing.
+
+  A local that shadows a global is the local: the checker records on the expression that a
+  bare name resolved to the global, and both backends name the C symbol from that record
+  rather than from the spelling (the first cut decided by spelling, and a `var errno` local
+  wrote the real `errno`; the corpus file's `shadow()` pins the fix).
+
+### Fixed
+
+- **Drop glue under colliding type names finds the right `Drop`, and only it (A13).** When
+  two modules define one type name and one of them has a `Drop` — `file.Writer` beside
+  `json.Writer` and `writer.Writer` — the reference keyed the impl under the BARE name:
+  `register_impls` was the one item pass that never set the current module, so the impl's
+  target lowered in a stale module, missed the colliding `Writer__m<file>` and degraded to
+  an opaque `Writer`. Two consequences from that one key. A `file.Writer` local was NEVER
+  dropped (its canonical key found no impl — a leaked handle with no diagnostic), and a
+  struct holding another module's `Writer` field, dropped from a module that did not import
+  that field's module, called `jestyr_impl_Drop__Writer__drop` — a symbol nothing emits —
+  and failed to link. Had the names lined up, that field would have been handed to
+  `file.Writer`'s `fclose`. The drop walker now matches a decl by its canonical name and
+  lowers its field types from the DECLARING module (`ast_type_to_ty_in`), and the impl pass
+  sets its module like every other. The self-hosted compiler was already right — its loader
+  renames colliding types in the token stream — and the two agree byte-for-byte on the new
+  probe `examples/std/drop_collide_demo.jtr` (`jdropcollide`), which proves the drop by the
+  file size read back. No port change, no reseed.
+
+- **The self-hosted loader no longer renames a LOCAL that shares a colliding function's
+  name (A14).** `jc` flattens an import closure at the token level and rewrites a module's
+  own colliding top-level names at bare uses; a parameter or `let` of the same name was
+  rewritten too, so `httpc.request(…, read body: str)` emitted `j_body__m4` for the local
+  (`httpc` also exports `fn body`) and `runtime`'s `let now` became `j_now__m16` beside
+  three modules' `fn now`. `jestyrc` resolves scope before it canonicalizes and built the
+  same programs. The loader now tracks the current function's binders — parameters, `let`/
+  `var`, `for x in` — and leaves their uses alone. Found by `jc_build_matrix` recording
+  `FAIL httpd_demo`, which is that file doing its job; the port-built demo now prints the
+  pinned transcript.
+
+### Changed
+
+- **The content-triggered link rule is one function.** `-pthread`, `-lssl -lcrypto` and
+  `-lws2_32` were kept in three copies — the driver's two build sites and the test
+  harness — and a program could link under `jestyrc build` and fail under `cargo test`
+  (`tls_test` did, until the third copy learned OpenSSL). `link_args` in `main.rs` now
+  returns the whole argument tail in the order GNU ld needs, every site that links emitted
+  C calls it, and a unit test pins the order and the triggers on the argument list without
+  running a compiler. Nothing reaches `CC_FLAGS`; no attest manifest changes.
+
+- **A computed value may no longer be passed to a `mut`/`out` parameter of a type with no
+  indirection (A11).** `twice(a + b)` into `mut n: i64` used to compile (the value parked in
+  a compound literal) and the callee's writes went nowhere anyone could read. It is now an
+  error on both compilers: *"cannot pass a computed value to the `mut` parameter `n` of
+  `twice`: the type `i64` holds no indirection … bind the value to a `var` and pass that"*.
+  The boundary is the type, not the syntax: a value that carries a pointer — a slice cast,
+  a call returning a slice, a struct with a `*mut` field — is still accepted, because its
+  element writes really reach the caller. One corpus file carried the refused shape and
+  was rewritten; eight probes (four refused, four accepted) run through both toolchains.
+
+### Fixed
+
+- **`return ok(local)` no longer drops the local it returns (A12).** For a struct that owns
+  something, `return d` and `return ok(D{ … })` moved correctly, but `return ok(d)` copied
+  `d` into the result and then ran the local's drops — the caller received a closed file and
+  freed strings, with no diagnostic, and the run ended in heap corruption. The move analysis
+  (`collect_moved`) now treats the one argument of a returned `ok(...)`/`err(...)` exactly as
+  it treats a bare returned local, on both compilers. Nothing in the corpus had tripped it
+  because every fallible constructor returned a literal. `examples/return_ok_local.jtr` pins
+  it (three drops, all after `main` ends); the port mirror was watched failing on that file.
+
+### Added
+
+- **`std/kv`** — a key-value store whose only durable artefact is an `alog`. 10 tests, and
+  `examples/std/kv_demo.jtr` (`jstate`), whose transcript is pinned. Storage V2 (area 9):
+  KV, atomic batches, compaction, migrations, backup.
+
+  **The log is durability, not capacity.** Every live key and value is memory-resident; the
+  log is replayed at open and appended on every write. That is the right shape for what the
+  tier asked for — configuration, service state, a build's bookkeeping — and the wrong one
+  for a dataset larger than memory, which the header says rather than hides (`file.Reader`
+  has no seek, so an offset index could not have fetched a value on demand anyway).
+
+  **A batch is atomic BECAUSE it is one record.** The log already makes one record complete
+  or discarded; a batch rides that directly instead of through a begin/commit pair and the
+  recovery state machine a pair needs. The price is a ceiling (`KV_MAX_RECORD`, 1 MiB), which
+  also bounds the replay buffer. The suite cuts a three-key batch three bytes short and
+  reopens with none of the three and the previous batch untouched.
+
+  **Compaction, migration and snapshot are ONE rewrite**: every live entry into a fresh file
+  beside the store, then `sysfs.rename_replace`. A crash at any point leaves the old file or
+  the new one. After a compaction or migration the in-memory state is rebuilt by REPLAYING
+  THE NEW FILE, so what the caller sees is provably what a reopen would see. The HEAD record
+  carries two numbers of different kinds — the module's `format`, refused when newer, and the
+  caller's `schema`, which `migrate` moves forward only under a rewrite and only upward, so
+  "migrate on every start-up" is safe to write. Deleting an absent key writes nothing; every
+  writer applies its own bytes by parsing them through the ONE batch parser, so an encoder
+  that drifted from the reader would fail at the write rather than at the next reopen.
+
+  **Four mutations watched failing** (skip the reset before reload; frame every batch as a
+  batch of one; accept a newer format; write absent deletes) — each caught by the test that
+  names it.
+
+  **Two things measured on the way, recorded in the tier note:** `return ok(local)` for a
+  `Drop`-bearing struct drops the local at the return that carries it out (the module opens
+  INTO a caller-owned handle to route around it), and `from_utf8` traps on non-UTF-8, so a
+  record's framing must be assembled in a `[]u8` buffer, never a `String`.
+
+- **Registered four suites that were gating nothing.** `semver_test`, `resolve_test`,
+  `lockfile_test` and `cache_test` landed without an entry in the Rust runner: runnable by
+  hand, green for their authors, and checked by nothing on CI. `io_suites_pass` now runs them
+  with their counts pinned (15, 10, 10, 8).
+
+- **`std/cache`** — a **content-addressed** store: the key is the SHA-256 of the value.
+  8 tests. Completes the package substrate (semver → resolve → lockfile → cache).
+
+  A cache keyed by NAME has to answer "is this entry still right", and every answer is a
+  heuristic — an mtime, an etag, a version someone remembered to bump. Keyed by CONTENT it
+  never asks: `abc…` either holds the bytes that hash to `abc…` or it is corrupt, and that is
+  decidable locally without trusting whoever supplied it. So **storing is idempotent** (no
+  invalidation, because nothing can go stale), **an entry verifies without its source**, and
+  two callers racing to store the same content write identical bytes to the same path.
+
+  It also sidesteps a real constraint: `std/sysfs` deliberately exposes no mtime, because
+  `struct stat`’s layout differs per platform and guessing it is how this tree’s silent-`int`
+  miscompiles happened. A name-keyed cache would be stuck; a content-addressed one never
+  wanted one.
+
+  **Writes are atomic** — write beside the entry, `rename_replace` onto it — and that matters
+  more here than usual: a half-written entry’s NAME asserts a hash its contents do not have,
+  so it would be served confidently until something re-verified it. Entries are sharded two
+  hex characters deep, the split git and Nix both use. Every entry point takes an `fs.Fs`, so
+  a component handed `fs.denied()` cannot reach the disk through this API — tested, so the
+  gate is a check rather than a convention.
+
+- **`std/lockfile`** — record a resolution, and prove a later one agrees with it. 10 tests.
+
+  **A lockfile here is a WITNESS, not a source of truth**, and that follows from `std/resolve`
+  selecting minimally. Under maximal selection a lockfile is correctness-critical: resolution
+  consults the registry, the registry changes, so the only reason two builds agree is that one
+  read the lock instead of resolving — delete the file and they diverge. Under minimal
+  selection two builds of the same graph already agree. So this does not *cause* agreement, it
+  **records what was decided so a later build can prove it decided the same thing**.
+
+  That changes what the API is. There is no "install from the lockfile" entry point, because
+  there is nothing it could do that resolving would not: you `render` a solution and `verify`
+  a later one. A disagreement therefore means a REQUIREMENT changed, which is worth being
+  told; the suite pins that publishing a new release leaves the lock verifying.
+
+  Format is `jestyr-lock/v1`, `pkg <name> <version>` sorted by name so the bytes depend on the
+  selection and not on declaration order. **`resolver mvs` is recorded on purpose** — a lock
+  produced under one selection policy means nothing under another, the same reason
+  `jestyr-attest` writes its `cc-flags`; a lock naming another resolver is refused rather than
+  compared. The digest covers the `pkg` lines only, so it survives a header that grows.
+
+  Two design points, each probed by breaking it rather than trusted: **`verify` checks the
+  digest FIRST**, so a hand-edited body reads as a corrupt file rather than as legitimate
+  drift — the two call for completely different responses; and **it checks in BOTH
+  directions**, because "every locked package is still selected" alone would let a new
+  transitive dependency enter a build unrecorded and still report agreement. Removing either
+  fails exactly the test that names it.
+
+- **`std/resolve`** — dependency resolution by **minimal version selection**. 10 tests.
+
+  Given `^1.2.0` and a registry holding 1.2.0, 1.5.0 and 1.9.0 it selects **1.2.0**, where
+  npm and Cargo select the highest. **The reason is reproducibility.** Under maximal
+  selection the answer depends on what the registry contained at the moment you resolved —
+  publishing tonight changes what everyone selects tomorrow — so reproducibility has to be
+  bought back with a lockfile, and that lockfile becomes correctness-critical rather than a
+  cache. Under minimal selection resolution is a pure function of the requirement graph:
+  **adding a release cannot change an existing resolution**, which the suite asserts by
+  resolving, publishing a newer version, and resolving again. You also get the versions your
+  dependencies were tested against. The cost, stated plainly: no automatic patch fixes —
+  upgrading becomes an explicit act rather than a side effect of building on a Tuesday.
+
+  One version per package, which is close to forced: the compiler flattens an import closure
+  into one translation unit, so two versions would collide on symbol names. A conflict is
+  therefore reported, never papered over by duplication.
+
+  `^` and `<` add upper bounds, which is what makes this not pure MVS — Go has only lower
+  bounds and needs no search. It does not backtrack: it iterates a fixpoint with selection
+  pinned **monotone**, which is what makes it terminate, and reports anything it cannot
+  decide. `budget_exhausted` separates a non-convergence from a genuine conflict, because
+  mislabelling one as the other sends someone to debug the wrong thing. The constraint set is
+  **rebuilt** each round rather than accumulated, so a superseded version’s upper bound cannot
+  contradict its successor’s floor and report a conflict in a graph that resolves cleanly.
+
+  **One of these tests was vacuous and a probe caught it.** All ten passed first run, so each
+  claim was checked by breaking the implementation. Flipping to maximal selection failed five
+  — correctly. Making constraints accumulate failed *none*: the phantom-conflict test rooted
+  at `b >=2.0.0`, so `b` was already 2.0.0 in round one and the superseded bound was never
+  contributed under either policy. Rewritten so the lift arrives late, it now fails under
+  accumulation. A test for a fixpoint has to reach the round where the behaviour happens.
+
+- **`std/semver`** — semantic versions: parse, validate, and order them. `@no_alloc @no_os`,
+  so a resolver can call it in a loop without an arena and `@no_alloc` code can call it at all.
+  15 tests in `examples/std/semver_test.jtr`; both compilers agree on its emission byte for byte.
+
+  This is the layer directly under a resolver. `std/buildgraph` already answers "what depends
+  on what, in what order, and is it acyclic" over the compiler’s own content-hash manifest,
+  and its header names version solving as what sits below it. That is this.
+
+  **A `Version` stores byte OFFSETS, not borrows, and that is forced rather than chosen.** The
+  obvious shape holds `pre: str` sub-views of the input; Jestyr refuses it, because a `str`
+  field is a borrow and storing one that outlives the call is what the escape checker exists
+  to stop. So a `Version` carries ranges into the source and every function that needs the
+  text takes the source alongside — the same `ExprData`/`src` pairing the compiler itself uses.
+  It is why `compare` takes two sources: the general case is a requirement parsed from one
+  string against a candidate parsed from another.
+
+  **The suite pins the five precedence rules that get implemented wrong**, each chosen so the
+  obvious wrong implementation fails it: a pre-release sorts BEFORE its release (a string
+  compare inverts this); build metadata is ignored entirely, not used as a tiebreaker;
+  numeric identifiers compare numerically (`-2` < `-10`, which lexical order reverses);
+  numeric ranks below alphanumeric; and a longer run wins a tied prefix. **Writing them down
+  was not enough** — the suite caught three real defects on its first run, including a scanner
+  that used the single-identifier character set to scan a whole dotted run and so rejected
+  every `1.0.0-rc.1`, and an empty-run check that accepted `1.0.0-` and `1.0.0+`.
+
+  **`^` on a zero major is not `^`.** Caret means "up to the next change of the leftmost
+  NON-ZERO component", so `^0.2.3` admits `<0.3.0` and `^0.0.3` only `<0.0.4`. Reading `^` as
+  "same major" is the most common range bug, and on 0.x it is the difference between a patch
+  bump and an unreviewed breaking change.
+
+  Two deliberate departures from Cargo, both toward not guessing: **a bare `1.2.3` requirement
+  is EXACT** (if you want a range, spell one), and **a pre-release candidate only satisfies a
+  requirement that names a pre-release on the same release triple** — so `^1.2.3` never
+  installs `2.0.0-rc1`, the rule npm and Cargo both adopted after shipping the permissive one.
+
+- **`select` gains a `closed { … }` arm**, which runs when every channel it waits on is closed
+  and drained. Both toolchains; `examples/std/select.jtr` grew a Part 3 that uses it.
+
+  It is sugar, and deliberately nothing more. A `select` whose channels were all closed and
+  drained already completed rather than spinning — the arm is somewhere to put a statement at
+  a point the lowering was already computing. What it replaces is a sentinel: Part 2 of the
+  example has to read a counter before the `select`, read it again after, and infer from "it
+  did not move" that everything was closed. Part 3 says it directly and prints the same two
+  numbers, which is what makes it a check rather than a demo.
+
+  **`closed` is a CONTEXTUAL keyword**, recognised only inside a `select` body and only when
+  followed by `{`. It had to be: the standard library already exports `alog.closed()`,
+  `sysnet.closed()` and `syswatch.closed()`, and binds a local `closed` in two more modules,
+  so reserving the word would have broken five files, three of them public API. A test pins
+  both halves — that the name still works ordinarily, and that the arm still parses.
+
+  **The arm must be written last** (`E0025`; a second one is `E0024`). Not style: readiness is
+  tested before the closed condition, which is what keeps closing a channel non-destructive,
+  so a `closed` written first would still run last — source order contradicting evaluation
+  order. `ExprKind::Select` became a struct variant carrying `closed: Option<Block>`, and the
+  six cgen walkers that scan arm bodies for calls, spawns, closures, moves, refs and structs
+  now scan the closed block too; missing one would have hidden code from the backend rather
+  than rejected it. The port's `ref_expr_id` shim counts the new block node for the same
+  reason it counts arm bodies — that omission is precisely the A1 divergence shape.
+
+- **`@deprecated` now reaches the attestation manifest and the generated docs.** It gets its
+  own manifest line — `  deprecated:` bare, or `  deprecated: <msg>` — and a
+  `> **Deprecated**` blockquote ahead of the prose in `jestyrc doc`. Both toolchains.
+
+  It was not doing *nothing* before: it already reached cgen as
+  `__attribute__((deprecated("…")))`, so callers got a C-level warning. What it missed were
+  the two places that *describe* the API — which meant the tool whose job is reporting
+  contract changes could not report the one change an author makes specifically to warn
+  callers.
+
+  **It is deliberately neither a guarantee nor part of the signature.** The **Guarantees**
+  block is titled "checked by the compiler", and a deprecation is proven nothing — it is a
+  status the author asserts, so folding it in would make "checked" false for one entry. And
+  `attest --diff` classifies any signature change as **breaking**, so carrying it in `sig:`
+  would report *deprecating* an API as a breaking change — backwards, since every existing
+  call still compiles and still works, and a gate that fires on the one action taken to avoid
+  breaking people is a gate that gets switched off.
+
+  So every deprecation verdict is `Compatible` — added, removed, or message changed — and all
+  three are still reported, because "this is going away" is exactly what a contract diff is
+  read for. An older manifest with no such line parses as "not deprecated", so it still diffs
+  against a new one.
+
+  The extractor is shared between the doc generator and the manifest on both sides, for the
+  same reason the guarantee extractor is: the documented deprecation and the attested one
+  cannot drift. Non-fn records are always absent — `attrs.rs` declares the attribute's targets
+  as `Fn` and `Method`, so that is its declared surface rather than a gap.
+
 ### Changed
 
 - **A `@copy` struct may no longer carry a non-Copy field.** `@copy` says duplicating the
@@ -82,6 +646,102 @@ versions are snapshots, not stability promises.
   the self-hosted compiler's own sources.
 
 ### Fixed
+
+- **A `mut` argument no longer has to be a place.** `f(mut s as Buf)`, `f(mut mk())` and
+  `f(mut a + b)` compile; before, each leaked gcc's own *"lvalue required as unary `&`
+  operand"* — no span, no Jestyr message, `jestyrc check` passing and only the C compiler
+  objecting. Both toolchains; `examples/mut_arg_value.jtr` is the corpus file, and the port
+  mirror was watched failing without it.
+
+  A `mut`/`out` parameter passes by address, so its argument routes through `emit_place`,
+  whose contract is that it yields a C lvalue. Every *place* form already did — a name, a
+  field, a checked index, a deref — but its catch-all handed back whatever `emit_expr`
+  produced, and a cast, a call or an arithmetic expression is a value. Those now park in a
+  **compound literal of array type**, the same shape the range sub-view and `abi_ref_arg`
+  already use.
+
+  **The callee gets a copy whose indirection is shared**, which is why this is not a fix that
+  quietly loses your writes: a slice is `{ ptr, len }`, so copying the descriptor copies the
+  pointer and element writes land in the caller's buffer. Only a whole-value reassignment is
+  lost, and a temporary has nowhere to put one. The corpus file checks this in both
+  directions — the elements inside a sub-view move, the one outside it does not.
+
+  **The most useful case is the least obvious one.** `s as Buf` for a `distinct Buf = []i64`
+  is not a temporary at all: `Jestyr_Buf` *is* `JestyrSlice_i64`, so the cast is a type-level
+  no-op and the argument is a place wearing another type. The ordinary newtype idiom simply
+  did not work in `mut` position.
+
+  **Why the guard is `is_c_lvalue` here and must not be anywhere else on this path.** That
+  predicate answers "never" for an index, while `emit_place`'s checked-index arm renders a
+  real lvalue — so using it to decide parking in general would copy an element and *silently
+  discard a `mut` callee's writes*. It cannot do that here: `Field`, `Index` and `Deref` each
+  return from their own arm above, so the only lvalue reaching the catch-all is a `Name`. The
+  hazard is excluded by construction rather than by care. (`abi_ref_arg` can afford the
+  imprecision because it serves a `read` parameter, where a wrong "no" costs a copy.)
+
+  Left open deliberately: whether a `mut` argument that aliases **nothing** — `f(mut a + b)`,
+  where the callee's writes are unobservable by construction — should be *refused*. That is a
+  language question, not a lowering one, and a refusal is a rule owing `escape` on both sides.
+  Note the previous state was not "such arguments are refused" but "they work if they happen
+  to render as a C lvalue": `f(mut P{ x: 1 })` compiled, because a C compound literal is one.
+
+- **`Self` now works as a type anywhere inside a trait impl** — as a parameter, a return, a
+  local's type, and nested (`[]Self`) — for a struct receiver and a primitive one alike. Fixed
+  on both toolchains; `examples/trait_self.jtr` is the corpus file, and the two mirrors were
+  each watched failing on their own.
+
+  It was **two defects wearing two faces**, which is why it was recorded as narrower than it
+  was. `Self` was only ever resolved in one place: the return type recorded for callers.
+
+  *In cgen*, `Self` reached neither type door. The written-type door refused it outright
+  ("cannot lower the external type `Self`"); the inferred-type door missed the substitution
+  and fell through to **`int`, silently, with no diagnostic**. Both doors already consult the
+  monomorphization substitution, so `Self` is now bound there once, per impl — one entry
+  rather than two special cases, which is also what makes the nested forms resolve, since the
+  emitters recurse through the map.
+
+  *In typeck*, a body's `Self` stayed opaque. That was a documented deferral, justified as
+  costing nothing because assignability is lenient on an opaque name — **but leniency was not
+  the only consumer.** The escape checker refuses a *borrow* whose type never resolved, so
+  `fn f(read self, mut o: Self)` was rejected at `check` with a message about escape analysis.
+  The `read` and `take` forms slipped through only because that backstop is about borrows.
+  The `{Self → target}` map the impl-registration pass already builds is now applied to
+  parameters and the return, not just to the recorded return.
+
+  This also closes a latent divergence: the self-hosted compiler had no `Self` refusal at all,
+  so where the reference errored, `jc` alone silently emitted `int` and `JestyrSlice_Self`. It
+  was unreachable only because the reference refused first.
+
+- **A range sub-view may now be passed as a `mut` argument** — `sort(xs[0 .. mid])` rather
+  than an `alloc` + `slice(T, raw, N)` bound to a named local at every call site. Fixed on
+  both toolchains; `examples/slice_range_mut.jtr` is the corpus file, and the port mirror was
+  watched failing without it.
+
+  A `mut`/`out` parameter passes by address, so its argument routes through `emit_place`, the
+  lvalue-yielding twin of `emit_expr`. Its `Index` arm assumed the index is a scalar element
+  offset — but a range index is not: `xs[a .. b]` computes a whole new `{ ptr, len }` view,
+  and there is no element whose address could be taken. The arm emitted the `Range` node as
+  though it were an offset and hit "the C backend does not support ranges yet", **pointing at
+  the range**, which is what disguised a missing *place* case as a missing *range* feature.
+
+  The sub-view is a value, and `emit_place` owes its callers an lvalue, so it is parked in a
+  **compound literal of array type**: `(T[1]){ v }` decays to `T*` and `(*…)` reads back as a
+  place, with block lifetime rather than that of the statement expression that computed it —
+  the same shape, for the same reason, that `abi_ref_arg` already uses. The callee receives a
+  copy of `{ ptr, len }` whose `ptr` still names the caller's buffer, so element writes land
+  in the original; only a whole-view reassignment is lost, and a temporary sub-view has no
+  home to write one back to. The bounds assert survives the wrapping, so a bad sub-range still
+  faults before the callee sees it.
+
+  `str` took the same route and was equally broken — a `mut str` parameter given `s[a .. b]`
+  failed as a raw gcc "lvalue required", since `jestyr_rt_substr(…)` is a call. The
+  fixed-size-array case is deliberately unchanged: typeck does not extend re-slicing to
+  arrays, so the guard covers only the two bases the backend actually lowers a range over.
+
+  **Two recorded descriptions of this defect were wrong**, and the more recent one was the
+  worse: it claimed a `read` parameter failed identically and that the fix was a parser
+  change. Neither held — `examples/slice_range.jtr` had shipped `from_utf8(b[0 .. 3])` all
+  along, and `check` passed throughout. Nothing outside `cgen` was involved.
 
 - **The two backends agree on a `select` between two `concurrent` blocks.** The last live
   two-compiler divergence: a `spawn` trampoline's C symbol embeds an `ExprId`, and the

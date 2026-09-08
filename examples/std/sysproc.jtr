@@ -112,8 +112,15 @@
 //
 // ─── What is still not here ───────────────────────────────────────────────────
 //
-// No environment control, no working directory, no process groups. Each is a real thing
-// to want and none of them is needed to lift the ceiling this module exists to lift.
+// ~~No environment control, no working directory, no process groups.~~ All three now have
+// ONE additive entry point, `start_at` at the bottom of this file, because all three are
+// facts that can only be decided at the instant a process comes into being. The policy
+// above them — what a group is, what a jail projects — is `std/sandbox`'s.
+//
+// `start_exec`, beside it, is the other thing a SUPERVISED child needs: a program started
+// without a shell in the middle, so the handle this module holds is the child's own and
+// killing it kills the process the caller meant. Both were appended; nothing above them
+// changed.
 //
 // **The environment a child inherits is now the SAME on both platforms** (see `env_block`
 // at the `posix_spawn` call). What follows is the difference as it stood, kept because the
@@ -1137,4 +1144,484 @@ pub fn wait_or_kill(mut c: Child, mut clk: time.Clock, timeout_nanos: i64) -> St
     }
     release(c)
     return s
+}
+
+// ---- starting a PROGRAM, not a shell line ---------------------------------------------
+//
+// `start` goes through the platform shell, and that is right for a command: it is what
+// `std/process` does and what a caller's string was written for. It is wrong for a
+// SUPERVISED child, for a reason that only shows when the child is killed: the handle
+// this module holds is the SHELL's. `TerminateProcess` on `cmd.exe /c prog` ends `cmd.exe`
+// and leaves `prog` running as an orphan that nothing can reach any more — the very
+// process the supervisor was supposed to be in charge of. (POSIX `sh -c` usually `exec`s
+// a lone simple command in place, so the same call happens to kill the right process
+// there; "usually" is not a contract.)
+//
+// So this starts `path` DIRECTLY, with `args` as its arguments. No shell means no quoting
+// rules: `args` is split on single spaces and nothing else, and an argument containing a
+// space cannot be expressed. A caller who needs the shell's rules has `start`.
+//
+// On POSIX that is `posix_spawn(path, argv, environ)`, the same call `start` makes with
+// `/bin/sh -c` taken out of the middle. On Windows the command line is `"path" args`, and
+// the quotes are safe here where they were not for `start`: it is `cmd.exe` that strips a
+// leading quote pair, and there is no `cmd.exe` on this path — `CreateProcessA` parses a
+// quoted first token exactly as the C runtime will hand it to the child's `argv[0]`.
+//
+// The same capability gate, the same `Child`, the same waits. Only the first step differs.
+
+// How many space-separated words `args` holds. Runs of spaces count as one separator,
+// so `"a  b"` is two words and `""` is none.
+@no_alloc @no_os fn word_count(read args: str) -> usize {
+    var n: usize = 0
+    var in_word: bool = false
+    var i: usize = 0
+    for i < args.len {
+        if args[i] == 32 {
+            in_word = false
+        } else {
+            if in_word == false { n = n + 1 }
+            in_word = true
+        }
+        i = i + 1
+    }
+    return n
+}
+
+@cfg(posix) pub fn start_exec(mut s: Spawner, read path: str, read args: str) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+    if s.allowed == false {
+        s.refused = s.refused + 1
+        return err(SysProcRefused)
+    }
+
+    // argv = { path, word, word, …, NULL }: 64-bit pointer slots, as in `start`. Every
+    // word lives in ONE buffer, NUL-terminated in place, and the slots point into it — so
+    // there is one allocation to give back rather than one per word to remember.
+    let words: usize = word_count(args)
+    var argv: *mut i64 = alloc(i64, words + 2)
+    var pathp: *mut u8 = nul_copy(path)
+    var wbuf: *mut u8 = alloc(u8, args.len + 1)
+    unsafe { (argv + 0).* = pathp as i64 }
+    var slot: usize = 1
+    var n: usize = 0
+    var i: usize = 0
+    for i < args.len {
+        if args[i] != 32 {
+            unsafe { (argv + slot).* = (wbuf + n) as i64 }
+            slot = slot + 1
+            var j: usize = i
+            for j < args.len {
+                if args[j] == 32 { break }
+                unsafe { (wbuf + n).* = args[j] }
+                n = n + 1
+                j = j + 1
+            }
+            unsafe { (wbuf + n).* = 0 }
+            n = n + 1
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    unsafe { (argv + slot).* = 0 }
+
+    var pidp: *mut i64 = alloc(i64, 1)
+    unsafe { (pidp + 0).* = 0 }
+    // `env_block()` for the same reason `start` passes it: a null `envp` reaches `execve`
+    // unchanged and hands the child NOTHING.
+    let rc: i32 = posix_spawn(pidp as cptr, pathp as cptr, null, null, argv as cptr, env_block())
+    var pid: i64 = 0
+    unsafe { pid = (pidp + 0).* }
+    free_ptr(pidp)
+    free_ptr(wbuf)
+    free_ptr(argv)
+    free_ptr(pathp)
+
+    if rc != 0 { return err(SysProcFailed(rc)) }
+
+    s.started = s.started + 1
+    return ok(Child{ h: 0, th: 0, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: SPROC_NO_PIPE, outp: SPROC_NO_PIPE })
+}
+
+@cfg(windows) pub fn start_exec(mut s: Spawner, read path: str, read args: str) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+    if s.allowed == false {
+        s.refused = s.refused + 1
+        return err(SysProcRefused)
+    }
+
+    // `"path" args`, NUL-terminated. One buffer, built by hand: `nul_join` takes a prefix
+    // and a body, and this line has three parts.
+    var line: *mut u8 = alloc(u8, path.len + args.len + 4)
+    var n: usize = 0
+    unsafe { (line + n).* = 34 }
+    n = n + 1
+    var i: usize = 0
+    for i < path.len {
+        unsafe { (line + n).* = path[i] }
+        n = n + 1
+        i = i + 1
+    }
+    unsafe { (line + n).* = 34 }
+    n = n + 1
+    if args.len > 0 {
+        unsafe { (line + n).* = 32 }
+        n = n + 1
+        var k: usize = 0
+        for k < args.len {
+            unsafe { (line + n).* = args[k] }
+            n = n + 1
+            k = k + 1
+        }
+    }
+    unsafe { (line + n).* = 0 }
+
+    var si: *mut u8 = alloc(u8, SPROC_STARTUPINFO_LEN)
+    var pi: *mut u8 = alloc(u8, SPROC_PROCESS_INFO_LEN)
+    zero_bytes(si, SPROC_STARTUPINFO_LEN)
+    zero_bytes(pi, SPROC_PROCESS_INFO_LEN)
+    let sw: *mut u32 = si as *mut u32
+    unsafe { (sw + 0).* = SPROC_STARTUPINFO_LEN as u32 }
+
+    let rc: i32 = CreateProcessA(null, line as cptr, null, null, 0, 0, null, null, si as cptr, pi as cptr)
+    var code: i32 = 0
+    if rc == 0 { code = syserr.last_raw() }
+
+    var h: i64 = 0
+    var th: i64 = 0
+    var pid: i64 = 0
+    if rc != 0 {
+        let ps: *mut i64 = pi as *mut i64
+        unsafe { h = (ps + SPROC_PI_HPROCESS_SLOT).* }
+        unsafe { th = (ps + SPROC_PI_HTHREAD_SLOT).* }
+        let pw: *mut u32 = pi as *mut u32
+        var raw: u32 = 0
+        unsafe { raw = (pw + SPROC_PI_PID_WORD).* }
+        pid = raw as i64
+    }
+
+    free_ptr(pi)
+    free_ptr(si)
+    free_ptr(line)
+
+    if rc == 0 { return err(SysProcFailed(code)) }
+
+    s.started = s.started + 1
+    return ok(Child{ h: h, th: th, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: SPROC_NO_PIPE, outp: SPROC_NO_PIPE })
+}
+
+// ---- facts decided at the instant of creation: cwd, one more variable, apartness ------
+//
+// **Everything above this line is unchanged.** What follows is the one entry point the
+// header's "still not here" list was waiting for, and it is here rather than in
+// `std/sandbox` for a single reason: a working directory, an environment and a process
+// group are all things a process is BORN with. Windows sets them in `CreateProcessA`'s
+// arguments; POSIX sets them in the child between `fork` and `exec`. Neither can be
+// changed from outside after the fact without a race — a child that starts and THEN is
+// moved into a group may already have spawned a grandchild that is not in it — so the
+// primitive has to be here, at the one moment the platform offers. The POLICY (what a
+// group is for, what a jail projects) is `std/sandbox`'s and is not repeated here.
+//
+// `env_extra` is ONE `NAME=value` string appended to the INHERITED environment, not a
+// replacement for it. Jestyr has no way to set a variable in its own process (`std/env`
+// reads only), and a child that received only the extra would lose `PATH`, which is the
+// exact asymmetry `start` closed. On POSIX the parent's `environ` (`env_block()`) is copied
+// into a fresh array with one more slot; on Windows `GetEnvironmentStringsA` is copied with
+// one more entry, and it is appended rather than inserted in sorted order because the C
+// runtime's `getenv` does not rely on the order and rebuilding the block sorted would be a
+// second parser for a format nobody else reads.
+//
+// `apart` is the platform-shaped half, stated rather than smoothed over: on POSIX the child
+// becomes the leader of a NEW process group (`setpgid(0, 0)` before `exec`, and the parent
+// repeats it so a signal to `-pid` cannot race the child), which is the whole mechanism;
+// on Windows there is no group to join at creation, so the child is created SUSPENDED and
+// the caller puts it in a Job object BEFORE it runs a single instruction, then `resume`s
+// it. A caller that forgets `resume` on Windows has a child that never runs; on POSIX
+// `resume` is a no-op that answers whether the child is live.
+//
+// `cwd` may be empty (inherit). On POSIX a `chdir` that fails makes the child exit 126
+// before `exec`, the shell's own "cannot execute" code; on Windows `CreateProcessA` fails
+// and the caller gets the platform's number.
+
+@cfg(posix) extern "unistd.h" fn chdir(path: cptr) -> i32
+@cfg(posix) extern "unistd.h" fn setpgid(pid: i64, pgid: i64) -> i32
+@cfg(posix) extern "unistd.h" fn execve(path: cptr, argv: cptr, envp: cptr) -> i32
+
+@cfg(windows) extern "windows.h" fn GetEnvironmentStringsA() -> cptr
+@cfg(windows) extern "windows.h" fn FreeEnvironmentStringsA(block: cptr) -> i32
+@cfg(windows) extern "windows.h" fn ResumeThread(h: cptr) -> i32
+
+// `CREATE_SUSPENDED`, measured with the rest (`the_windows_job_constants_match_the_real_
+// headers` in `src/proptests.rs`).
+const SPROC_CREATE_SUSPENDED: i32 = 4
+
+// The OS handle as an integer — what a caller needs to hand the child to another Win32
+// object (a Job). 0 on POSIX, where `pid_of` is the identity.
+@no_alloc @no_os pub fn handle_of(read c: Child) -> i64 { return c.h }
+
+// The inherited environment block plus `extra`, as a fresh Windows block: `A=1\0B=2\0` …
+// `extra\0\0`. The caller frees it.
+@cfg(windows) fn env_block_with(read extra: str) -> *mut u8 {
+    let blk: cptr = GetEnvironmentStringsA()
+    // `n` stops on the FIRST NUL of the terminating pair, so `n + 1` bytes are the whole
+    // inherited block including the last string's own terminator. An empty block (`\0\0`)
+    // contributes nothing rather than a leading empty string.
+    var n: usize = 0
+    if blk != null {
+        let p: *mut u8 = blk as *mut u8
+        var going: bool = true
+        for going {
+            var a: u8 = 0
+            unsafe { a = (p + n).* }
+            if (a as i32) == 0 {
+                var b: u8 = 0
+                let k: usize = n + 1
+                unsafe { b = (p + k).* }
+                if (b as i32) == 0 { going = false } else { n = n + 1 }
+            } else {
+                n = n + 1
+            }
+        }
+    }
+    var head: usize = 0
+    if n > 0 { head = n + 1 }
+    var blob: *mut u8 = alloc(u8, head + extra.len + 2)
+    if blk != null {
+        let p: *mut u8 = blk as *mut u8
+        var i: usize = 0
+        for i < head {
+            var b: u8 = 0
+            unsafe { b = (p + i).* }
+            unsafe { (blob + i).* = b }
+            i = i + 1
+        }
+        FreeEnvironmentStringsA(blk)
+    }
+    var j: usize = 0
+    for j < extra.len {
+        let at: usize = head + j
+        unsafe { (blob + at).* = extra[j] }
+        j = j + 1
+    }
+    let t1: usize = head + extra.len
+    let t2: usize = t1 + 1
+    unsafe { (blob + t1).* = 0 }
+    unsafe { (blob + t2).* = 0 }
+    return blob
+}
+
+// The inherited `environ` plus `extra`, as a fresh NULL-terminated array of pointers. The
+// strings are the runtime's own and are not copied; only the array is the caller's to free.
+@cfg(posix) fn env_with(extra: *mut u8) -> *mut i64 {
+    let blk: cptr = env_block()
+    var n: usize = 0
+    if blk != null {
+        let ep: *mut i64 = blk as *mut i64
+        var going: bool = true
+        for going {
+            var v: i64 = 0
+            unsafe { v = (ep + n).* }
+            if v == 0 { going = false } else { n = n + 1 }
+        }
+    }
+    var arr: *mut i64 = alloc(i64, n + 2)
+    if blk != null {
+        let ep: *mut i64 = blk as *mut i64
+        var i: usize = 0
+        for i < n {
+            var v: i64 = 0
+            unsafe { v = (ep + i).* }
+            unsafe { (arr + i).* = v }
+            i = i + 1
+        }
+    }
+    let n1: usize = n + 1
+    unsafe { (arr + n).* = extra as i64 }
+    unsafe { (arr + n1).* = 0 }
+    return arr
+}
+
+// Start `cmd` through the platform shell in `cwd` (empty: inherit), with `env_extra`
+// (empty: nothing) added to the inherited environment, `apart` as described above. The
+// same capability gate and the same `Child` as `start`; no pipes.
+@cfg(windows) pub fn start_at(mut s: Spawner, read cmd: str, read cwd: str, read env_extra: str, apart: bool) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+    if s.allowed == false {
+        s.refused = s.refused + 1
+        return err(SysProcRefused)
+    }
+
+    var line: *mut u8 = nul_join("cmd.exe /c ", cmd)
+    var si: *mut u8 = alloc(u8, SPROC_STARTUPINFO_LEN)
+    var pi: *mut u8 = alloc(u8, SPROC_PROCESS_INFO_LEN)
+    zero_bytes(si, SPROC_STARTUPINFO_LEN)
+    zero_bytes(pi, SPROC_PROCESS_INFO_LEN)
+    let sw: *mut u32 = si as *mut u32
+    unsafe { (sw + 0).* = SPROC_STARTUPINFO_LEN as u32 }
+
+    var dir: *mut u8 = null
+    if cwd.len > 0 { dir = nul_copy(cwd) }
+    var envb: *mut u8 = null
+    if env_extra.len > 0 { envb = env_block_with(env_extra) }
+    var flags: i32 = 0
+    if apart { flags = SPROC_CREATE_SUSPENDED }
+
+    let rc: i32 = CreateProcessA(null, line as cptr, null, null, 0, flags, envb as cptr, dir as cptr, si as cptr, pi as cptr)
+    var code: i32 = 0
+    if rc == 0 { code = syserr.last_raw() }
+
+    var h: i64 = 0
+    var th: i64 = 0
+    var pid: i64 = 0
+    if rc != 0 {
+        let ps: *mut i64 = pi as *mut i64
+        unsafe { h = (ps + SPROC_PI_HPROCESS_SLOT).* }
+        unsafe { th = (ps + SPROC_PI_HTHREAD_SLOT).* }
+        let pw: *mut u32 = pi as *mut u32
+        var raw: u32 = 0
+        unsafe { raw = (pw + SPROC_PI_PID_WORD).* }
+        pid = raw as i64
+    }
+
+    if envb != null { free_ptr(envb) }
+    if dir != null { free_ptr(dir) }
+    free_ptr(pi)
+    free_ptr(si)
+    free_ptr(line)
+
+    if rc == 0 { return err(SysProcFailed(code)) }
+
+    s.started = s.started + 1
+    return ok(Child{ h: h, th: th, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: SPROC_NO_PIPE, outp: SPROC_NO_PIPE })
+}
+
+@cfg(posix) pub fn start_at(mut s: Spawner, read cmd: str, read cwd: str, read env_extra: str, apart: bool) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+    if s.allowed == false {
+        s.refused = s.refused + 1
+        return err(SysProcRefused)
+    }
+
+    // Everything is built BEFORE the fork, for `start_piped`'s reason: nothing between
+    // `fork` and `exec` may allocate.
+    var shp: *mut u8 = nul_copy("/bin/sh")
+    var a0: *mut u8 = nul_copy("sh")
+    var a1: *mut u8 = nul_copy("-c")
+    var a2: *mut u8 = nul_copy(cmd)
+    var argv: *mut i64 = alloc(i64, 4)
+    unsafe { (argv + 0).* = a0 as i64 }
+    unsafe { (argv + 1).* = a1 as i64 }
+    unsafe { (argv + 2).* = a2 as i64 }
+    unsafe { (argv + 3).* = 0 }
+    var dirp: *mut u8 = null
+    if cwd.len > 0 { dirp = nul_copy(cwd) }
+    var extra: *mut u8 = null
+    var envp: *mut i64 = null
+    if env_extra.len > 0 {
+        extra = nul_copy(env_extra)
+        envp = env_with(extra)
+    }
+
+    let pid: i64 = fork()
+    if pid == 0 {
+        // **The child.** `setpgid`, `chdir`, `execve`, `_exit` — all async-signal-safe.
+        if apart { setpgid(0, 0) }
+        if dirp != null {
+            if chdir(dirp as cptr) != 0 { sys_exit(126) }
+        }
+        if envp != null {
+            execve(shp as cptr, argv as cptr, envp as cptr)
+        } else {
+            execv(shp as cptr, argv as cptr)
+        }
+        sys_exit(127)
+    }
+
+    // The parent's half of the group change, so a signal to `-pid` sent immediately after
+    // this returns cannot arrive before the child has moved itself. Harmless after `exec`.
+    if pid > 0 and apart { setpgid(pid, pid) }
+
+    if envp != null { free_ptr(envp) }
+    if extra != null { free_ptr(extra) }
+    if dirp != null { free_ptr(dirp) }
+    free_ptr(argv)
+    free_ptr(a2)
+    free_ptr(a1)
+    free_ptr(a0)
+    free_ptr(shp)
+
+    if pid < 0 {
+        let c1: i32 = syserr.last_raw()
+        return err(SysProcFailed(c1))
+    }
+
+    s.started = s.started + 1
+    return ok(Child{ h: 0, th: 0, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: SPROC_NO_PIPE, outp: SPROC_NO_PIPE })
+}
+
+// Let a child created `apart` on Windows run. True if it is now running (or was never
+// suspended, on POSIX); false for a released child.
+@cfg(windows) pub fn resume(mut c: Child) -> bool {
+    if c.live == false { return false }
+    // `ResumeThread` returns the PREVIOUS suspend count, or -1 on failure.
+    return ResumeThread(c.th as cptr) >= 0
+}
+
+@cfg(posix) pub fn resume(mut c: Child) -> bool {
+    return c.live
+}
+
+// ---- readiness: can the output be read WITHOUT blocking? -----------------------------
+//
+// Added for `std/plugin`'s server mode. A pipe read blocks until the child writes or
+// closes, so a parent with a BUDGET cannot simply call `read_output`: a child that does
+// neither would hold it for as long as it likes, and the budget would be decoration. The
+// question a bounded reader needs is "would a read return now?", asked before every read
+// and answered without one.
+//
+// `PeekNamedPipe` works on ANONYMOUS pipes despite its name, and it is the only
+// non-blocking question Windows answers about one — `WSAPoll` is sockets-only, and an
+// anonymous pipe cannot be opened overlapped. On POSIX a pipe is a descriptor like any
+// other and `poll` answers, bound under the SAME signature `std/syspoll` binds it with,
+// deliberately: one C symbol, one signature, corpus-wide (the sweep named in the
+// platform section above is what holds that).
+@cfg(windows) extern "windows.h" fn PeekNamedPipe(h: cptr, buf: cptr, n: u32, got: cptr, avail: cptr, left: cptr) -> i32
+@cfg(posix) extern "poll.h" fn poll(fds: cptr, n: u64, timeout_ms: i32) -> i32
+
+// Would a read on `h` return WITHOUT blocking? True when bytes are waiting AND when the
+// other end is gone — a read then returns EOF at once, which is `std/syspoll`'s definition
+// of readable and the only one a timeout loop can use. A failed query is reported as
+// ready rather than as "wait more": a caller's bounded loop must end on its own budget or
+// on a read, never on a lie that keeps it sleeping.
+@cfg(windows) fn pipe_ready(h: i64) -> bool {
+    var avail: *mut u32 = alloc(u32, 1)
+    unsafe { (avail + 0).* = 0 }
+    let rc: i32 = PeekNamedPipe(h as cptr, null, 0, null, avail as cptr, null)
+    var k: u32 = 0
+    unsafe { k = (avail + 0).* }
+    free_ptr(avail)
+    // A broken pipe — the child closed its end — FAILS the peek with ERROR_BROKEN_PIPE,
+    // exactly as `pipe_read` fails at EOF. Ready, because the read will return 0 now.
+    if rc == 0 { return true }
+    return k > 0
+}
+
+@cfg(posix) fn pipe_ready(h: i64) -> bool {
+    // One `struct pollfd`: `{ int fd; short events; short revents; }`, 8 bytes, the
+    // layout `std/syspoll` pins against the real kernel. `events` is POLLIN (1); ANY
+    // `revents` bit — readable, hung up, error — means a read returns at once.
+    var pfd: *mut u8 = alloc(u8, 8)
+    zero_bytes(pfd, 8)
+    let fw: *mut i32 = pfd as *mut i32
+    unsafe { (fw + 0).* = h as i32 }
+    unsafe { (pfd + 4).* = 1 as u8 }
+    let rc: i32 = poll(pfd as cptr, 1, 0)
+    free_ptr(pfd)
+    if rc == 0 { return false }
+    return true
+}
+
+// Can `read_output` return right now? `std/plugin`'s host asks this, sleeps a slice of
+// its budget on its `time.Clock` when the answer is no, and kills the child when the
+// budget is gone. A child without an output pipe is reported ready — `read_output`
+// answers -1 at once, and a loop waiting for readiness would otherwise never end.
+pub fn output_ready(read c: Child) -> bool {
+    if c.outp == SPROC_NO_PIPE { return true }
+    return pipe_ready(c.outp)
 }

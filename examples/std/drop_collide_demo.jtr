@@ -1,0 +1,64 @@
+// std/drop_collide_demo.jtr — `jdropcollide`: drop glue when three modules spell one name.
+//
+//   drop_collide_demo         a `file.Writer` dropped by scope, beside a `log.Logger`
+//
+// Three modules in this program's closure each define a `Writer` — `file`, `writer` and
+// `json` — and only `file.Writer` has a `Drop` (it closes the handle). The program holds
+// two things at once that used to be incompatible in one closure (A13):
+//
+//   1. a `file.Writer` that goes out of scope WITHOUT `finish` — its `Drop` must run, and
+//      the proof is the file's size read back afterwards: 3 bytes means the drop flushed
+//      and closed the handle, 0 or -1 means it never ran;
+//   2. a `log.Logger`, which holds a `json.Writer` FIELD, from a module that does NOT
+//      import `json` — the shape whose scope-exit glue used to call
+//      `jestyr_impl_Drop__Writer__drop`, a function no module emits, and failed to link.
+//
+// Both were one defect: the reference keyed `file`'s `Drop` under the bare name and
+// lowered the logger's field type from the wrong module. Had the names lined up, the
+// logger's `json.Writer` would have been handed to `file.Writer`'s `fclose`.
+//
+// The transcript is pinned by `jdropcollide_drops_the_right_writer_and_only_that_one`.
+
+import "file"
+import "fs"
+import "log"
+import "sink"
+import "writer"
+import "time"
+
+const SCRATCH: str = "zz_drop_collide.tmp"
+
+fn write_three_bytes_and_let_go() {
+    var w: file.Writer = file.create(SCRATCH.cstr)
+    file.write_str(w, "abc")
+    // No `finish`: `w` leaves scope here and `file.Writer`'s `Drop` closes it.
+}
+
+fn main() -> i32 {
+    print_str("-- jdropcollide --")
+
+    write_three_bytes_and_let_go()
+    var r: file.Reader = file.open(SCRATCH.cstr)
+    print_str("bytes on disk after the writer was dropped")
+    print_int(file.size(r))
+    file.close(r)
+    print_str("scratch file removed")
+    print_bool(fs.remove(SCRATCH))
+
+    // A logger holds `json.Writer` — a `Writer` with NO `Drop` — reached from a module
+    // that imports `file` and `log` but never `json`.
+    var raw: *mut u8 = alloc(u8, 256)
+    var buf: []u8 = slice(u8, raw, 256)
+    var s: Sink = sink.new()
+    var lg: log.Logger = log.make(time.manual(1000), writer.to_buffer(), log.LOG_INFO, log.LOG_LOGFMT)
+    if log.begin(lg, log.LOG_INFO, "held beside a file writer") {
+        log.kv_str(lg, "writers", "three")
+        log.end(lg, s, buf)
+    }
+    print_str("records emitted by the logger")
+    print_int(log.emitted(lg))
+    print_str(sink.view(s, buf))
+    log.free(lg)
+    free_ptr(raw)
+    return 0
+}

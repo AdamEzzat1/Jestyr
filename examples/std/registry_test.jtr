@@ -1,0 +1,221 @@
+// std/registry_test.jtr — publish, load, resolve, fetch; then the same fetch over HTTP.
+//
+// The end-to-end shape of `jc add`: a registry directory is populated with three versions
+// of two packages, `load` turns its index and manifests into the solver's table, `resolve`
+// selects minimally, and `fetch` admits the selected archive into the content-addressed
+// cache only after re-hashing it against the digest the index promised. The tampering case
+// is the one that matters: an archive changed under its published name is REFUSED, and the
+// cache never sees it.
+//
+// The HTTP half serves the same directory through `std/httpd`'s static route on a spawned
+// thread and fetches through `std/httpc`. The server there is kept in raw memory rather
+// than a local: a `Server` holds a `writer.Writer`, this program also links `std/file`,
+// and that pair used to trip the drop-glue defect A13. A13 is CLOSED (`drop_collide_demo`
+// pins the pair); a local `Server` would work now, and the raw-memory shape is kept only
+// because the thread hands the server's lifetime around by pointer anyway.
+//
+// Run:  jestyrc test examples/std/registry_test.jtr
+
+import "cache"
+import "fs"
+import "httpd"
+import "log"
+import "manifest"
+import "mem"
+import "registry"
+import "resolve"
+import "sysfs"
+import "sysnet"
+import "test"
+import "test_report"
+import "time"
+import "writer"
+
+const RG_T_CAP: usize = 16384
+const RG_ROOT: str = "examples/std/fixtures"
+const RG_CACHE: str = "examples/std/fixtures/zz_regcache"
+
+fn nothing() { }
+
+fn scrub(mut h: fs.Fs, read a: Allocator) {
+    fs.erase(h, "examples/std/fixtures/index")
+    fs.erase(h, "examples/std/fixtures/base-1.0.0.manifest")
+    fs.erase(h, "examples/std/fixtures/base-1.0.0.tar")
+    fs.erase(h, "examples/std/fixtures/web-1.0.0.manifest")
+    fs.erase(h, "examples/std/fixtures/web-1.0.0.tar")
+    fs.erase(h, "examples/std/fixtures/web-1.1.0.manifest")
+    fs.erase(h, "examples/std/fixtures/web-1.1.0.tar")
+}
+
+// Remove a cache entry, its shard, and the cache root.
+fn tidy_cache(mut h: fs.Fs, read a: Allocator, read ch: cache.Cache, read key: str) {
+    if key.len == 64 {
+        let _e: bool = cache.evict(h, a, ch, key)
+        var sh: String = string_new()
+        string_push(sh, RG_CACHE)
+        string_push(sh, "/")
+        string_push(sh, key[0 .. 2])
+        let _d: bool = sysfs.remove_dir(h, a, string_view(sh)) catch false
+        string_free(sh)
+    }
+    let _r: bool = sysfs.remove_dir(h, a, RG_CACHE) catch false
+}
+
+fn populate(mut h: fs.Fs, read a: Allocator, read r: registry.Registry) -> bool {
+    var d1: manifest.Draft = manifest.draft(a, "base", "1.0.0")
+    var m1: String = manifest.draft_render(a, d1)
+    var d2: manifest.Draft = manifest.draft(a, "web", "1.0.0")
+    manifest.draft_dep(d2, "base", "^1.0.0")
+    var m2: String = manifest.draft_render(a, d2)
+    var d3: manifest.Draft = manifest.draft(a, "web", "1.1.0")
+    manifest.draft_dep(d3, "base", "^1.0.0")
+    var m3: String = manifest.draft_render(a, d3)
+    var fine: bool = true
+    if registry.publish(h, a, r, string_view(m1), "BASE-ARCHIVE-BYTES") != registry.PUBLISH_OK { fine = false }
+    if registry.publish(h, a, r, string_view(m2), "WEB-1.0.0-ARCHIVE") != registry.PUBLISH_OK { fine = false }
+    if registry.publish(h, a, r, string_view(m3), "WEB-1.1.0-ARCHIVE") != registry.PUBLISH_OK { fine = false }
+    string_free(m3)  string_free(m2)  string_free(m1)
+    return fine
+}
+
+@test fn publish_load_resolve_and_fetch_through_the_cache() -> bool {
+    var raw: *mut u8 = alloc(u8, RG_T_CAP)
+    var rep: []u8 = slice(u8, raw, RG_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h, a)
+    var r: registry.Registry = registry.open(a, RG_ROOT)
+
+    test.is_true(c, rep, "three versions publish", populate(h, a, r))
+    test.is_true(c, rep, "web 1.0.0 is listed", registry.has(h, a, r, "web", "1.0.0"))
+    test.is_false(c, rep, "web 2.0.0 is not", registry.has(h, a, r, "web", "2.0.0"))
+
+    // A published version is immutable: the same name and version again is refused.
+    var d: manifest.Draft = manifest.draft(a, "web", "1.0.0")
+    var again: String = manifest.draft_render(a, d)
+    test.eq_i64(c, rep, "republishing a version is refused", registry.publish(h, a, r, string_view(again), "OTHER") as i64, registry.PUBLISH_EXISTS as i64)
+    test.eq_i64(c, rep, "a bad manifest is refused", registry.publish(h, a, r, "not a manifest", "x") as i64, registry.PUBLISH_BAD_MANIFEST as i64)
+    string_free(again)
+
+    // The solver's table, built from the index and the manifests.
+    var skipped: i64 = 0
+    var reg: resolve.Registry = registry.load(h, a, r, skipped)
+    test.eq_i64(c, rep, "nothing skipped", skipped, 0)
+    test.eq_usize(c, rep, "two packages", resolve.package_count(reg), 2)
+    test.eq_usize(c, rep, "three versions", resolve.version_count(reg), 3)
+    resolve.add_root(reg, "web", "^1.0.0")
+    let sol: resolve.Solution = resolve.solve(a, reg)
+    test.is_true(c, rep, "resolves", resolve.solved(sol))
+    // Minimal version selection: 1.0.0 satisfies `^1.0.0`, so 1.1.0 is not chosen.
+    test.eq_str(c, rep, "web resolves minimally", resolve.selected_version(reg, sol, "web"), "1.0.0")
+    test.eq_str(c, rep, "and base comes along", resolve.selected_version(reg, sol, "base"), "1.0.0")
+
+    // Fetch the selected archive: the key is the promised digest, and the bytes verify.
+    var ch: cache.Cache = cache.open(a, RG_CACHE)
+    var key: String = registry.fetch(h, a, r, "web", "1.0.0", ch)
+    var promised: String = string_new()
+    registry.promised_digest(h, a, r, "web", "1.0.0", promised)
+    test.is_true(c, rep, "the fetch produced a key", cache.key_is_wellformed(string_view(key)))
+    test.eq_str(c, rep, "which is the index's digest", string_view(key), string_view(promised))
+    test.is_true(c, rep, "and the cache verifies it", cache.verify(h, a, ch, string_view(key)))
+    var back: String = cache.load(h, a, ch, string_view(key))
+    test.eq_str(c, rep, "with the archive's bytes", string_view(back), "WEB-1.0.0-ARCHIVE")
+
+    // **Tampering.** The archive changes under its published name; the digest does not.
+    fs.put(h, "examples/std/fixtures/web-1.1.0.tar", "TAMPERED")
+    var key2: String = registry.fetch(h, a, r, "web", "1.1.0", ch)
+    test.eq_usize(c, rep, "a tampered archive is refused", string_view(key2).len, 0)
+    var tk: String = cache.key_of(a, "TAMPERED")
+    test.is_false(c, rep, "and never reached the cache", cache.has(h, a, ch, string_view(tk)))
+    var none: String = registry.fetch(h, a, r, "web", "9.9.9", ch)
+    test.eq_usize(c, rep, "an unknown version fetches nothing", string_view(none).len, 0)
+
+    tidy_cache(h, a, ch, string_view(key))
+    string_free(none)  string_free(tk)  string_free(key2)  string_free(back)  string_free(promised)  string_free(key)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- over HTTP --------------------------------------------------------------------------------
+
+fn h_reg(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    var h: fs.Fs = fs.host()
+    httpd.serve_file(x, h, RG_ROOT, httpd.param(x, "*"))
+    return 0
+}
+
+// The registry server, on its own thread. Publishes the port through `port_out`, serves for
+// `budget_ms`, then stops. Its `Server` lives in raw memory (see the header).
+fn serve_registry(port_out: *mut i64, budget_ms: i64) -> i64 {
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var p: *mut httpd.Server = alloc(httpd.Server, 1)
+    unsafe { p.* = httpd.make(a, time.host(), log.make(time.manual(0), writer.to_buffer(), log.LOG_INFO, log.LOG_LOGFMT), false, 4, 65536) }
+    var started: bool = false
+    unsafe { started = httpd.start(p.*, net, sysnet.loopback(0), 8) }
+    if started == false { return 0 - 1 }
+    unsafe { httpd.route(p.*, "GET", "/registry/*", httpd.handler(null, &h_reg)) }
+    unsafe { port_out.* = httpd.port(p.*) as i64 }
+    var served: i64 = 0
+    unsafe { served = httpd.serve_for(p.*, net, budget_ms) }
+    unsafe { httpd.stop(p.*, net) }
+    sysnet.shutdown(net)
+    return served
+}
+
+@test fn the_same_registry_fetches_over_http() -> bool {
+    var raw: *mut u8 = alloc(u8, RG_T_CAP)
+    var rep: []u8 = slice(u8, raw, RG_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h, a)
+    var r: registry.Registry = registry.open(a, RG_ROOT)
+    test.is_true(c, rep, "published", populate(h, a, r))
+    var ch: cache.Cache = cache.open(a, RG_CACHE)
+
+    var port: *mut i64 = alloc(i64, 1)
+    unsafe { (port + 0).* = 0 }
+    var key: String = string_new()
+    var bogus: String = string_new()
+    var served: i64 = 0
+    concurrent {
+        let sv = spawn serve_registry(port, 1500)
+        // Wait for the server to publish its port.
+        var clock: time.Clock = time.host()
+        var p: i64 = 0
+        var tries: i64 = 0
+        for p == 0 and tries < 200 {
+            time.wait(clock, 10000000)
+            unsafe { p = (port + 0).* }
+            tries = tries + 1
+        }
+        var net: sysnet.Net = sysnet.host()
+        if p > 0 {
+            let addr: sysnet.SocketAddr = sysnet.loopback(p as u16)
+            string_free(key)
+            key = registry.fetch_http(net, addr, "/registry", h, a, "web", "1.0.0", ch)
+            string_free(bogus)
+            bogus = registry.fetch_http(net, addr, "/registry", h, a, "web", "9.9.9", ch)
+        }
+        sysnet.shutdown(net)
+        served = await sv
+    }
+    var promised: String = string_new()
+    registry.promised_digest(h, a, r, "web", "1.0.0", promised)
+    test.is_true(c, rep, "the server answered", served >= 2)
+    test.eq_str(c, rep, "the HTTP fetch yields the promised digest", string_view(key), string_view(promised))
+    test.is_true(c, rep, "and the cache verifies it", cache.verify(h, a, ch, string_view(key)))
+    test.eq_usize(c, rep, "an unknown version over HTTP is nothing", string_view(bogus).len, 0)
+
+    tidy_cache(h, a, ch, string_view(key))
+    string_free(promised)  string_free(bogus)  string_free(key)
+    free_ptr(port as *mut u8)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

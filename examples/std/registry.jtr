@@ -1,0 +1,382 @@
+// std/registry.jtr — where packages come from: a directory, or the same directory over HTTP.
+//
+// TIER: `sys`, by dependency. The layer the package substrate stopped short of: `semver` →
+// `resolve` → `lockfile` → `cache` decide and record; this module PUBLISHES a package and
+// FETCHES one, and turns a registry's index into the `resolve.Registry` the solver reads.
+//
+// ─── The protocol is a directory layout, and HTTP is a directory served ────────────────
+//
+//     <root>/index                       one line per version: `pkg <name> <version> <sha256>`
+//     <root>/<name>-<version>.manifest   the package's `std/manifest` text
+//     <root>/<name>-<version>.tar        the package's contents (`std/tar`), the bytes hashed
+//
+// A registry reached over HTTP is exactly these paths under a base URL, which is what
+// `std/httpd`'s static route serves without knowing it. So there is ONE format and two
+// transports, and `fetch_http` is `fetch` with `httpc` where `fs` was. A third transport
+// (a real API with authentication, mirrors, signatures) would add operations, not change
+// the bytes.
+//
+// ─── Nothing is trusted on arrival ────────────────────────────────────────────────────
+//
+// The index names the SHA-256 of each archive, and a fetch re-hashes what it received
+// against that name BEFORE the bytes reach the cache; a mismatch is refused, not stored.
+// Then the cache keys the archive by its content, so the key a fetch returns is the digest
+// the index promised — a resolver that recorded it has a fact it can re-check forever. The
+// manifest is verified the same way, by parsing: a manifest the format refuses is a package
+// the registry refuses to publish.
+//
+// ─── What `load` does for the solver ──────────────────────────────────────────────────
+//
+// `resolve` selects MINIMALLY over a `Registry` it is handed, and needs every version's
+// dependencies to do it. `load` reads the index and each manifest and builds that table — so
+// resolution never touches an archive, only text, and a registry of a thousand packages is
+// resolved from a thousand small files.
+//
+// Deliberately absent: signatures (a registry that is not yours needs them; `sha256` is a
+// hash, not an authentication), yanking, mirrors, and any write over HTTP — publishing is a
+// filesystem operation by whoever owns the directory.
+//
+// Run the tests:  jestyrc test examples/std/registry_test.jtr
+
+import "cache"
+import "fs"
+import "httpc"
+import "list"
+import "manifest"
+import "mem"
+import "resolve"
+import "sha256"
+import "sysnet"
+
+pub struct Registry {
+    root: String,
+}
+
+impl Drop for Registry {
+    fn drop(mut self) {
+        string_free(self.root)
+    }
+}
+
+pub fn open(read a: Allocator, read root: str) -> Registry {
+    var r: Registry = Registry{ root: string_new() }
+    string_push(r.root, root)
+    return r
+}
+
+pub fn root_path(read r: Registry) -> read str { return string_view(r.root) }
+
+fn join(read r: Registry, read tail: str) -> String {
+    var p: String = string_new()
+    string_push(p, string_view(r.root))
+    string_push(p, "/")
+    string_push(p, tail)
+    return p
+}
+
+// `<name>-<version>.<ext>`
+fn entry_file(read name: str, read version: str, read ext: str) -> String {
+    var s: String = string_new()
+    string_push(s, name)
+    string_push(s, "-")
+    string_push(s, version)
+    string_push(s, ".")
+    string_push(s, ext)
+    return s
+}
+
+// ---- the index -----------------------------------------------------------------------------
+//
+// Parsed into a flat list so `load`, `fetch` and `has` share one reader. 6 ints per entry:
+// name s/e, version s/e, sha s/e — offsets into the index text.
+
+fn parse_index(read text: str, mut rows: List(i32)) -> bool {
+    var at: usize = 0
+    for at < text.len {
+        var e: usize = at
+        for e < text.len {
+            if (text[e] as i32) == 10 { break }
+            e = e + 1
+        }
+        var le: usize = e
+        if le > at {
+            if (text[le - 1] as i32) == 13 { le = le - 1 }
+        }
+        if le > at {
+            // `pkg NAME VERSION SHA`
+            var w: usize = at
+            var ws: usize = at
+            var field: i32 = 0
+            var fine: bool = true
+            var spans: List(i32) = list.make(i32, mem.system_allocator())
+            for w <= le {
+                var end_word: bool = false
+                if w == le { end_word = true }
+                if end_word == false {
+                    if (text[w] as i32) == 32 { end_word = true }
+                }
+                if end_word {
+                    list.push(i32, spans, ws as i32)
+                    list.push(i32, spans, w as i32)
+                    field = field + 1
+                    ws = w + 1
+                }
+                w = w + 1
+            }
+            if field != 4 { fine = false }
+            if fine {
+                if str_eq(text[list.get(i32, spans, 0) as usize .. list.get(i32, spans, 1) as usize], "pkg") == false { fine = false }
+            }
+            if fine {
+                let ss: usize = list.get(i32, spans, 6) as usize
+                let se: usize = list.get(i32, spans, 7) as usize
+                if cache.key_is_wellformed(text[ss .. se]) == false { fine = false }
+            }
+            if fine == false { return false }
+            list.push(i32, rows, list.get(i32, spans, 2))
+            list.push(i32, rows, list.get(i32, spans, 3))
+            list.push(i32, rows, list.get(i32, spans, 4))
+            list.push(i32, rows, list.get(i32, spans, 5))
+            list.push(i32, rows, list.get(i32, spans, 6))
+            list.push(i32, rows, list.get(i32, spans, 7))
+        }
+        at = e + 1
+    }
+    return true
+}
+
+// Read `<root>/index`, or "" when the registry is empty or unreadable.
+pub fn index_text(mut f: fs.Fs, read a: Allocator, read r: Registry) -> String {
+    var p: String = join(r, "index")
+    var t: String = string_new()
+    if fs.present(f, string_view(p)) {
+        string_free(t)
+        t = fs.open_text(f, string_view(p))
+    }
+    string_free(p)
+    return t
+}
+
+// Is `<name> <version>` in the index?
+pub fn has(mut f: fs.Fs, read a: Allocator, read r: Registry, read name: str, read version: str) -> bool {
+    var t: String = index_text(f, a, r)
+    let found: bool = find_row(string_view(t), a, name, version) >= 0
+    string_free(t)
+    return found
+}
+
+// The row index of `<name> <version>` in an index text, or -1.
+fn find_row(read text: str, read a: Allocator, read name: str, read version: str) -> isize {
+    var rows: List(i32) = list.make(i32, a)
+    if parse_index(text, rows) == false { return 0 - 1 }
+    let n: usize = list.len(i32, rows) / 6
+    var i: usize = 0
+    for i < n {
+        let ns: usize = list.get(i32, rows, i * 6) as usize
+        let ne: usize = list.get(i32, rows, i * 6 + 1) as usize
+        let vs: usize = list.get(i32, rows, i * 6 + 2) as usize
+        let ve: usize = list.get(i32, rows, i * 6 + 3) as usize
+        if str_eq(text[ns .. ne], name) {
+            if str_eq(text[vs .. ve], version) { return i as isize }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// The digest the index promises for `<name> <version>`, appended to `dst`. False if absent.
+pub fn promised_digest(mut f: fs.Fs, read a: Allocator, read r: Registry, read name: str, read version: str, mut dst: String) -> bool {
+    var t: String = index_text(f, a, r)
+    let tv: str = string_view(t)
+    var rows: List(i32) = list.make(i32, a)
+    var found: bool = false
+    if parse_index(tv, rows) {
+        let i: isize = find_row(tv, a, name, version)
+        if i >= 0 {
+            let ss: usize = list.get(i32, rows, (i as usize) * 6 + 4) as usize
+            let se: usize = list.get(i32, rows, (i as usize) * 6 + 5) as usize
+            string_push(dst, tv[ss .. se])
+            found = true
+        }
+    }
+    string_free(t)
+    return found
+}
+
+// ---- publishing -------------------------------------------------------------------------------
+
+pub const PUBLISH_OK: i32 = 0
+pub const PUBLISH_BAD_MANIFEST: i32 = 1
+pub const PUBLISH_EXISTS: i32 = 2       // that name and version are already published
+pub const PUBLISH_REFUSED: i32 = 3      // the filesystem refused
+
+// Publish `archive` (the package's tar bytes) described by `manifest_text`. The manifest is
+// parsed first — a registry never holds a manifest the format refuses — and a version that
+// is already published is refused rather than replaced: a package that changes under a
+// fixed version is the thing a content hash exists to make impossible.
+pub fn publish(mut f: fs.Fs, read a: Allocator, read r: Registry, read manifest_text: str, read archive: str) -> i32 {
+    var m: manifest.Manifest = manifest.parse(a, manifest_text)
+    if manifest.parsed(m) == false { return PUBLISH_BAD_MANIFEST }
+    if has(f, a, r, manifest.name(m), manifest.version(m)) { return PUBLISH_EXISTS }
+
+    var mf: String = entry_file(manifest.name(m), manifest.version(m), "manifest")
+    var mp: String = join(r, string_view(mf))
+    var tf: String = entry_file(manifest.name(m), manifest.version(m), "tar")
+    var tp: String = join(r, string_view(tf))
+    var fine: bool = true
+    if fs.put(f, string_view(mp), manifest_text) == false { fine = false }
+    if fine {
+        if fs.put(f, string_view(tp), archive) == false { fine = false }
+    }
+    if fine {
+        // The index is rewritten whole: old text plus one line. Small, and it keeps the
+        // file a plain text nobody needs a tool to read.
+        var t: String = index_text(f, a, r)
+        var digest: String = cache.key_of(a, archive)
+        string_push(t, "pkg ")
+        string_push(t, manifest.name(m))
+        string_push(t, " ")
+        string_push(t, manifest.version(m))
+        string_push(t, " ")
+        string_push(t, string_view(digest))
+        string_push(t, "\n")
+        var ip: String = join(r, "index")
+        if fs.put(f, string_view(ip), string_view(t)) == false { fine = false }
+        string_free(ip)
+        string_free(digest)
+        string_free(t)
+    }
+    string_free(tp)
+    string_free(tf)
+    string_free(mp)
+    string_free(mf)
+    if fine { return PUBLISH_OK }
+    return PUBLISH_REFUSED
+}
+
+// ---- loading the solver's table ----------------------------------------------------------------
+
+// Build a `resolve.Registry` from the index and every manifest it names. A manifest that
+// fails to parse drops ITS version, not the whole registry — recorded in `skipped`.
+pub fn load(mut f: fs.Fs, read a: Allocator, read r: Registry, mut skipped: i64) -> resolve.Registry {
+    var reg: resolve.Registry = resolve.registry(a)
+    var t: String = index_text(f, a, r)
+    let tv: str = string_view(t)
+    var rows: List(i32) = list.make(i32, a)
+    if parse_index(tv, rows) {
+        let n: usize = list.len(i32, rows) / 6
+        var i: usize = 0
+        for i < n {
+            let ns: usize = list.get(i32, rows, i * 6) as usize
+            let ne: usize = list.get(i32, rows, i * 6 + 1) as usize
+            let vs: usize = list.get(i32, rows, i * 6 + 2) as usize
+            let ve: usize = list.get(i32, rows, i * 6 + 3) as usize
+            var mf: String = entry_file(tv[ns .. ne], tv[vs .. ve], "manifest")
+            var mp: String = join(r, string_view(mf))
+            var mt: String = fs.open_text(f, string_view(mp))
+            var m: manifest.Manifest = manifest.parse(a, string_view(mt))
+            if manifest.parsed(m) {
+                resolve.add_package(reg, manifest.name(m))
+                let v: i32 = resolve.add_version(reg, manifest.name(m), manifest.version(m))
+                var d: usize = 0
+                for d < manifest.dep_count(m) {
+                    resolve.add_dep(reg, v, manifest.dep_name(m, d), manifest.dep_req(m, d))
+                    d = d + 1
+                }
+            } else {
+                skipped = skipped + 1
+            }
+            string_free(mt)
+            string_free(mp)
+            string_free(mf)
+            i = i + 1
+        }
+    }
+    string_free(t)
+    return reg
+}
+
+// ---- fetching -----------------------------------------------------------------------------------
+
+// Fetch `<name> <version>`'s archive into `c`, verifying it against the index's digest FIRST.
+// Returns the cache key (which IS that digest), or "" — absent, unreadable, or a mismatch.
+pub fn fetch(mut f: fs.Fs, read a: Allocator, read r: Registry, read name: str, read version: str, read c: cache.Cache) -> String {
+    var want: String = string_new()
+    if promised_digest(f, a, r, name, version, want) == false {
+        string_free(want)
+        return string_new()
+    }
+    var tf: String = entry_file(name, version, "tar")
+    var tp: String = join(r, string_view(tf))
+    var bytes: String = fs.open_text(f, string_view(tp))
+    string_free(tp)
+    string_free(tf)
+    let key: String = admit(f, a, string_view(want), string_view(bytes), c)
+    string_free(bytes)
+    string_free(want)
+    return key
+}
+
+// The one admission rule both transports share: hash, compare to the promise, then store.
+fn admit(mut f: fs.Fs, read a: Allocator, read want: str, read bytes: str, read c: cache.Cache) -> String {
+    var got: String = cache.key_of(a, bytes)
+    let same: bool = str_eq(string_view(got), want)
+    string_free(got)
+    if same == false { return string_new() }
+    return cache.store(f, a, c, bytes)
+}
+
+// `fetch` over HTTP: the same paths under `base` (e.g. `/registry`) on the server at
+// `addr`, fetched with `std/httpc`, admitted by the same rule. The index is fetched for the
+// promise, then the archive; a server that answers anything but 200 yields "".
+//
+// **This blocks on the server.** Against a server in another process that is the normal
+// case; against `std/httpd` in THIS process it deadlocks, exactly as `httpc.fetch` does —
+// the test runs the server on a spawned thread.
+pub fn fetch_http(mut net: sysnet.Net, read addr: sysnet.SocketAddr, read base: str, mut f: fs.Fs, read a: Allocator, read name: str, read version: str, read c: cache.Cache) -> String {
+    var ip: String = string_new()
+    string_push(ip, base)
+    string_push(ip, "/index")
+    var idx: String = string_new()
+    let st: i32 = httpc.fetch(net, addr, "GET", string_view(ip), "", "", idx)
+    string_free(ip)
+    if st != 200 {
+        string_free(idx)
+        return string_new()
+    }
+    let iv: str = string_view(idx)
+    var rows: List(i32) = list.make(i32, a)
+    var want: String = string_new()
+    var found: bool = false
+    if parse_index(iv, rows) {
+        let i: isize = find_row(iv, a, name, version)
+        if i >= 0 {
+            let ss: usize = list.get(i32, rows, (i as usize) * 6 + 4) as usize
+            let se: usize = list.get(i32, rows, (i as usize) * 6 + 5) as usize
+            string_push(want, iv[ss .. se])
+            found = true
+        }
+    }
+    string_free(idx)
+    if found == false {
+        string_free(want)
+        return string_new()
+    }
+    var tf: String = entry_file(name, version, "tar")
+    var tp: String = string_new()
+    string_push(tp, base)
+    string_push(tp, "/")
+    string_push(tp, string_view(tf))
+    var bytes: String = string_new()
+    let st2: i32 = httpc.fetch(net, addr, "GET", string_view(tp), "", "", bytes)
+    string_free(tp)
+    string_free(tf)
+    var key: String = string_new()
+    if st2 == 200 {
+        string_free(key)
+        key = admit(f, a, string_view(want), string_view(bytes), c)
+    }
+    string_free(bytes)
+    string_free(want)
+    return key
+}

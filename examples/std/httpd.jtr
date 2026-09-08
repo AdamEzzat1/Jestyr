@@ -1,0 +1,1010 @@
+// std/httpd.jtr — an HTTP/1.1 server above the parser: routing, middleware, keep-alive,
+// timeouts, streaming responses, static files and an access log.
+//
+// TIER: `sys`, by dependency. Every byte in and out goes through `std/sysnet`; readiness comes
+// from `std/syspoll`; files from `std/fs`; time from a `time.Clock` the server is GIVEN.
+//
+// ─── The shape: one thread, one poll, a table of connections ─────────────────────────
+//
+// The server is single-threaded and readiness-driven. A `step` asks the poller which of the
+// listener and the live connections can be read without blocking, then does exactly that
+// much work: accepts what is waiting, reads what has arrived, answers every complete request
+// in the buffer, and closes what has timed out. Nothing here blocks except the poll itself,
+// and the poll is bounded by the caller's budget.
+//
+// That is a deliberate choice over threads or `spawn`. `spawn` may not take a `mut`
+// parameter — the language refuses the shared-state race a per-connection worker would
+// need — so a thread per connection would have to be built out of channels, and a server
+// whose requests arrive through channels is a different, larger module. One loop is also
+// what makes the suite EXACT: client and server take turns in one process, so a test
+// asserts a transcript rather than a race.
+//
+// ─── Handlers are function pointers with a context, and there is ONE of them per route ──
+//
+// A handler is `fn(*mut u8, mut Exchange) -> i32` plus the `*mut u8` it is called with — the
+// `runtime.Task` shape, for `runtime`'s reason: a closure that captures cannot be stored, a
+// fn pointer can. Middleware is the same shape in a list, run in order before routing; one
+// answering `HTTPD_DONE` has written the response and routing is skipped.
+//
+// ─── Keep-alive, and why the buffer is per connection ─────────────────────────────────
+//
+// HTTP/1.1 keeps the connection unless a side says `Connection: close`; HTTP/1.0 closes
+// unless it says `keep-alive`. A client may PIPELINE: send the next request before reading
+// the answer to the last. So each connection owns a buffer, the parser reports how many bytes
+// a message consumed (`req.total`), and the loop answers every complete message it holds
+// before asking the kernel for more — the bytes after one request are the start of the next.
+//
+// ─── Two timeouts, because they are two different failures ───────────────────────────
+//
+// A READ timeout closes a connection that has sent PART of a request and stopped: that is
+// Slowloris, and the parser's bounds (`HTTP_TOO_LARGE`) close only the memory half of it. An
+// IDLE timeout closes a kept-alive connection nobody is using, so a table slot is not held
+// forever by a client that went away without saying so. They are separate knobs with
+// separate answers (408 for the first, a silent close for the second) because a client that
+// stalled mid-request and one that finished and left are not the same client.
+//
+// ─── Streaming responses ──────────────────────────────────────────────────────────────
+//
+// `respond` sends a body it is given whole. `stream_begin`/`stream_write`/`stream_end` send
+// `Transfer-Encoding: chunked` and one chunk per write, for a body whose size is not known
+// up front. The chunk framing is written here and decoded by `std/http` — the same module
+// that refuses to DECODE anything ambiguous, so what this emits is what the parser accepts.
+//
+// ─── What is deliberately absent ──────────────────────────────────────────────────────
+//
+// **No TLS** (area 8). **No request-body streaming**: a request must fit the connection
+// buffer, and one that does not is `431` and a close; a server that accepts uploads larger
+// than memory is a different design. **No HTTP/1.0 keep-alive negotiation beyond the
+// header.** **No compression, no ranges, no ETags** for static files.
+//
+// Worked example:  examples/std/httpd_demo.jtr
+// Run the tests:   jestyrc test examples/std/httpd_test.jtr
+
+import "fs"
+import "http"
+import "list"
+import "log"
+import "mem"
+import "runtime"
+import "sink"
+import "sysnet"
+import "syspoll"
+import "time"
+
+pub const HTTPD_NEXT: i32 = 0      // a middleware answer: keep going
+pub const HTTPD_DONE: i32 = 1      // a middleware answer: the response is written, stop here
+
+// ---- handlers ---------------------------------------------------------------------------
+
+@copy pub struct Handler {
+    pub ctx: *mut u8,
+    pub f: fn(*mut u8, mut Exchange) -> i32,
+}
+
+@no_alloc @no_os pub fn handler(ctx: *mut u8, f: fn(*mut u8, mut Exchange) -> i32) -> Handler {
+    return Handler{ ctx: ctx, f: f }
+}
+
+// ---- the exchange ----------------------------------------------------------------------
+//
+// One request and its response, handed to middleware and to the route's handler. The request
+// bytes are the connection's buffer; every accessor is a view into it, valid for the length
+// of the call. The response goes to the socket as it is written.
+
+pub struct Exchange {
+    buf: *mut u8,
+    have: usize,
+    req: http.Request,
+    hs: *mut http.Header,
+    nhs: usize,
+    bbuf: *mut u8,              // the DECODED body when the request was chunked, else null
+    blen: usize,
+    route: i32,                 // the matched route's index, -1 before routing / when none
+    params: List(i32),          // 4 per param: name off, name len (in the router's patterns),
+                                //              value off, value len (in `buf`)
+    pats: *mut u8,              // the router's pattern bytes, for the param names
+    plen: usize,
+    path: http.Span,
+    query: http.Span,
+    fd: i64,
+    status: i32,
+    hdrs: String,               // extra headers, already rendered as `Name: value\r\n`
+    sent: bool,
+    streaming: bool,
+    bytes_out: i64,
+    keep_alive: bool,
+    obuf: *mut u8,
+    ocap: usize,
+}
+
+// ---- reading the request ----
+
+pub fn method(read x: Exchange) -> str {
+    let b: []u8 = slice(u8, x.buf, x.have)
+    return http.span_str(x.req.method, b)
+}
+
+// The target up to the `?`.
+pub fn path(read x: Exchange) -> str {
+    let b: []u8 = slice(u8, x.buf, x.have)
+    return http.span_str(x.path, b)
+}
+
+// Everything after the `?`, or "".
+pub fn query(read x: Exchange) -> str {
+    let b: []u8 = slice(u8, x.buf, x.have)
+    return http.span_str(x.query, b)
+}
+
+// The first header named `name` (give it lower-case), or "".
+pub fn header(read x: Exchange, read name: str) -> str {
+    let b: []u8 = slice(u8, x.buf, x.have)
+    let hs: []http.Header = slice(http.Header, x.hs, x.nhs)
+    return http.header_value(hs, x.nhs, b, name)
+}
+
+// The request body, decoded. `str`, so a body that is not UTF-8 reads as "" — `body_len`
+// still reports its length, which is how a caller tells "empty" from "not text".
+pub fn body(read x: Exchange) -> str {
+    if x.bbuf != null {
+        let d: []u8 = slice(u8, x.bbuf, x.blen)
+        let r = try_from_utf8(d)
+        if is_err(r) { return "" }
+        return unwrap(r)
+    }
+    let b: []u8 = slice(u8, x.buf, x.have)
+    let r2 = try_from_utf8(b[x.req.body.off .. x.req.body.off + x.req.body.len])
+    if is_err(r2) { return "" }
+    return unwrap(r2)
+}
+
+@no_alloc @no_os pub fn body_len(read x: Exchange) -> usize {
+    if x.bbuf != null { return x.blen }
+    return x.req.body.len
+}
+
+@no_alloc @no_os pub fn matched_route(read x: Exchange) -> i32 { return x.route }
+@no_alloc @no_os pub fn is_keep_alive(read x: Exchange) -> bool { return x.keep_alive }
+@no_alloc @no_os pub fn responded(read x: Exchange) -> bool { return x.sent }
+@no_alloc @no_os pub fn status_sent(read x: Exchange) -> i32 { return x.status }
+
+// The value bound to `:name` (or `*`) by the matched route, or "".
+pub fn param(read x: Exchange, read name: str) -> str {
+    let n: usize = list.len(i32, x.params) / 4
+    let pb: []u8 = slice(u8, x.pats, x.plen)
+    let b: []u8 = slice(u8, x.buf, x.have)
+    var i: usize = 0
+    for i < n {
+        let noff: usize = list.get(i32, x.params, i * 4) as usize
+        let nlen: usize = list.get(i32, x.params, i * 4 + 1) as usize
+        if str_eq(from_utf8(pb[noff .. noff + nlen]), name) {
+            let voff: usize = list.get(i32, x.params, i * 4 + 2) as usize
+            let vlen: usize = list.get(i32, x.params, i * 4 + 3) as usize
+            return http.span_str(http.span(voff, vlen), b)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ---- writing the response ----
+
+// The reason phrase for a status, for the handful this server emits itself and the common
+// ones a handler will. Unknown codes get a neutral phrase rather than a refusal: the phrase
+// carries no meaning to a client, only the number does.
+@no_alloc @no_os pub fn reason_for(status: i32) -> str {
+    if status == 200 { return "OK" }
+    if status == 201 { return "Created" }
+    if status == 204 { return "No Content" }
+    if status == 301 { return "Moved Permanently" }
+    if status == 302 { return "Found" }
+    if status == 304 { return "Not Modified" }
+    if status == 400 { return "Bad Request" }
+    if status == 401 { return "Unauthorized" }
+    if status == 403 { return "Forbidden" }
+    if status == 404 { return "Not Found" }
+    if status == 405 { return "Method Not Allowed" }
+    if status == 408 { return "Request Timeout" }
+    if status == 413 { return "Payload Too Large" }
+    if status == 431 { return "Request Header Fields Too Large" }
+    if status == 500 { return "Internal Server Error" }
+    if status == 503 { return "Service Unavailable" }
+    return "Status"
+}
+
+// Add a header to the response about to be written. Refused (false) after the status line
+// has gone out, and refused for a value that would split the message — `std/http`'s rule.
+pub fn set_header(mut x: Exchange, read name: str, read value: str) -> bool {
+    if x.sent { return false }
+    if http.safe_header_name(name) == false { return false }
+    if http.safe_header_value(value) == false { return false }
+    string_push(x.hdrs, name)
+    string_push(x.hdrs, ": ")
+    string_push(x.hdrs, value)
+    string_push(x.hdrs, "\r\n")
+    return true
+}
+
+fn send_bytes_out(mut x: Exchange, read b: []u8) -> bool {
+    let s: sysnet.Socket = sysnet.adopt(x.fd)
+    let n: usize = sysnet.send_all(s, b) catch 0
+    x.bytes_out = x.bytes_out + (n as i64)
+    return n == b.len
+}
+
+// Write the status line and headers into the output buffer. `framing` is the one framing
+// header the caller chose (a `Content-Length` line or the chunked one).
+fn write_head(mut x: Exchange, mut s: Sink, mut ob: []u8, status: i32, read ctype: str) -> bool {
+    if http.begin_response(s, ob, status, reason_for(status)) == false { return false }
+    sink.put_str(s, ob, string_view(x.hdrs))
+    if ctype.len > 0 {
+        if http.put_header(s, ob, "Content-Type", ctype) == false { return false }
+    }
+    if x.keep_alive == false {
+        http.put_header(s, ob, "Connection", "close")
+    }
+    return true
+}
+
+// Send a whole response: status, headers, `Content-Length`, body. The body goes out from the
+// caller's bytes, not through the output buffer, so it may be larger than the buffer.
+pub fn respond(mut x: Exchange, status: i32, read ctype: str, read body: str) -> bool {
+    if x.sent { return false }
+    var ob: []u8 = slice(u8, x.obuf, x.ocap)
+    var s: Sink = sink.new()
+    if write_head(x, s, ob, status, ctype) == false { return false }
+    http.put_content_length(s, ob, body.len)
+    http.end_headers(s, ob)
+    if sink.overflowed(s) { return false }
+    x.sent = true
+    x.status = status
+    if send_bytes_out(x, ob[0 .. sink.written(s)]) == false { return false }
+    if body.len == 0 { return true }
+    let bb: []u8 = slice(u8, body.ptr as *mut u8, body.len)
+    return send_bytes_out(x, bb)
+}
+
+// Begin a chunked response. Every `stream_write` is one chunk; `stream_end` terminates it.
+pub fn stream_begin(mut x: Exchange, status: i32, read ctype: str) -> bool {
+    if x.sent { return false }
+    var ob: []u8 = slice(u8, x.obuf, x.ocap)
+    var s: Sink = sink.new()
+    if write_head(x, s, ob, status, ctype) == false { return false }
+    http.put_header(s, ob, "Transfer-Encoding", "chunked")
+    http.end_headers(s, ob)
+    if sink.overflowed(s) { return false }
+    x.sent = true
+    x.streaming = true
+    x.status = status
+    return send_bytes_out(x, ob[0 .. sink.written(s)])
+}
+
+@no_alloc @no_os fn put_hex_usize(mut s: Sink, mut b: []u8, v: usize) {
+    if v == 0 {
+        sink.put(s, b, 48 as u8)
+        return
+    }
+    var digits: usize = 0
+    var t: usize = v
+    for t > 0 {
+        digits = digits + 1
+        t = t / 16
+    }
+    var i: usize = digits
+    for i > 0 {
+        var shift: usize = (i - 1) * 4
+        let d: usize = (v >> (shift as u64)) & 15
+        if d < 10 { sink.put(s, b, (48 + d) as u8) } else { sink.put(s, b, (87 + d) as u8) }
+        i = i - 1
+    }
+}
+
+// One chunk. An empty write is a no-op rather than a terminator — a zero-length chunk IS the
+// terminator on the wire, and a caller writing "" in a loop must not end the body by accident.
+pub fn stream_write(mut x: Exchange, read data: str) -> bool {
+    if x.streaming == false { return false }
+    if data.len == 0 { return true }
+    var ob: []u8 = slice(u8, x.obuf, x.ocap)
+    var s: Sink = sink.new()
+    put_hex_usize(s, ob, data.len)
+    sink.put_str(s, ob, "\r\n")
+    if send_bytes_out(x, ob[0 .. sink.written(s)]) == false { return false }
+    let bb: []u8 = slice(u8, data.ptr as *mut u8, data.len)
+    if send_bytes_out(x, bb) == false { return false }
+    var s2: Sink = sink.new()
+    sink.put_str(s2, ob, "\r\n")
+    return send_bytes_out(x, ob[0 .. sink.written(s2)])
+}
+
+pub fn stream_end(mut x: Exchange) -> bool {
+    if x.streaming == false { return false }
+    var ob: []u8 = slice(u8, x.obuf, x.ocap)
+    var s: Sink = sink.new()
+    sink.put_str(s, ob, "0\r\n\r\n")
+    x.streaming = false
+    return send_bytes_out(x, ob[0 .. sink.written(s)])
+}
+
+// ---- static files ----
+
+// The media type for a file name, by extension. Unknown extensions are bytes.
+@no_alloc @no_os pub fn content_type_for(read name: str) -> str {
+    var dot: usize = name.len
+    var i: usize = name.len
+    for i > 0 {
+        let c: i32 = name[i - 1] as i32
+        if c == 46 { dot = i - 1  break }
+        if c == 47 { break }
+        i = i - 1
+    }
+    if dot >= name.len { return "application/octet-stream" }
+    let ext: str = name[dot + 1 .. name.len]
+    if str_eq(ext, "html") { return "text/html; charset=utf-8" }
+    if str_eq(ext, "htm") { return "text/html; charset=utf-8" }
+    if str_eq(ext, "css") { return "text/css" }
+    if str_eq(ext, "js") { return "application/javascript" }
+    if str_eq(ext, "json") { return "application/json" }
+    if str_eq(ext, "txt") { return "text/plain; charset=utf-8" }
+    if str_eq(ext, "svg") { return "image/svg+xml" }
+    if str_eq(ext, "png") { return "image/png" }
+    if str_eq(ext, "jpg") { return "image/jpeg" }
+    if str_eq(ext, "jpeg") { return "image/jpeg" }
+    if str_eq(ext, "gif") { return "image/gif" }
+    if str_eq(ext, "ico") { return "image/x-icon" }
+    return "application/octet-stream"
+}
+
+// May `rel` be joined under a root? A path is refused if any segment is `..`, if it carries
+// a backslash or a NUL, or if it is absolute after the leading `/` is stripped. This is the
+// whole of the traversal defence and it is deliberately a whitelist of shapes rather than a
+// normalisation: a path that needs normalising to be safe is one to refuse.
+@no_alloc @no_os pub fn safe_relative_path(read rel: str) -> bool {
+    var i: usize = 0
+    var seg_start: usize = 0
+    for i <= rel.len {
+        var at_end: bool = false
+        if i == rel.len { at_end = true }
+        var c: i32 = 47
+        if at_end == false { c = rel[i] as i32 }
+        if c == 0 or c == 92 { return false }
+        if c == 47 {
+            let seg: str = rel[seg_start .. i]
+            if str_eq(seg, "..") { return false }
+            seg_start = i + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Serve `<root>/<rel>` with the media type of its extension, or 404. A refused path is a 404
+// too — telling a probing client "that exists but you may not" is information it should not
+// have. `rel` is normally `param(x, "*")` from a `/static/*` route; an empty `rel` serves
+// `index.html`.
+pub fn serve_file(mut x: Exchange, mut f: fs.Fs, read root: str, read rel: str) -> bool {
+    var start: usize = 0
+    for start < rel.len {
+        if (rel[start] as i32) != 47 { break }
+        start = start + 1
+    }
+    if start >= rel.len { return serve_named(x, f, root, "index.html") }
+    return serve_named(x, f, root, rel[start .. rel.len])
+}
+
+fn serve_named(mut x: Exchange, mut f: fs.Fs, read root: str, read r: str) -> bool {
+    if safe_relative_path(r) == false { return respond(x, 404, "text/plain", "not found") }
+    var p: String = string_new()
+    string_push(p, root)
+    string_push(p, "/")
+    string_push(p, r)
+    if fs.present(f, string_view(p)) == false {
+        string_free(p)
+        return respond(x, 404, "text/plain", "not found")
+    }
+    var data: String = fs.open_text(f, string_view(p))
+    let sent: bool = respond(x, 200, content_type_for(r), string_view(data))
+    string_free(data)
+    string_free(p)
+    return sent
+}
+
+// ---- the router ----------------------------------------------------------------------------
+//
+// Patterns are `/`-separated segments; a segment `:name` binds one path segment, and a final
+// `*` binds the rest of the path (slashes included). Method `*` matches any method. Routes
+// are tried in the order they were added, first match wins — which makes the order the
+// author's precedence rule rather than a specificity score they cannot see.
+
+pub struct Router {
+    pats: String,
+    used: usize,
+    routes: List(i32),          // 4 per route: method off, method len, pattern off, pattern len
+    handlers: List(Handler),
+}
+
+impl Drop for Router {
+    fn drop(mut self) {
+        string_free(self.pats)
+    }
+}
+
+pub fn router(read a: Allocator) -> Router {
+    return Router{ pats: string_new(), used: 0, routes: list.make(i32, a), handlers: list.make(Handler, a) }
+}
+
+pub fn add_route(mut r: Router, read method: str, read pattern: str, h: Handler) -> i32 {
+    let id: i32 = (list.len(i32, r.routes) / 4) as i32
+    list.push(i32, r.routes, r.used as i32)
+    list.push(i32, r.routes, method.len as i32)
+    string_push(r.pats, method)
+    r.used = r.used + method.len
+    list.push(i32, r.routes, r.used as i32)
+    list.push(i32, r.routes, pattern.len as i32)
+    string_push(r.pats, pattern)
+    r.used = r.used + pattern.len
+    list.push(Handler, r.handlers, h)
+    return id
+}
+
+@no_alloc @no_os pub fn route_count(read r: Router) -> usize { return list.len(i32, r.routes) / 4 }
+
+// Match `pattern` against `path`, pushing params (name off/len into the pattern bytes, value
+// off/len into the request buffer — `path_off` is where the path starts there).
+fn match_pattern(read pat: str, pat_off: usize, read path: str, path_off: usize, mut params: List(i32)) -> bool {
+    var pi: usize = 0
+    var ti: usize = 0
+    let before: usize = list.len(i32, params)
+    for true {
+        // The next pattern segment.
+        var pe: usize = pi
+        for pe < pat.len {
+            if (pat[pe] as i32) == 47 { break }
+            pe = pe + 1
+        }
+        var te: usize = ti
+        for te < path.len {
+            if (path[te] as i32) == 47 { break }
+            te = te + 1
+        }
+        let pseg: str = pat[pi .. pe]
+        let tseg: str = path[ti .. te]
+        if str_eq(pseg, "*") {
+            // The rest of the path, slashes and all.
+            list.push(i32, params, (pat_off + pi) as i32)
+            list.push(i32, params, 1)
+            list.push(i32, params, (path_off + ti) as i32)
+            list.push(i32, params, (path.len - ti) as i32)
+            return true
+        }
+        var seg_ok: bool = false
+        if pseg.len > 0 {
+            if (pseg[0] as i32) == 58 {
+                if tseg.len > 0 {
+                    list.push(i32, params, (pat_off + pi + 1) as i32)
+                    list.push(i32, params, (pseg.len - 1) as i32)
+                    list.push(i32, params, (path_off + ti) as i32)
+                    list.push(i32, params, tseg.len as i32)
+                    seg_ok = true
+                }
+            } else {
+                if str_eq(pseg, tseg) { seg_ok = true }
+            }
+        } else {
+            if tseg.len == 0 { seg_ok = true }
+        }
+        if seg_ok == false {
+            list.truncate(i32, params, before)
+            return false
+        }
+        let p_done: bool = pe >= pat.len
+        let t_done: bool = te >= path.len
+        if p_done and t_done { return true }
+        if p_done or t_done {
+            list.truncate(i32, params, before)
+            return false
+        }
+        pi = pe + 1
+        ti = te + 1
+    }
+    return false
+}
+
+fn find_route(read r: Router, read method: str, read path: str, path_off: usize, mut params: List(i32)) -> i32 {
+    let pv: str = string_view(r.pats)
+    let n: usize = list.len(i32, r.routes) / 4
+    var i: usize = 0
+    for i < n {
+        let moff: usize = list.get(i32, r.routes, i * 4) as usize
+        let mlen: usize = list.get(i32, r.routes, i * 4 + 1) as usize
+        let poff: usize = list.get(i32, r.routes, i * 4 + 2) as usize
+        let plen: usize = list.get(i32, r.routes, i * 4 + 3) as usize
+        let m: str = pv[moff .. moff + mlen]
+        var mok: bool = false
+        if str_eq(m, "*") { mok = true }
+        if str_eq(m, method) { mok = true }
+        if mok {
+            if match_pattern(pv[poff .. poff + plen], poff, path, path_off, params) { return i as i32 }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ---- the server -------------------------------------------------------------------------
+
+@copy struct Conn {
+    fd: i64,
+    buf: *mut u8,
+    have: usize,
+    last: i64,          // clock reading at the last byte received or sent
+    served: i64,        // requests answered on this connection
+    live: bool,
+}
+
+fn conn_at(p: *mut Conn, i: usize) -> Conn {
+    unsafe { (p + i).* }
+}
+
+fn conn_set(p: *mut Conn, i: usize, c: Conn) {
+    unsafe { (p + i).* = c }
+}
+
+@move pub struct Server {
+    r: Router,
+    mws: List(Handler),
+    lis: sysnet.Socket,
+    listening: bool,
+    conns: *mut Conn,
+    ncap: usize,
+    bufcap: usize,
+    hs: *mut http.Header,
+    obuf: *mut u8,
+    ocap: usize,
+    lbuf: *mut u8,
+    lcap: usize,
+    llen: usize,            // the last access-log record's rendered length
+    clock: time.Clock,
+    lg: log.Logger,
+    logging: bool,
+    poller: runtime.Poller,
+    read_timeout: i64,      // nanos; a partial request older than this is 408 + close
+    idle_timeout: i64,      // nanos; a kept-alive connection quiet this long is closed
+    max_requests: i64,      // per connection, then `Connection: close`
+    accepted: i64,
+    served: i64,
+    rejected: i64,          // connections refused for want of a table slot
+    timeouts: i64,
+    bad: i64,               // requests refused by the parser
+}
+
+const HTTPD_HEADERS: usize = 100
+const HTTPD_OUT_CAP: usize = 16384
+const HTTPD_LOG_CAP: usize = 2048
+
+// A server over `clock` and `lg`, with room for `max_conns` connections of `buf_cap` bytes
+// each. `logging` false keeps the logger but never writes to it — the knob a test that wants
+// silence flips, and the shape that keeps a `Logger` a required field rather than an option.
+pub fn make(read a: Allocator, take clock: time.Clock, take lg: log.Logger, logging: bool, max_conns: usize, buf_cap: usize) -> Server {
+    var conns: *mut Conn = alloc(Conn, max_conns)
+    var i: usize = 0
+    for i < max_conns {
+        conn_set(conns, i, Conn{ fd: 0 - 1, buf: null, have: 0, last: 0, served: 0, live: false })
+        i = i + 1
+    }
+    return Server{ r: router(a), mws: list.make(Handler, a), lis: sysnet.closed(), listening: false,
+                   conns: conns, ncap: max_conns, bufcap: buf_cap,
+                   hs: alloc(http.Header, HTTPD_HEADERS), obuf: alloc(u8, HTTPD_OUT_CAP), ocap: HTTPD_OUT_CAP,
+                   lbuf: alloc(u8, HTTPD_LOG_CAP), lcap: HTTPD_LOG_CAP, llen: 0,
+                   clock: clock, lg: lg, logging: logging, poller: syspoll.host(),
+                   read_timeout: 10000000000, idle_timeout: 30000000000, max_requests: 1000,
+                   accepted: 0, served: 0, rejected: 0, timeouts: 0, bad: 0 }
+}
+
+pub fn set_timeouts(mut sv: Server, read_ms: i64, idle_ms: i64) {
+    sv.read_timeout = read_ms * 1000000
+    sv.idle_timeout = idle_ms * 1000000
+}
+
+@no_alloc @no_os pub fn set_max_requests(mut sv: Server, n: i64) { sv.max_requests = n }
+
+pub fn use_middleware(mut sv: Server, h: Handler) {
+    list.push(Handler, sv.mws, h)
+}
+
+pub fn route(mut sv: Server, read method: str, read pattern: str, h: Handler) -> i32 {
+    return add_route(sv.r, method, pattern, h)
+}
+
+@no_alloc @no_os pub fn accepted(read sv: Server) -> i64 { return sv.accepted }
+@no_alloc @no_os pub fn served(read sv: Server) -> i64 { return sv.served }
+@no_alloc @no_os pub fn rejected(read sv: Server) -> i64 { return sv.rejected }
+@no_alloc @no_os pub fn timeouts(read sv: Server) -> i64 { return sv.timeouts }
+@no_alloc @no_os pub fn bad_requests(read sv: Server) -> i64 { return sv.bad }
+@no_alloc @no_os pub fn is_listening(read sv: Server) -> bool { return sv.listening }
+
+pub fn live_connections(read sv: Server) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    for i < sv.ncap {
+        if conn_at(sv.conns, i).live { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// `start`/`stop`, not `listen`/`close`: `sysnet` binds both as C symbols, and an extern's
+// name is taken in every module that links it.
+pub fn start(mut sv: Server, mut net: sysnet.Net, read addr: sysnet.SocketAddr, backlog: i32) -> bool {
+    if sv.listening { return false }
+    sv.lis = sysnet.listen_on(net, addr, backlog) catch sysnet.closed()
+    sv.listening = sysnet.is_open(sv.lis)
+    return sv.listening
+}
+
+// The port the listener was given — the answer to binding port 0.
+pub fn port(read sv: Server) -> u16 {
+    if sv.listening == false { return 0 }
+    let a: sysnet.SocketAddr = sysnet.local_addr(sv.lis) catch sysnet.addr(0, 0)
+    return a.port
+}
+
+fn close_conn(mut sv: Server, i: usize) {
+    var c: Conn = conn_at(sv.conns, i)
+    if c.live == false { return }
+    var s: sysnet.Socket = sysnet.adopt(c.fd)
+    sysnet.close_socket(s) catch nothing()
+    if c.buf != null { free_ptr(c.buf) }
+    conn_set(sv.conns, i, Conn{ fd: 0 - 1, buf: null, have: 0, last: 0, served: 0, live: false })
+}
+
+fn nothing() { }
+
+// Close the listener and every connection. The server may not start again.
+pub fn stop(mut sv: Server, mut net: sysnet.Net) {
+    var i: usize = 0
+    for i < sv.ncap {
+        close_conn(sv, i)
+        i = i + 1
+    }
+    if sv.listening {
+        sysnet.close_socket(sv.lis) catch nothing()
+        sv.listening = false
+    }
+}
+
+// Release the buffers. Separate from `stop` so a stopped server can still be asked its
+// counters; call it last.
+pub fn free(mut sv: Server) {
+    if sv.conns != null {
+        free_ptr(sv.conns as *mut u8)
+        sv.conns = null
+        sv.ncap = 0
+    }
+    if sv.hs != null { free_ptr(sv.hs as *mut u8)  sv.hs = null }
+    if sv.obuf != null { free_ptr(sv.obuf)  sv.obuf = null }
+    if sv.lbuf != null { free_ptr(sv.lbuf)  sv.lbuf = null }
+    log.free(sv.lg)
+}
+
+// Send a minimal response with no handler involved — the parser's refusals and the read
+// timeout.
+fn send_plain(mut sv: Server, fd: i64, status: i32, read text: str) -> i64 {
+    var ob: []u8 = slice(u8, sv.obuf, sv.ocap)
+    var s: Sink = sink.new()
+    http.begin_response(s, ob, status, reason_for(status))
+    http.put_header(s, ob, "Content-Type", "text/plain")
+    http.put_content_length(s, ob, text.len)
+    http.put_header(s, ob, "Connection", "close")
+    http.end_headers(s, ob)
+    sink.put_str(s, ob, text)
+    let sock: sysnet.Socket = sysnet.adopt(fd)
+    let n: usize = sysnet.send_all(sock, ob[0 .. sink.written(s)]) catch 0
+    return n as i64
+}
+
+// The access-log record for one exchange.
+fn access_log(mut sv: Server, read x: Exchange, ms: i64) {
+    if sv.logging == false { return }
+    if log.begin(sv.lg, log.LOG_INFO, "request") == false { return }
+    log.kv_str(sv.lg, "method", method(x))
+    log.kv_str(sv.lg, "path", path(x))
+    log.kv_i64(sv.lg, "status", x.status as i64)
+    log.kv_i64(sv.lg, "bytes", x.bytes_out)
+    log.kv_i64(sv.lg, "ms", ms)
+    var lb: []u8 = slice(u8, sv.lbuf, sv.lcap)
+    var s: Sink = sink.new()
+    log.end(sv.lg, s, lb)
+    sv.llen = sink.written(s)
+}
+
+// The last access-log record as rendered (logfmt or JSON, per the logger), or "" when
+// logging is off or nothing has been served. What the writer received; a test reads it
+// here rather than through a buffered writer it cannot see into.
+pub fn last_log(read sv: Server) -> str {
+    let lb: []u8 = slice(u8, sv.lbuf, sv.lcap)
+    return from_utf8(lb[0 .. sv.llen])
+}
+
+// Does `req` ask to keep the connection? HTTP/1.1 keeps unless `close`; HTTP/1.0 closes
+// unless `keep-alive`.
+fn wants_keep_alive(read b: []u8, read hs: []http.Header, read req: http.Request) -> bool {
+    let cv: str = http.header_value(hs, req.headers, b, "connection")
+    if eq_ci_str(cv, "close") { return false }
+    if req.minor == 0 {
+        return eq_ci_str(cv, "keep-alive")
+    }
+    return true
+}
+
+@no_alloc @no_os fn eq_ci_str(read a: str, read b: str) -> bool {
+    if a.len != b.len { return false }
+    for i in 0..a.len {
+        var c: i32 = a[i] as i32
+        var d: i32 = b[i] as i32
+        if c >= 65 and c <= 90 { c = c + 32 }
+        if d >= 65 and d <= 90 { d = d + 32 }
+        if c != d { return false }
+    }
+    return true
+}
+
+// Answer one complete request at the front of connection `i`'s buffer. Returns true when the
+// connection stays open.
+fn answer(mut sv: Server, i: usize, read req: http.Request, nhs: usize) -> bool {
+    var c: Conn = conn_at(sv.conns, i)
+    let t0: i64 = time.read_nanos(sv.clock)
+    let b: []u8 = slice(u8, c.buf, c.have)
+    let hs: []http.Header = slice(http.Header, sv.hs, nhs)
+
+    // Split the target at `?`.
+    var qoff: usize = req.target.off + req.target.len
+    var k: usize = req.target.off
+    for k < req.target.off + req.target.len {
+        if (b[k] as i32) == 63 { qoff = k  break }
+        k = k + 1
+    }
+    var qspan: http.Span = http.span(qoff, 0)
+    if qoff < req.target.off + req.target.len {
+        qspan = http.span(qoff + 1, req.target.off + req.target.len - qoff - 1)
+    }
+
+    var keep: bool = wants_keep_alive(b, hs, req)
+    if c.served + 1 >= sv.max_requests { keep = false }
+
+    let pv: str = string_view(sv.r.pats)
+    var x: Exchange = Exchange{ buf: c.buf, have: c.have, req: req, hs: sv.hs, nhs: nhs,
+                                bbuf: null, blen: 0, route: 0 - 1, params: list.make(i32, mem.system_allocator()),
+                                pats: pv.ptr as *mut u8, plen: pv.len,
+                                path: http.span(req.target.off, qoff - req.target.off), query: qspan,
+                                fd: c.fd, status: 0, hdrs: string_new(), sent: false, streaming: false,
+                                bytes_out: 0, keep_alive: keep, obuf: sv.obuf, ocap: sv.ocap }
+
+    // A chunked body is decoded once, up front, into its own buffer.
+    if req.chunked {
+        var dec: *mut u8 = alloc(u8, req.body.len + 1)
+        var db: []u8 = slice(u8, dec, req.body.len + 1)
+        let n: isize = http.decode_chunked(b, req.body, db)
+        if n >= 0 {
+            x.bbuf = dec
+            x.blen = n as usize
+        } else {
+            free_ptr(dec)
+        }
+    }
+
+    // Middleware, in order. One that answers DONE has written the response.
+    var halted: bool = false
+    var mi: usize = 0
+    for mi < list.len(Handler, sv.mws) {
+        let h: Handler = list.get(Handler, sv.mws, mi)
+        let v: i32 = h.f(h.ctx, x)
+        if v == HTTPD_DONE { halted = true  break }
+        mi = mi + 1
+    }
+
+    if halted == false {
+        x.route = find_route(sv.r, method(x), path(x), req.target.off, x.params)
+        if x.route >= 0 {
+            let h2: Handler = list.get(Handler, sv.r.handlers, x.route as usize)
+            h2.f(h2.ctx, x)
+            if x.streaming { stream_end(x) }
+            if x.sent == false { respond(x, 500, "text/plain", "the handler sent nothing") }
+        } else {
+            respond(x, 404, "text/plain", "not found")
+        }
+    } else {
+        if x.streaming { stream_end(x) }
+        if x.sent == false { respond(x, 500, "text/plain", "the middleware sent nothing") }
+    }
+
+    let t1: i64 = time.read_nanos(sv.clock)
+    access_log(sv, x, (t1 - t0) / 1000000)
+    sv.served = sv.served + 1
+
+    // Consume the request: whatever follows is the next one.
+    let rest: usize = c.have - req.total
+    var j: usize = 0
+    var cb: []u8 = slice(u8, c.buf, sv.bufcap)
+    for j < rest {
+        cb[j] = cb[req.total + j]
+        j = j + 1
+    }
+    c.have = rest
+    c.served = c.served + 1
+    c.last = t1
+    conn_set(sv.conns, i, c)
+
+    if x.bbuf != null { free_ptr(x.bbuf) }
+    string_free(x.hdrs)
+    return x.keep_alive
+}
+
+// Parse and answer every complete request in connection `i`'s buffer. Returns true when the
+// connection stays open.
+fn drain(mut sv: Server, i: usize) -> bool {
+    for true {
+        var c: Conn = conn_at(sv.conns, i)
+        if c.have == 0 { return true }
+        var req: http.Request = http.empty_request()
+        var hs: []http.Header = slice(http.Header, sv.hs, HTTPD_HEADERS)
+        let b: []u8 = slice(u8, c.buf, c.have)
+        let o: i32 = http.parse_request(b, hs, req)
+        if o == http.HTTP_INCOMPLETE {
+            if c.have >= sv.bufcap {
+                // A request that fills the whole buffer without completing cannot be
+                // answered by waiting: the buffer IS the bound.
+                sv.bad = sv.bad + 1
+                send_plain(sv, c.fd, 431, "request too large")
+                return false
+            }
+            return true
+        }
+        if o != http.HTTP_OK {
+            sv.bad = sv.bad + 1
+            var st: i32 = 400
+            if o == http.HTTP_TOO_LARGE { st = 431 }
+            send_plain(sv, c.fd, st, http.outcome_name(o))
+            return false
+        }
+        if answer(sv, i, req, req.headers) == false { return false }
+    }
+    return true
+}
+
+fn accept_ready(mut sv: Server, mut net: sysnet.Net) {
+    var s: sysnet.Socket = sysnet.accept_one(net, sv.lis) catch sysnet.closed()
+    if sysnet.is_open(s) == false { return }
+    sv.accepted = sv.accepted + 1
+    var slot: usize = sv.ncap
+    var i: usize = 0
+    for i < sv.ncap {
+        if conn_at(sv.conns, i).live == false { slot = i  break }
+        i = i + 1
+    }
+    if slot >= sv.ncap {
+        // No room. Refuse with a 503 rather than leaving the client to time out: the
+        // table is a deliberate bound, and a bound that is silent is a hang.
+        sv.rejected = sv.rejected + 1
+        send_plain(sv, s.fd, 503, "too many connections")
+        sysnet.close_socket(s) catch nothing()
+        return
+    }
+    let now: i64 = time.read_nanos(sv.clock)
+    conn_set(sv.conns, slot, Conn{ fd: s.fd, buf: alloc(u8, sv.bufcap), have: 0, last: now, served: 0, live: true })
+}
+
+fn read_ready(mut sv: Server, i: usize) {
+    var c: Conn = conn_at(sv.conns, i)
+    if c.have >= sv.bufcap {
+        sv.bad = sv.bad + 1
+        send_plain(sv, c.fd, 431, "request too large")
+        close_conn(sv, i)
+        return
+    }
+    var cb: []u8 = slice(u8, c.buf, sv.bufcap)
+    var win: []u8 = cb[c.have .. sv.bufcap]
+    let sock: sysnet.Socket = sysnet.adopt(c.fd)
+    // A failed read and a clean close both end the connection; the distinction does not
+    // change what a server can do with the socket.
+    let n: usize = sysnet.recv_bytes(sock, win) catch 0
+    if n == 0 {
+        close_conn(sv, i)
+        return
+    }
+    c.have = c.have + n
+    c.last = time.read_nanos(sv.clock)
+    conn_set(sv.conns, i, c)
+    if drain(sv, i) == false { close_conn(sv, i) }
+}
+
+fn expire(mut sv: Server) {
+    let now: i64 = time.read_nanos(sv.clock)
+    var i: usize = 0
+    for i < sv.ncap {
+        let c: Conn = conn_at(sv.conns, i)
+        if c.live {
+            if c.have > 0 {
+                if now - c.last > sv.read_timeout {
+                    sv.timeouts = sv.timeouts + 1
+                    send_plain(sv, c.fd, 408, "request timeout")
+                    close_conn(sv, i)
+                }
+            } else {
+                if now - c.last > sv.idle_timeout {
+                    sv.timeouts = sv.timeouts + 1
+                    close_conn(sv, i)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// One round: wait up to `wait_ms` for something readable, then do everything that is ready
+// and expire what has timed out. Returns the requests answered in this round, or -1 when the
+// server is not listening.
+pub fn step(mut sv: Server, mut net: sysnet.Net, wait_ms: i64) -> i64 {
+    if sv.listening == false { return 0 - 1 }
+    let before: i64 = sv.served
+    let n: usize = sv.ncap + 1
+    var fds: *mut i64 = alloc(i64, n)
+    var rdy: *mut u8 = alloc(u8, n)
+    var idx: *mut i64 = alloc(i64, n)
+    unsafe { (fds + 0).* = sv.lis.fd }
+    unsafe { (idx + 0).* = 0 - 1 }
+    var m: usize = 1
+    var i: usize = 0
+    for i < sv.ncap {
+        let c: Conn = conn_at(sv.conns, i)
+        if c.live {
+            unsafe { (fds + m).* = c.fd }
+            unsafe { (idx + m).* = i as i64 }
+            m = m + 1
+        }
+        i = i + 1
+    }
+    var k: usize = 0
+    for k < m {
+        unsafe { (rdy + k).* = 0 as u8 }
+        k = k + 1
+    }
+    var wait: i64 = wait_ms * 1000000
+    if wait < 0 { wait = 0 }
+    let got: i64 = runtime.ask(sv.poller, fds, rdy, m, wait)
+    if got > 0 {
+        var j: usize = 0
+        for j < m {
+            var r: u8 = 0
+            unsafe { r = (rdy + j).* }
+            if (r as i32) != 0 {
+                var which: i64 = 0
+                unsafe { which = (idx + j).* }
+                if which < 0 { accept_ready(sv, net) } else { read_ready(sv, which as usize) }
+            }
+            j = j + 1
+        }
+    }
+    expire(sv)
+    free_ptr(idx)
+    free_ptr(rdy)
+    free_ptr(fds)
+    return sv.served - before
+}
+
+// Step until `budget_ms` of waiting has been spent. Returns the requests answered. The wait
+// per step is bounded by what is left of the budget, so a quiet server returns on time.
+pub fn serve_for(mut sv: Server, mut net: sysnet.Net, budget_ms: i64) -> i64 {
+    let start: i64 = time.read_nanos(sv.clock)
+    var total: i64 = 0
+    for true {
+        let spent: i64 = (time.read_nanos(sv.clock) - start) / 1000000
+        let left: i64 = budget_ms - spent
+        if left <= 0 { break }
+        var w: i64 = left
+        if w > 50 { w = 50 }
+        let n: i64 = step(sv, net, w)
+        if n < 0 { break }
+        total = total + n
+    }
+    return total
+}

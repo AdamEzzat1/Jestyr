@@ -62,6 +62,10 @@ struct Record {
     is_pub: bool,
     sig: String,
     guarantees: Vec<String>,
+    /// `@deprecated`: `None` absent, `Some("")` bare, `Some(msg)` with a message.
+    /// Its own field rather than a guarantee or a piece of the signature — see
+    /// [`doc::fn_deprecated`] for why both of those are the wrong home.
+    deprecated: Option<String>,
 }
 
 /// Build the attestation manifest for a checked program. `src` must be the buffer
@@ -89,6 +93,17 @@ pub fn manifest(source_id: &str, src: &str, ast: &Ast, info: &TypeInfo) -> Strin
         out.push_str(&format!("{} {}\n", r.kind, r.name));
         out.push_str(&format!("  vis: {}\n", if r.is_pub { "pub" } else { "priv" }));
         out.push_str(&format!("  sig: {}\n", r.sig));
+        // Ahead of the guarantees, so a reader meets "do not call this" before the
+        // proven facts about what calling it would do. A bare `@deprecated` renders
+        // the bare key; `@deprecated("")` collapses to the same line, which loses
+        // nothing a caller could act on.
+        if let Some(msg) = &r.deprecated {
+            if msg.is_empty() {
+                out.push_str("  deprecated:\n");
+            } else {
+                out.push_str(&format!("  deprecated: {msg}\n"));
+            }
+        }
         for g in &r.guarantees {
             out.push_str(&format!("  guarantee: {g}\n"));
         }
@@ -185,6 +200,7 @@ fn collect_records(ast: &Ast, src: &str) -> Vec<Record> {
                 is_pub: f.is_pub,
                 sig: doc::fn_sig(ast, src, f),
                 guarantees: doc::fn_guarantees(ast, src, f),
+                deprecated: doc::fn_deprecated(ast, f),
             }),
             Item::Const(c) => records.push(Record {
                 kind: "const",
@@ -192,6 +208,7 @@ fn collect_records(ast: &Ast, src: &str) -> Vec<Record> {
                 is_pub: c.is_pub,
                 sig: doc::const_sig(ast, src, c),
                 guarantees: Vec::new(),
+                deprecated: None,
             }),
             Item::Enum(e) => records.push(Record {
                 kind: "enum",
@@ -199,6 +216,7 @@ fn collect_records(ast: &Ast, src: &str) -> Vec<Record> {
                 is_pub: e.is_pub,
                 sig: format!("enum {}", e.name.name),
                 guarantees: Vec::new(),
+                deprecated: None,
             }),
             Item::Struct { is_pub, is_record, is_union, name, .. } => {
                 let kind = if *is_union {
@@ -214,6 +232,7 @@ fn collect_records(ast: &Ast, src: &str) -> Vec<Record> {
                     is_pub: *is_pub,
                     sig: format!("{kind} {}", name.name),
                     guarantees: Vec::new(),
+                    deprecated: None,
                 });
             }
             Item::Extern(e) => records.push(Record {
@@ -222,6 +241,7 @@ fn collect_records(ast: &Ast, src: &str) -> Vec<Record> {
                 is_pub: e.is_pub,
                 sig: doc::extern_sig(ast, e),
                 guarantees: Vec::new(),
+                deprecated: None,
             }),
             // **A trait IS part of the ABI, and leaving it out was a false negative
             // inside the tool whose whole job is finding breakage.**
@@ -247,6 +267,7 @@ fn collect_records(ast: &Ast, src: &str) -> Vec<Record> {
                 is_pub: t.is_pub,
                 sig: trait_sig(ast, src, t),
                 guarantees: Vec::new(),
+                deprecated: None,
             }),
             // An impl is the other half: a type that stops implementing a trait breaks
             // every call through it, and that is invisible if only the trait is
@@ -263,6 +284,7 @@ fn collect_records(ast: &Ast, src: &str) -> Vec<Record> {
                 is_pub: true,
                 sig: impl_sig(ast, src, i),
                 guarantees: Vec::new(),
+                deprecated: None,
             }),
             // Still not standalone C items, and neither carries a callable surface:
             // a `distinct` is attested by the struct/fn records that mention it, and
@@ -329,6 +351,8 @@ pub struct ParsedItem {
     pub errors: BTreeSet<String>,
     /// param name → its refinement-range text (e.g. `0..100`).
     pub refines: BTreeMap<String, String>,
+    /// `@deprecated`: `None` absent, `Some("")` bare, `Some(msg)` with a message.
+    pub deprecated: Option<String>,
 }
 
 impl ParsedItem {
@@ -436,6 +460,12 @@ pub fn parse_manifest(text: &str) -> Result<ParsedManifest, String> {
                     it.sig = v.to_string();
                 } else if let Some(v) = body.strip_prefix("guarantee: ") {
                     it.absorb_guarantee(v);
+                } else if let Some(v) = body.strip_prefix("deprecated:") {
+                    // `deprecated:` bare, `deprecated: <msg>` with one. A manifest
+                    // written before this line existed simply has none, and parses to
+                    // `None` — so an old manifest still diffs against a new one, and
+                    // reads as "not deprecated then, deprecated now".
+                    it.deprecated = Some(v.strip_prefix(' ').unwrap_or("").to_string());
                 }
             }
         } else {
@@ -569,6 +599,25 @@ fn diff_item(key: &str, o: &ParsedItem, n: &ParsedItem, out: &mut Vec<Change>) {
     // Type signature (params/return), with the structurally-compared bits removed.
     if o.sig_core() != n.sig_core() {
         push(Verdict::Breaking, format!("signature changed: `{}` → `{}`", o.sig_core(), n.sig_core()));
+    }
+
+    // Deprecation. **Every verdict here is `Compatible`, and that is the point.** A
+    // deprecated function still compiles, still links, and still returns what it always
+    // did — nothing a caller wrote stops working. Classifying it `Breaking` would fire
+    // the CI gate on the one action a library author takes to AVOID breaking people, and
+    // a gate that fires on good behaviour is a gate that gets switched off.
+    //
+    // It still has to be REPORTED, though: "this is going away" is exactly what someone
+    // reads a contract diff to find out, and until now it was the one thing `@deprecated`
+    // could not tell them.
+    match (&o.deprecated, &n.deprecated) {
+        (None, Some(m)) if m.is_empty() => push(Verdict::Compatible, "now `@deprecated`".into()),
+        (None, Some(m)) => push(Verdict::Compatible, format!("now `@deprecated`: {m}")),
+        (Some(_), None) => push(Verdict::Compatible, "no longer `@deprecated`".into()),
+        (Some(a), Some(b)) if a != b => {
+            push(Verdict::Compatible, format!("deprecation message changed: `{a}` → `{b}`"))
+        }
+        _ => {}
     }
 
     // `@no_panic` is a postcondition: losing it is breaking, gaining it compatible.

@@ -1,0 +1,56 @@
+// A named local carried out of a fallible function by `ok(...)` is MOVED, not dropped.
+//
+// Three makers, three return shapes. `mk_plain` returns a bare local and `mk_literal`
+// wraps a struct literal — both always moved correctly. `mk_ok` wraps a NAMED local, and
+// until A12 the backend copied it into the result and then ran the local's drops: the
+// caller received a struct whose String had been freed, and the second free at the end of
+// `main` corrupted the heap. `drop fired` printing before the caller reads the value is
+// the symptom; the expected transcript has exactly three drops, all at the end of `main`.
+//
+// Run:  jestyrc run examples/return_ok_local.jtr
+
+trait Drop { fn drop(mut self) }
+
+struct D { t: String, tag: i64 }
+
+impl Drop for D {
+    fn drop(mut self) {
+        print_str("drop fired")
+        string_free(self.t)
+    }
+}
+
+fn mk_plain() -> D {
+    var d: D = D{ t: string_new(), tag: 1 }
+    string_push(d.t, "plain")
+    return d
+}
+
+fn mk_ok() -> D !{ Nope } {
+    var d: D = D{ t: string_new(), tag: 2 }
+    string_push(d.t, "ok-wrapped")
+    return ok(d)
+}
+
+fn mk_literal() -> D !{ Nope } {
+    var t: String = string_new()
+    string_push(t, "literal")
+    return ok(D{ t: t, tag: 3 })
+}
+
+fn main() -> i32 {
+    print_str("-- plain return --")
+    var a: D = mk_plain()
+    print_str(string_view(a.t))
+    print_int(a.tag)
+    print_str("-- ok(local) return --")
+    var b: D = mk_ok() catch mk_plain()
+    print_str(string_view(b.t))
+    print_int(b.tag)
+    print_str("-- ok(literal) return --")
+    var c: D = mk_literal() catch mk_plain()
+    print_str(string_view(c.t))
+    print_int(c.tag)
+    print_str("-- end of main --")
+    return 0
+}

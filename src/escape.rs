@@ -1087,6 +1087,7 @@ impl<'a> Checker<'a> {
                 self.check_give_away(ctx, id, *callee, args);
                 self.check_loop_mutation(ctx, id, *callee, args);
                 self.check_slice_alias(id, *callee, args);
+                self.check_mut_value_arg(id, *callee, args);
                 self.check_effect_call(id, *callee, span);
                 self.check_deterministic_call(id, *callee, span);
                 self.check_manual_drop(id, span);
@@ -1259,7 +1260,7 @@ impl<'a> Checker<'a> {
                 ctx.loop_floor.pop();
                 return;
             }
-            ExprKind::Select(arms) => {
+            ExprKind::Select { arms, closed } => {
                 // Each arm receives an owned `i64` (a fresh value moved out of the
                 // channel), not a borrow — so the binding can't escape. Walk the
                 // channel expression and the arm body.
@@ -1268,6 +1269,13 @@ impl<'a> Checker<'a> {
                     ctx.push();
                     ctx.bind(&arm.bind.name, false);
                     self.check_block(ctx, &arm.body, false);
+                    ctx.pop();
+                }
+                // The `closed` arm binds nothing, but its body is ordinary code and
+                // owes the same ownership check as any other block.
+                if let Some(c) = closed {
+                    ctx.push();
+                    self.check_block(ctx, c, false);
                     ctx.pop();
                 }
                 if self.deterministic {
@@ -1690,6 +1698,118 @@ impl<'a> Checker<'a> {
                 return; // one refusal per call
             }
             seen.push(key);
+        }
+    }
+
+    /// A11 — a `mut`/`out` argument that is a COMPUTED VALUE of a type with no
+    /// indirection is refused, because the callee's writes land in a temporary that
+    /// nothing can read: `twice(a + b)` into `mut n: i64` compiles to a write into a
+    /// compound literal and the caller sees nothing. The lowering exists (a value parks
+    /// in `(T[1]){ v }`, the A7 shape) and is kept, because a value WITH indirection —
+    /// `add(s as Buf)`, `f(mk_slice())` — shares its `ptr` with the caller and the
+    /// element writes are real. The boundary is therefore the TYPE, not the syntax:
+    /// "not a place, and the type transitively contains no indirection". A struct with a
+    /// `*mut T` field is not in this category; an `i64`, a `bool`, a `P{ x: 1 }` of
+    /// plain fields are.
+    ///
+    /// An error, not a warning: the port's `jc build` refuses on any escape diagnostic
+    /// and has no severity model, so a warning would be a program one compiler builds
+    /// and the other does not. Lives here, in `escape`, on BOTH sides — `typeck.jtr`
+    /// has no diagnostic channel (the two-sided rule this tree keeps relearning).
+    ///
+    /// The argument's own INFERRED type is what is tested, not the parameter's
+    /// declared one: the two agree by assignability, and the inferred one is a `Ty`
+    /// on both call shapes where the declared one is an AST type on the method path.
+    /// `Unknown`/`Error`/opaque types are treated as "has indirection" — this rule
+    /// refuses only what it can prove, never what it cannot name.
+    fn check_mut_value_arg(&mut self, call_id: ExprId, callee: ExprId, args: &[ExprId]) {
+        let (fname, rows, runtime): (String, Vec<(String, Conv)>, Vec<ExprId>) =
+            if let Some(mr) = self.info.method_call(call_id).cloned() {
+                let ExprKind::Field { base, .. } = &self.ast.expr_at(callee).kind else {
+                    return;
+                };
+                let Some(f) = self.find_fn(&mr.fn_name) else { return };
+                let rows = f
+                    .params
+                    .iter()
+                    .filter(|p| !p.comptime)
+                    .map(|p| (p.name.name.clone(), p.conv))
+                    .collect();
+                let mut v = vec![*base];
+                v.extend_from_slice(args);
+                (mr.fn_name.clone(), rows, v)
+            } else {
+                let Some(name) = self.resolved_callee_name(call_id, callee) else { return };
+                let Some(sig) = self.info.table.fns.get(&name) else { return };
+                let rows = sig.params.iter().map(|p| (p.name.clone(), p.conv)).collect();
+                (name, rows, args.to_vec())
+            };
+        for (i, &arg) in runtime.iter().enumerate() {
+            let Some((pname, conv)) = rows.get(i) else { break };
+            if !matches!(conv, Conv::Mut | Conv::Out) {
+                continue;
+            }
+            if self.is_place_expr(arg) {
+                continue;
+            }
+            let ty = self.info.type_of(arg).clone();
+            if self.ty_has_indirection(&ty, 0) {
+                continue;
+            }
+            let which = if *conv == Conv::Out { "out" } else { "mut" };
+            let shown = ty.display(&self.info.table);
+            self.error(
+                self.ast.expr_at(arg).span,
+                format!(
+                    "cannot pass a computed value to the `{which}` parameter `{pname}` of `{fname}`: \
+                     the type `{shown}` holds no indirection, so the callee's writes would land in a \
+                     temporary nothing can read — bind the value to a `var` and pass that"
+                ),
+            );
+            return; // one refusal per call
+        }
+    }
+
+    /// Is `id` a PLACE — something with an address the callee's writes reach: a
+    /// name, `self`, or a field / index / deref chain rooted in one? A cast, a call
+    /// and an operator are values.
+    fn is_place_expr(&self, id: ExprId) -> bool {
+        match &self.ast.expr_at(id).kind {
+            ExprKind::Name(_) | ExprKind::SelfValue => true,
+            ExprKind::Field { base, .. }
+            | ExprKind::Index { base, .. }
+            | ExprKind::Deref { base } => self.is_place_expr(*base),
+            _ => false,
+        }
+    }
+
+    /// Does a value of `ty` carry a pointer through which a write is shared — a
+    /// slice's `ptr`, a raw pointer, a `str`/`String`, a reference — directly or in
+    /// any field, payload, element or `distinct` base? Anything this cannot
+    /// classify (`Opaque`, `Unknown`, generics) answers `true`, so the A11 refusal
+    /// stays on the side of accepting.
+    fn ty_has_indirection(&self, ty: &Ty, depth: usize) -> bool {
+        if depth > 16 {
+            return true;
+        }
+        match ty {
+            Ty::Unit => false,
+            Ty::Prim(n) => {
+                matches!(*n, "str" | "cstr" | "cptr" | "os_str" | "String" | "Builder" | "Cow")
+            }
+            Ty::Named(i) => match self.info.table.types.get(*i).map(|t| &t.kind) {
+                Some(TypeKindG::Struct { fields }) => {
+                    fields.iter().any(|(_, f)| self.ty_has_indirection(f, depth + 1))
+                }
+                Some(TypeKindG::Enum { variants }) => variants
+                    .iter()
+                    .any(|(_, payload)| payload.iter().any(|f| self.ty_has_indirection(f, depth + 1))),
+                Some(TypeKindG::Distinct { base }) => self.ty_has_indirection(base, depth + 1),
+                None => true,
+            },
+            Ty::Array { elem, .. } => self.ty_has_indirection(elem, depth + 1),
+            // Everything that IS a pointer, or that this rule declines to classify.
+            _ => true,
         }
     }
 

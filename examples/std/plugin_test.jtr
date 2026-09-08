@@ -1,11 +1,22 @@
-// std/plugin_test.jtr — the frame, and the refusals that happen before a process starts.
+// std/plugin_test.jtr — the frame, the refusals, and a server-mode host against children
+// that are NOT plugins.
 //
-// The END-TO-END half of this protocol — a real plugin, really invoked, failing three
-// different ways — is `plugin_demo.jtr` and the Rust test that drives it, because it needs a
-// COMPILED plugin and a `.jtr` suite cannot build one.
+// Two halves. The first is everything that needs no second process: the frame, the order
+// the validity checks happen in, the stream header read on its own, and the capability
+// refusals. The second starts REAL children through `sysproc` — shell commands, not
+// plugins — because every failure the server-mode host must tell apart is a way of NOT
+// answering, and `exit 3`, `exit 0`, a line of prose and a sleep are those ways spelled in
+// any shell. A child that dies by signal (POSIX) or with an NTSTATUS exit (Windows) is the
+// one `@cfg`-split command, which is why this file is in `CGEN_GOLDEN_ALLOWLIST`.
 //
-// What is here is everything that does not need a second process: the frame, the order the
-// validity checks happen in, and the capability refusals. All of it runs on any host.
+// What a `.jtr` suite cannot do is BUILD a plugin, so the half that needs one — a real
+// server answering many calls on one process, the hostile payload back byte for byte, an
+// error frame, a kill mid-nap — is `plugin_server_demo.jtr` and the Rust test that pins its
+// transcript (`jplugin_keeps_one_plugin_and_survives_it`); the one-shot mode's equivalent is
+// `plugin_demo.jtr` and `jhost_survives_every_way_a_plugin_can_fail`.
+//
+// If a test in the second half ever HANGS rather than fails, the host blocked in a read it
+// should have bounded — that is a defect, not a flake.
 //
 // Run:  jestyrc test examples/std/plugin_test.jtr
 
@@ -14,10 +25,31 @@ import "file"
 import "fs"
 import "process"
 import "mem"
+import "sysproc"
+import "time"
 import "test"
 import "test_report"
 
+// A child that never writes and stays alive for about two seconds — long enough that the
+// one test using it can still find it running after the manual-clock budget has expired,
+// which is what "the host did not wait for the child" means.
+@cfg(posix) fn slow_cmd() -> str { return "sleep 2" }
+@cfg(windows) fn slow_cmd() -> str { return "ping -n 3 127.0.0.1 > nul" }
+
+// A child that does not exit normally: a signal on POSIX, an NTSTATUS exit on Windows —
+// `0xC0000005`, what an access violation reports, negative as `i32`.
+@cfg(posix) fn crash_cmd() -> str { return "kill -9 $$" }
+@cfg(windows) fn crash_cmd() -> str { return "exit -1073741819" }
+
 const P_T_CAP: usize = 8192
+// The budget the tests below hand a connection whose child is expected to ANSWER (by
+// exiting, or by writing prose) rather than to hang. Ten seconds, because a budget is only
+// ever SPENT on the path that times out: on every other path it is a ceiling nobody
+// approaches, and making it tight buys nothing while making the suite a race against how
+// long `cmd.exe` takes to start a child on a loaded machine — measured here at 75–120ms
+// with a tail past 300ms. The one test that means to time out drives a MANUAL clock instead,
+// where the budget is gone on the first poll and no real time passes at all.
+const P_T_ROOMY: i64 = 10000000000
 const P_T_REQ: str = "zz_plugin_req.bin"
 const P_T_RESP: str = "zz_plugin_resp.bin"
 
@@ -219,7 +251,7 @@ fn lay_down(read a: Allocator, read bytes: []u8) {
     // asked first. Without it this reads as "the plugin crashed", sending a caller to debug a
     // plugin that never ran.
     var denied: plugin.Host = plugin.host(process.denied(), fs.host())
-    let r1: plugin.Reply = plugin.call(denied, a, "anything", P_T_REQ, P_T_RESP, payload[0 .. n], resp)
+    let r1: plugin.Reply = plugin.call_once(denied, a, "anything", P_T_REQ, P_T_RESP, payload[0 .. n], resp)
     test.eq_i64(c, rep, "a denied process refuses", r1.outcome as i64, plugin.PLUGIN_REFUSED as i64)
     test.is_false(c, rep, "and it did not succeed", plugin.succeeded(r1))
     test.eq_i64(c, rep, "the call was counted", plugin.calls(denied), 1)
@@ -228,16 +260,16 @@ fn lay_down(read a: Allocator, read bytes: []u8) {
     // A host that cannot write cannot stage a request either, and refuses for the same reason
     // rather than producing a half-written one.
     var nowrite: plugin.Host = plugin.host(process.host(), fs.read_only())
-    let r2: plugin.Reply = plugin.call(nowrite, a, "anything", P_T_REQ, P_T_RESP, payload[0 .. n], resp)
+    let r2: plugin.Reply = plugin.call_once(nowrite, a, "anything", P_T_REQ, P_T_RESP, payload[0 .. n], resp)
     test.eq_i64(c, rep, "a read-only filesystem refuses", r2.outcome as i64, plugin.PLUGIN_REFUSED as i64)
 
     // **A path with a space is refused rather than mis-quoted.** The two paths are appended to
     // a shell command line unquoted, and quoting differs between `cmd.exe` and `sh` — a
     // half-right rule would send the plugin a truncated path and blame the plugin.
     var okhost: plugin.Host = plugin.host(process.host(), fs.host())
-    let r3: plugin.Reply = plugin.call(okhost, a, "anything", "has a space.bin", P_T_RESP, payload[0 .. n], resp)
+    let r3: plugin.Reply = plugin.call_once(okhost, a, "anything", "has a space.bin", P_T_RESP, payload[0 .. n], resp)
     test.eq_i64(c, rep, "a request path with a space refuses", r3.outcome as i64, plugin.PLUGIN_REFUSED as i64)
-    let r4: plugin.Reply = plugin.call(okhost, a, "anything", P_T_REQ, "also spaced.bin", payload[0 .. n], resp)
+    let r4: plugin.Reply = plugin.call_once(okhost, a, "anything", P_T_REQ, "also spaced.bin", payload[0 .. n], resp)
     test.eq_i64(c, rep, "a response path with a space refuses", r4.outcome as i64, plugin.PLUGIN_REFUSED as i64)
 
     // The outcome names, which are what a demo and a build log print.
@@ -249,6 +281,265 @@ fn lay_down(read a: Allocator, read bytes: []u8) {
 
     var f: fs.Fs = fs.host()
     scrub(f)
+    free_ptr(rb)
+    free_ptr(pb)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- the stream header, on its own ------------------------------------------------------
+
+// On a stream the header is read before the payload it announces, so `header_len` must
+// refuse everything that is not the start of a message BEFORE a length is believed — and
+// the hostile bytes the transport exists to carry must survive an encode/decode pair
+// unchanged, which is the in-process half of the round trip `jplugin` makes for real.
+@test fn the_stream_header_is_believed_only_after_its_magic() -> bool {
+    var raw: *mut u8 = alloc(u8, P_T_CAP)
+    var rep: []u8 = slice(u8, raw, P_T_CAP)
+    var c: test.Check = test.new()
+
+    var fb: *mut u8 = alloc(u8, 512)
+    var frame: []u8 = slice(u8, fb, 512)
+    var pb: *mut u8 = alloc(u8, 512)
+    var payload: []u8 = slice(u8, pb, 512)
+
+    // `a\r\nb\0c` then 0xFF 0xFE: the bytes a text-mode stream or a UTF-8 String would lose.
+    payload[0] = 97 as u8
+    payload[1] = 13 as u8
+    payload[2] = 10 as u8
+    payload[3] = 98 as u8
+    payload[4] = 0 as u8
+    payload[5] = 99 as u8
+    payload[6] = 255 as u8
+    payload[7] = 254 as u8
+    let total: usize = plugin.encode(frame, plugin.PLUGIN_KIND_RESPONSE, plugin.PLUGIN_VERSION, payload[0 .. 8])
+    test.eq_i64(c, rep, "the header alone announces the payload length",
+        plugin.header_len(frame[0 .. plugin.PLUGIN_HEADER]) as i64, 8)
+    test.eq_i64(c, rep, "and the frame's kind is what was encoded", plugin.frame_kind(frame), plugin.PLUGIN_KIND_RESPONSE)
+    var i: usize = 0
+    var intact: bool = true
+    for i < 8 {
+        if frame[plugin.PLUGIN_HEADER + i] != payload[i] { intact = false }
+        i = i + 1
+    }
+    test.is_true(c, rep, "CR, LF, NUL and non-UTF-8 bytes sit in the frame unchanged", intact)
+
+    // Fewer than twelve bytes is not a header at all.
+    test.eq_i64(c, rep, "a short header is refused", plugin.header_len(frame[0 .. 11]) as i64, 0 - 1)
+    // The magic is checked FIRST: with it wrong, the length field is never consulted, so a
+    // stream of prose cannot talk the host into a multi-megabyte read.
+    frame[0] = 72 as u8
+    test.eq_i64(c, rep, "a wrong magic is refused before the length is read",
+        plugin.header_len(frame[0 .. plugin.PLUGIN_HEADER]) as i64, 0 - 1)
+    frame[0] = 74 as u8
+    // A length past the frame's limit is refused even under a good magic.
+    frame[8] = 255 as u8
+    frame[9] = 255 as u8
+    frame[10] = 255 as u8
+    frame[11] = 127 as u8
+    test.eq_i64(c, rep, "an impossible length is refused", plugin.header_len(frame[0 .. plugin.PLUGIN_HEADER]) as i64, 0 - 1)
+
+    // The two new outcome names, which the demo prints.
+    test.eq_str(c, rep, "timed-out", plugin.outcome_name(plugin.PLUGIN_TIMED_OUT), "timed-out")
+    test.eq_str(c, rep, "down", plugin.outcome_name(plugin.PLUGIN_DOWN), "down")
+
+    free_ptr(pb)
+    free_ptr(fb)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- the server-mode host, against children that are not plugins ------------------------
+
+fn setup(mut buf: []u8, read text: str) -> usize { return load(buf, text) }
+
+// A child that exits with a code without answering ran and REPORTED trouble — its exit code
+// is the report — so it is `failed` with that code, and the connection is over.
+@test fn a_child_that_exits_without_answering_is_failed_with_its_code() -> bool {
+    var raw: *mut u8 = alloc(u8, P_T_CAP)
+    var rep: []u8 = slice(u8, raw, P_T_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+    var clk: time.Clock = time.host()
+    var pb: *mut u8 = alloc(u8, 256)
+    var payload: []u8 = slice(u8, pb, 256)
+    var rb: *mut u8 = alloc(u8, 256)
+    var resp: []u8 = slice(u8, rb, 256)
+    let n: usize = setup(payload, "hello")
+
+    var h: plugin.Conn = plugin.connect(sp, clk, "exit 3", P_T_ROOMY) catch plugin.no_conn()
+    test.is_true(c, rep, "connected", plugin.is_up(h))
+    let r: plugin.Reply = plugin.call(h, payload[0 .. n], resp)
+    test.eq_str(c, rep, "failed", plugin.outcome_name(r.outcome), "failed")
+    test.eq_i64(c, rep, "with the child's own code", r.exit_code as i64, 3)
+    test.is_false(c, rep, "and the connection is over", plugin.is_up(h))
+    test.is_true(c, rep, "the exit status is kept", sysproc.is_exited(plugin.exit_status(h)))
+
+    // Every call after that is `down` — never a hang, never a fresh failure of some other
+    // kind — and the books count it.
+    let r2: plugin.Reply = plugin.call(h, payload[0 .. n], resp)
+    test.eq_str(c, rep, "a later call is down", plugin.outcome_name(r2.outcome), "down")
+    test.eq_i64(c, rep, "calls", plugin.conn_calls(h), 2)
+    test.eq_i64(c, rep, "failures", plugin.conn_failures(h), 2)
+    // `hangup` on a connection that is already over reports what is known and does not block.
+    let st: sysproc.Status = plugin.hangup(h)
+    test.eq_i64(c, rep, "hangup reports the exit that already happened", sysproc.code_of(st) as i64, 3)
+
+    free_ptr(rb)
+    free_ptr(pb)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **Exit 0 is not success.** A child that closes its output having written nothing — and
+// exits 0 — promised an answer it never gave: `bad-response`, the one-shot rule carried over.
+// A child that writes PROSE is the same outcome by a different route: the magic is wrong
+// after twelve bytes, and the length that follows is never believed.
+@test fn a_child_that_writes_nothing_or_prose_is_a_bad_response() -> bool {
+    var raw: *mut u8 = alloc(u8, P_T_CAP)
+    var rep: []u8 = slice(u8, raw, P_T_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+    var clk: time.Clock = time.host()
+    var pb: *mut u8 = alloc(u8, 256)
+    var payload: []u8 = slice(u8, pb, 256)
+    var rb: *mut u8 = alloc(u8, 256)
+    var resp: []u8 = slice(u8, rb, 256)
+    let n: usize = setup(payload, "hello")
+
+    var quiet: plugin.Conn = plugin.connect(sp, clk, "exit 0", P_T_ROOMY) catch plugin.no_conn()
+    let r1: plugin.Reply = plugin.call(quiet, payload[0 .. n], resp)
+    test.eq_str(c, rep, "exit 0 with no answer is bad-response", plugin.outcome_name(r1.outcome), "bad-response")
+    test.eq_i64(c, rep, "with exit code 0", r1.exit_code as i64, 0)
+    test.is_false(c, rep, "and the connection is over", plugin.is_up(quiet))
+    plugin.hangup(quiet)
+
+    // More than twelve bytes of not-a-frame, so the refusal is the MAGIC's and not a short
+    // read's. `echo` is spelled the same in cmd.exe and sh.
+    var prose: plugin.Conn = plugin.connect(sp, clk, "echo this is prose and not a frame at all", P_T_ROOMY) catch plugin.no_conn()
+    let r2: plugin.Reply = plugin.call(prose, payload[0 .. n], resp)
+    test.eq_str(c, rep, "prose is bad-response", plugin.outcome_name(r2.outcome), "bad-response")
+    test.is_false(c, rep, "and the stream cannot be trusted again", plugin.is_up(prose))
+    let st: sysproc.Status = plugin.hangup(prose)
+    test.is_true(c, rep, "the child was hung up on, not killed", sysproc.is_exited(st))
+
+    free_ptr(rb)
+    free_ptr(pb)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **A hung plugin must not hang the host.** The child never writes and lives ~2 seconds; the
+// budget is spent on a MANUAL clock, so it is gone at once and the call must come back
+// `timed-out` with the child killed — measured on the real clock, well inside the child's
+// lifetime, which is the assertion a host that blocked in `read` would fail.
+@test fn a_child_that_never_answers_is_killed_inside_the_budget() -> bool {
+    var raw: *mut u8 = alloc(u8, P_T_CAP)
+    var rep: []u8 = slice(u8, raw, P_T_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+    var clk: time.Clock = time.manual(0)
+    var real: time.Clock = time.host()
+    var pb: *mut u8 = alloc(u8, 256)
+    var payload: []u8 = slice(u8, pb, 256)
+    var rb: *mut u8 = alloc(u8, 256)
+    var resp: []u8 = slice(u8, rb, 256)
+    let n: usize = setup(payload, "hello")
+
+    var h: plugin.Conn = plugin.connect(sp, clk, slow_cmd(), 100000000) catch plugin.no_conn()
+    let t0: i64 = time.read_nanos(real)
+    let r: plugin.Reply = plugin.call(h, payload[0 .. n], resp)
+    let spent_ms: i64 = (time.read_nanos(real) - t0) / 1000000
+    test.eq_str(c, rep, "timed-out", plugin.outcome_name(r.outcome), "timed-out")
+    test.is_true(c, rep, "the host did not wait for the child", spent_ms < 1000)
+    test.is_true(c, rep, "the child was killed", sysproc.is_signalled(plugin.exit_status(h)))
+    test.is_false(c, rep, "and the connection is over", plugin.is_up(h))
+    // The host is still standing: a fresh connection works.
+    var again: plugin.Conn = plugin.connect(sp, clk, "exit 0", 100000000) catch plugin.no_conn()
+    test.is_true(c, rep, "the host can connect again", plugin.is_up(again))
+    plugin.hangup(again)
+
+    free_ptr(rb)
+    free_ptr(pb)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A child that does not exit normally is `crashed`, not `failed`: a signal on POSIX, and
+// on Windows an exit code with the high bit set — an NTSTATUS, which is how an access
+// violation is reported and what tells it from a plugin's own `exit 3`.
+@test fn a_child_that_dies_abnormally_is_crashed_not_failed() -> bool {
+    var raw: *mut u8 = alloc(u8, P_T_CAP)
+    var rep: []u8 = slice(u8, raw, P_T_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+    var clk: time.Clock = time.host()
+    var pb: *mut u8 = alloc(u8, 256)
+    var payload: []u8 = slice(u8, pb, 256)
+    var rb: *mut u8 = alloc(u8, 256)
+    var resp: []u8 = slice(u8, rb, 256)
+    let n: usize = setup(payload, "hello")
+
+    var h: plugin.Conn = plugin.connect(sp, clk, crash_cmd(), P_T_ROOMY) catch plugin.no_conn()
+    let r: plugin.Reply = plugin.call(h, payload[0 .. n], resp)
+    test.eq_str(c, rep, "crashed", plugin.outcome_name(r.outcome), "crashed")
+    test.is_false(c, rep, "and the connection is over", plugin.is_up(h))
+    plugin.hangup(h)
+
+    free_ptr(rb)
+    free_ptr(pb)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+fn refused_conn(mut seen: bool) -> plugin.Conn {
+    seen = true
+    return plugin.no_conn()
+}
+
+// A denied spawner refuses the connection as `PluginRefused` — its own error, not a start
+// failure — the spawner counts the attempt, and the `Conn` handed back through `catch` is
+// `down` to every call rather than a crash.
+@test fn a_denied_spawner_refuses_a_connection_and_no_conn_is_down() -> bool {
+    var raw: *mut u8 = alloc(u8, P_T_CAP)
+    var rep: []u8 = slice(u8, raw, P_T_CAP)
+    var c: test.Check = test.new()
+    var d: sysproc.Spawner = sysproc.denied()
+    var clk: time.Clock = time.manual(0)
+    var pb: *mut u8 = alloc(u8, 256)
+    var payload: []u8 = slice(u8, pb, 256)
+    var rb: *mut u8 = alloc(u8, 256)
+    var resp: []u8 = slice(u8, rb, 256)
+    let n: usize = setup(payload, "hello")
+
+    var refused: bool = false
+    var h: plugin.Conn = plugin.connect(d, clk, "exit 0", 1000) catch |e| match e {
+        PluginRefused => refused_conn(refused),
+        _ => plugin.no_conn()
+    }
+    test.is_true(c, rep, "refused as PluginRefused, not as a start failure", refused)
+    test.is_false(c, rep, "nothing is up", plugin.is_up(h))
+    // The budget a connection was opened with is readable, and re-settable afterwards. A
+    // host tightens it once the plugin has answered, so that the timeout it then enforces is
+    // about the plugin rather than about how long a process start took — see `set_budget`.
+    test.eq_i64(c, rep, "a connection that never opened carries no budget", plugin.budget_of(h), 0)
+    plugin.set_budget(h, 400000000)
+    test.eq_i64(c, rep, "and it can be tightened for the next call", plugin.budget_of(h), 400000000)
+    test.eq_i64(c, rep, "the spawner started nothing", sysproc.started(d), 0)
+    test.eq_i64(c, rep, "and counted the attempt", sysproc.refused(d), 1)
+
+    let r: plugin.Reply = plugin.call(h, payload[0 .. n], resp)
+    test.eq_str(c, rep, "a call on no connection is down", plugin.outcome_name(r.outcome), "down")
+    test.eq_i64(c, rep, "and counted", plugin.conn_calls(h), 1)
+    let st: sysproc.Status = plugin.hangup(h)
+    test.is_true(c, rep, "hangup on no connection reports an exit and returns", sysproc.is_exited(st))
+
     free_ptr(rb)
     free_ptr(pb)
     let ok: bool = test_report.finish(c, rep)

@@ -1,0 +1,517 @@
+// std/httpd_test.jtr — the server, on real loopback sockets, one exchange at a time.
+//
+// Every test here runs a real `Server` and a real `Client` in ONE thread, taking turns: the
+// client sends, the server is driven for a bounded budget, the client reads. There is no
+// scheduler in the transcript, so each assertion is exact — which is the property the
+// single-threaded design was chosen for. The routing, middleware, keep-alive, streaming and
+// static-file cases are all such transcripts; the timeout case is the one that waits, and
+// it asserts a lower bound only.
+//
+// Run:  jestyrc test examples/std/httpd_test.jtr
+
+import "fs"
+import "http"
+import "httpc"
+import "httpd"
+import "log"
+import "mem"
+import "sysnet"
+import "test"
+import "test_report"
+import "time"
+import "writer"
+
+const HD_T_CAP: usize = 16384
+const HD_T_STATIC: str = "examples"
+
+fn nothing() { }
+
+fn quiet_logger() -> log.Logger {
+    return log.make(time.manual(0), writer.to_buffer(), log.LOG_INFO, log.LOG_LOGFMT)
+}
+
+// ---- handlers -------------------------------------------------------------------------
+
+fn h_hello(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    httpd.set_header(x, "X-Served-By", "jhttpd")
+    httpd.respond(x, 200, "text/plain", "hello")
+    return 0
+}
+
+fn h_user(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    var s: String = string_new()
+    string_push(s, "user:")
+    string_push(s, httpd.param(x, "id"))
+    httpd.respond(x, 200, "text/plain", string_view(s))
+    string_free(s)
+    return 0
+}
+
+fn h_echo(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    var s: String = string_new()
+    string_push(s, "echo:")
+    string_push(s, httpd.body(x))
+    httpd.respond(x, 200, "text/plain", string_view(s))
+    string_free(s)
+    return 0
+}
+
+fn h_query(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    var s: String = string_new()
+    string_push(s, "q=")
+    string_push(s, httpd.query(x))
+    httpd.respond(x, 200, "text/plain", string_view(s))
+    string_free(s)
+    return 0
+}
+
+fn h_stream(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    httpd.stream_begin(x, 200, "text/plain")
+    httpd.stream_write(x, "ab")
+    httpd.stream_write(x, "")            // a no-op, NOT a terminator
+    httpd.stream_write(x, "cd")
+    httpd.stream_write(x, "ef")
+    httpd.stream_end(x)
+    return 0
+}
+
+fn h_static(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    var h: fs.Fs = fs.host()
+    httpd.serve_file(x, h, HD_T_STATIC, httpd.param(x, "*"))
+    return 0
+}
+
+// A handler that records that it RAN, through the context pointer — the only way to see
+// whether a middleware's `DONE` really skipped routing. The client cannot: a handler that
+// runs after a 401 has its own response refused as a duplicate, so the status looks right
+// either way, and a probe that ignored `DONE` passed the first version of this suite.
+fn h_counted(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    var p: *mut i64 = ctx as *mut i64
+    unsafe { p.* = p.* + 1 }
+    httpd.respond(x, 200, "text/plain", "counted")
+    return 0
+}
+
+fn h_silent(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    return 0                             // sends nothing: the server must answer for it
+}
+
+// Middleware: refuse anything without the token.
+fn mw_auth(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    if str_eq(httpd.header(x, "x-token"), "ok") { return httpd.HTTPD_NEXT }
+    httpd.respond(x, 401, "text/plain", "no token")
+    return httpd.HTTPD_DONE
+}
+
+// Middleware: count every request that reaches it, through the context pointer.
+fn mw_count(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    var p: *mut i64 = ctx as *mut i64
+    unsafe { p.* = p.* + 1 }
+    return httpd.HTTPD_NEXT
+}
+
+// ---- helpers ------------------------------------------------------------------------------
+
+fn boot(read a: Allocator, mut net: sysnet.Net, logging: bool) -> httpd.Server {
+    var sv: httpd.Server = httpd.make(a, time.host(), quiet_logger(), logging, 4, 8192)
+    httpd.start(sv, net, sysnet.loopback(0), 8)
+    httpd.route(sv, "GET", "/hello", httpd.handler(null, &h_hello))
+    httpd.route(sv, "GET", "/users/:id", httpd.handler(null, &h_user))
+    httpd.route(sv, "POST", "/echo", httpd.handler(null, &h_echo))
+    httpd.route(sv, "GET", "/q", httpd.handler(null, &h_query))
+    httpd.route(sv, "GET", "/stream", httpd.handler(null, &h_stream))
+    httpd.route(sv, "GET", "/static/*", httpd.handler(null, &h_static))
+    httpd.route(sv, "*", "/silent", httpd.handler(null, &h_silent))
+    return sv
+}
+
+fn addr_of(read sv: httpd.Server) -> sysnet.SocketAddr {
+    return sysnet.loopback(httpd.port(sv))
+}
+
+// One request through a fresh connection, with the server driven in between.
+fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: str, read extra: str, read body: str, mut dst: String) -> i32 {
+    var c: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    if httpc.is_open(c) == false { return 0 - 1 }
+    httpc.request(c, method, path, extra, body)
+    httpd.serve_for(sv, net, 40)
+    var st: i32 = 0 - 1
+    if httpc.read_response(c) == http.HTTP_OK {
+        st = httpc.status(c)
+        httpc.body(c, dst)
+    }
+    httpc.hangup(c)
+    // The server sees the close on its next step; take it now so the table is clean.
+    httpd.serve_for(sv, net, 5)
+    return st
+}
+
+// ---- routing --------------------------------------------------------------------------------
+
+@test fn routes_match_by_method_and_pattern_and_bind_params() -> bool {
+    var raw: *mut u8 = alloc(u8, HD_T_CAP)
+    var rep: []u8 = slice(u8, raw, HD_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = boot(a, net, false)
+    test.is_true(c, rep, "the server listens", httpd.is_listening(sv))
+
+    var b: String = string_new()
+    test.eq_i64(c, rep, "GET /hello is 200", ask(sv, net, "GET", "/hello", "", "", b) as i64, 200)
+    test.eq_str(c, rep, "with its body", string_view(b), "hello")
+
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "a :param route matches", ask(sv, net, "GET", "/users/42", "", "", b) as i64, 200)
+    test.eq_str(c, rep, "and binds the segment", string_view(b), "user:42")
+
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "a missing segment does not match", ask(sv, net, "GET", "/users", "", "", b) as i64, 404)
+
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "the method is part of the match", ask(sv, net, "POST", "/hello", "", "", b) as i64, 404)
+
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "a POST with a body reaches its handler", ask(sv, net, "POST", "/echo", "", "ping", b) as i64, 200)
+    test.eq_str(c, rep, "which reads the body", string_view(b), "echo:ping")
+
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "the query is split off the path", ask(sv, net, "GET", "/q?x=1&y=2", "", "", b) as i64, 200)
+    test.eq_str(c, rep, "and readable", string_view(b), "q=x=1&y=2")
+
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "an unknown path is 404", ask(sv, net, "GET", "/nope", "", "", b) as i64, 404)
+
+    // A handler that answers nothing is a server bug, and the server says so rather than
+    // leaving the client hanging on a connection that will never carry a response.
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "a silent handler is a 500", ask(sv, net, "GET", "/silent", "", "", b) as i64, 500)
+
+    test.eq_i64(c, rep, "eight requests served", httpd.served(sv), 8)
+    test.eq_usize(c, rep, "and no connection left open", httpd.live_connections(sv), 0)
+
+    string_free(b)
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn middleware_runs_in_order_and_may_end_the_exchange() -> bool {
+    var raw: *mut u8 = alloc(u8, HD_T_CAP)
+    var rep: []u8 = slice(u8, raw, HD_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = boot(a, net, false)
+    var seen: *mut i64 = alloc(i64, 1)
+    unsafe { (seen + 0).* = 0 }
+    var ran: *mut i64 = alloc(i64, 1)
+    unsafe { (ran + 0).* = 0 }
+    httpd.use_middleware(sv, httpd.handler(seen as *mut u8, &mw_count))
+    httpd.use_middleware(sv, httpd.handler(null, &mw_auth))
+    httpd.route(sv, "GET", "/counted", httpd.handler(ran as *mut u8, &h_counted))
+
+    var b: String = string_new()
+    test.eq_i64(c, rep, "without the token the auth middleware answers", ask(sv, net, "GET", "/counted", "", "", b) as i64, 401)
+    test.eq_str(c, rep, "with its own body", string_view(b), "no token")
+    // **The assertion that makes DONE observable**: the route's handler did not run.
+    var r0: i64 = 0
+    unsafe { r0 = (ran + 0).* }
+    test.eq_i64(c, rep, "and the route handler never ran", r0, 0)
+
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "with the token the route answers", ask(sv, net, "GET", "/counted", "X-Token: ok\r\n", "", b) as i64, 200)
+    test.eq_str(c, rep, "the handler's body", string_view(b), "counted")
+    var r1: i64 = 0
+    unsafe { r1 = (ran + 0).* }
+    test.eq_i64(c, rep, "and this time it ran, once", r1, 1)
+
+    // The counter ran first both times — order is the list's order, and a DONE from a later
+    // middleware does not skip an earlier one.
+    var n: i64 = 0
+    unsafe { n = (seen + 0).* }
+    test.eq_i64(c, rep, "the counting middleware saw both", n, 2)
+
+    string_free(b)
+    free_ptr(ran as *mut u8)
+    free_ptr(seen as *mut u8)
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- keep-alive ----------------------------------------------------------------------------
+
+@test fn a_connection_carries_many_requests_and_pipelined_ones() -> bool {
+    var raw: *mut u8 = alloc(u8, HD_T_CAP)
+    var rep: []u8 = slice(u8, raw, HD_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = boot(a, net, false)
+
+    var cl: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    test.is_true(c, rep, "connected", httpc.is_open(cl))
+
+    // Two requests, one after the other, on ONE socket.
+    httpc.request(cl, "GET", "/hello", "", "")
+    httpd.serve_for(sv, net, 40)
+    test.eq_i64(c, rep, "first answered", httpc.read_response(cl) as i64, http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "200", httpc.status(cl) as i64, 200)
+    test.eq_i64(c, rep, "the connection stayed", httpd.live_connections(sv) as i64, 1)
+
+    httpc.request(cl, "GET", "/users/7", "", "")
+    httpd.serve_for(sv, net, 40)
+    test.eq_i64(c, rep, "second answered on the same socket", httpc.read_response(cl) as i64, http.HTTP_OK as i64)
+    var b: String = string_new()
+    httpc.body(cl, b)
+    test.eq_str(c, rep, "with its own body", string_view(b), "user:7")
+    test.eq_i64(c, rep, "one connection accepted for two requests", httpd.accepted(sv), 1)
+
+    // **Pipelining**: both requests in one write, before either answer is read. The server
+    // must answer both, in order, from one buffer.
+    httpc.send_raw(cl, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\nGET /users/9 HTTP/1.1\r\nHost: x\r\n\r\n")
+    httpd.serve_for(sv, net, 40)
+    test.eq_i64(c, rep, "pipelined: first", httpc.read_response(cl) as i64, http.HTTP_OK as i64)
+    string_free(b)  b = string_new()
+    httpc.body(cl, b)
+    test.eq_str(c, rep, "hello first", string_view(b), "hello")
+    test.eq_i64(c, rep, "pipelined: second", httpc.read_response(cl) as i64, http.HTTP_OK as i64)
+    string_free(b)  b = string_new()
+    httpc.body(cl, b)
+    test.eq_str(c, rep, "then the user", string_view(b), "user:9")
+    test.eq_i64(c, rep, "four served", httpd.served(sv), 4)
+
+    // `Connection: close` ends it after the answer.
+    httpc.request(cl, "GET", "/hello", "Connection: close\r\n", "")
+    httpd.serve_for(sv, net, 40)
+    test.eq_i64(c, rep, "answered before closing", httpc.read_response(cl) as i64, http.HTTP_OK as i64)
+    test.eq_str(c, rep, "and the server said so", httpc.header(cl, "connection"), "close")
+    test.eq_usize(c, rep, "the server dropped it", httpd.live_connections(sv), 0)
+    httpc.hangup(cl)
+
+    // HTTP/1.0 closes by default.
+    var c2: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.send_raw(c2, "GET /hello HTTP/1.0\r\n\r\n")
+    httpd.serve_for(sv, net, 40)
+    test.eq_i64(c, rep, "a 1.0 request is answered", httpc.read_response(c2) as i64, http.HTTP_OK as i64)
+    test.eq_usize(c, rep, "and its connection closed", httpd.live_connections(sv), 0)
+    httpc.hangup(c2)
+
+    string_free(b)
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- streaming --------------------------------------------------------------------------------
+
+@test fn a_streamed_response_is_chunked_and_decodes_whole() -> bool {
+    var raw: *mut u8 = alloc(u8, HD_T_CAP)
+    var rep: []u8 = slice(u8, raw, HD_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = boot(a, net, false)
+
+    var cl: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.request(cl, "GET", "/stream", "", "")
+    httpd.serve_for(sv, net, 40)
+    test.eq_i64(c, rep, "answered", httpc.read_response(cl) as i64, http.HTTP_OK as i64)
+    test.is_true(c, rep, "framed as chunked", httpc.is_chunked(cl))
+    var b: String = string_new()
+    test.is_true(c, rep, "decodes", httpc.body(cl, b))
+    // The empty write in the middle must not have terminated the body.
+    test.eq_str(c, rep, "all three chunks, in order", string_view(b), "abcdef")
+    // And the connection is still usable: chunked framing ended the message, not the socket.
+    httpc.request(cl, "GET", "/hello", "", "")
+    httpd.serve_for(sv, net, 40)
+    test.eq_i64(c, rep, "the next request on the same socket", httpc.read_response(cl) as i64, http.HTTP_OK as i64)
+    httpc.hangup(cl)
+
+    string_free(b)
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- static files -----------------------------------------------------------------------------
+
+@test fn static_files_are_served_by_type_and_traversal_is_refused() -> bool {
+    var raw: *mut u8 = alloc(u8, HD_T_CAP)
+    var rep: []u8 = slice(u8, raw, HD_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var h: fs.Fs = fs.host()
+    // The static root is the repository's own `examples/` directory, and the "secret" one
+    // level above it is a file that really exists there. No scratch tree — originally
+    // because `std/sysfs` would bring `std/file` into the closure, and a second type named
+    // `Writer` next to `writer.Writer` tripped the drop-glue defect A13. That defect is
+    // CLOSED (`drop_collide_demo` pins the pair); the shape is kept because it is simpler.
+    fs.put(h, "examples/zz_httpd_asset.css", "body{}")
+    var sv: httpd.Server = boot(a, net, false)
+
+    var b: String = string_new()
+    test.eq_i64(c, rep, "a file under the root", ask(sv, net, "GET", "/static/zz_httpd_asset.css", "", "", b) as i64, 200)
+    test.eq_str(c, rep, "with its bytes", string_view(b), "body{}")
+
+    // The media type is checked through a kept-alive client, because `ask` drops headers.
+    var cl: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.request(cl, "GET", "/static/zz_httpd_asset.css", "", "")
+    httpd.serve_for(sv, net, 40)
+    httpc.read_response(cl)
+    test.eq_str(c, rep, "typed by extension", httpc.header(cl, "content-type"), "text/css")
+    httpc.request(cl, "GET", "/static/hello.jtr", "", "")
+    httpd.serve_for(sv, net, 40)
+    httpc.read_response(cl)
+    test.eq_i64(c, rep, "a real corpus file is served", httpc.status(cl) as i64, 200)
+    test.eq_str(c, rep, "an unknown extension is bytes", httpc.header(cl, "content-type"), "application/octet-stream")
+    httpc.hangup(cl)
+    httpd.serve_for(sv, net, 5)
+
+    // **Traversal.** `CHANGELOG.md` exists one level up; the path must not reach it, and the
+    // refusal must look exactly like a missing file.
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "`..` is refused as a 404", ask(sv, net, "GET", "/static/../CHANGELOG.md", "", "", b) as i64, 404)
+    test.is_false(c, rep, "and nothing of it leaked", contains(string_view(b), "Changelog"))
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "a missing file is a 404", ask(sv, net, "GET", "/static/zz_nope.txt", "", "", b) as i64, 404)
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "an empty rest asks for index.html, absent here", ask(sv, net, "GET", "/static/", "", "", b) as i64, 404)
+
+    // The pure half, on every host.
+    test.is_true(c, rep, "plain", httpd.safe_relative_path("a/b.txt"))
+    test.is_false(c, rep, "dot-dot inside", httpd.safe_relative_path("a/../b"))
+    test.is_false(c, rep, "dot-dot alone", httpd.safe_relative_path(".."))
+    test.is_false(c, rep, "backslash", httpd.safe_relative_path("a\\b"))
+    test.is_true(c, rep, "a dot-file is fine", httpd.safe_relative_path(".well-known/x"))
+    test.eq_str(c, rep, "json type", httpd.content_type_for("x/y.json"), "application/json")
+    test.eq_str(c, rep, "html type", httpd.content_type_for("index.html"), "text/html; charset=utf-8")
+    test.eq_str(c, rep, "no extension", httpd.content_type_for("README"), "application/octet-stream")
+
+    string_free(b)
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    fs.erase(h, "examples/zz_httpd_asset.css")
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- access log ---------------------------------------------------------------------------------
+
+@test fn every_exchange_writes_one_access_log_record() -> bool {
+    var raw: *mut u8 = alloc(u8, HD_T_CAP)
+    var rep: []u8 = slice(u8, raw, HD_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = boot(a, net, true)
+
+    var b: String = string_new()
+    ask(sv, net, "GET", "/users/5", "", "", b)
+    let rec: str = httpd.last_log(sv)
+    test.is_true(c, rep, "a record was written", rec.len > 0)
+    test.is_true(c, rep, "with the method", contains(rec, "method=GET"))
+    test.is_true(c, rep, "the path", contains(rec, "path=/users/5"))
+    test.is_true(c, rep, "the status", contains(rec, "status=200"))
+    test.is_true(c, rep, "and the bytes sent", contains(rec, "bytes="))
+
+    string_free(b)  b = string_new()
+    ask(sv, net, "GET", "/nope", "", "", b)
+    test.is_true(c, rep, "a 404 is logged as one", contains(httpd.last_log(sv), "status=404"))
+
+    string_free(b)
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- refusals and timeouts --------------------------------------------------------------------
+
+@test fn a_smuggling_attempt_is_refused_and_the_connection_closed() -> bool {
+    var raw: *mut u8 = alloc(u8, HD_T_CAP)
+    var rep: []u8 = slice(u8, raw, HD_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = boot(a, net, false)
+
+    var cl: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.send_raw(cl, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /hello HTTP/1.1\r\n\r\n")
+    httpd.serve_for(sv, net, 40)
+    test.eq_i64(c, rep, "a response came back", httpc.read_response(cl) as i64, http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "and it is a 400", httpc.status(cl) as i64, 400)
+    test.eq_i64(c, rep, "counted as a bad request", httpd.bad_requests(sv), 1)
+    test.eq_i64(c, rep, "nothing was served — the smuggled GET never ran", httpd.served(sv), 0)
+    // The connection is gone: a second read finds nothing at all.
+    test.eq_i64(c, rep, "the connection was closed", httpc.read_response(cl) as i64, http.HTTP_INCOMPLETE as i64)
+    httpc.hangup(cl)
+
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_stalled_request_times_out_and_an_idle_connection_is_closed() -> bool {
+    var raw: *mut u8 = alloc(u8, HD_T_CAP)
+    var rep: []u8 = slice(u8, raw, HD_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = boot(a, net, false)
+    httpd.set_timeouts(sv, 60, 60)
+
+    // Slowloris: half a request line, then silence.
+    var cl: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.send_raw(cl, "GET /hel")
+    var clk: time.Clock = time.host()
+    let t0: i64 = time.read_nanos(clk)
+    httpd.serve_for(sv, net, 200)
+    let waited: i64 = (time.read_nanos(clk) - t0) / 1000000
+    test.eq_i64(c, rep, "the stall was answered with a 408", httpc.read_response(cl) as i64, http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "408", httpc.status(cl) as i64, 408)
+    test.eq_i64(c, rep, "counted as a timeout", httpd.timeouts(sv), 1)
+    test.is_true(c, rep, "and not before the read timeout", waited >= 60)
+    httpc.hangup(cl)
+
+    // Idle: a connection that opens and says nothing is closed without a response.
+    var c2: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpd.serve_for(sv, net, 200)
+    test.eq_i64(c, rep, "the idle connection got no response", httpc.read_response(c2) as i64, http.HTTP_INCOMPLETE as i64)
+    test.eq_i64(c, rep, "and was counted", httpd.timeouts(sv), 2)
+    test.eq_usize(c, rep, "nothing is left in the table", httpd.live_connections(sv), 0)
+    httpc.hangup(c2)
+
+    // The control: a request that completes in time is served normally under the same knobs.
+    var b: String = string_new()
+    test.eq_i64(c, rep, "a prompt request is unaffected", ask(sv, net, "GET", "/hello", "", "", b) as i64, 200)
+    string_free(b)
+
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

@@ -1,0 +1,441 @@
+// std/livecfg.jtr — a configuration that follows its file, and never half-way.
+//
+// `std/config` merges sources by precedence, `std/ini` reads the file above it, and
+// `std/syswatch` says when a directory changed. Each of them said composing them was the
+// caller's job; this is that composition, done once, so the property every service wants
+// from a reloadable config is proven here rather than re-derived per service.
+//
+// ─── A reload that fails keeps the previous configuration WHOLE ────────────────────
+//
+// This is the whole design. A reload never touches the live configuration. It builds a
+// CANDIDATE — a clone of the base (schema + every non-file source) with the new file
+// applied on top — and only when the file validated completely does the candidate become
+// the configuration, in one swap. A file with one bad value and three good ones applies
+// NONE of them: the old configuration stands, every problem is recorded with its byte
+// span, and `render_problems` turns them into `file:line:col` through `std/diag`.
+//
+// The alternative — apply key by key and stop at the first problem — leaves a service
+// running a configuration nobody ever wrote, which is a bug that reproduces only under
+// the exact edit that triggered it. `a_reload_that_fails_validation_keeps_the_previous_
+// configuration_whole` writes a file with one good change beside one bad value and
+// asserts the good change did NOT land.
+//
+// Building the candidate from the BASE rather than from the current configuration is
+// what makes a key REMOVED from the file revert to its default: `apply` in `std/config`
+// can set a value but never unset one, and a merge in place would keep every stale file
+// value forever. `a_key_removed_from_the_file_reverts_to_its_default` pins it.
+//
+// ─── Precedence stays a property of the source ─────────────────────────────────────
+//
+// The candidate starts as a clone of the base, which already holds the environment and
+// command-line values at their own origins, so a file value for a key the environment
+// set arrives as `CFG_SHADOWED` and changes nothing. That is `std/config`'s rule applied
+// unchanged: a reload is a `file` source and a `file` source does not outrank `env`.
+// **A shadowed file value is therefore NOT validated** — `config.apply` answers shadowed
+// before it parses — and this module treats shadowed as "not a problem", as `config`'s
+// own comment says it is. A file whose only fault is a bad value for a key the
+// environment overrides reloads clean; the day the override goes away, the next reload
+// reports it. That is a decision a caller could disagree with, so it is stated.
+//
+// ─── The generation moves when the EFFECTIVE configuration does ───────────────────
+//
+// `generation` counts applied reloads that changed at least one value. Re-saving a file
+// unchanged, or editing only its comments, answers `LIVE_SAME` and leaves the generation
+// alone — so a caller that caches something derived from the configuration compares one
+// integer and rebuilds only when it must. The reload's OUTCOME says whether the file was
+// re-read; the generation says whether that mattered.
+//
+// ─── Change notification, redaction respected ──────────────────────────────────────
+//
+// One callback per changed KEY, with the old and new values RENDERED — through
+// `config.render_value`, which redacts by declaration. A secret key reports that it
+// changed, as `**** -> ****`, and never its text; the suite asserts the token's bytes are
+// absent from everything the callback saw. An unset value renders as the empty string,
+// which is indistinguishable from an empty string value; the report is about the key
+// moving, and `origin_of` says the rest.
+//
+// ─── Polling, not a thread ─────────────────────────────────────────────────────────
+//
+// `step` is one pass of the caller's own loop: it drains the watcher and re-reads the
+// file only when something changed. This tree's event-loop tier is single-threaded on
+// purpose (`std/runtime`), and a reload that ran on another thread would hand a service a
+// configuration mid-request. On Windows the watcher reports THAT the directory changed and
+// never what, and on Linux it names the entry until its queue overflows — so any change
+// under the directory triggers a re-read, and `LIVE_SAME` is the cheap answer when it was
+// some other file. `reload_now` is the same step without the watcher, for a caller with
+// its own trigger (a signal, an admin endpoint, a test that wants an exact transcript).
+//
+// It is called `step` and not `poll` because `poll` is `std/syspoll`'s C symbol, and an
+// extern's name is taken in every module that links it — `std/syswatch` brings `syspoll`
+// in, so a Jestyr `poll` here is a duplicate definition. The same rule moved `connect`,
+// `close` and `listen` out of `std/httpd`.
+//
+// No debounce. An editor may write a file in pieces, and a step between two pieces reads
+// a half-written file — which fails validation and keeps the previous configuration,
+// which is exactly the property above doing its job; the next notification re-reads the
+// finished file. A debounce is a policy with a latency cost, and it belongs to the caller
+// that knows its editor (`syswatch_demo.jtr` shows one).
+//
+// ─── What it does NOT do ───────────────────────────────────────────────────────────
+//
+// No watching of the file's PARENT for the file to appear: a watcher on a directory that
+// does not exist yet is a retry policy. No hot-swap of the schema: keys are declared once,
+// before the first load, because a key declared after a reload would exist in the
+// configuration but not in the base the next candidate is built from. No env or CLI
+// parsing: those arrive through `apply`, as `std/config` takes them.
+//
+// Worked example:  jestyrc run examples/std/livecfg_demo.jtr
+// Run the tests:   jestyrc test examples/std/livecfg_test.jtr
+
+import "mem"
+import "list"
+import "sink"
+import "config"
+import "ini"
+import "diag"
+import "syswatch"
+import "runtime"
+import "fs"
+import "time"
+
+// What one reload step did.
+pub const LIVE_QUIET: i32 = 0        // the watcher reported nothing; the file was not read
+pub const LIVE_SAME: i32 = 1         // re-read and validated; no effective value moved
+pub const LIVE_CHANGED: i32 = 2      // applied; the generation advanced
+pub const LIVE_REJECTED: i32 = 3     // the file did not validate; the previous configuration stands
+pub const LIVE_UNREADABLE: i32 = 4   // the file could not be read; the previous configuration stands
+
+// Room for one rendered key name, one old value and one new value when a change is
+// reported. A value longer than this is cut, and the sink counts the loss — a change
+// report is a notification, not the value's transport.
+const LIVE_SLOT: usize = 512
+
+// How many drain rounds `poll` allows the watcher before giving up on convergence — the
+// same bound `syswatch_test` uses.
+const LIVE_DRAIN_ROUNDS: usize = 16
+
+// The change callback: `on_change(ctx, key, old, new)`. The `ctx` + fn-pointer shape
+// `mem.Allocator` established — the only way a fn pointer carries state.
+@copy pub struct Change {
+    ctx: *mut u8,
+    on_change: fn(*mut u8, str, str, str),
+}
+
+@no_alloc @no_os pub fn change(ctx: *mut u8, f: fn(*mut u8, str, str, str)) -> Change {
+    return Change{ ctx: ctx, on_change: f }
+}
+
+// The callback a `Live` starts with: never called, because `has_cb` is false until
+// `on_change` installs one. It exists so the field is total rather than optional.
+fn ignore_change(ctx: *mut u8, key: str, old: str, new: str) { }
+
+@no_alloc @no_os pub fn no_change() -> Change {
+    return Change{ ctx: null, on_change: &ignore_change }
+}
+
+// A reloadable configuration. Owns two `config.Config`s: `base` holds the schema and every
+// non-file source, `cur` is the effective configuration a reader sees. Everything the
+// module touches outside itself — the clock, the filesystem, the watcher — was handed in.
+@move pub struct Live {
+    a: Allocator,
+    clock: time.Clock,
+    f: fs.Fs,
+    w: syswatch.Watcher,
+    path: String,
+    base: config.Config,
+    cur: config.Config,
+    generation: i64,
+    applied_at: i64,
+    reloads: i64,
+    rejections: i64,
+    last_src: String,       // the text of the last file read, so problems render against it
+    last: ini.Ini,          // the problems of the last read
+    unreadable: bool,       // the last read found no file
+    cb: Change,
+    has_cb: bool,
+    loaded: bool,
+}
+
+// Build one. `w` is the watcher over the file's DIRECTORY (`syswatch.open_dir`), or
+// `syswatch.closed()` for a configuration driven by `reload_now` alone — `step` on a
+// closed watcher answers `LIVE_QUIET` and never reads. Nothing is read here: declare the
+// schema and apply the non-file sources first, then `reload_now`.
+pub fn make(read a: Allocator, take clock: time.Clock, take f: fs.Fs, take w: syswatch.Watcher, read path: str) -> Live {
+    var p: String = string_new()
+    string_push(p, path)
+    return Live{
+        a: a,
+        clock: clock,
+        f: f,
+        w: w,
+        path: p,
+        base: config.make(a),
+        cur: config.make(a),
+        generation: 0,
+        applied_at: 0,
+        reloads: 0,
+        rejections: 0,
+        last_src: string_new(),
+        last: ini.make(a),
+        unreadable: false,
+        cb: no_change(),
+        has_cb: false,
+        loaded: false,
+    }
+}
+
+fn nothing() { }
+
+// Release both configurations, the recorded problems, and the watcher.
+pub fn free(mut l: Live) {
+    syswatch.close_watch(l.w) catch nothing()
+    config.free(l.base)
+    config.free(l.cur)
+    ini.free(l.last)
+    string_free(l.path)
+    string_free(l.last_src)
+}
+
+// ---- the schema and the non-file sources ------------------------------------------
+
+// Declare a key, as `config.declare`. Declared into both configurations so their ids
+// agree; -1 if the name is taken or a load has already happened (see the header).
+pub fn declare(mut l: Live, read name: str, k: i32, is_secret: bool) -> i32 {
+    if l.loaded { return 0 - 1 }
+    let id: i32 = config.declare(l.base, name, k, is_secret)
+    if id < 0 { return id }
+    config.declare(l.cur, name, k, is_secret)
+    return id
+}
+
+// Offer a value from a NON-FILE source — `CFG_DEFAULT`, `CFG_ENV`, `CFG_CLI` — to both
+// configurations, so it holds through every future reload. A `CFG_FILE` origin is refused
+// as `CFG_SHADOWED`: the file is this module's source, and a hand-applied file value would
+// outlive the file that no longer says it.
+pub fn apply(mut l: Live, read name: str, read text: str, from: i32) -> i32 {
+    if from == config.CFG_FILE { return config.CFG_SHADOWED }
+    let r: i32 = config.apply(l.base, name, text, from)
+    if r != config.CFG_OK { return r }
+    config.apply(l.cur, name, text, from)
+    return r
+}
+
+// Install the change callback. Fires once per key whose effective value moved, on the
+// reload that moved it, before `generation` advances.
+pub fn on_change(mut l: Live, read cb: Change) {
+    l.cb = cb
+    l.has_cb = true
+}
+
+// ---- reading -------------------------------------------------------------------------
+
+pub fn generation(read l: Live) -> i64 { return l.generation }
+
+// The clock's reading when the current generation was applied; 0 before the first.
+pub fn applied_at(read l: Live) -> i64 { return l.applied_at }
+
+// Applied reloads (changed or same) and rejected ones, so a config that never moved is
+// distinguishable from one that was never read.
+pub fn reloads(read l: Live) -> i64 { return l.reloads }
+pub fn rejections(read l: Live) -> i64 { return l.rejections }
+
+pub fn watching(read l: Live) -> bool { return syswatch.is_open(l.w) }
+
+// The watcher's handle and poller, so a caller with a `runtime.Runtime` can register the
+// configuration as one more thing its loop waits on (`runtime.watch(rt, handle(l), tok,
+// task)` under `set_poller(rt, poller(l))`) and call `step` when the task fires — instead
+// of stepping on a timer. **The pairing `std/syswatch` asks for holds here too**: the two
+// come from the same watcher and mean nothing apart.
+pub fn handle(read l: Live) -> i64 { return syswatch.handle(l.w) }
+pub fn poller(read l: Live) -> runtime.Poller { return syswatch.poller(l.w) }
+
+pub fn by_name(read l: Live, read name: str) -> i32 { return config.by_name(l.cur, name) }
+pub fn get_int(read l: Live, id: i32) -> i64 { return config.get_int(l.cur, id) }
+pub fn get_bool(read l: Live, id: i32) -> bool { return config.get_bool(l.cur, id) }
+pub fn value_is(read l: Live, id: i32, read s: str) -> bool { return config.value_is(l.cur, id, s) }
+pub fn origin_of(read l: Live, id: i32) -> i32 { return config.origin_of(l.cur, id) }
+pub fn is_set(read l: Live, id: i32) -> bool { return config.is_set(l.cur, id) }
+
+// `section_key` over the effective configuration, so a component holding a
+// `config.Section` reads through the `Live` without reaching into it.
+pub fn section_key(read l: Live, read s: config.Section, read leaf: str) -> i32 {
+    return config.section_key(l.cur, s, leaf)
+}
+
+// The effective configuration, as `config.render`: name order, secrets redacted.
+pub fn render(mut sk: sink.Sink, mut buf: []u8, read l: Live) {
+    config.render(sk, buf, l.cur)
+}
+
+pub fn outcome_name(r: i32) -> str {
+    if r == LIVE_QUIET { return "quiet" }
+    if r == LIVE_SAME { return "same" }
+    if r == LIVE_CHANGED { return "changed" }
+    if r == LIVE_REJECTED { return "rejected" }
+    if r == LIVE_UNREADABLE { return "unreadable" }
+    return "?"
+}
+
+// ---- reloading -----------------------------------------------------------------------
+
+// Is problem `i` of `x` one that invalidates the file? A shadowed value is not — see the
+// header.
+fn is_fault(read x: ini.Ini, i: usize) -> bool {
+    if ini.problem_code(x, i) != ini.INI_REFUSED { return true }
+    return ini.problem_cfg(x, i) != config.CFG_SHADOWED
+}
+
+// How many of the last read's problems invalidate the file. Zero after a clean reload,
+// and zero after `LIVE_UNREADABLE` — that case is `unreadable()`.
+pub fn problem_count(read l: Live) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    let total: usize = ini.problem_count(l.last)
+    for i < total {
+        if is_fault(l.last, i) { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+pub fn unreadable(read l: Live) -> bool { return l.unreadable }
+
+// Report every changed key between `cur` and `cand` through the callback. Runs BEFORE the
+// swap, so the old values are still the live ones; returns how many keys moved, which is
+// what decides the generation.
+fn report_changes(mut l: Live, read cand: config.Config) -> i64 {
+    var moved: i64 = 0
+    let n: i32 = config.declared(cand) as i32
+    var kraw: *mut u8 = alloc(u8, LIVE_SLOT)
+    var oraw: *mut u8 = alloc(u8, LIVE_SLOT)
+    var nraw: *mut u8 = alloc(u8, LIVE_SLOT)
+    var kbuf: []u8 = slice(u8, kraw, LIVE_SLOT)
+    var obuf: []u8 = slice(u8, oraw, LIVE_SLOT)
+    var nbuf: []u8 = slice(u8, nraw, LIVE_SLOT)
+    var id: i32 = 0
+    for id < n {
+        if config.same_value(l.cur, cand, id) == false {
+            moved = moved + 1
+            if l.has_cb {
+                var ks: sink.Sink = sink.new()
+                var os: sink.Sink = sink.new()
+                var ns: sink.Sink = sink.new()
+                config.render_name(ks, kbuf, cand, id)
+                // Rendered through `config`, so redaction is the declaration's decision
+                // here exactly as it is in `render`.
+                config.render_value(os, obuf, l.cur, id)
+                config.render_value(ns, nbuf, cand, id)
+                l.cb.on_change(l.cb.ctx, sink.view(ks, kbuf), sink.view(os, obuf), sink.view(ns, nbuf))
+            }
+        }
+        id = id + 1
+    }
+    free_ptr(nraw)
+    free_ptr(oraw)
+    free_ptr(kraw)
+    return moved
+}
+
+// Read the file, validate it against the schema, and apply it whole or not at all.
+//
+// The steps, in order: read (an unreadable file is `LIVE_UNREADABLE` and nothing else
+// happens); build the candidate from the base; parse the file into it; if any problem
+// remains that is not a shadowed value, drop the candidate and answer `LIVE_REJECTED`
+// with the problems kept for `render_problems`; otherwise report each moved key, swap,
+// and answer `LIVE_CHANGED` or `LIVE_SAME`. The generation advances only on `CHANGED`.
+pub fn reload_now(mut l: Live) -> i32 {
+    l.loaded = true
+    let path: str = string_view(l.path)
+    if fs.present(l.f, path) == false {
+        l.unreadable = true
+        return LIVE_UNREADABLE
+    }
+    var src: String = fs.open_text(l.f, path)
+    l.unreadable = false
+
+    var cand: config.Config = config.clone(l.base, l.a)
+    var x: ini.Ini = ini.make(l.a)
+    ini.load(x, cand, string_view(src), config.CFG_FILE)
+
+    // Keep this read's text and problems whatever the verdict, so `render_problems`
+    // always describes the most recent file.
+    ini.free(l.last)
+    l.last = x
+    string_free(l.last_src)
+    l.last_src = src
+
+    if problem_count(l) > 0 {
+        config.free(cand)
+        l.rejections = l.rejections + 1
+        return LIVE_REJECTED
+    }
+
+    let moved: i64 = report_changes(l, cand)
+    config.free(l.cur)
+    l.cur = cand
+    l.reloads = l.reloads + 1
+    if moved == 0 { return LIVE_SAME }
+    l.generation = l.generation + 1
+    l.applied_at = time.read_nanos(l.clock)
+    return LIVE_CHANGED
+}
+
+// One pass of the caller's loop: drain the watcher, and re-read the file only if it
+// reported a change. Never blocks. A closed watcher answers `LIVE_QUIET` forever.
+pub fn step(mut l: Live) -> i32 {
+    if syswatch.is_open(l.w) == false { return LIVE_QUIET }
+    var evraw: *mut syswatch.Change = alloc(syswatch.Change, 8)
+    var evs: []syswatch.Change = slice(syswatch.Change, evraw, 8)
+    var nraw: *mut u8 = alloc(u8, 512)
+    var names: []u8 = slice(u8, nraw, 512)
+    // Drain until empty: one save is several notifications on both platforms, and the
+    // two coalesce differently. Bounded, as `syswatch.drain`'s header asks.
+    var seen: usize = 0
+    var got: usize = 1
+    var rounds: usize = 0
+    for got > 0 and rounds < LIVE_DRAIN_ROUNDS {
+        got = syswatch.drain(l.w, evs, names) catch 0
+        seen = seen + got
+        rounds = rounds + 1
+    }
+    free_ptr(nraw)
+    free_ptr(evraw)
+    if seen == 0 { return LIVE_QUIET }
+    return reload_now(l)
+}
+
+// ---- reporting -----------------------------------------------------------------------
+
+// Render every problem of the last read as a `std/diag` diagnostic against the file's
+// own text — `file:line:col` and a caret under the key — in the plain theme. An
+// unreadable file renders one line. Writes nothing after a clean reload.
+//
+// The caller must check `sink.overflowed(sk)`.
+pub fn render_problems(mut sk: sink.Sink, mut buf: []u8, read l: Live) {
+    let path: str = string_view(l.path)
+    if l.unreadable {
+        sink.put_str(sk, buf, "error[E-LIVE]: cannot read `")
+        sink.put_str(sk, buf, path)
+        sink.put_str(sk, buf, "`; the previous configuration stands")
+        sink.put_nl(sk, buf)
+        return
+    }
+    var m: diag.SourceMap = diag.map_new(l.a)
+    let fid: diag.FileId = diag.add_file(m, path, string_view(l.last_src))
+    let total: usize = ini.problem_count(l.last)
+    var i: usize = 0
+    for i < total {
+        if is_fault(l.last, i) {
+            let sp: diag.Span = diag.span(fid, ini.problem_start(l.last, i), ini.problem_end(l.last, i))
+            var d: diag.Diagnostic = diag.new_error(l.a, "E-INI", ini.code_name(ini.problem_code(l.last, i)))
+            let cf: i32 = ini.problem_cfg(l.last, i)
+            if cf >= 0 {
+                diag.primary(d, sp, config.outcome_name(cf))
+            } else {
+                diag.primary(d, sp, "here")
+            }
+            diag.render(sk, buf, m, d, diag.plain())
+        }
+        i = i + 1
+    }
+}

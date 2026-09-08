@@ -1,0 +1,574 @@
+// std/trace_test.jtr — durations, nesting, two renderings of one record, and every refusal.
+//
+// Everything here runs on `time.manual(1000)` into buffered exporters, so **no test in this
+// file touches the operating system** — the property `std/trace` was shaped around: a
+// tracer reaches the OS only through the clock and the exporter it is given, so replacing
+// both makes every duration and every byte exact.
+//
+// The centre of the file is `the_same_run_exports_identically_through_both_renderers`. It
+// does not compare the two renderings to golden strings; it PARSES the JSON back with
+// `std/json` and checks every field of every record against the text line's fields, with
+// a name and a value chosen to break both formats. Two exporters that drifted apart — a
+// key present in one, a value quoted in one and split in the other — fail there, and
+// nowhere else would notice.
+//
+// Run:  jestyrc test examples/std/trace_test.jtr
+
+import "trace"
+import "sink"
+import "json"
+import "log"
+import "writer"
+import "time"
+import "mem"
+import "str"
+import "test"
+import "test_report"
+
+const TRACE_T_CAP: usize = 8192
+const OUT_CAP: usize = 2048
+
+@test fn a_segment_is_timed_by_the_clock_it_is_given() -> bool {
+    var raw: *mut u8 = alloc(u8, TRACE_T_CAP)
+    var rep: []u8 = slice(u8, raw, TRACE_T_CAP)
+    var c: test.Check = test.new()
+
+    var o: trace.Out = trace.buffer(OUT_CAP)
+    var t: trace.Tracer = trace.make(time.manual(1000), trace.to_text(o))
+
+    // **The duration is the clock's, not the wall's.** That is what makes this an exact
+    // string rather than a bound, and the same reason `runtime` takes a `Clock`.
+    let a: i64 = trace.begin(t, "work")
+    test.eq_i64(c, rep, "the first id is 1", a, 1)
+    test.eq_i64(c, rep, "and it is the current segment", trace.current(t), 1)
+    trace.advance(t, 300)
+    test.is_true(c, rep, "end exports", trace.end(t, a))
+    test.eq_str(c, rep, "one line, exact", trace.out_view(o),
+        "id=1 parent=0 name=work start=1000 dur=300\n")
+    test.eq_i64(c, rep, "one finished", trace.finished(t), 1)
+    test.eq_i64(c, rep, "nothing is current", trace.current(t), 0)
+
+    // A parent's duration INCLUDES its children and the gaps between them: the outer
+    // segment is a stopwatch on the whole stretch, not a sum of the inner ones.
+    trace.out_reset(o)
+    let p: i64 = trace.begin(t, "outer")
+    trace.advance(t, 50)
+    let k: i64 = trace.begin(t, "inner")
+    trace.advance(t, 100)
+    trace.end(t, k)
+    trace.advance(t, 25)
+    trace.end(t, p)
+    test.eq_str(c, rep, "the child is timed alone and the parent over everything", trace.out_view(o),
+        "id=3 parent=2 name=inner start=1350 dur=100\nid=2 parent=0 name=outer start=1300 dur=175\n")
+
+    // The control: a clock that does not move yields a zero duration, so the 300 above
+    // came from `advance` and not from anything ambient.
+    trace.out_reset(o)
+    let z: i64 = trace.begin(t, "instant")
+    trace.end(t, z)
+    test.eq_str(c, rep, "no advance, no duration", trace.out_view(o),
+        "id=4 parent=0 name=instant start=1475 dur=0\n")
+
+    trace.free(t)
+    trace.free_buffer(o)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_child_records_its_parent_and_is_exported_first() -> bool {
+    var raw: *mut u8 = alloc(u8, TRACE_T_CAP)
+    var rep: []u8 = slice(u8, raw, TRACE_T_CAP)
+    var c: test.Check = test.new()
+
+    var o: trace.Out = trace.buffer(OUT_CAP)
+    var t: trace.Tracer = trace.make(time.manual(0), trace.to_text(o))
+
+    // Three deep. Each child names the segment it was opened INSIDE, and the records
+    // arrive in END order — the header's claim that a consumer wanting the tree rebuilds
+    // it from `id` and `parent`, and that the leaf comes first.
+    let a: i64 = trace.begin(t, "a")
+    let b: i64 = trace.begin(t, "b")
+    let d: i64 = trace.begin(t, "d")
+    test.eq_usize(c, rep, "three open", trace.open_count(t), 3)
+    test.is_true(c, rep, "the outermost is still open", trace.is_open(t, a))
+    trace.end(t, d)
+    // A sibling opened after `d` ended nests under `b`, not under the closed `d`.
+    let e: i64 = trace.begin(t, "e")
+    trace.end(t, e)
+    trace.end(t, b)
+    trace.end(t, a)
+    test.eq_str(c, rep, "leaves first, root last, every parent named", trace.out_view(o),
+        "id=3 parent=2 name=d start=0 dur=0\n\
+id=4 parent=2 name=e start=0 dur=0\n\
+id=2 parent=1 name=b start=0 dur=0\n\
+id=1 parent=0 name=a start=0 dur=0\n")
+    test.eq_i64(c, rep, "four finished", trace.finished(t), 4)
+    test.eq_i64(c, rep, "none abandoned", trace.abandoned(t), 0)
+    test.eq_usize(c, rep, "none open", trace.open_count(t), 0)
+
+    // Attributes land on the INNERMOST open segment, and a parent may add more after a
+    // child has closed — `status` after `db` is the demo's shape.
+    trace.out_reset(o)
+    let p: i64 = trace.begin(t, "request")
+    trace.attr_str(t, "method", "GET")
+    let q: i64 = trace.begin(t, "db")
+    trace.attr_i64(t, "rows", 3)
+    trace.end(t, q)
+    trace.attr_i64(t, "status", 200)
+    trace.end(t, p)
+    test.eq_str(c, rep, "each attribute is on the segment that was innermost when it was set",
+        trace.out_view(o),
+        "id=6 parent=5 name=db start=0 dur=0 rows=3\n\
+id=5 parent=0 name=request start=0 dur=0 method=GET status=200\n")
+
+    // The control for "innermost": with nothing open there is nowhere to put one.
+    test.is_false(c, rep, "an attribute with nothing open is refused", trace.attr_i64(t, "lost", 1))
+
+    trace.free(t)
+    trace.free_buffer(o)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The name and the value that decide whether the two renderers agree: a space would split
+// a bare logfmt field, an `=` would invent a key, a quote would close a JSON string early
+// and a newline would end both records where no reader expects it.
+const T_HOSTILE_NAME: str = "fetch user"
+const T_HOSTILE_VALUE: str = "q=\"a b\"\nnext"
+
+// The run both renderers see. Written once, so a difference between the two outputs can
+// only come from the exporters.
+fn hostile_run(mut t: trace.Tracer) {
+    let r: i64 = trace.begin(t, "request")
+    trace.attr_str(t, "path", "/items")
+    trace.advance(t, 10)
+    let f: i64 = trace.begin(t, T_HOSTILE_NAME)
+    trace.attr_str(t, "query", T_HOSTILE_VALUE)
+    trace.attr_str(t, "empty", "")
+    trace.attr_i64(t, "neg", 0 - 42)
+    trace.advance(t, 120)
+    trace.end(t, f)
+    trace.attr_i64(t, "status", 200)
+    trace.end(t, r)
+}
+
+// The `i`th line of `t`, without its terminator.
+fn line_at(read t: str, want: usize) -> read str {
+    var n: usize = 0
+    var start: usize = 0
+    for i in 0..t.len {
+        if (t[i] as i32) == 10 {
+            if n == want { return t[start .. i] }
+            n = n + 1
+            start = i + 1
+        }
+    }
+    return t[t.len .. t.len]
+}
+
+// How many `key=value` fields a text line has. Walks it the way a logfmt reader does: a
+// quoted value runs to its closing quote, honouring backslash escapes; a bare one to the
+// next space.
+fn count_fields(read line: str) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    for i < line.len {
+        // key
+        for i < line.len and (line[i] as i32) != 61 { i = i + 1 }
+        if i >= line.len { return n }
+        i = i + 1
+        n = n + 1
+        i = skip_value(line, i)
+        if i < line.len { i = i + 1 }          // the separating space
+    }
+    return n
+}
+
+// The index just past the value starting at `i`.
+fn skip_value(read line: str, at: usize) -> usize {
+    var i: usize = at
+    if i < line.len and (line[i] as i32) == 34 {
+        i = i + 1
+        for i < line.len {
+            let ch: i32 = line[i] as i32
+            if ch == 92 { i = i + 2 } else if ch == 34 { return i + 1 } else { i = i + 1 }
+        }
+        return i
+    }
+    for i < line.len and (line[i] as i32) != 32 { i = i + 1 }
+    return i
+}
+
+// The raw value token of field `key` in `line` — quotes included if it was quoted — or an
+// empty view when the field is absent. Written so that `absent` and `empty` differ: an
+// absent field returns `line[0 .. 0]`, and the caller checks `found` first.
+fn field_token(read line: str, read key: str, mut found: *mut u8) -> read str {
+    var i: usize = 0
+    unsafe { found.* = 0 as u8 }
+    for i < line.len {
+        let ks: usize = i
+        for i < line.len and (line[i] as i32) != 61 { i = i + 1 }
+        if i >= line.len { return line[0 .. 0] }
+        let k: str = line[ks .. i]
+        i = i + 1
+        let vs: usize = i
+        i = skip_value(line, i)
+        if str.eq(k, key) {
+            unsafe { found.* = 1 as u8 }
+            return line[vs .. i]
+        }
+        if i < line.len { i = i + 1 }
+    }
+    return line[0 .. 0]
+}
+
+@test fn the_same_run_exports_identically_through_both_renderers() -> bool {
+    var raw: *mut u8 = alloc(u8, TRACE_T_CAP)
+    var rep: []u8 = slice(u8, raw, TRACE_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var ot: trace.Out = trace.buffer(OUT_CAP)
+    var tt: trace.Tracer = trace.make(time.manual(1000), trace.to_text(ot))
+    hostile_run(tt)
+
+    var oj: trace.Out = trace.buffer(OUT_CAP)
+    var tj: trace.Tracer = trace.make(time.manual(1000), trace.to_jsonl(oj))
+    hostile_run(tj)
+
+    // **Ids are a counter, so two tracers running the same code agree on them.** Asserted
+    // through the exporters, because that is where a consumer would notice.
+    test.eq_i64(c, rep, "both runs finished two", trace.finished(tj), trace.finished(tt))
+    test.eq_i64(c, rep, "both exported two", trace.out_records(oj), 2)
+    test.eq_i64(c, rep, "and lost none", trace.out_lost(oj) + trace.out_lost(ot), 0)
+
+    let text: str = trace.out_view(ot)
+    let jsonl: str = trace.out_view(oj)
+
+    // A record is ONE line in both formats, even with a newline inside a value.
+    test.eq_usize(c, rep, "two text lines", test.line_count(text), 2)
+    test.eq_usize(c, rep, "two json lines", test.line_count(jsonl), 2)
+
+    // Every record, every field. The JSON is parsed back — not string-matched — and each
+    // of its pairs is looked up in the text line by key. A quoted text value is itself a
+    // JSON string, so it is parsed too and compared decoded; a bare one is compared as is.
+    var scratch_raw: *mut u8 = alloc(u8, 256)
+    var scratch: []u8 = slice(u8, scratch_raw, 256)
+    var found_raw: *mut u8 = alloc(u8, 1)
+    var checked: i64 = 0
+    for rec in 0..2 {
+        let jl: str = line_at(jsonl, rec as usize)
+        let tl: str = line_at(text, rec as usize)
+        var doc: json.Doc = json.parse(a, jl)
+        test.is_true(c, rep, "the json record parses", json.parsed(doc))
+        if json.parsed(doc) {
+            let root: usize = json.root(doc) as usize
+            test.eq_usize(c, rep, "the same number of fields", count_fields(tl), json.len(doc, root))
+            var i: usize = 0
+            for i < json.len(doc, root) {
+                let key: str = json.pair_key(doc, root, i)
+                let v: usize = json.pair_value(doc, root, i)
+                let tok: str = field_token(tl, key, found_raw)
+                var was_found: u8 = 0
+                unsafe { was_found = found_raw.* }
+                test.is_true(c, rep, "the text line has the field", (was_found as i32) == 1)
+                var same: bool = false
+                match json.kind(doc, v) {
+                    json_number => {
+                        var s: Sink = sink.new()
+                        sink.put_i64(s, scratch, json.as_i64(doc, v))
+                        same = str.eq(sink.view(s, scratch), tok)
+                    },
+                    json_string => {
+                        if tok.len > 0 and (tok[0] as i32) == 34 {
+                            var q: json.Doc = json.parse(a, tok)
+                            if json.parsed(q) {
+                                same = str.eq(json.as_str(q, json.root(q) as usize), json.as_str(doc, v))
+                            }
+                        } else {
+                            same = str.eq(tok, json.as_str(doc, v))
+                        }
+                    },
+                    json_null => { same = false },
+                    json_bool => { same = false },
+                    json_array => { same = false },
+                    json_object => { same = false },
+                }
+                test.is_true(c, rep, "the field agrees in both renderings", same)
+                checked = checked + 1
+                i = i + 1
+            }
+        }
+    }
+    // Anti-vacuity: five fixed fields per record, plus three attributes on the inner one
+    // and two on the outer — fifteen, so a renderer that dropped a field could not pass
+    // by comparing fewer.
+    test.eq_i64(c, rep, "fifteen fields were compared", checked, 15)
+
+    // And the hostile bytes did what they were there to do: both were quoted and escaped,
+    // neither ended a line early.
+    test.is_true(c, rep, "the name with a space is quoted in the text",
+        str.has(text, "name=\"fetch user\""))
+    test.is_true(c, rep, "and its newline is the two-byte escape",
+        str.has(text, "query=\"q=\\\"a b\\\"\\nnext\""))
+    test.is_true(c, rep, "the empty value is visibly there", str.has(text, "empty=\"\""))
+    test.is_true(c, rep, "json escapes it identically", str.has(jsonl, "\"query\":\"q=\\\"a b\\\"\\nnext\""))
+
+    free_ptr(found_raw)
+    free_ptr(scratch_raw)
+    trace.free(tt)
+    trace.free(tj)
+    trace.free_buffer(ot)
+    trace.free_buffer(oj)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn opening_past_the_capacity_is_refused_and_counted() -> bool {
+    var raw: *mut u8 = alloc(u8, TRACE_T_CAP)
+    var rep: []u8 = slice(u8, raw, TRACE_T_CAP)
+    var c: test.Check = test.new()
+
+    var o: trace.Out = trace.buffer(OUT_CAP)
+    // Two open segments, three attributes, thirty-two bytes of text. Small enough that
+    // every limit is reachable in a few calls.
+    var t: trace.Tracer = trace.make_sized(time.manual(0), trace.to_text(o), 2, 3, 32)
+
+    // The open stack. The third `begin` returns 0 — no real segment has that id — and the
+    // two that opened are unaffected.
+    let a: i64 = trace.begin(t, "a")
+    let b: i64 = trace.begin(t, "b")
+    let refused: i64 = trace.begin(t, "c")
+    test.eq_i64(c, rep, "the third open is refused", refused, 0)
+    test.eq_i64(c, rep, "and counted", trace.dropped(t), 1)
+    test.eq_usize(c, rep, "two remain open", trace.open_count(t), 2)
+    test.is_false(c, rep, "ending the refused id is unmatched, not a crash", trace.end(t, refused))
+    test.eq_i64(c, rep, "which is counted too", trace.unmatched(t), 1)
+
+    // The attribute table: three fit, the fourth is refused and the caller sees `false`.
+    test.is_true(c, rep, "attr 1", trace.attr_i64(t, "x", 1))
+    test.is_true(c, rep, "attr 2", trace.attr_i64(t, "y", 2))
+    test.is_true(c, rep, "attr 3", trace.attr_i64(t, "z", 3))
+    test.is_false(c, rep, "attr 4 does not fit", trace.attr_i64(t, "w", 4))
+    test.eq_i64(c, rep, "the refusal is truncated, not dropped", trace.truncated(t), 1)
+    test.eq_i64(c, rep, "dropped is unchanged", trace.dropped(t), 1)
+
+    // **The segment still exports, with exactly the attributes that fit.** A refused
+    // attribute is a counted loss, never a corrupted record.
+    trace.end(t, b)
+    test.eq_str(c, rep, "three attributes, no fourth", trace.out_view(o),
+        "id=2 parent=1 name=b start=0 dur=0 x=1 y=2 z=3\n")
+
+    // Ending `b` released its bytes and its table rows, so the arena is a stack: `a` can
+    // take attributes again.
+    test.is_true(c, rep, "space came back when the child ended", trace.attr_i64(t, "p", 9))
+
+    // The arena. A name that does not fit is `dropped` — the segment never opened — and a
+    // value that does not fit is `truncated`. Two limits, two counters, because the fixes
+    // differ: one is a name too long for the tracer, the other is a value.
+    let long_name: str = "a name much longer than the thirty-two bytes this tracer has"
+    test.eq_i64(c, rep, "a name that cannot fit is refused", trace.begin(t, long_name), 0)
+    test.eq_i64(c, rep, "as dropped", trace.dropped(t), 2)
+    test.is_false(c, rep, "a value that cannot fit is refused", trace.attr_str(t, "v", long_name))
+    test.eq_i64(c, rep, "as truncated", trace.truncated(t), 2)
+    trace.out_reset(o)
+    trace.end(t, a)
+    test.eq_str(c, rep, "and the segment that was open exports what it had", trace.out_view(o),
+        "id=1 parent=0 name=a start=0 dur=0 p=9\n")
+
+    // The control: an ordinary run on the same tiny tracer refuses nothing. Without it the
+    // assertions above would hold for a tracer that refused everything.
+    let d: i64 = trace.begin(t, "d")
+    trace.attr_str(t, "k", "v")
+    test.is_true(c, rep, "an ordinary segment fits", trace.end(t, d))
+    test.eq_i64(c, rep, "three finished", trace.finished(t), 3)
+
+    trace.free(t)
+    trace.free_buffer(o)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn ending_an_outer_segment_abandons_the_inner_ones() -> bool {
+    var raw: *mut u8 = alloc(u8, TRACE_T_CAP)
+    var rep: []u8 = slice(u8, raw, TRACE_T_CAP)
+    var c: test.Check = test.new()
+
+    var o: trace.Out = trace.buffer(OUT_CAP)
+    var t: trace.Tracer = trace.make(time.manual(0), trace.to_text(o))
+
+    // The realistic bug: an early return between `b`'s begin and its end. `a` still ends
+    // correctly; `b` and `d` are gone, and the loss is COUNTED rather than invisible.
+    let a: i64 = trace.begin(t, "a")
+    let b: i64 = trace.begin(t, "b")
+    trace.attr_i64(t, "never", 1)
+    let d: i64 = trace.begin(t, "d")
+    test.is_true(c, rep, "the outer segment ends", trace.end(t, a))
+    test.eq_i64(c, rep, "two were abandoned", trace.abandoned(t), 2)
+    test.eq_i64(c, rep, "one finished", trace.finished(t), 1)
+    test.eq_usize(c, rep, "nothing is open", trace.open_count(t), 0)
+    test.eq_str(c, rep, "only the outer one was exported, without the inner attribute",
+        trace.out_view(o), "id=1 parent=0 name=a start=0 dur=0\n")
+
+    // The abandoned ids are no longer open, so ending them later is `unmatched`.
+    test.is_false(c, rep, "b is gone", trace.end(t, b))
+    test.is_false(c, rep, "d is gone", trace.end(t, d))
+    test.eq_i64(c, rep, "both counted", trace.unmatched(t), 2)
+
+    // The control: properly nested ends abandon nothing, so the count above is about the
+    // mis-nesting and not about `end` counting every call.
+    let p: i64 = trace.begin(t, "p")
+    let q: i64 = trace.begin(t, "q")
+    trace.end(t, q)
+    trace.end(t, p)
+    test.eq_i64(c, rep, "still two abandoned", trace.abandoned(t), 2)
+    test.eq_i64(c, rep, "three finished", trace.finished(t), 3)
+
+    // **`free` abandons what is still open**, and a freed tracer refuses rather than
+    // writing through a null table — the same shutdown-ordering promise `log.free` makes.
+    trace.begin(t, "left open")
+    trace.free(t)
+    test.eq_i64(c, rep, "freed with one open: abandoned", trace.abandoned(t), 3)
+    test.eq_i64(c, rep, "a freed tracer opens nothing", trace.begin(t, "too late"), 0)
+    test.is_false(c, rep, "and records nothing", trace.attr_i64(t, "k", 1))
+    test.is_false(c, rep, "and ends nothing", trace.end(t, 1))
+    test.eq_i64(c, rep, "without counting any of it as a refusal", trace.dropped(t), 0)
+
+    trace.free_buffer(o)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_finished_segment_is_one_log_record() -> bool {
+    var raw: *mut u8 = alloc(u8, TRACE_T_CAP)
+    var rep: []u8 = slice(u8, raw, TRACE_T_CAP)
+    var c: test.Check = test.new()
+
+    // A buffered logfmt logger on its own clock, handed to the tracer as its exporter.
+    var lo: trace.LogOut = trace.to_log(
+        log.make(time.manual(500), writer.to_buffer(), log.LOG_INFO, log.LOG_LOGFMT),
+        log.LOG_INFO, OUT_CAP)
+    var t: trace.Tracer = trace.make(time.manual(1000), trace.log_exporter(lo))
+
+    let r: i64 = trace.begin(t, "request")
+    trace.attr_str(t, "path", "/a b")
+    let d: i64 = trace.begin(t, "db")
+    trace.attr_i64(t, "rows", 3)
+    trace.advance(t, 300)
+    trace.end(t, d)
+    trace.attr_i64(t, "status", 200)
+    trace.advance(t, 50)
+    trace.end(t, r)
+
+    // **One record per segment, in `std/log`'s own rendering.** `ts` is the logger's clock
+    // (500, never advanced) and `dur` the tracer's — two clocks, as the header says — and
+    // the segment's name is the message, its ids and duration the first fields, its
+    // attributes the rest, quoted by the logger's rule.
+    test.eq_str(c, rep, "two log records, exact", trace.log_view(lo),
+        "ts=500 level=info msg=db id=2 parent=1 dur=300 rows=3\n\
+ts=500 level=info msg=request id=1 parent=0 dur=350 path=\"/a b\" status=200\n")
+    test.eq_i64(c, rep, "the logger counts two emitted", trace.log_records(lo), 2)
+
+    // The logger's threshold still applies: a tracer logging at DEBUG through an INFO
+    // logger ships nothing, and the logger counts the drop — the tracer does not have a
+    // second opinion about levels.
+    var quiet: trace.LogOut = trace.to_log(
+        log.make(time.manual(0), writer.to_buffer(), log.LOG_INFO, log.LOG_JSON),
+        log.LOG_DEBUG, OUT_CAP)
+    var tq: trace.Tracer = trace.make(time.manual(0), trace.log_exporter(quiet))
+    let s: i64 = trace.begin(tq, "chatty")
+    trace.attr_i64(tq, "n", 1)
+    trace.end(tq, s)
+    test.eq_i64(c, rep, "the tracer finished it", trace.finished(tq), 1)
+    test.eq_i64(c, rep, "the logger filtered it", trace.log_records(quiet), 0)
+    test.eq_usize(c, rep, "and nothing reached the buffer", trace.log_view(quiet).len, 0)
+
+    trace.free(tq)
+    trace.free_log(quiet)
+    trace.free(t)
+    trace.free_log(lo)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- a caller's own exporter --------------------------------------------------------
+//
+// The vtable's reason to exist: an exporter this module has never heard of, in four
+// functions over a block of counters. `ctx` is four `i64`s — opens, closes, attributes
+// seen, and the last duration reported.
+
+fn tally_open(ctx: *mut u8, id: i64, parent: i64, name: str, start: i64, dur: i64) {
+    var p: *mut i64 = ctx as *mut i64
+    unsafe {
+        p.* = p.* + 1
+        (p + 3).* = dur
+    }
+}
+fn tally_str(ctx: *mut u8, key: str, value: str) {
+    var p: *mut i64 = ctx as *mut i64
+    unsafe { (p + 2).* = (p + 2).* + 1 }
+}
+fn tally_i64(ctx: *mut u8, key: str, value: i64) {
+    var p: *mut i64 = ctx as *mut i64
+    unsafe { (p + 2).* = (p + 2).* + 1 }
+}
+fn tally_close(ctx: *mut u8) {
+    var p: *mut i64 = ctx as *mut i64
+    unsafe { (p + 1).* = (p + 1).* + 1 }
+}
+
+fn tally_at(p: *mut i64, i: usize) -> i64 {
+    var v: i64 = 0
+    unsafe { v = (p + i).* }
+    return v
+}
+
+@test fn a_caller_can_write_its_own_exporter() -> bool {
+    var raw: *mut u8 = alloc(u8, TRACE_T_CAP)
+    var rep: []u8 = slice(u8, raw, TRACE_T_CAP)
+    var c: test.Check = test.new()
+
+    var counters: *mut i64 = alloc(i64, 4)
+    for i in 0..4 {
+        unsafe { (counters + i).* = 0 }
+    }
+    let e: trace.Exporter = trace.exporter(counters as *mut u8, &tally_open, &tally_str, &tally_i64, &tally_close)
+    var t: trace.Tracer = trace.make(time.manual(0), e)
+
+    let a: i64 = trace.begin(t, "a")
+    trace.attr_str(t, "k", "v")
+    trace.attr_i64(t, "n", 2)
+    let b: i64 = trace.begin(t, "b")
+    trace.advance(t, 70)
+    trace.end(t, b)
+    trace.advance(t, 5)
+    trace.end(t, a)
+
+    // Every open is closed, the attributes are visited between them, and the last record
+    // was the parent's — 75, not the child's 70.
+    test.eq_i64(c, rep, "two opens", tally_at(counters, 0), 2)
+    test.eq_i64(c, rep, "two closes", tally_at(counters, 1), 2)
+    test.eq_i64(c, rep, "two attributes visited", tally_at(counters, 2), 2)
+    test.eq_i64(c, rep, "the parent's duration came last", tally_at(counters, 3), 75)
+
+    // `discard()` is a real exporter that sees everything and keeps nothing; the tracer's
+    // accounting is unaffected by where the records go.
+    var q: trace.Tracer = trace.make(time.manual(0), trace.discard())
+    let s: i64 = trace.begin(q, "silent")
+    trace.attr_i64(q, "n", 1)
+    test.is_true(c, rep, "a discarded segment still ends", trace.end(q, s))
+    test.eq_i64(c, rep, "and is counted as finished", trace.finished(q), 1)
+
+    trace.free(q)
+    trace.free(t)
+    free_ptr(counters as *mut u8)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

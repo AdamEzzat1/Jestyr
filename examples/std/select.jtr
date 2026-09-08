@@ -6,7 +6,7 @@
 // value (Crystal/Go CSP ergonomics, here over Jestyr's move-only `Channel(i64)`).
 // The total is an order-independent sum, so the result is deterministic.
 //
-//   jestyrc run examples/std/select.jtr   →   66
+//   jestyrc run examples/std/select.jtr   →   66  146 4  146 4
 import "sync"
 
 // One producer: send two values into its channel (by move).
@@ -84,5 +84,42 @@ fn main() -> i32 {
 
     sync.channel_free(i64, c)
     sync.channel_free(i64, d)
+
+    // --- Part 3: the same drain again, with the `closed` ARM ----------------------
+    //
+    // Part 2 has to say the quiet part out loud: read `seen` before the `select`, read
+    // it after, and infer from "it did not move" that everything was closed. That is a
+    // sentinel — three lines of bookkeeping around the one line that matters, and it is
+    // only correct because every arm happens to increment the same counter.
+    //
+    // `closed { … }` is that inference, named. The exit condition was already computed
+    // (all channels closed AND drained) and was already where the loop ended; the arm is
+    // somewhere to put a statement, not a new capability. Nothing here can do what
+    // Part 2 could not — the point is that it says so directly.
+    //
+    // The totals must match Part 2 exactly, which is what makes this a check rather than
+    // a demo: 146 and 4, reached without a sentinel. And because closing is tested only
+    // AFTER every readiness arm, the values buffered before the close still arrive — if
+    // the arm ran early, both numbers would drop.
+    var e = sync.channel_make(i64, 8)
+    var f = sync.channel_make(i64, 8)
+    fill_close(e, 30)            // 31, 32, then close
+    fill_close(f, 40)            // 41, 42, then close
+
+    var sum3: i64 = 0
+    var seen3: i64 = 0
+    var live: bool = true
+    for live {
+        select {
+            recv(e) => p { sum3 = sum3 + p  seen3 = seen3 + 1 }
+            recv(f) => q { sum3 = sum3 + q  seen3 = seen3 + 1 }
+            closed { live = false }
+        }
+    }
+    print_int(sum3 as i32)       // 146 — identical to Part 2
+    print_int(seen3 as i32)      // 4
+
+    sync.channel_free(i64, e)
+    sync.channel_free(i64, f)
     return 0
 }

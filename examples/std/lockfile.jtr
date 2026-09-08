@@ -1,0 +1,343 @@
+// std/lockfile.jtr — record a resolution, and prove a later one agrees with it.
+//
+// TIER: `std` (allocates; no OS). Renders to a `String` and parses from a `str`; reading and
+// writing the file is the caller's, for the same reason `std/buildgraph` parses a manifest
+// you hand it.
+//
+// ─── A lockfile here is a WITNESS, not a source of truth ────────────────────────────
+//
+// This is the part that differs from every lockfile you have used, and it follows from
+// `std/resolve` selecting minimally. Under maximal selection the lockfile is
+// correctness-critical: resolution consults the registry, the registry changes, so the only
+// reason two builds agree is that one of them read the lockfile instead of resolving. Drop
+// the file and the builds diverge.
+//
+// Under minimal selection resolution is already a pure function of the requirement graph.
+// Two builds of the same graph agree whether or not a lockfile exists. So this file does not
+// *cause* agreement — it **records what was decided so a later build can prove it decided
+// the same thing**, and says precisely what moved when it did not.
+//
+// That changes what the API is for. There is no "install from the lockfile" entry point,
+// because there is nothing it could do that resolving would not: you `render` a solution and
+// you `verify` a later one. A build that wants to fail on drift compares; a build that does
+// not, does not. The file is evidence, and evidence you can regenerate is still evidence —
+// it is how you notice that a requirement changed under you.
+//
+// ─── The format ─────────────────────────────────────────────────────────────────────
+//
+//   jestyr-lock/v1
+//   resolver mvs
+//   selection-sha256 <hex>
+//   pkg <name> <version>
+//   pkg <name> <version>
+//
+// `pkg` lines are sorted by NAME, so the bytes depend on the selection and not on the order
+// packages were declared, registry insertion order, or map iteration — the same
+// order-independence argument `std/metrics` makes about its dump, and `resolve_test` already
+// pins the resolver half of it.
+//
+// **`resolver mvs` is recorded on purpose.** A lockfile produced under one selection policy
+// means nothing under another, and a file that does not say which policy produced it invites
+// exactly that comparison. It is the same reason `jestyr-attest` writes its `cc-flags`.
+//
+// **The digest covers the `pkg` lines only**, not the header. The header may gain fields; the
+// selection is what is being attested, so the value stays stable across a header that grows
+// and changes the moment a version does. It is checked FIRST in `verify`, because a hand-
+// edited body should be reported as a corrupt file rather than as a version disagreement —
+// those call for completely different responses.
+
+import "list"
+import "resolve"
+import "sha256"
+
+pub const LOCK_OK: i32 = 0
+pub const LOCK_VERSION_DIFFERS: i32 = 1
+pub const LOCK_MISSING: i32 = 2          // selected now, absent from the lock
+pub const LOCK_EXTRA: i32 = 3            // in the lock, not selected now
+pub const LOCK_DIGEST: i32 = 4           // the body does not match its own digest
+pub const LOCK_MALFORMED: i32 = 5
+
+// A parsed lockfile: its own text plus spans, for the reason `std/semver` records — a struct
+// may not hold a `str`.
+pub struct Lock {
+    text: String,
+    name_s: List(i32), name_e: List(i32),
+    ver_s: List(i32), ver_e: List(i32),
+    dig_s: i32, dig_e: i32,
+    ok: bool,
+}
+
+pub fn lock_valid(read l: Lock) -> bool { return l.ok }
+pub fn entry_count(read l: Lock) -> usize { return list.len(i32, l.name_s) }
+
+pub fn entry_name(read l: Lock, i: usize) -> read str {
+    let t: str = string_view(l.text)
+    return t[list.get(i32, l.name_s, i) as usize .. list.get(i32, l.name_e, i) as usize]
+}
+
+pub fn entry_version(read l: Lock, i: usize) -> read str {
+    let t: str = string_view(l.text)
+    return t[list.get(i32, l.ver_s, i) as usize .. list.get(i32, l.ver_e, i) as usize]
+}
+
+pub fn digest(read l: Lock) -> read str {
+    let t: str = string_view(l.text)
+    return t[l.dig_s as usize .. l.dig_e as usize]
+}
+
+@no_alloc @no_os fn str_eq2(read a: str, read b: str) -> bool {
+    if a.len != b.len { return false }
+    var i: usize = 0
+    for i < a.len {
+        if (a[i] as i32) != (b[i] as i32) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Byte-lexical `a < b`.
+@no_alloc @no_os fn str_lt(read a: str, read b: str) -> bool {
+    var lim: usize = a.len
+    if b.len < lim { lim = b.len }
+    var i: usize = 0
+    for i < lim {
+        let x: i32 = a[i] as i32
+        let y: i32 = b[i] as i32
+        if x < y { return true }
+        if x > y { return false }
+        i = i + 1
+    }
+    return a.len < b.len
+}
+
+// The canonical body: `pkg <name> <version>\n` per selected package, sorted by name.
+//
+// Sorted by an index selection sort rather than `core.sl_sort`, because the comparison needs
+// the registry's text and a plain fn-pointer comparator cannot carry it. A build's package
+// count is small and this runs once.
+fn push_body(mut sb: String, read a: Allocator, read r: resolve.Registry, read s: resolve.Solution) {
+    let np: usize = resolve.package_count(r)
+    var order: List(i32) = list.make(i32, a)
+    var p: usize = 0
+    for p < np {
+        if resolve.selected(s, p as i32) >= 0 { list.push(i32, order, p as i32) }
+        p = p + 1
+    }
+    let n: usize = list.len(i32, order)
+    var i: usize = 0
+    for i < n {
+        var best: usize = i
+        var j: usize = i + 1
+        for j < n {
+            let bj: str = resolve.package_name(r, list.get(i32, order, j))
+            let bb: str = resolve.package_name(r, list.get(i32, order, best))
+            if str_lt(bj, bb) { best = j }
+            j = j + 1
+        }
+        if best != i {
+            let tmp: i32 = list.get(i32, order, i)
+            list.set(i32, order, i, list.get(i32, order, best))
+            list.set(i32, order, best, tmp)
+        }
+        i = i + 1
+    }
+    var k: usize = 0
+    for k < n {
+        let pi: i32 = list.get(i32, order, k)
+        string_push(sb, "pkg ")
+        string_push(sb, resolve.package_name(r, pi))
+        string_push(sb, " ")
+        string_push(sb, resolve.version_string(r, resolve.selected(s, pi)))
+        string_push(sb, "\n")
+        k = k + 1
+    }
+}
+
+// Render a solution as a lockfile.
+pub fn render(read a: Allocator, read r: resolve.Registry, read s: resolve.Solution) -> String {
+    var body: String = string_new()
+    push_body(body, a, r, s)
+    var lf: String = string_new()
+    string_push(lf, "jestyr-lock/v1\n")
+    string_push(lf, "resolver mvs\n")
+    string_push(lf, "selection-sha256 ")
+    let bv: str = string_view(body)
+    sha256.push_sha256_hex(lf, bv)
+    string_push(lf, "\n")
+    string_push(lf, bv)
+    string_free(body)
+    return lf
+}
+
+fn empty_lock(read a: Allocator) -> Lock {
+    return Lock{ text: string_new(),
+        name_s: list.make(i32, a), name_e: list.make(i32, a),
+        ver_s: list.make(i32, a), ver_e: list.make(i32, a),
+        dig_s: 0, dig_e: 0, ok: false }
+}
+
+// Parse a lockfile. Total: a malformed file comes back with `lock_valid` false rather than a
+// partial reading, because a half-parsed lock that verifies against nothing is worse than a
+// refused one.
+pub fn parse(read a: Allocator, read text: str) -> Lock {
+    var l: Lock = empty_lock(a)
+    string_push(l.text, text)
+    let t: str = string_view(l.text)
+    let n: usize = t.len
+
+    var i: usize = 0
+    var line_no: i32 = 0
+    var saw_header: bool = false
+    var saw_resolver: bool = false
+    var saw_digest: bool = false
+
+    for i < n {
+        let start: usize = i
+        for i < n {
+            if (t[i] as i32) == 10 { break }
+            i = i + 1
+        }
+        var e: usize = i
+        // Tolerate CRLF: a lockfile is a text file and will be checked in somewhere.
+        if e > start {
+            if (t[e - 1] as i32) == 13 { e = e - 1 }
+        }
+        if i < n { i = i + 1 }
+        let line: str = t[start .. e]
+        line_no = line_no + 1
+
+        if line.len == 0 { continue }
+
+        if !saw_header {
+            if !str_eq2(line, "jestyr-lock/v1") { return l }
+            saw_header = true
+            continue
+        }
+        if starts(line, "resolver ") {
+            let v: str = line[9 .. line.len]
+            // A lock produced under a different selection policy is not comparable.
+            if !str_eq2(v, "mvs") { return l }
+            saw_resolver = true
+            continue
+        }
+        if starts(line, "selection-sha256 ") {
+            l.dig_s = (start + 17) as i32
+            l.dig_e = e as i32
+            saw_digest = true
+            continue
+        }
+        if starts(line, "pkg ") {
+            // `pkg <name> <version>` — exactly two fields.
+            var sp: usize = start + 4
+            var cut: usize = sp
+            for cut < e {
+                if (t[cut] as i32) == 32 { break }
+                cut = cut + 1
+            }
+            if cut >= e { return l }                       // no version
+            if cut == sp { return l }                      // empty name
+            if cut + 1 >= e { return l }                   // empty version
+            list.push(i32, l.name_s, sp as i32)
+            list.push(i32, l.name_e, cut as i32)
+            list.push(i32, l.ver_s, (cut + 1) as i32)
+            list.push(i32, l.ver_e, e as i32)
+            continue
+        }
+        return l                                            // an unknown line
+    }
+    if !saw_header { return l }
+    if !saw_resolver { return l }
+    if !saw_digest { return l }
+    l.ok = true
+    return l
+}
+
+@no_alloc @no_os fn starts(read s: str, read p: str) -> bool {
+    if s.len < p.len { return false }
+    var i: usize = 0
+    for i < p.len {
+        if (s[i] as i32) != (p[i] as i32) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// The outcome of comparing a lock against a fresh resolution. `kind` is one of the `LOCK_*`
+// constants; `entry` is the lock entry index for a disagreement about a package the lock
+// names, and -1 otherwise.
+pub struct Verdict { agrees: bool, kind: i32, entry: isize, pkg: isize }
+
+pub fn agrees(read v: Verdict) -> bool { return v.agrees }
+pub fn verdict_kind(read v: Verdict) -> i32 { return v.kind }
+pub fn verdict_entry(read v: Verdict) -> isize { return v.entry }
+pub fn verdict_package(read v: Verdict) -> isize { return v.pkg }
+
+// Does `l` record the same selection that `s` just produced?
+//
+// Checked in the order a reader should act on: the digest first, because a body that does not
+// match its own hash is a corrupt or hand-edited file and every difference below it is
+// untrustworthy; then a version that moved; then a package that appeared or disappeared. The
+// FIRST disagreement is reported rather than a count, because the first one is usually the
+// cause of the rest.
+pub fn verify(read a: Allocator, read l: Lock, read r: resolve.Registry, read s: resolve.Solution) -> Verdict {
+    if !l.ok { return Verdict{ agrees: false, kind: LOCK_MALFORMED, entry: 0 - 1, pkg: 0 - 1 } }
+
+    // Recompute the digest over the lock's OWN entries, so a tampered version line is caught
+    // here rather than being reported as a legitimate difference from the fresh resolution.
+    var body: String = string_new()
+    var i: usize = 0
+    for i < list.len(i32, l.name_s) {
+        string_push(body, "pkg ")
+        string_push(body, entry_name(l, i))
+        string_push(body, " ")
+        string_push(body, entry_version(l, i))
+        string_push(body, "\n")
+        i = i + 1
+    }
+    var want: String = string_new()
+    sha256.push_sha256_hex(want, string_view(body))
+    let matches_digest: bool = str_eq2(string_view(want), digest(l))
+    string_free(body)
+    string_free(want)
+    if !matches_digest {
+        return Verdict{ agrees: false, kind: LOCK_DIGEST, entry: 0 - 1, pkg: 0 - 1 }
+    }
+
+    // Every locked package must still be selected, at the same version.
+    var k: usize = 0
+    for k < list.len(i32, l.name_s) {
+        let nm: str = entry_name(l, k)
+        let pi: isize = resolve.package_index(r, nm)
+        var sel: i32 = 0 - 1
+        if pi >= 0 { sel = resolve.selected(s, pi as i32) }
+        if sel < 0 {
+            return Verdict{ agrees: false, kind: LOCK_EXTRA, entry: k as isize, pkg: pi }
+        }
+        if !str_eq2(resolve.version_string(r, sel), entry_version(l, k)) {
+            return Verdict{ agrees: false, kind: LOCK_VERSION_DIFFERS, entry: k as isize, pkg: pi }
+        }
+        k = k + 1
+    }
+
+    // …and every selected package must be locked. Without this half a lock could omit a
+    // package entirely and still "agree", which is the failure that lets a new transitive
+    // dependency enter a build unrecorded.
+    let np: usize = resolve.package_count(r)
+    var p: usize = 0
+    for p < np {
+        if resolve.selected(s, p as i32) >= 0 {
+            let nm: str = resolve.package_name(r, p as i32)
+            var found: bool = false
+            var q: usize = 0
+            for q < list.len(i32, l.name_s) {
+                if str_eq2(entry_name(l, q), nm) { found = true  break }
+                q = q + 1
+            }
+            if !found {
+                return Verdict{ agrees: false, kind: LOCK_MISSING, entry: 0 - 1, pkg: p as isize }
+            }
+        }
+        p = p + 1
+    }
+    return Verdict{ agrees: true, kind: LOCK_OK, entry: 0 - 1, pkg: 0 - 1 }
+}

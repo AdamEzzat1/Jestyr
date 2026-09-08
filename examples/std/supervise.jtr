@@ -1,0 +1,712 @@
+// std/supervise.jtr — keeping child PROCESSES running according to a policy.
+//
+// TIER: `sys`, through `std/sysproc`. A `Supervisor` is GIVEN everything it needs — a
+// `time.Clock` for its deadlines, a `sysproc.Spawner` for its children, an `Allocator`
+// for its table — and reaches the operating system through no other route. Hand it
+// `time.manual()` and every restart decision it makes is a pure function of the exit
+// codes it observed and the clock it was shown.
+//
+// ─── What this is, and what `std/service` already is ────────────────────────────────
+//
+// `std/service` is the lifecycle of the program you are IN: ready against live, drain,
+// the reason it stopped. This is the other side of that line — a program that keeps OTHER
+// programs running. The two share their words where the words mean the same thing (a
+// child "exits", a supervisor "stops"), and this module invents no health vocabulary of
+// its own: a supervised child's health is whether it is still there, which is the one
+// question `sysproc.try_wait` answers.
+//
+// ─── The policy is the classic one, and its three numbers are stated rather than tuned ──
+//
+// A child is registered with a `Policy`: WHEN to restart it (`never`, `on_failure`,
+// `always` — a failure is a non-zero exit or a signal), HOW MANY restarts are allowed in
+// a window (at most N within M nanoseconds — "give up after N crashes in a minute"), and
+// HOW LONG to wait before each one (a fixed delay, or a doubling one with a cap).
+//
+// The budget counts RESTARTS, not exits: with N = 3, the third crash is still restarted
+// and the fourth crash, finding three restarts inside the window, gives up. A `max_restarts`
+// of zero therefore gives up on the first crash, and a value below zero means no limit —
+// stated here because both are legal and neither is an error.
+//
+// A doubling backoff resets to its base when a run outlasted the window: a child that ran
+// for an hour and then crashed is not the child that crashed four times in a row, and the
+// window is the one notion of "stable" this module already has, so it is not a second
+// number to tune.
+//
+// ─── `tick` has no thread; the caller's loop drives it ──────────────────────────────
+//
+// The event-loop tier of this tree is single-threaded on purpose (`std/runtime`,
+// `std/httpd`), and a supervisor with a thread of its own would be the hidden runtime
+// that tier refuses to have. So `tick` is one step: reap what exited (`sysproc.try_wait`
+// — it never blocks), decide per policy, start what has come due. A child changes state at
+// most ONCE per tick, so an exit and the restart it schedules are two observable steps
+// even when the delay is zero — the same rule `runtime.fire_due` keeps for a timer
+// registered mid-pass.
+//
+// `poll_for` is the waiting form, and it takes a SECOND clock. That is not redundancy:
+// the supervisor's own clock is POLICY time (deadlines, windows, backoff), and the one
+// `poll_for` is handed is the time a caller can afford to SPEND blocking. In production
+// both are `time.host()`. In a test the policy clock is `time.manual()` — so every
+// deadline in the transcript is a number the test chose — while the children are REAL
+// processes whose exits happen in real time, which is what the second clock waits on. One
+// clock could not be both, and a supervisor that reached for `time.host()` itself would
+// be touching the OS behind the caller's back.
+//
+// ─── What is deliberately NOT here ─────────────────────────────────────────────────
+//
+// No logging: events go to a callback (`ctx` + fn pointer, the `mem.Allocator` shape) so a
+// caller logs through `std/log` and this module knows nothing about it. No signal
+// handling: `std/sysignal` owns the trigger and the caller's loop decides when to
+// `stop_all`. No graceful termination: `sysproc.terminate` is `SIGKILL`, and a polite
+// shutdown is a protocol between the caller and its child, which the supervisor cannot
+// know. No dependency ordering between children, and no supervision TREE — a supervisor
+// is a flat, bounded table, and a tree is a supervisor whose children are supervisors.
+//
+// `add` takes a shell line (`sysproc.start`) and `add_exec` takes a program and its
+// arguments (`sysproc.start_exec`). A supervised child should usually be the second: the
+// handle from the first is the SHELL's, and killing `cmd.exe /c prog` leaves `prog`
+// running as an orphan the supervisor can no longer reach. Both are offered because a
+// shell line is sometimes exactly what an operator wrote.
+//
+// Worked example:  examples/std/supervise_demo.jtr
+// Run the tests:   jestyrc test examples/std/supervise_test.jtr
+
+import "mem"
+import "sysproc"
+import "time"
+
+// ---- the policy --------------------------------------------------------------------
+
+// When to restart.
+pub const SUP_NEVER: i32 = 0
+pub const SUP_ON_FAILURE: i32 = 1
+pub const SUP_ALWAYS: i32 = 2
+
+// How the delay between restarts behaves.
+pub const SUP_FIXED: i32 = 0
+pub const SUP_DOUBLING: i32 = 1
+
+// How many restart timestamps the table keeps per child. The budget's N cannot exceed
+// it — `add` refuses a larger one rather than counting a window it cannot see all of.
+pub const SUP_HIST_CAP: usize = 32
+
+// How many bytes of command a slot holds. `add` refuses a longer one.
+pub const SUP_CMD_CAP: usize = 1024
+
+// How long `poll_for` sleeps between liveness checks — the same floor `sysproc` uses.
+const SUP_POLL_NANOS: i64 = 1000000
+
+@copy pub struct Policy {
+    restart: i32,           // SUP_NEVER / SUP_ON_FAILURE / SUP_ALWAYS
+    max_restarts: i64,      // N; 0 gives up at the first crash, negative means no limit
+    window_nanos: i64,      // M; 0 or less means "ever" — every restart counts forever
+    backoff: i32,           // SUP_FIXED / SUP_DOUBLING
+    delay_nanos: i64,       // the first delay, and the fixed one
+    max_delay_nanos: i64,   // the doubling cap
+}
+
+// Run it once and leave it alone whatever happens.
+@no_alloc @no_os pub fn never() -> Policy {
+    return Policy{ restart: SUP_NEVER, max_restarts: 0, window_nanos: 0, backoff: SUP_FIXED, delay_nanos: 0, max_delay_nanos: 0 }
+}
+
+// Restart per `restart`, at most `max_restarts` times within `window_nanos`, waiting a
+// fixed `delay_nanos` before each one.
+@no_alloc @no_os pub fn policy(restart: i32, max_restarts: i64, window_nanos: i64, delay_nanos: i64) -> Policy {
+    return Policy{ restart: restart, max_restarts: max_restarts, window_nanos: window_nanos, backoff: SUP_FIXED, delay_nanos: delay_nanos, max_delay_nanos: delay_nanos }
+}
+
+// The same policy with a delay that doubles after every restart, never exceeding
+// `max_delay_nanos` (which is raised to the base delay if it is below it — a cap under
+// the floor would be a delay that shrinks).
+@no_alloc @no_os pub fn doubling(read p: Policy, max_delay_nanos: i64) -> Policy {
+    var cap: i64 = max_delay_nanos
+    if cap < p.delay_nanos { cap = p.delay_nanos }
+    return Policy{ restart: p.restart, max_restarts: p.max_restarts, window_nanos: p.window_nanos, backoff: SUP_DOUBLING, delay_nanos: p.delay_nanos, max_delay_nanos: cap }
+}
+
+@no_alloc @no_os pub fn policy_name(restart: i32) -> str {
+    if restart == SUP_NEVER { return "never" }
+    if restart == SUP_ON_FAILURE { return "on-failure" }
+    if restart == SUP_ALWAYS { return "always" }
+    return "?"
+}
+
+// ---- what a child is doing ----------------------------------------------------------
+
+// A start is scheduled at `due_of` — the first start too, so `add` and `tick` are the
+// only two steps and a registered child is not silently running before anyone ticked.
+pub const SUP_WAITING: i32 = 0
+pub const SUP_RUNNING: i32 = 1
+// It exited and the policy says leave it: `never`, or `on_failure` after a clean exit.
+pub const SUP_DONE: i32 = 2
+// It will not be started again: the budget is spent, or a start itself failed.
+pub const SUP_GAVE_UP: i32 = 3
+// `stop_all` ended it, or cancelled the restart it was waiting for.
+pub const SUP_STOPPED: i32 = 4
+
+@no_alloc @no_os pub fn phase_name(ph: i32) -> str {
+    if ph == SUP_WAITING { return "waiting" }
+    if ph == SUP_RUNNING { return "running" }
+    if ph == SUP_DONE { return "done" }
+    if ph == SUP_GAVE_UP { return "gave-up" }
+    if ph == SUP_STOPPED { return "stopped" }
+    return "?"
+}
+
+// How the LAST run ended. `sysproc`'s own two states, plus the two this module adds.
+pub const SUP_OUT_NONE: i32 = 0          // no run has ended yet
+pub const SUP_OUT_EXITED: i32 = 1        // `last_code_of` is its exit status
+pub const SUP_OUT_SIGNALLED: i32 = 2     // killed — by `stop_all`, or by something else
+pub const SUP_OUT_START_FAILED: i32 = 3  // the platform (or a denied Spawner) refused to start it
+
+@no_alloc @no_os pub fn outcome_name(o: i32) -> str {
+    if o == SUP_OUT_NONE { return "none" }
+    if o == SUP_OUT_EXITED { return "exited" }
+    if o == SUP_OUT_SIGNALLED { return "signalled" }
+    if o == SUP_OUT_START_FAILED { return "start-failed" }
+    return "?"
+}
+
+// ---- events ------------------------------------------------------------------------
+//
+// `on_event(ctx, kind, slot, detail)`. `detail` is the exit code for `SUP_EV_EXITED`,
+// the restart's ordinal (1 for the first restart) for `SUP_EV_RESTARTED`, the restart
+// count for `SUP_EV_GAVE_UP`, 1 for a `SUP_EV_STOPPED` that killed a process and 0 for
+// one that only cancelled a scheduled restart, and 0 for `SUP_EV_STARTED`.
+
+pub const SUP_EV_STARTED: i32 = 0
+pub const SUP_EV_EXITED: i32 = 1
+pub const SUP_EV_RESTARTED: i32 = 2
+pub const SUP_EV_GAVE_UP: i32 = 3
+pub const SUP_EV_STOPPED: i32 = 4
+
+@no_alloc @no_os pub fn event_name(kind: i32) -> str {
+    if kind == SUP_EV_STARTED { return "started" }
+    if kind == SUP_EV_EXITED { return "exited" }
+    if kind == SUP_EV_RESTARTED { return "restarted" }
+    if kind == SUP_EV_GAVE_UP { return "gave-up" }
+    if kind == SUP_EV_STOPPED { return "stopped" }
+    return "?"
+}
+
+// The callback a supervisor starts with. Never observable: it does nothing, so a caller
+// who wants no events need not register anything.
+fn no_event(ctx: *mut u8, kind: i32, slot: usize, detail: i32) {}
+
+// ---- the supervisor ------------------------------------------------------------------
+
+// A bounded table of children, one column per fact. Struct-of-arrays rather than a
+// `List(Slot)`: `sysproc.Child` is `@move`, and a column of them behind a raw pointer is
+// read and written one slot at a time, which is how the language lets a resource be
+// held in a table at all.
+pub struct Supervisor {
+    clock: time.Clock,
+    sp: sysproc.Spawner,
+    a: Allocator,
+    cap: usize,
+    n: usize,
+    // per child
+    kids: *mut sysproc.Child,
+    pols: *mut Policy,
+    phase: *mut i32,
+    outcome: *mut i32,
+    code: *mut i32,
+    runs: *mut i64,         // how many times it has been started; restarts = runs - 1
+    due: *mut i64,          // when the next start is scheduled (SUP_WAITING)
+    delay: *mut i64,        // the delay the NEXT restart will wait
+    began: *mut i64,        // when the current run started
+    hist: *mut i64,         // SUP_HIST_CAP restart timestamps per child, a ring
+    hist_n: *mut i64,       // how many restarts have been recorded into the ring
+    is_exec: *mut bool,     // `add_exec` (path + args) or `add` (a shell line)
+    cmds: *mut u8,          // SUP_CMD_CAP bytes per child: path then args
+    path_len: *mut usize,
+    args_len: *mut usize,
+    // events
+    ctx: *mut u8,
+    on_event: fn(*mut u8, i32, usize, i32),
+    // totals
+    starts: i64,
+    exits: i64,
+    gave_ups: i64,
+    killed: i64,
+}
+
+// A supervisor for up to `cap` children. Nothing runs until `tick`.
+pub fn make(read a: Allocator, take clk: time.Clock, take sp: sysproc.Spawner, cap: usize) -> Supervisor {
+    return Supervisor{
+        clock: clk, sp: sp, a: a, cap: cap, n: 0,
+        kids: mem.allocate(sysproc.Child, a, cap),
+        pols: mem.allocate(Policy, a, cap),
+        phase: mem.allocate(i32, a, cap),
+        outcome: mem.allocate(i32, a, cap),
+        code: mem.allocate(i32, a, cap),
+        runs: mem.allocate(i64, a, cap),
+        due: mem.allocate(i64, a, cap),
+        delay: mem.allocate(i64, a, cap),
+        began: mem.allocate(i64, a, cap),
+        hist: mem.allocate(i64, a, cap * SUP_HIST_CAP),
+        hist_n: mem.allocate(i64, a, cap),
+        is_exec: mem.allocate(bool, a, cap),
+        cmds: mem.allocate(u8, a, cap * SUP_CMD_CAP),
+        path_len: mem.allocate(usize, a, cap),
+        args_len: mem.allocate(usize, a, cap),
+        ctx: null, on_event: &no_event,
+        starts: 0, exits: 0, gave_ups: 0, killed: 0,
+    }
+}
+
+// Stop everything still running, give every handle back, and free the table. A
+// supervisor cannot go away and leave its children behind: that would be exactly the
+// orphan it exists to prevent. Call `stop_all` first if you want its report.
+pub fn free(mut s: Supervisor) {
+    stop_all(s)
+    mem.release(sysproc.Child, s.a, s.kids)
+    mem.release(Policy, s.a, s.pols)
+    mem.release(i32, s.a, s.phase)
+    mem.release(i32, s.a, s.outcome)
+    mem.release(i32, s.a, s.code)
+    mem.release(i64, s.a, s.runs)
+    mem.release(i64, s.a, s.due)
+    mem.release(i64, s.a, s.delay)
+    mem.release(i64, s.a, s.began)
+    mem.release(i64, s.a, s.hist)
+    mem.release(i64, s.a, s.hist_n)
+    mem.release(bool, s.a, s.is_exec)
+    mem.release(u8, s.a, s.cmds)
+    mem.release(usize, s.a, s.path_len)
+    mem.release(usize, s.a, s.args_len)
+    s.n = 0
+    s.cap = 0
+}
+
+// Route events to `f`, with `ctx` handed back on every call.
+@no_alloc @no_os pub fn set_events(mut s: Supervisor, ctx: *mut u8, f: fn(*mut u8, i32, usize, i32)) {
+    s.ctx = ctx
+    s.on_event = f
+}
+
+@no_alloc @no_os pub fn count(read s: Supervisor) -> usize { return s.n }
+@no_alloc @no_os pub fn capacity(read s: Supervisor) -> usize { return s.cap }
+
+// Totals over the supervisor's life.
+@no_alloc @no_os pub fn starts(read s: Supervisor) -> i64 { return s.starts }
+@no_alloc @no_os pub fn exits(read s: Supervisor) -> i64 { return s.exits }
+@no_alloc @no_os pub fn gave_ups(read s: Supervisor) -> i64 { return s.gave_ups }
+@no_alloc @no_os pub fn killed(read s: Supervisor) -> i64 { return s.killed }
+
+// The policy clock, read and moved. `advance` is how a test with a manual clock reaches
+// the deadlines; it is false on a host clock, as `time.advance` is.
+pub fn now(mut s: Supervisor) -> i64 { return time.read_nanos(s.clock) }
+pub fn advance(mut s: Supervisor, by: i64) -> bool { return time.advance(s.clock, by) }
+
+// ---- the columns, one accessor each ------------------------------------------------
+
+@no_alloc @no_os fn ph(read s: Supervisor, i: usize) -> i32 {
+    let v: i32 = unsafe { (s.phase + i).* }
+    return v
+}
+
+@no_alloc @no_os fn set_ph(mut s: Supervisor, i: usize, v: i32) {
+    unsafe { (s.phase + i).* = v }
+}
+
+@no_alloc @no_os fn i64_at(p: *mut i64, i: usize) -> i64 {
+    let v: i64 = unsafe { (p + i).* }
+    return v
+}
+
+@no_alloc @no_os fn set_i64(p: *mut i64, i: usize, v: i64) {
+    unsafe { (p + i).* = v }
+}
+
+// Per child. Out-of-range slots read as a child that does not exist: `SUP_STOPPED`,
+// no outcome, no runs.
+@no_alloc @no_os pub fn phase_of(read s: Supervisor, i: usize) -> i32 {
+    if i >= s.n { return SUP_STOPPED }
+    return ph(s, i)
+}
+
+@no_alloc @no_os pub fn outcome_of(read s: Supervisor, i: usize) -> i32 {
+    if i >= s.n { return SUP_OUT_NONE }
+    let v: i32 = unsafe { (s.outcome + i).* }
+    return v
+}
+
+// The last run's exit code. 0 until a run has ended.
+@no_alloc @no_os pub fn last_code_of(read s: Supervisor, i: usize) -> i32 {
+    if i >= s.n { return 0 }
+    let v: i32 = unsafe { (s.code + i).* }
+    return v
+}
+
+// How many times it has been RE-started: 0 after the first start.
+@no_alloc @no_os pub fn restarts_of(read s: Supervisor, i: usize) -> i64 {
+    if i >= s.n { return 0 }
+    let r: i64 = i64_at(s.runs, i)
+    if r <= 0 { return 0 }
+    return r - 1
+}
+
+// Is its budget spent (or did a start fail)? The question a dashboard asks.
+@no_alloc @no_os pub fn gave_up(read s: Supervisor, i: usize) -> bool {
+    return phase_of(s, i) == SUP_GAVE_UP
+}
+
+// When its next start is due, on the policy clock. Meaningful while `SUP_WAITING`.
+@no_alloc @no_os pub fn due_of(read s: Supervisor, i: usize) -> i64 {
+    if i >= s.n { return 0 }
+    return i64_at(s.due, i)
+}
+
+@no_alloc @no_os pub fn policy_of(read s: Supervisor, i: usize) -> Policy {
+    if i >= s.n { return never() }
+    let p: Policy = unsafe { (s.pols + i).* }
+    return p
+}
+
+// How many children are in each of the two live phases.
+@no_alloc @no_os pub fn running(read s: Supervisor) -> usize {
+    var k: usize = 0
+    var i: usize = 0
+    for i < s.n {
+        if ph(s, i) == SUP_RUNNING { k = k + 1 }
+        i = i + 1
+    }
+    return k
+}
+
+@no_alloc @no_os pub fn waiting(read s: Supervisor) -> usize {
+    var k: usize = 0
+    var i: usize = 0
+    for i < s.n {
+        if ph(s, i) == SUP_WAITING { k = k + 1 }
+        i = i + 1
+    }
+    return k
+}
+
+// Running or waiting to run: the loop condition of a driver. Zero means every child has
+// reached a final phase and there is nothing left for `tick` to do.
+@no_alloc @no_os pub fn active(read s: Supervisor) -> usize {
+    return running(s) + waiting(s)
+}
+
+// The earliest scheduled start among the waiting children, on the policy clock, or -1
+// when none is waiting — how long a driver could sleep, the way `runtime.next_deadline`
+// answers it.
+@no_alloc @no_os pub fn next_deadline(read s: Supervisor) -> i64 {
+    var best: i64 = 0 - 1
+    var i: usize = 0
+    for i < s.n {
+        if ph(s, i) == SUP_WAITING {
+            let d: i64 = i64_at(s.due, i)
+            if best < 0 or d < best { best = d }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ---- registering ----------------------------------------------------------------------
+
+// Common to both forms: copy the command bytes into the slot and schedule the first
+// start for NOW. Refuses (-1) a full table, a command the slot cannot hold, and a budget
+// the history ring cannot count.
+fn register(mut s: Supervisor, read path: str, read args: str, exec: bool, read p: Policy) -> i64 {
+    if s.n >= s.cap { return 0 - 1 }
+    if path.len + args.len > SUP_CMD_CAP { return 0 - 1 }
+    if p.max_restarts > SUP_HIST_CAP as i64 { return 0 - 1 }
+    let i: usize = s.n
+    let base: usize = i * SUP_CMD_CAP
+    var k: usize = 0
+    for k < path.len {
+        unsafe { (s.cmds + base + k).* = path[k] }
+        k = k + 1
+    }
+    var j: usize = 0
+    for j < args.len {
+        unsafe { (s.cmds + base + path.len + j).* = args[j] }
+        j = j + 1
+    }
+    unsafe { (s.path_len + i).* = path.len }
+    unsafe { (s.args_len + i).* = args.len }
+    unsafe { (s.is_exec + i).* = exec }
+    unsafe { (s.kids + i).* = sysproc.no_child() }
+    unsafe { (s.pols + i).* = p }
+    unsafe { (s.outcome + i).* = SUP_OUT_NONE }
+    unsafe { (s.code + i).* = 0 }
+    set_i64(s.runs, i, 0)
+    set_i64(s.due, i, time.read_nanos(s.clock))
+    set_i64(s.delay, i, p.delay_nanos)
+    set_i64(s.began, i, 0)
+    set_i64(s.hist_n, i, 0)
+    set_ph(s, i, SUP_WAITING)
+    s.n = s.n + 1
+    return i as i64
+}
+
+// Register a shell line, as `sysproc.start` runs it. Returns the slot, or -1.
+pub fn add(mut s: Supervisor, read cmd: str, read p: Policy) -> i64 {
+    return register(s, cmd, "", false, p)
+}
+
+// Register a program and its space-separated arguments, as `sysproc.start_exec` runs
+// them — the form a supervised child should usually take (see the header).
+pub fn add_exec(mut s: Supervisor, read path: str, read args: str, read p: Policy) -> i64 {
+    return register(s, path, args, true, p)
+}
+
+// ---- starting -------------------------------------------------------------------------
+
+// Start slot `i` now. The command is copied out of the table into a scratch buffer for
+// the call: `sysproc` copies what it needs before returning, so the scratch is freed
+// straight after.
+fn start_slot(mut s: Supervisor, i: usize, now: i64) {
+    let base: usize = i * SUP_CMD_CAP
+    let plen: usize = unsafe { (s.path_len + i).* }
+    let alen: usize = unsafe { (s.args_len + i).* }
+    let exec: bool = unsafe { (s.is_exec + i).* }
+    var scratch: *mut u8 = alloc(u8, plen + alen + 1)
+    var k: usize = 0
+    for k < plen + alen {
+        var b: u8 = 0
+        unsafe { b = (s.cmds + base + k).* }
+        unsafe { (scratch + k).* = b }
+        k = k + 1
+    }
+    let whole: []u8 = slice(u8, scratch, plen + alen)
+    let pv: []u8 = whole[0 .. plen]
+    let av: []u8 = whole[plen .. plen + alen]
+    let path: str = from_utf8(pv)
+    let args: str = from_utf8(av)
+
+    // `no_child()` is the failure value on both paths: it is not live, and nothing that
+    // started is ever not live.
+    var ch: sysproc.Child = sysproc.no_child()
+    if exec {
+        ch = sysproc.start_exec(s.sp, path, args) catch sysproc.no_child()
+    } else {
+        ch = sysproc.start(s.sp, path) catch sysproc.no_child()
+    }
+    free_ptr(scratch)
+
+    let runs: i64 = i64_at(s.runs, i)
+    if sysproc.is_live(ch) == false {
+        // Final. A start the platform refused is not a crash the budget was written for,
+        // and retrying a command that cannot be found is how a supervisor fills a log.
+        unsafe { (s.outcome + i).* = SUP_OUT_START_FAILED }
+        set_ph(s, i, SUP_GAVE_UP)
+        s.gave_ups = s.gave_ups + 1
+        s.on_event(s.ctx, SUP_EV_GAVE_UP, i, runs as i32)
+        return
+    }
+
+    unsafe { (s.kids + i).* = ch }
+    set_i64(s.runs, i, runs + 1)
+    set_i64(s.began, i, now)
+    set_ph(s, i, SUP_RUNNING)
+    s.starts = s.starts + 1
+    if runs == 0 {
+        s.on_event(s.ctx, SUP_EV_STARTED, i, 0)
+    } else {
+        // A restart: it goes into the window's history at the time it HAPPENED, which is
+        // now — not at the time it was decided, which was a delay ago.
+        let hn: i64 = i64_at(s.hist_n, i)
+        set_i64(s.hist, i * SUP_HIST_CAP + (hn as usize) % SUP_HIST_CAP, now)
+        set_i64(s.hist_n, i, hn + 1)
+        s.on_event(s.ctx, SUP_EV_RESTARTED, i, runs as i32)
+    }
+}
+
+// How many restarts of slot `i` fall inside the window ending now.
+@no_alloc @no_os fn restarts_in_window(read s: Supervisor, i: usize, now: i64, window: i64) -> i64 {
+    let hn: i64 = i64_at(s.hist_n, i)
+    var seen: usize = hn as usize
+    if seen > SUP_HIST_CAP { seen = SUP_HIST_CAP }
+    var k: usize = 0
+    var in_window: i64 = 0
+    for k < seen {
+        let ts: i64 = i64_at(s.hist, i * SUP_HIST_CAP + k)
+        if window <= 0 or now - ts < window { in_window = in_window + 1 }
+        k = k + 1
+    }
+    return in_window
+}
+
+// ---- reaping --------------------------------------------------------------------------
+
+// Has slot `i` (running) exited? If so: record how, release the handle, and decide what
+// the policy says. Returns whether anything changed.
+fn reap(mut s: Supervisor, i: usize, now: i64) -> bool {
+    var ch: sysproc.Child = unsafe { (s.kids + i).* }
+    let st: sysproc.Status = sysproc.try_wait(ch)
+    if sysproc.is_running(st) {
+        unsafe { (s.kids + i).* = ch }
+        return false
+    }
+    sysproc.release(ch)
+    unsafe { (s.kids + i).* = ch }
+
+    let code: i32 = sysproc.code_of(st)
+    var failed: bool = code != 0
+    if sysproc.is_signalled(st) {
+        unsafe { (s.outcome + i).* = SUP_OUT_SIGNALLED }
+        failed = true
+    } else {
+        unsafe { (s.outcome + i).* = SUP_OUT_EXITED }
+    }
+    unsafe { (s.code + i).* = code }
+    s.exits = s.exits + 1
+    s.on_event(s.ctx, SUP_EV_EXITED, i, code)
+
+    let p: Policy = unsafe { (s.pols + i).* }
+    var again: bool = p.restart == SUP_ALWAYS
+    if p.restart == SUP_ON_FAILURE and failed { again = true }
+    if again == false {
+        set_ph(s, i, SUP_DONE)
+        return true
+    }
+
+    // The budget. A negative N is no limit; otherwise N restarts inside the window means
+    // this crash is the one that gives up.
+    if p.max_restarts >= 0 {
+        if restarts_in_window(s, i, now, p.window_nanos) >= p.max_restarts {
+            set_ph(s, i, SUP_GAVE_UP)
+            s.gave_ups = s.gave_ups + 1
+            s.on_event(s.ctx, SUP_EV_GAVE_UP, i, restarts_of(s, i) as i32)
+            return true
+        }
+    }
+
+    // The backoff. `delay` holds what THIS restart waits; the one after is computed here
+    // so `due_of` can be read before it is used. A run that outlasted the window resets a
+    // doubling delay to its base — see the header.
+    var d: i64 = i64_at(s.delay, i)
+    if p.backoff == SUP_DOUBLING and p.window_nanos > 0 {
+        if now - i64_at(s.began, i) >= p.window_nanos { d = p.delay_nanos }
+    }
+    set_i64(s.due, i, now + d)
+    var next: i64 = d
+    if p.backoff == SUP_DOUBLING {
+        next = d * 2
+        if next > p.max_delay_nanos { next = p.max_delay_nanos }
+        if next < p.delay_nanos { next = p.delay_nanos }
+    }
+    set_i64(s.delay, i, next)
+    set_ph(s, i, SUP_WAITING)
+    return true
+}
+
+// ---- the step ------------------------------------------------------------------------
+
+// One step: reap the running, start the due. Never blocks. Returns how many children
+// changed phase. A child changes at most once per tick — see the header.
+pub fn tick(mut s: Supervisor) -> i64 {
+    let now: i64 = time.read_nanos(s.clock)
+    var changed: i64 = 0
+    var i: usize = 0
+    for i < s.n {
+        let p: i32 = ph(s, i)
+        if p == SUP_RUNNING {
+            if reap(s, i, now) { changed = changed + 1 }
+        } else {
+            if p == SUP_WAITING and i64_at(s.due, i) <= now {
+                start_slot(s, i, now)
+                changed = changed + 1
+            }
+        }
+        i = i + 1
+    }
+    return changed
+}
+
+// How many running children have ALREADY exited, asked without blocking. The answer is
+// cached in each `Child`, so the `tick` that follows sees the same exits.
+fn exited_so_far(mut s: Supervisor) -> i64 {
+    var k: i64 = 0
+    var i: usize = 0
+    for i < s.n {
+        if ph(s, i) == SUP_RUNNING {
+            var ch: sysproc.Child = unsafe { (s.kids + i).* }
+            let st: sysproc.Status = sysproc.try_wait(ch)
+            unsafe { (s.kids + i).* = ch }
+            if sysproc.is_running(st) == false { k = k + 1 }
+        }
+        i = i + 1
+    }
+    return k
+}
+
+// Wait — on `blk`, the clock the caller can afford to spend — until at least one running
+// child has exited or `budget_nanos` has passed, then `tick`. Returns how many exits were
+// observed: zero means the budget ran out first, which is a normal answer.
+//
+// Returns at once when nothing is running: there is nothing to wait FOR, and a scheduled
+// restart is the policy clock's business, which `next_deadline` tells the caller about.
+// The driver shape this composes into is
+//
+//     for supervise.active(s) > 0 {
+//         supervise.tick(s)
+//         supervise.poll_for(s, clk, budget)
+//     }
+//
+// with `budget` chosen from `next_deadline` — or, under a manual policy clock, with
+// `advance` between the two calls.
+pub fn poll_for(mut s: Supervisor, mut blk: time.Clock, budget_nanos: i64) -> i64 {
+    var seen: i64 = 0
+    if running(s) > 0 {
+        var waited: i64 = 0
+        seen = exited_so_far(s)
+        for seen == 0 {
+            if waited >= budget_nanos { break }
+            var slice: i64 = SUP_POLL_NANOS
+            let left: i64 = budget_nanos - waited
+            if slice > left { slice = left }
+            waited = waited + time.wait(blk, slice)
+            seen = exited_so_far(s)
+        }
+    }
+    tick(s)
+    return seen
+}
+
+// ---- stopping ------------------------------------------------------------------------
+
+// End everything: kill what is running (`sysproc.terminate`, then `wait_or_kill` so the
+// process is reaped and released whatever the kill reported), and cancel every scheduled
+// restart. Returns how many processes were killed; a child that had already exited by the
+// time it was reached is recorded with the outcome it really had.
+//
+// `SUP_EV_STOPPED` fires once per child that was live, with `detail` 1 for a kill and 0
+// for a cancelled restart, so a log can tell "we killed it" from "it never came back".
+pub fn stop_all(mut s: Supervisor) -> i64 {
+    var n: i64 = 0
+    var i: usize = 0
+    for i < s.n {
+        let p: i32 = ph(s, i)
+        if p == SUP_RUNNING {
+            var ch: sysproc.Child = unsafe { (s.kids + i).* }
+            sysproc.terminate(ch)
+            let st: sysproc.Status = sysproc.wait_or_kill(ch, s.clock, 0)
+            unsafe { (s.kids + i).* = ch }
+            if sysproc.is_signalled(st) {
+                unsafe { (s.outcome + i).* = SUP_OUT_SIGNALLED }
+            } else {
+                unsafe { (s.outcome + i).* = SUP_OUT_EXITED }
+            }
+            unsafe { (s.code + i).* = sysproc.code_of(st) }
+            set_ph(s, i, SUP_STOPPED)
+            s.exits = s.exits + 1
+            s.killed = s.killed + 1
+            n = n + 1
+            s.on_event(s.ctx, SUP_EV_STOPPED, i, 1)
+        } else {
+            if p == SUP_WAITING {
+                set_ph(s, i, SUP_STOPPED)
+                s.on_event(s.ctx, SUP_EV_STOPPED, i, 0)
+            }
+        }
+        i = i + 1
+    }
+    return n
+}

@@ -1,0 +1,348 @@
+// std/semver_test.jtr — the precedence rules and the range rules, each pinned by the case
+// a naive implementation gets wrong.
+//
+// Every assertion here is chosen so the OBVIOUS wrong implementation fails it. A suite that
+// only checks `1.0.0 < 2.0.0` passes against a string compare, against a lexical identifier
+// compare, and against a caret that ignores the zero-major rule — it proves nothing about
+// the parts that are actually hard. The five numbered rules below are each a real defect in
+// some shipped resolver.
+//
+// Run:  jestyrc test examples/std/semver_test.jtr
+import "semver"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 4096
+
+// `a` must sort strictly before `b`, AND the reverse must hold. One-sided checking passes
+// an implementation that returns -1 for everything.
+fn lt(mut c: test.Check, mut rep: []u8, read a: str, read b: str) {
+    let va: semver.Version = semver.parse(a)
+    let vb: semver.Version = semver.parse(b)
+    test.is_true(c, rep, a, semver.valid(va))
+    test.is_true(c, rep, b, semver.valid(vb))
+    test.is_true(c, rep, a, semver.compare(a, va, b, vb) < 0)
+    test.is_true(c, rep, b, semver.compare(b, vb, a, va) > 0)
+}
+
+fn same(mut c: test.Check, mut rep: []u8, read a: str, read b: str) {
+    let va: semver.Version = semver.parse(a)
+    let vb: semver.Version = semver.parse(b)
+    test.is_true(c, rep, a, semver.valid(va))
+    test.is_true(c, rep, b, semver.valid(vb))
+    test.eq_i64(c, rep, a, semver.compare(a, va, b, vb) as i64, 0)
+}
+
+fn admits(mut c: test.Check, mut rep: []u8, read req: str, read ver: str, want: bool, read why: str) {
+    let r: semver.Req = semver.parse_req(req)
+    let v: semver.Version = semver.parse(ver)
+    test.is_true(c, rep, req, semver.req_valid(r))
+    test.is_true(c, rep, ver, semver.valid(v))
+    test.eq_bool(c, rep, why, semver.matches(req, r, ver, v), want)
+}
+
+@test fn parses_the_three_numbers_and_the_two_tails() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    let src: str = "1.22.333-alpha.1+build.7"
+    let v: semver.Version = semver.parse(src)
+    test.is_true(c, rep, "valid", semver.valid(v))
+    test.eq_i64(c, rep, "major", semver.major(v), 22 - 21)
+    test.eq_i64(c, rep, "minor", semver.minor(v), 22)
+    test.eq_i64(c, rep, "patch", semver.patch(v), 333)
+    // The tails are byte ranges into the ORIGINAL string, so they must read back exactly —
+    // an off-by-one in the offsets shows up here and nowhere in the ordering tests.
+    test.eq_str(c, rep, "pre", semver.prerelease(src, v), "alpha.1")
+    test.eq_str(c, rep, "build", semver.build(src, v), "build.7")
+
+    let plain: semver.Version = semver.parse("1.2.3")
+    test.eq_str(c, rep, "no pre", semver.prerelease("1.2.3", plain), "")
+    test.eq_str(c, rep, "no build", semver.build("1.2.3", plain), "")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn rejects_what_the_spec_rejects() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // Each is a shape a lenient parser accepts, and each would put two spellings of one
+    // version into a lockfile.
+    test.is_false(c, rep, "too few fields", semver.valid(semver.parse("1.0")))
+    test.is_false(c, rep, "too many fields", semver.valid(semver.parse("1.0.0.0")))
+    test.is_false(c, rep, "leading zero in major", semver.valid(semver.parse("01.0.0")))
+    test.is_false(c, rep, "leading zero in ident", semver.valid(semver.parse("1.0.0-01")))
+    test.is_false(c, rep, "empty identifier", semver.valid(semver.parse("1.0.0-alpha..1")))
+    test.is_false(c, rep, "empty pre-release", semver.valid(semver.parse("1.0.0-")))
+    test.is_false(c, rep, "trailing dot", semver.valid(semver.parse("1.0.0-alpha.")))
+    test.is_false(c, rep, "empty build", semver.valid(semver.parse("1.0.0+")))
+    test.is_false(c, rep, "no `v` prefix", semver.valid(semver.parse("v1.0.0")))
+    test.is_false(c, rep, "no trailing space", semver.valid(semver.parse("1.0.0 ")))
+    test.is_false(c, rep, "empty", semver.valid(semver.parse("")))
+    test.is_false(c, rep, "not a number", semver.valid(semver.parse("1.x.0")))
+
+    // …while `0` is a legal field, which is what makes the leading-zero rule a rule about
+    // EXTRA zeros rather than about the digit. Without these the parser could reject all
+    // zeros and still pass every line above.
+    test.is_true(c, rep, "0.0.0", semver.valid(semver.parse("0.0.0")))
+    test.is_true(c, rep, "bare 0 identifier", semver.valid(semver.parse("1.0.0-0")))
+    test.is_true(c, rep, "hyphen in identifier", semver.valid(semver.parse("1.0.0-a-b")))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn an_invalid_version_reports_where() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // "Every problem is a span" — the offending run, not just a boolean.
+    //          0123456789
+    let v: semver.Version = semver.parse("1.0.0-alpha..1")
+    test.is_false(c, rep, "invalid", semver.valid(v))
+    test.eq_usize(c, rep, "span start", semver.error_start(v), 6)
+    test.eq_usize(c, rep, "span end", semver.error_end(v), 14)
+
+    let z: semver.Version = semver.parse("01.0.0")
+    test.is_false(c, rep, "leading zero invalid", semver.valid(z))
+    test.eq_usize(c, rep, "zero span start", semver.error_start(z), 0)
+    test.eq_usize(c, rep, "zero span end", semver.error_end(z), 2)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn rule_1_a_prerelease_sorts_before_its_release() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // The rule a string compare inverts: "" < "alpha" lexically, but ABSENT is GREATER.
+    lt(c, rep, "1.0.0-alpha", "1.0.0")
+    lt(c, rep, "1.0.0-rc.1", "1.0.0")
+    lt(c, rep, "2.0.0-a", "2.0.0")
+    // …and it does not leak across releases: the NEXT version's pre-release is still above
+    // this one's release.
+    lt(c, rep, "1.0.0", "1.0.1-alpha")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn rule_2_build_metadata_is_ignored_entirely() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // Not a tiebreaker and not a suffix — it does not participate.
+    same(c, rep, "1.0.0+a", "1.0.0+b")
+    same(c, rep, "1.0.0+zzz", "1.0.0")
+    same(c, rep, "1.0.0-rc.1+a", "1.0.0-rc.1+b")
+    // The corollary that catches a "compare the whole string" shortcut: metadata must not
+    // rescue an ordering the numbers already decided.
+    lt(c, rep, "1.0.0+zzz", "1.0.1+aaa")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn rule_3_numeric_identifiers_compare_numerically() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // Lexically "10" < "2", which silently reverses a version series.
+    lt(c, rep, "1.0.0-2", "1.0.0-10")
+    lt(c, rep, "1.0.0-alpha.2", "1.0.0-alpha.10")
+    lt(c, rep, "1.0.0-9", "1.0.0-11")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn rule_4_numeric_ranks_below_alphanumeric() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // Digits precede letters in ASCII too, so this passes by accident under a byte compare.
+    // The case that separates them is a LONG digit run against a short word: lexically
+    // "999" < "a" holds, but so would "999" < "A" — the point is the rule is about KIND,
+    // not bytes, and `1.0.0-999` must lose to any alphanumeric identifier.
+    lt(c, rep, "1.0.0-1", "1.0.0-alpha")
+    lt(c, rep, "1.0.0-999", "1.0.0-a")
+    lt(c, rep, "1.0.0-2", "1.0.0-1a")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn rule_5_a_longer_run_wins_a_tied_prefix() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    lt(c, rep, "1.0.0-alpha", "1.0.0-alpha.1")
+    lt(c, rep, "1.0.0-a.1", "1.0.0-a.1.0")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_spec_ordering_example_holds_end_to_end() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // The chain printed in the SemVer 2.0.0 spec itself, as a transitive ladder. Each
+    // adjacent pair exercises a different one of the five rules, so a single wrong rule
+    // breaks exactly one link rather than the whole suite — which is what makes a failure
+    // here point at the cause.
+    lt(c, rep, "1.0.0-alpha", "1.0.0-alpha.1")
+    lt(c, rep, "1.0.0-alpha.1", "1.0.0-alpha.beta")
+    lt(c, rep, "1.0.0-alpha.beta", "1.0.0-beta")
+    lt(c, rep, "1.0.0-beta", "1.0.0-beta.2")
+    lt(c, rep, "1.0.0-beta.2", "1.0.0-beta.11")
+    lt(c, rep, "1.0.0-beta.11", "1.0.0-rc.1")
+    lt(c, rep, "1.0.0-rc.1", "1.0.0")
+    lt(c, rep, "1.0.0", "1.0.1")
+    lt(c, rep, "1.0.1", "1.1.0")
+    lt(c, rep, "1.1.0", "2.0.0")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_bare_requirement_is_exact() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // Deliberately NOT caret: someone who writes a version means that version.
+    admits(c, rep, "1.2.3", "1.2.3", true, "the version itself")
+    admits(c, rep, "1.2.3", "1.2.4", false, "not a later patch")
+    admits(c, rep, "=1.2.3", "1.2.3", true, "the explicit spelling agrees")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn caret_stops_at_the_leftmost_nonzero_component() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    admits(c, rep, "^1.2.3", "1.2.3", true, "the floor itself")
+    admits(c, rep, "^1.2.3", "1.9.9", true, "a later minor")
+    admits(c, rep, "^1.2.3", "2.0.0", false, "the next major")
+    admits(c, rep, "^1.2.3", "1.2.2", false, "below the floor")
+
+    // **The rule that is usually wrong.** On a zero major the caret pins the MINOR, so
+    // `^0.2.3` must refuse `0.3.0`. An implementation reading `^` as "same major" accepts
+    // it, and a 0.x ecosystem takes an unreviewed breaking change.
+    admits(c, rep, "^0.2.3", "0.2.9", true, "a later patch inside 0.2")
+    admits(c, rep, "^0.2.3", "0.3.0", false, "the next MINOR is out of range on 0.x")
+
+    // And on a zero minor it pins the PATCH.
+    admits(c, rep, "^0.0.3", "0.0.3", true, "the floor")
+    admits(c, rep, "^0.0.3", "0.0.4", false, "the next patch is out of range on 0.0.x")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn tilde_is_patch_level_within_one_minor() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    admits(c, rep, "~1.2.3", "1.2.3", true, "the floor")
+    admits(c, rep, "~1.2.3", "1.2.9", true, "a later patch")
+    admits(c, rep, "~1.2.3", "1.3.0", false, "the next minor")
+    admits(c, rep, "~1.2.3", "1.2.2", false, "below the floor")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_comparison_operators_mean_what_they_say() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    admits(c, rep, ">=1.2.3", "1.2.3", true, ">= includes the bound")
+    admits(c, rep, ">1.2.3", "1.2.3", false, "> excludes it")
+    admits(c, rep, ">1.2.3", "1.2.4", true, "> admits above")
+    admits(c, rep, "<=1.2.3", "1.2.3", true, "<= includes the bound")
+    admits(c, rep, "<1.2.3", "1.2.3", false, "< excludes it")
+    admits(c, rep, "<1.2.3", "1.2.2", true, "< admits below")
+    admits(c, rep, ">= 1.2.3", "1.2.3", true, "a space after the operator is allowed")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_prerelease_candidate_needs_an_opted_in_requirement() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // The rule npm and Cargo both arrived at after shipping the permissive version: a
+    // pre-release is by definition not ready, so a plain range must not reach one.
+    admits(c, rep, "^1.2.3", "2.0.0-rc1", false, "a caret does not admit the next major's rc")
+    admits(c, rep, ">=1.0.0", "1.5.0-beta", false, "an open range does not admit a beta")
+    admits(c, rep, "^1.2.3", "1.9.0-rc1", false, "nor one inside its own range")
+
+    // …unless the requirement names a pre-release on the SAME release triple.
+    admits(c, rep, ">=1.2.3-rc.1", "1.2.3-rc.2", true, "same triple, requirement opted in")
+    admits(c, rep, ">=1.2.3-rc.1", "1.2.3-rc.1", true, "the named one itself")
+    admits(c, rep, ">=1.2.3-rc.1", "1.9.0-rc.1", false, "a DIFFERENT triple is still refused")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_malformed_requirement_reports_rather_than_matching() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    let r: semver.Req = semver.parse_req("^1.0")
+    test.is_false(c, rep, "invalid requirement", semver.req_valid(r))
+    // A requirement that failed to parse must never admit anything. The fail-OPEN version
+    // of this silently installs whatever it is handed, which is the worst outcome available.
+    let v: semver.Version = semver.parse("1.0.0")
+    test.is_false(c, rep, "admits nothing", semver.matches("^1.0", r, "1.0.0", v))
+    // Its span is re-based onto the REQUIREMENT string rather than the version sub-view, so
+    // a caret under it lands on the right column.
+    test.is_true(c, rep, "span past the operator", semver.req_error_start(r) >= 1)
+
+    // A valid requirement against an INVALID candidate is equally closed.
+    let good: semver.Req = semver.parse_req("^1.0.0")
+    let broken: semver.Version = semver.parse("1.x.0")
+    test.is_false(c, rep, "invalid candidate matches nothing",
+                  semver.matches("^1.0.0", good, "1.x.0", broken))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
