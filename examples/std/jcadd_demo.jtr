@@ -1,0 +1,225 @@
+// examples/std/jcadd_demo.jtr — `jadd`: one dependency added, and a whole graph decided.
+//
+// Run:  jestyrc run examples/std/jcadd_demo.jtr
+//
+// ─── What this demonstrates ───────────────────────────────────────────────────
+//
+// A scratch registry is published into a temporary tree: three packages, two versions each.
+// A project's manifest starts with ONE dependency (`base ^1.0.0`) and the command adds a
+// second — `jc add http ^1.0.0`. `http` is not a leaf: version 1.0.0 requires `text ^1.0.0`,
+// and nothing in the project ever names `text`, so the third package arrives only because the
+// graph was resolved rather than the edge.
+//
+// Three of the six published versions are deliberately never chosen. `base 1.1.0`,
+// `text 1.2.0` and `http 1.5.0` all satisfy their requirements and are all newer; minimal
+// version selection takes the LOWEST that satisfies, so publishing them cannot move an
+// existing build. That is `std/resolve`'s central decision, visible here as three lines the
+// lockfile does not contain.
+//
+// Then the same command runs again. It reports the dependency as neither added nor updated,
+// the manifest and the lockfile as unchanged, every archive as already cached — and it writes
+// nothing: the two files are byte-identical and no staging file is left behind. `add` decides
+// that by comparing the candidate it rendered against the bytes on disk, so idempotence is a
+// measured property rather than a convention.
+//
+// Every number is deterministic — the same registry, the same bytes, and a lockfile digest
+// that is a SHA-256 of its own body — so `jadd_resolves_a_transitive_dependency_once`
+// asserts this transcript to the line, the lockfile's hex included.
+//
+// The scratch tree is scrubbed at BOTH ends: at the start because a previous run may have
+// died holding it, and at the end because a demo that leaves files behind fails the next run
+// for the wrong reason.
+
+import "cache"
+import "fs"
+import "jcadd"
+import "manifest"
+import "mem"
+import "registry"
+import "sysfs"
+
+const JA_DIR: str = "zz_jadd"
+const JA_REG: str = "zz_jadd/reg"
+const JA_CACHE: str = "zz_jadd/cache"
+const JA_MANIFEST: str = "zz_jadd/jestyr-package"
+const JA_LOCK: str = "zz_jadd/jestyr-lock"
+
+// The published archives. Their bytes are their identity — the cache keys them by content —
+// so the scrub can find every entry it must remove from these six strings alone.
+const AR_BASE_100: str = "base-1.0.0-archive"
+const AR_BASE_110: str = "base-1.1.0-archive"
+const AR_TEXT_100: str = "text-1.0.0-archive"
+const AR_TEXT_120: str = "text-1.2.0-archive"
+const AR_HTTP_100: str = "http-1.0.0-archive"
+const AR_HTTP_150: str = "http-1.5.0-archive"
+
+fn nothing() { }
+
+// Print `t` without its trailing newline, so a file's own line breaks are the only ones.
+fn show_text(read t: str) {
+    var e: usize = t.len
+    if e > 0 {
+        if (t[e - 1] as i32) == 10 { e = e - 1 }
+    }
+    print_str(t[0 .. e])
+}
+
+// Publish one version. `dep` empty means a leaf.
+fn publish_one(mut h: fs.Fs, read a: Allocator, read r: registry.Registry,
+               read name: str, read ver: str, read dep: str, read dreq: str, read bytes: str) -> bool {
+    var d: manifest.Draft = manifest.draft(a, name, ver)
+    if dep.len > 0 { manifest.draft_dep(d, dep, dreq) }
+    var t: String = manifest.draft_render(a, d)
+    let s: i32 = registry.publish(h, a, r, string_view(t), bytes)
+    string_free(t)
+    return s == registry.PUBLISH_OK
+}
+
+// Remove one registry entry's two files.
+fn unpublish(mut h: fs.Fs, read name: str, read ver: str) {
+    var p: String = string_new()
+    string_push(p, JA_REG)
+    string_push(p, "/")
+    string_push(p, name)
+    string_push(p, "-")
+    string_push(p, ver)
+    string_push(p, ".manifest")
+    fs.erase(h, string_view(p))
+    string_free(p)
+    var q: String = string_new()
+    string_push(q, JA_REG)
+    string_push(q, "/")
+    string_push(q, name)
+    string_push(q, "-")
+    string_push(q, ver)
+    string_push(q, ".tar")
+    fs.erase(h, string_view(q))
+    string_free(q)
+}
+
+// Remove the cache entry for `bytes` and the shard directory it lived in.
+fn drop_entry(mut h: fs.Fs, read a: Allocator, read ch: cache.Cache, read bytes: str) {
+    var key: String = cache.key_of(a, bytes)
+    let k: str = string_view(key)
+    let _e: bool = cache.evict(h, a, ch, k)
+    var sh: String = string_new()
+    string_push(sh, JA_CACHE)
+    string_push(sh, "/")
+    string_push(sh, k[0 .. 2])
+    let _d: bool = sysfs.remove_dir(h, a, string_view(sh)) catch false
+    string_free(sh)
+    string_free(key)
+}
+
+fn scrub(mut h: fs.Fs, read a: Allocator) {
+    var ch: cache.Cache = cache.open(a, JA_CACHE)
+    drop_entry(h, a, ch, AR_BASE_100)
+    drop_entry(h, a, ch, AR_BASE_110)
+    drop_entry(h, a, ch, AR_TEXT_100)
+    drop_entry(h, a, ch, AR_TEXT_120)
+    drop_entry(h, a, ch, AR_HTTP_100)
+    drop_entry(h, a, ch, AR_HTTP_150)
+    unpublish(h, "base", "1.0.0")
+    unpublish(h, "base", "1.1.0")
+    unpublish(h, "text", "1.0.0")
+    unpublish(h, "text", "1.2.0")
+    unpublish(h, "http", "1.0.0")
+    unpublish(h, "http", "1.5.0")
+    fs.erase(h, "zz_jadd/reg/index")
+    fs.erase(h, JA_MANIFEST)
+    fs.erase(h, JA_LOCK)
+    fs.erase(h, "zz_jadd/jestyr-package.jcadd")
+    fs.erase(h, "zz_jadd/jestyr-lock.jcadd")
+    let _c: bool = sysfs.remove_dir(h, a, JA_CACHE) catch false
+    let _r: bool = sysfs.remove_dir(h, a, JA_REG) catch false
+    let _t: bool = sysfs.remove_dir(h, a, JA_DIR) catch false
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h, a)
+    let _d1: bool = sysfs.make_dir(h, a, JA_DIR) catch false
+    let _d2: bool = sysfs.make_dir(h, a, JA_REG) catch false
+
+    print_str("-- jadd --")
+    var r: registry.Registry = registry.open(a, JA_REG)
+    var pubs: i32 = 0
+    if publish_one(h, a, r, "base", "1.0.0", "", "", AR_BASE_100) { pubs = pubs + 1 }
+    if publish_one(h, a, r, "base", "1.1.0", "", "", AR_BASE_110) { pubs = pubs + 1 }
+    if publish_one(h, a, r, "text", "1.0.0", "", "", AR_TEXT_100) { pubs = pubs + 1 }
+    if publish_one(h, a, r, "text", "1.2.0", "", "", AR_TEXT_120) { pubs = pubs + 1 }
+    if publish_one(h, a, r, "http", "1.0.0", "text", "^1.0.0", AR_HTTP_100) { pubs = pubs + 1 }
+    if publish_one(h, a, r, "http", "1.5.0", "text", "^1.2.0", AR_HTTP_150) { pubs = pubs + 1 }
+    print_str("versions published")
+    print_int(pubs as i64)
+
+    fs.put(h, JA_MANIFEST, "jestyr-package/v1\nname app\nversion 0.1.0\ndep base ^1.0.0\n")
+    print_str("the manifest before")
+    var before: String = fs.open_text(h, JA_MANIFEST)
+    show_text(string_view(before))
+
+    var ch: cache.Cache = cache.open(a, JA_CACHE)
+    print_str("-- jc add http ^1.0.0 --")
+    var rp: jcadd.Report = jcadd.add(h, a, JA_MANIFEST, JA_LOCK, r, ch, "http", "^1.0.0")
+    print_str("status")
+    print_str(jcadd.status_name(jcadd.status(rp)))
+    print_str("added, updated")
+    print_bool(jcadd.added(rp))
+    print_bool(jcadd.updated(rp))
+    print_str("packages resolved, rounds")
+    print_int(jcadd.packages(rp) as i64)
+    print_int(jcadd.rounds(rp) as i64)
+    print_str("archives fetched, already cached")
+    print_int(jcadd.fetched(rp) as i64)
+    print_int(jcadd.cached(rp) as i64)
+    print_str("manifest written, lockfile written")
+    print_bool(jcadd.manifest_written(rp))
+    print_bool(jcadd.lock_written(rp))
+
+    print_str("the manifest after")
+    var after: String = fs.open_text(h, JA_MANIFEST)
+    show_text(string_view(after))
+    print_str("the lockfile")
+    var lk: String = fs.open_text(h, JA_LOCK)
+    show_text(string_view(lk))
+    print_str("text is there because http 1.0.0 requires it; the project never named it")
+    print_str("and the three newer versions are absent, which is minimal selection")
+
+    // ---- the same command again -------------------------------------------------------
+    print_str("-- the same command again --")
+    var rp2: jcadd.Report = jcadd.add(h, a, JA_MANIFEST, JA_LOCK, r, ch, "http", "^1.0.0")
+    print_str("status")
+    print_str(jcadd.status_name(jcadd.status(rp2)))
+    print_str("added, updated")
+    print_bool(jcadd.added(rp2))
+    print_bool(jcadd.updated(rp2))
+    print_str("manifest changed, lock changed")
+    print_bool(jcadd.manifest_changed(rp2))
+    print_bool(jcadd.lock_changed(rp2))
+    print_str("archives fetched, already cached")
+    print_int(jcadd.fetched(rp2) as i64)
+    print_int(jcadd.cached(rp2) as i64)
+    print_str("manifest written, lockfile written")
+    print_bool(jcadd.manifest_written(rp2))
+    print_bool(jcadd.lock_written(rp2))
+
+    var after2: String = fs.open_text(h, JA_MANIFEST)
+    var lk2: String = fs.open_text(h, JA_LOCK)
+    print_str("-- the check --")
+    print_str("the manifest is the same bytes")
+    print_bool(str_eq(string_view(after), string_view(after2)))
+    print_str("the lockfile is the same bytes")
+    print_bool(str_eq(string_view(lk), string_view(lk2)))
+    print_str("no staging file survived either run")
+    print_bool(fs.present(h, "zz_jadd/jestyr-package.jcadd") == false)
+    print_bool(fs.present(h, "zz_jadd/jestyr-lock.jcadd") == false)
+
+    string_free(lk2)
+    string_free(after2)
+    string_free(lk)
+    string_free(after)
+    string_free(before)
+    scrub(h, a)
+    return 0
+}

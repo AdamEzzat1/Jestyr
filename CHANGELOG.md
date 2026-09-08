@@ -7,6 +7,38 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/jcadd`** — `jc add <name> <req>` as one command over the whole package substrate:
+  read the local manifest, add or update the dependency, resolve the WHOLE graph against the
+  registry, fetch what is missing through the content-addressed cache, write the lockfile, and
+  re-render the manifest canonically. A LIBRARY (`add(...) -> Report`) with a thin `main`
+  around it rather than a subcommand of `jc` — `jc` is `examples/std/cgen.jtr`, a
+  self-hosting closure module, and a subcommand there rewrites the bootstrap seed; the shape
+  is `census_cli`/`doc_cli`/`escape_cli`'s.
+
+  **A failure moves neither file.** Everything that can fail happens before anything visible
+  moves — the request, the manifest, the candidate (rendered AND parsed back, so a manifest
+  this command writes is one it can read), the resolution, the fetch, the lockfile — and only
+  then are both files staged beside their targets and renamed into place. `registry.fetch`
+  re-hashes an archive against the digest the index promised, so a tampered archive fails with
+  both files still their original bytes. The residual window is stated rather than hidden: two
+  renames are not one atomic act, and the manifest renames first because manifest-new/lock-old
+  is the ordinary state a hand-edited dependency leaves, which `lockfile.verify` reports as
+  drift and the next `add` repairs.
+
+  **Idempotence is measured, not conventional**: the candidate and the rendered lockfile are
+  compared against the bytes on disk and neither is written when nothing moved, so a second
+  run creates no temporary file at all. The whole graph is resolved rather than the new edge,
+  so `add` reports a conflict the new dependency merely revealed; a missing manifest is
+  refused (`ADD_NO_MANIFEST`) rather than invented. 3 tests — six refusals each leaving the
+  manifest byte for byte what it was, one add whose lockfile is checked against a fresh
+  resolution through `lockfile.verify`, and the atomicity claim injected at both places the
+  sequence can still fail after the candidate exists (a tampered archive, and an
+  `fs.read_only()` handle over a warm cache). Demo `jadd` (`examples/std/jcadd_demo.jtr`)
+  publishes a scratch registry, adds a dependency whose own dependency resolves transitively,
+  and runs the same command again to show nothing moves; transcript pinned. Not built:
+  `jc remove`, `jc update`, `jc init`, unpacking an archive into a working tree, a registry
+  chosen by name, or concurrency control between two `add`s on one directory.
+
 - **`std/trace`** — timed, nested segments of work with attributes, exported to whoever is
   listening. A `Tracer` is GIVEN a `time.Clock` and an `Exporter` (`std/log`'s design: no
   ambient tracer, no global), so under `time.manual()` every duration and every id is
