@@ -13,7 +13,7 @@ fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
 
 // unwrap a parse result with a default (tail-position match — the supported form).
 fn uo(take r: Result(f64, ParseFloatError), take d: f64) -> f64 {
-    match r { ok(v) => v, err(e) => d }
+    match r { success(v) => v, failure(e) => d }
 }
 
 // 1 iff `s` parses and its bits equal `expected`'s bits.
@@ -32,8 +32,8 @@ fn same(a: str, b: str) -> i32 {
 // 1 iff `s` is rejected (an error, not a value).
 fn rej(s: str) -> i32 {
     match core.parse_float(s) {
-        ok(v) => 0,
-        err(e) => 1,
+        success(v) => 0,
+        failure(e) => 1,
     }
 }
 

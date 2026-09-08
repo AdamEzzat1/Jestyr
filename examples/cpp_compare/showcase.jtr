@@ -62,7 +62,7 @@ fn fill_and_sum(read a: Allocator, n: i32) -> i32 {
 }
 
 fn unwrap_i64(take r: Result(i64, ParseIntError), take fallback: i64) -> i64 {
-    match r { ok(v) => v, err(e) => fallback }
+    match r { success(v) => v, failure(e) => fallback }
 }
 
 fn setf(p: *mut f64, i: i32, v: f64) { unsafe { (p + i).* = v } }

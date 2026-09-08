@@ -13,7 +13,7 @@ import "../std/core"
 import "../std/io"
 
 fn unwrap_or(take r: Result(i64, ParseIntError), take fallback: i64) -> i64 {
-    match r { ok(v) => v, err(e) => fallback }
+    match r { success(v) => v, failure(e) => fallback }
 }
 
 fn main() -> i32 {

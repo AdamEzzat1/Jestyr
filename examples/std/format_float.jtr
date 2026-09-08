@@ -16,7 +16,7 @@ fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
 // unwrap a parse result (tail-position match — the C-backend-supported form), with a
 // default on error (never taken here, since format_float output always parses).
 fn uo_f(take r: Result(f64, ParseFloatError), take d: f64) -> f64 {
-    match r { ok(v) => v, err(e) => d }
+    match r { success(v) => v, failure(e) => d }
 }
 
 // format x into a fresh buffer, parse it back, return 1 iff bit-identical to x.
