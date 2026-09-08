@@ -74,7 +74,8 @@
 // every header and refuse on any of them — and cannot write a response, because the response
 // belongs to the route's handler, which runs ONCE when the body is complete. A sink that
 // wants to say something says it with a status. `body(x)` is "" for a streamed request (the
-// bytes went to the sink, not to a buffer) and `body_streamed(x)` is how many there were.
+// bytes went to the sink, not to a buffer) and `body_streamed(x)` is how many DECODED bytes
+// there were — the payload, not the chunk framing that carried it.
 //
 // Both framings stream. `Content-Length` delivers exactly that many bytes and not one more,
 // so the bytes after it are the next request and never the body's; a client that promises
@@ -104,6 +105,14 @@
 //   * A head that does not fit the buffer at all is still `431` — that is a header bound, and
 //     a client told `413` would trim the wrong thing.
 //
+// Every one of those closes LINGERS first, and it has to: closing a socket that still holds
+// unread bytes makes the kernel send a RESET, and the reset destroys the response that was
+// just written to explain the refusal — so the client half way through an upload it should
+// stop sending would see a dropped connection and no reason. `linger_close` discards what has
+// ALREADY arrived, each read gated on a zero-timeout poll and the whole thing capped at
+// `HTTPD_LINGER_READS` bufferfuls. That is still not the drain refused above: its cost is
+// bounded by the server's own numbers, and the client cannot extend it by sending more.
+//
 // ─── What is deliberately absent ──────────────────────────────────────────────────────
 //
 // **No TLS** (area 8). **No body streaming OUT of a handler on demand** — `stream_write` is
@@ -112,7 +121,7 @@
 // implement. **No HTTP/1.0 keep-alive negotiation beyond the header.** **No compression, no
 // ranges, no ETags** for static files.
 //
-// Worked example:  examples/std/httpd_demo.jtr, examples/std/httpd_stream_demo.jtr
+// Worked example:  examples/std/httpd_demo.jtr
 // Run the tests:   jestyrc test examples/std/httpd_test.jtr
 
 import "fs"

@@ -9,6 +9,15 @@
 // and an access log — all against a real loopback socket, with the client in the same
 // thread. Client and server take turns, so the transcript is exact and
 // `jhttpd_serves_a_session_on_one_connection` pins it to the line.
+//
+// The last section is an UPLOAD, and it is the one worth reading twice. The server's
+// connection buffer is 1024 bytes and the bodies are 4000; neither one can ever be held
+// whole, so the sink's piece count (printed) is the proof they were not. The first goes up
+// with a `Content-Length`, the second chunk-encoded, and the two report the same byte count
+// and the same checksum — the framing is the client's choice and the handler cannot tell.
+// Immediately after each body the client PIPELINES a `GET /hello`, which is answered from
+// the same buffer: when a streamed body ends, the buffer sits exactly at the next request's
+// first byte.
 
 import "http"
 import "httpc"
@@ -55,6 +64,131 @@ fn h_admin(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
     return 0
 }
 
+// ---- the upload route: a sink, its counters, and the handler that reports them -----------
+//
+// The sink's context is three `i64` slots — bytes, checksum, pieces — because a sink is a fn
+// pointer and a closure that captures cannot be one. `pieces` is the number the demo prints:
+// a body handed over whole would say 1.
+fn up_open(ctx: *mut u8, read x: httpd.Exchange) -> i32 {
+    var p: *mut i64 = ctx as *mut i64
+    unsafe { (p + 0).* = 0 }
+    unsafe { (p + 1).* = 0 }
+    unsafe { (p + 2).* = 0 }
+    return 0
+}
+
+fn up_data(ctx: *mut u8, read d: []u8) -> i32 {
+    var p: *mut i64 = ctx as *mut i64
+    var n: i64 = 0
+    var sum: i64 = 0
+    var pieces: i64 = 0
+    unsafe { n = (p + 0).* }
+    unsafe { sum = (p + 1).* }
+    unsafe { pieces = (p + 2).* }
+    var i: usize = 0
+    for i < d.len {
+        sum = sum + (d[i] as i64)
+        i = i + 1
+    }
+    unsafe { (p + 0).* = n + (d.len as i64) }
+    unsafe { (p + 1).* = sum }
+    unsafe { (p + 2).* = pieces + 1 }
+    return 0
+}
+
+// The handler runs ONCE, after the last byte. It records what the EXCHANGE holds of the body
+// — which is nothing: the bytes went to the sink, so there is no buffer for them to be in.
+fn h_upload(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    var p: *mut i64 = ctx as *mut i64
+    unsafe { (p + 3).* = httpd.body_len(x) as i64 }
+    httpd.respond(x, 200, "text/plain", "stored")
+    return 0
+}
+
+fn show_upload(read label: str, p: *mut i64) {
+    var n: i64 = 0
+    var sum: i64 = 0
+    var pieces: i64 = 0
+    var buffered: i64 = 0
+    unsafe { n = (p + 0).* }
+    unsafe { sum = (p + 1).* }
+    unsafe { pieces = (p + 2).* }
+    unsafe { buffered = (p + 3).* }
+    print_str(label)
+    print_int(n)
+    print_str("checksum")
+    print_int(sum)
+    print_str("arrived in more than one piece")
+    print_bool(pieces > 1)
+    print_str("and the exchange buffered none of it")
+    print_bool(buffered == 0)
+}
+
+fn push_usize(mut s: String, v: usize) {
+    if v == 0 {
+        string_push(s, "0")
+        return
+    }
+    var raw: *mut u8 = alloc(u8, 24)
+    var b: []u8 = slice(u8, raw, 24)
+    var n: usize = 0
+    var t: usize = v
+    for t > 0 {
+        b[n] = (48 + (t % 10)) as u8
+        t = t / 10
+        n = n + 1
+    }
+    var i: usize = 0
+    for i < n / 2 {
+        let tmp: u8 = b[i]
+        b[i] = b[n - 1 - i]
+        b[n - 1 - i] = tmp
+        i = i + 1
+    }
+    string_push(s, from_utf8(b[0 .. n]))
+    free_ptr(raw)
+}
+
+fn push_hex(mut s: String, v: usize) {
+    if v == 0 {
+        string_push(s, "0")
+        return
+    }
+    var raw: *mut u8 = alloc(u8, 24)
+    var b: []u8 = slice(u8, raw, 24)
+    var n: usize = 0
+    var t: usize = v
+    for t > 0 {
+        let d: usize = t % 16
+        if d < 10 { b[n] = (48 + d) as u8 } else { b[n] = (87 + d) as u8 }
+        t = t / 16
+        n = n + 1
+    }
+    var i: usize = 0
+    for i < n / 2 {
+        let tmp: u8 = b[i]
+        b[i] = b[n - 1 - i]
+        b[n - 1 - i] = tmp
+        i = i + 1
+    }
+    string_push(s, from_utf8(b[0 .. n]))
+    free_ptr(raw)
+}
+
+// `n` bytes of a repeating pattern — deterministic, so the checksum in the transcript is a
+// fixed number and any byte lost or reordered changes it.
+fn pattern(n: usize, mut dst: String) {
+    var raw: *mut u8 = alloc(u8, n + 1)
+    var b: []u8 = slice(u8, raw, n)
+    var i: usize = 0
+    for i < n {
+        b[i] = (97 + (i % 26)) as u8
+        i = i + 1
+    }
+    string_push(dst, from_utf8(b))
+    free_ptr(raw)
+}
+
 fn show(read label: str, read body: str) {
     var s: String = string_new()
     string_push(s, label)
@@ -67,8 +201,10 @@ fn show(read label: str, read body: str) {
 fn main() -> i32 {
     let a: Allocator = mem.system_allocator()
     var net: sysnet.Net = sysnet.host()
+    // 1024 bytes of connection buffer, and the uploads below are 4000 — so nothing here can
+    // pass by accident of fitting.
     var sv: httpd.Server = httpd.make(a, time.host(),
-        log.make(time.manual(0), writer.to_buffer(), log.LOG_INFO, log.LOG_LOGFMT), true, 4, 8192)
+        log.make(time.manual(0), writer.to_buffer(), log.LOG_INFO, log.LOG_LOGFMT), true, 4, 1024)
     if httpd.start(sv, net, sysnet.loopback(0), 8) == false {
         print_str("could not listen")
         return 1
@@ -78,6 +214,14 @@ fn main() -> i32 {
     httpd.route(sv, "GET", "/greet/:name", httpd.handler(null, &h_greet))
     httpd.route(sv, "GET", "/count", httpd.handler(null, &h_count))
     httpd.route(sv, "GET", "/admin", httpd.handler(null, &h_admin))
+    var tally: *mut i64 = alloc(i64, 4)
+    var ti: usize = 0
+    for ti < 4 {
+        unsafe { (tally + ti).* = 0 }
+        ti = ti + 1
+    }
+    httpd.route_stream(sv, "POST", "/upload", httpd.handler(tally as *mut u8, &h_upload),
+                       httpd.body_sink(tally as *mut u8, &up_open, &up_data))
     let addr: sysnet.SocketAddr = sysnet.loopback(httpd.port(sv))
 
     print_str("-- jhttpd --")
@@ -134,6 +278,73 @@ fn main() -> i32 {
     show("GET /admin with the token", string_view(b))
     httpc.hangup(c2)
     httpd.serve_for(sv, net, 5)
+
+    // The upload. Two 4000-byte bodies through a 1024-byte buffer, one framed by
+    // `Content-Length` and one chunk-encoded, each followed IN THE SAME WRITE by a pipelined
+    // `GET /hello` that must be answered from what is left in the buffer.
+    print_str("-- an upload larger than the connection buffer --")
+    var payload: String = string_new()
+    pattern(4000, payload)
+    let pv: str = string_view(payload)
+
+    var m1: String = string_new()
+    string_push(m1, "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: ")
+    push_usize(m1, 4000)
+    string_push(m1, "\r\n\r\n")
+    string_push(m1, string_view(payload))
+    string_push(m1, "GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    var u1: httpc.Client = httpc.dial(net, addr, 16384)
+    httpc.send_raw(u1, string_view(m1))
+    httpd.serve_for(sv, net, 200)
+    httpc.read_response(u1)
+    string_free(b)  b = string_new()
+    httpc.body(u1, b)
+    show("POST /upload (content-length)", string_view(b))
+    show_upload("bytes the sink received", tally)
+    httpc.read_response(u1)
+    string_free(b)  b = string_new()
+    httpc.body(u1, b)
+    show("the request pipelined after the body", string_view(b))
+    httpc.hangup(u1)
+    httpd.serve_for(sv, net, 5)
+
+    var enc: String = string_new()
+    var off: usize = 0
+    for off < 4000 {
+        var n: usize = 700
+        if off + n > 4000 { n = 4000 - off }
+        push_hex(enc, n)
+        string_push(enc, "\r\n")
+        string_push(enc, pv[off .. off + n])
+        string_push(enc, "\r\n")
+        off = off + n
+    }
+    string_push(enc, "0\r\n\r\n")
+
+    var m2: String = string_new()
+    string_push(m2, "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n")
+    string_push(m2, string_view(enc))
+    string_push(m2, "GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    var u2: httpc.Client = httpc.dial(net, addr, 16384)
+    httpc.send_raw(u2, string_view(m2))
+    httpd.serve_for(sv, net, 200)
+    httpc.read_response(u2)
+    string_free(b)  b = string_new()
+    httpc.body(u2, b)
+    show("POST /upload (chunked)", string_view(b))
+    show_upload("bytes the sink received", tally)
+    httpc.read_response(u2)
+    string_free(b)  b = string_new()
+    httpc.body(u2, b)
+    show("the request pipelined after the body", string_view(b))
+    httpc.hangup(u2)
+    httpd.serve_for(sv, net, 5)
+
+    string_free(m2)
+    string_free(enc)
+    string_free(m1)
+    string_free(payload)
+    free_ptr(tally as *mut u8)
 
     print_str("-- the access log's last record names the status --")
     print_bool(contains(httpd.last_log(sv), "status=200"))
