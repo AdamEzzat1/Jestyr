@@ -18,7 +18,7 @@
 //   `!fail`    report an error the plugin can describe (an exit code, or an error frame)
 //   `!silent`  MISBEHAVE: exit 0 without answering (one-shot), or answer with prose instead of
 //              a frame (server) — the bad-response case, which no well-behaved plugin shows
-//   `!sleep`   stop answering for three seconds — longer than any budget a demo sets
+//   `!sleep`   stop answering for ten seconds — far longer than any budget a demo sets
 //   `!die`     exit mid-call with code 7, without answering
 //
 // In server mode every answer is prefixed with `#<n> ` — the number of requests this process
@@ -46,16 +46,22 @@ const ECHO_EXIT_WORK_FAILED: i32 = 5
 const ECHO_EXIT_WRITE_FAILED: i32 = 6
 const ECHO_EXIT_DIED: i32 = 7
 
-// How long `!sleep` sleeps. **Bounded from both sides, and the upper bound is the surprising
-// one.** It must comfortably outlast the budget of the call that means to time out —
-// `plugin_server_demo` tightens to 400ms first, so three seconds is over seven times that.
-// It must also be SHORT, because this is what a killed plugin costs its host in wall time:
-// `terminate` reaches `cmd.exe`, not this process, so a napping plugin is orphaned rather
-// than killed — and it was started with the host's own stdout among its inherited handles,
-// so anything CAPTURING the host's output (a shell's `$(…)`, the transcript test's
-// `Command::output`) waits for this nap to end before it sees end-of-file. A ten-second nap
-// made a two-second demo take ten seconds to read.
-const ECHO_NAP_NANOS: i64 = 3000000000
+// How long `!sleep` sleeps. **It only has to be bounded from BELOW now, and that is the
+// change worth recording.** It must comfortably outlast the budget of the call meant to time
+// out — `plugin_server_demo` tightens to 400ms first, so ten seconds is twenty-five times
+// that, and a timeout attributable to anything but this nap would need the machine to lose
+// nine and a half seconds.
+//
+// It used to need an upper bound as well, and the bound was tight: `plugin.terminate`
+// reached `cmd.exe` rather than this process, so a napping plugin was ORPHANED rather than
+// killed, and it held the host's inherited stdout — so anything capturing the host's output
+// waited out the whole nap before seeing end-of-file. That is why this was cut to three
+// seconds. `plugin.connect` now starts the plugin in a group and kills the group, and the
+// cost was measured through a pipe (which is what `Command::output` gives it), three runs
+// each: without the group 3.41s at a three-second nap and 10.46s at a ten-second one — the
+// nap, paid in full; with it 0.90s and 1.02s. The nap is free, so it is sized for the
+// property it demonstrates rather than for what it used to cost.
+const ECHO_NAP_NANOS: i64 = 10000000000
 
 fn main() -> i32 {
     if env.argc() < 2 { return serve_forever() }

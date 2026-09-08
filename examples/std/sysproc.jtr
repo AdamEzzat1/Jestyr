@@ -606,7 +606,28 @@ fn zero_bytes(p: *mut u8, n: usize) {
 // **stderr goes to the same pipe as stdout**, deliberately: a second pipe is a second
 // thing to drain, and draining two of them from one thread without a poll is the deadlock
 // above with extra steps. A caller who needs them apart can redirect in the command.
-@cfg(windows) pub fn start_piped(mut s: Spawner, read cmd: str) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+//
+// **The body is `start_piped_at`**, which is this call plus the three facts a process can
+// only be given at the instant it is created — a working directory, one more environment
+// variable, and apartness (its own process group, or a Windows child created suspended for
+// a Job to claim). `start_at` is the same generalisation of `start`, and the section near
+// the end of this file argues why those three belong at the creation call rather than in a
+// policy module. It is a delegation rather than a second copy because a piped start has a
+// dozen ordering rules in it — which handle is made non-inheritable, which end the parent
+// closes and when — and two copies of those is two places for the drain to stop seeing EOF.
+pub fn start_piped(mut s: Spawner, read cmd: str) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+    return start_piped_at(s, cmd, "", "", false)
+}
+
+// `start_piped`, plus `cwd` (empty: inherit), `env_extra` (empty: nothing — ONE
+// `NAME=value` appended to the inherited block) and `apart`. See `start_at` for what those
+// three mean and why they are here; the pipes are set up exactly as `start_piped` does.
+//
+// **A caller that passes `apart: true` on Windows owes a `resume`**, because the child is
+// created suspended so that a Job object can claim it before it runs an instruction — the
+// only order in which a grandchild cannot be born outside the group. `std/plugin.connect`
+// is the consumer this exists for.
+@cfg(windows) pub fn start_piped_at(mut s: Spawner, read cmd: str, read cwd: str, read env_extra: str, apart: bool) -> Child !{ SysProcFailed(i32), SysProcRefused } {
     if s.allowed == false {
         s.refused = s.refused + 1
         return err(SysProcRefused)
@@ -667,8 +688,15 @@ fn zero_bytes(p: *mut u8, n: usize) {
     unsafe { (ss + SPROC_SI_STDOUT_SLOT).* = out_wr }
     unsafe { (ss + SPROC_SI_STDERR_SLOT).* = out_wr }
 
+    var dir: *mut u8 = null
+    if cwd.len > 0 { dir = nul_copy(cwd) }
+    var envb: *mut u8 = null
+    if env_extra.len > 0 { envb = env_block_with(env_extra) }
+    var flags: i32 = 0
+    if apart { flags = SPROC_CREATE_SUSPENDED }
+
     // `bInheritHandles` TRUE — the whole point, and the flag `start` passes as 0.
-    let rc: i32 = CreateProcessA(null, line as cptr, null, null, 1, 0, null, null, si as cptr, pi as cptr)
+    let rc: i32 = CreateProcessA(null, line as cptr, null, null, 1, flags, envb as cptr, dir as cptr, si as cptr, pi as cptr)
     var code: i32 = 0
     if rc == 0 { code = syserr.last_raw() }
 
@@ -685,6 +713,8 @@ fn zero_bytes(p: *mut u8, n: usize) {
         pid = raw as i64
     }
 
+    if envb != null { free_ptr(envb) }
+    if dir != null { free_ptr(dir) }
     free_ptr(pi)
     free_ptr(si)
     free_ptr(line)
@@ -705,7 +735,7 @@ fn zero_bytes(p: *mut u8, n: usize) {
     return ok(Child{ h: h, th: th, pid: pid, live: true, done: false, state: SPROC_RUNNING, code: 0, inp: in_wr, outp: out_rd })
 }
 
-@cfg(posix) pub fn start_piped(mut s: Spawner, read cmd: str) -> Child !{ SysProcFailed(i32), SysProcRefused } {
+@cfg(posix) pub fn start_piped_at(mut s: Spawner, read cmd: str, read cwd: str, read env_extra: str, apart: bool) -> Child !{ SysProcFailed(i32), SysProcRefused } {
     if s.allowed == false {
         s.refused = s.refused + 1
         return err(SysProcRefused)
@@ -755,11 +785,19 @@ fn zero_bytes(p: *mut u8, n: usize) {
     unsafe { (argv + 1).* = a1 as i64 }
     unsafe { (argv + 2).* = a2 as i64 }
     unsafe { (argv + 3).* = 0 }
+    var dirp: *mut u8 = null
+    if cwd.len > 0 { dirp = nul_copy(cwd) }
+    var extra: *mut u8 = null
+    var envp: *mut i64 = null
+    if env_extra.len > 0 {
+        extra = nul_copy(env_extra)
+        envp = env_with(extra)
+    }
 
     let pid: i64 = fork()
     if pid == 0 {
         // **The child.** Everything from here to `execv` is async-signal-safe: `dup2`,
-        // `close`, `execv`, `_exit`. No allocation, no library state.
+        // `close`, `setpgid`, `chdir`, `execv`, `_exit`. No allocation, no library state.
         sys_close(out_rd)
         sys_close(in_wr)
         dup2(in_rd, 0)
@@ -767,12 +805,27 @@ fn zero_bytes(p: *mut u8, n: usize) {
         dup2(out_wr, 2)
         sys_close(in_rd)
         sys_close(out_wr)
-        execv(shp as cptr, argv as cptr)
+        if apart { setpgid(0, 0) }
+        if dirp != null {
+            if chdir(dirp as cptr) != 0 { sys_exit(126) }
+        }
+        if envp != null {
+            execve(shp as cptr, argv as cptr, envp as cptr)
+        } else {
+            execv(shp as cptr, argv as cptr)
+        }
         // Only reachable if exec FAILED. 127 is the shell's own "command not found",
         // which is the closest thing to a convention here.
         sys_exit(127)
     }
 
+    // The parent's half of the group change, so a signal to `-pid` sent immediately after
+    // this returns cannot arrive before the child has moved itself. Harmless after `exec`.
+    if pid > 0 and apart { setpgid(pid, pid) }
+
+    if envp != null { free_ptr(envp) }
+    if extra != null { free_ptr(extra) }
+    if dirp != null { free_ptr(dirp) }
     free_ptr(argv)
     free_ptr(a2)
     free_ptr(a1)
@@ -1319,6 +1372,14 @@ pub fn wait_or_kill(mut c: Child, mut clk: time.Clock, timeout_nanos: i64) -> St
 // moved into a group may already have spawned a grandchild that is not in it — so the
 // primitive has to be here, at the one moment the platform offers. The POLICY (what a
 // group is for, what a jail projects) is `std/sandbox`'s and is not repeated here.
+//
+// There are TWO of these entry points, not one: `start_at` (no pipes) and
+// `start_piped_at`, which is up in the pipes section beside the pipe rules it obeys.
+// They take the same three arguments and mean the same thing by them; the split is only
+// over whether the child's three standard handles are this process's or a pair of pipes.
+// `std/sandbox.start_grouped` is the first, `std/plugin.connect` the second — a plugin
+// has to be talked to AND has to die with its host, and one without the other is the
+// orphan that `std/plugin`'s header used to record as an open defect.
 //
 // `env_extra` is ONE `NAME=value` string appended to the INHERITED environment, not a
 // replacement for it. Jestyr has no way to set a variable in its own process (`std/env`

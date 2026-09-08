@@ -7,6 +7,36 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/plugin` kills the plugin, not its shell.** `connect` now starts its child in a
+  `sandbox.Group` — a Job object on Windows, a process group on POSIX — and `hangup`, the
+  timeout path and every other path that ends a connection take the GROUP down after the
+  child. `sysproc.terminate` reaches the child that was started, and on Windows that is
+  `cmd.exe` rather than the plugin under it (the shell does not `exec`), so a plugin killed
+  mid-call was orphaned holding the host's inherited handles: anything CAPTURING the host's
+  output waited for the orphan instead of seeing end-of-file. The two modules landed in the
+  same pass and the join was left undone; `plugin.jtr`'s header recorded it as such.
+
+  New: `sysproc.start_piped_at` (`start_piped` plus the three facts a process can only be
+  given at creation — `cwd`, one appended `NAME=value`, and `apart`), with `start_piped`
+  delegating to it rather than keeping a second copy of the pipe-ordering rules;
+  `sandbox.open_group` and `sandbox.join_group` made public, so the four-step order the group
+  depends on — open, start apart, join before the child runs, resume — is written once and
+  composed by a caller that has pipes but no `Jail`; `plugin.tree_reaped` (was the tree
+  CONFIRMED empty, bounded by `PLUGIN_REAP_NANOS`, never a wait) and `plugin.tree_live`.
+
+  **The workaround this removes was a measurement.** `plugin_echo`'s `!sleep` nap had been
+  cut from ten seconds to three because a killed plugin's nap was what its host's reader
+  paid; through a pipe, three runs each, the nap now costs nothing: without the group 3.41s
+  at a three-second nap and 10.46s at a ten-second one, with it 0.90s and 1.02s. The nap is
+  back to ten seconds — twenty-five times the 400ms budget it must beat — and
+  `jplugin_keeps_one_plugin_and_survives_it` asserts the elapsed time of its
+  `Command::output`, the one assertion in that test a re-orphaned plugin would fail.
+  `plugin_test` grows an eleventh test: a plugin whose shell keeps a grandchild, the
+  grandchild waited for so that the kill is a fair experiment, then killed past its budget
+  with the whole tree confirmed gone inside a bounded wait. **POSIX is compiled but not run
+  here** — a `sh -c` of a simple command usually `exec`s, so the orphan this fixes is a
+  Windows symptom, and `setpgid` + `kill(-pgid, …)` are exercised on Linux by CI alone.
+
 - **`std/trace`** — timed, nested segments of work with attributes, exported to whoever is
   listening. A `Tracer` is GIVEN a `time.Clock` and an `Exporter` (`std/log`'s design: no
   ambient tracer, no global), so under `time.manual()` every duration and every id is

@@ -41,6 +41,15 @@ import "test_report"
 @cfg(posix) fn crash_cmd() -> str { return "kill -9 $$" }
 @cfg(windows) fn crash_cmd() -> str { return "exit -1073741819" }
 
+// A "plugin" that never answers and whose shell keeps a GRANDCHILD alive — the shape the
+// group exists for. The grandchild SAYS it is alive by writing a marker before it sleeps, so
+// the test can wait for it to exist rather than kill the shell in the milliseconds before it
+// has spawned anything; that is the mistake `std/sandbox`'s own group test recorded making on
+// its first run, where the group emptied for the wrong reason. Both spellings are copied from
+// there, where they are known to nest correctly through the platform shell.
+@cfg(posix) fn tree_cmd() -> str { return "sh -c 'echo x> zz_plugin_grandchild.txt; sleep 30'; exit 0" }
+@cfg(windows) fn tree_cmd() -> str { return "cmd /c \"echo x> zz_plugin_grandchild.txt & ping -n 30 127.0.0.1 > nul\"" }
+
 const P_T_CAP: usize = 8192
 // The budget the tests below hand a connection whose child is expected to ANSWER (by
 // exiting, or by writing prose) rather than to hang. Ten seconds, because a budget is only
@@ -52,10 +61,21 @@ const P_T_CAP: usize = 8192
 const P_T_ROOMY: i64 = 10000000000
 const P_T_REQ: str = "zz_plugin_req.bin"
 const P_T_RESP: str = "zz_plugin_resp.bin"
+const P_T_MARKER: str = "zz_plugin_grandchild.txt"
 
 fn scrub(mut f: fs.Fs) {
     fs.erase(f, P_T_REQ)
     fs.erase(f, P_T_RESP)
+}
+
+// Wait up to `budget` real nanoseconds for `p` to appear.
+fn wait_for_file(mut f: fs.Fs, mut clk: time.Clock, read p: str, budget: i64) -> bool {
+    var waited: i64 = 0
+    for fs.present(f, p) == false {
+        if waited >= budget { return false }
+        waited = waited + time.wait(clk, 10000000)
+    }
+    return true
 }
 
 fn load(mut buf: []u8, read text: str) -> usize {
@@ -490,6 +510,68 @@ fn setup(mut buf: []u8, read text: str) -> usize { return load(buf, text) }
     test.eq_str(c, rep, "crashed", plugin.outcome_name(r.outcome), "crashed")
     test.is_false(c, rep, "and the connection is over", plugin.is_up(h))
     plugin.hangup(h)
+
+    free_ptr(rb)
+    free_ptr(pb)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **A timeout must kill the PLUGIN, not the shell that started it.** `terminate` reaches the
+// child `connect` started, and on Windows that is `cmd.exe`: the shell does not `exec`, so
+// killing it alone leaves everything under it running — holding whatever handles it inherited
+// from the host, which is how a plugin two modules away becomes a host that never reaches
+// end-of-file. `connect` therefore starts the plugin in a group and the timeout takes the
+// group down; this is that claim, in the shape `sandbox`'s own group test uses.
+//
+// The command's shell spawns a GRANDCHILD which announces itself and then sleeps for thirty
+// seconds. The test waits for the announcement — so the grandchild demonstrably exists before
+// anything is killed — lets the call time out on a manual clock, and then asks whether the
+// whole tree was confirmed gone. Every wait here is BOUNDED: if the group will not empty,
+// `tree_reaped` comes back false after `PLUGIN_REAP_NANOS` and this test FAILS. It does not
+// hang, and a hang would itself be the verdict.
+@test fn a_timeout_kills_the_plugins_whole_tree_and_not_only_its_shell() -> bool {
+    var raw: *mut u8 = alloc(u8, P_T_CAP)
+    var rep: []u8 = slice(u8, raw, P_T_CAP)
+    var c: test.Check = test.new()
+    var sp: sysproc.Spawner = sysproc.host()
+    // The budget is spent on a MANUAL clock, so it is gone on the first poll and the thirty
+    // seconds the grandchild means to sleep are never real seconds for this suite.
+    var clk: time.Clock = time.manual(0)
+    var real: time.Clock = time.host()
+    var f: fs.Fs = fs.host()
+    var pb: *mut u8 = alloc(u8, 256)
+    var payload: []u8 = slice(u8, pb, 256)
+    var rb: *mut u8 = alloc(u8, 256)
+    var resp: []u8 = slice(u8, rb, 256)
+    let n: usize = setup(payload, "hello")
+    fs.erase(f, P_T_MARKER)
+
+    var h: plugin.Conn = plugin.connect(sp, clk, tree_cmd(), 100000000) catch plugin.no_conn()
+    test.is_true(c, rep, "connected", plugin.is_up(h))
+    // **Anti-vacuity.** Without this the shell can die childless and the group empties for
+    // the wrong reason — a green test that proves nothing at all.
+    test.is_true(c, rep, "the grandchild reported in", wait_for_file(f, real, P_T_MARKER, 20000000000))
+    test.is_true(c, rep, "so the plugin's tree is running", plugin.tree_live(h))
+
+    let t0: i64 = time.read_nanos(real)
+    let r: plugin.Reply = plugin.call(h, payload[0 .. n], resp)
+    let spent_ms: i64 = (time.read_nanos(real) - t0) / 1000000
+    test.eq_str(c, rep, "timed-out", plugin.outcome_name(r.outcome), "timed-out")
+    test.is_true(c, rep, "the shell was killed", sysproc.is_signalled(plugin.exit_status(h)))
+    // The claim the group is for: not "a kill was requested" but "the tree is empty", asked
+    // of the platform and answered inside a bounded wait.
+    test.is_true(c, rep, "and the whole tree with it, confirmed", plugin.tree_reaped(h))
+    test.is_false(c, rep, "nothing is left running", plugin.tree_live(h))
+    test.is_false(c, rep, "the connection is over", plugin.is_up(h))
+    // Bounded in REAL time too: a host that waited out the grandchild would take thirty
+    // seconds to get here.
+    test.is_true(c, rep, "the host did not wait out the grandchild", spent_ms < 5000)
+
+    let st: sysproc.Status = plugin.hangup(h)
+    test.is_true(c, rep, "hangup on a killed connection returns", sysproc.is_signalled(st))
+    fs.erase(f, P_T_MARKER)
 
     free_ptr(rb)
     free_ptr(pb)
