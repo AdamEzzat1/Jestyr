@@ -460,9 +460,9 @@ obvious next layer if the tier wants an end-to-end `jc add`.
 ### ~~2.2 — HTTP V2 (area 6)~~ — **DONE: `std/httpd` + `std/httpc`**
 
 Routing, middleware, keep-alive with pipelining, read and idle timeouts, chunked streaming
-out, static files, an access log, a test client. Eight tests on real loopback sockets, five
-mutations watched failing, the `jhttpd` demo pinned. The long note's §3s has the design.
-What a successor should not re-derive:
+out AND request-body streaming IN, static files, an access log, a test client. Twelve tests
+on real loopback sockets, eleven mutations watched failing, the `jhttpd` demo pinned. The
+long note's §3s has the design. What a successor should not re-derive:
 
 * **One thread, one poll.** `spawn` refuses `mut` params, so a per-connection worker is a
   channel architecture; the readiness loop over `runtime.ask` is smaller and makes the
@@ -478,8 +478,37 @@ What a successor should not re-derive:
   `log` (→ `json`/`writer`) shared a closure with a struct holding a `json.Writer`.
   **CLOSED 2026-09-06** (reference-only; the port was already right — see the register).
   `httpd_test`'s dropped `sysfs` import may go back.
-* Not built: request-body streaming (a request must fit the connection buffer; 431 and a
-  close otherwise), TLS, compression, ranges, ETags.
+* **Request-body streaming is DONE (2026-09-08).** `route_stream(sv, method, pattern,
+  handler, sink)` registers a route whose body is PUSHED to a `BodySink` — `on_open(ctx,
+  read Exchange)` when the head is in, `on_data(ctx, read []u8)` per piece, both answering a
+  STATUS (0 accepts, anything else is sent and the connection closed). Four things not to
+  re-derive:
+  * **Push, not pull.** A `read_body(x, buf)` call would have to block, and one blocking
+    read on a single-threaded server is one slow uploader starving every connection. The
+    sink is fed from inside the poll and the loop returns.
+  * **`std/http` grew `parse_head` + `body_from_head` + `chunk_step`, and `parse_request` IS
+    the first two in order.** There is still exactly one start-line loop, one header loop and
+    one framing scan; a second framing decision is the whole smuggling class. `chunk_step`
+    drives the same `line_end`/`strict_hex` pair `frame_chunked` uses.
+  * **The head is PINNED at [0, head_len) while the body streams** and the window behind it
+    is refilled and slid. When the body ends, `req.total = head_len` and `answer`'s own
+    consume step leaves the buffer exactly at the next request's first byte — the pipelining
+    invariant is not a second implementation. The server's shared header array is refilled by
+    re-parsing the pinned head, because another connection may have used it meanwhile.
+  * **An error close MUST LINGER.** Closing a socket that still holds unread bytes makes the
+    kernel send a RESET, and the reset destroys the response just written to explain the
+    refusal — a 413 to a client half way through an upload simply vanished. `linger_close`
+    discards what has already arrived, each read gated on a ZERO-timeout `runtime.ask` and
+    the loop capped at 16 bufferfuls. This is not the drain the header refuses: its cost is
+    the server's number, not the client's. Three of the six mutations found this.
+* **A socket suite must not be able to hang.** `httpc` blocks, so `read_response` against a
+  server that stopped answering never returns, and three mutations were first detected as
+  hangs rather than named failures. `httpc.fd` + `httpc.pending` were added for this, and
+  the streaming cases read through a `resp_within` helper that polls first — `pending`
+  matters because a pipelined answer arrives in the same read as the one before it and never
+  makes the socket readable a second time.
+* Not built: `Expect: 100-continue` (a client that waits for it gets nothing until the read
+  timeout), a pull-shaped body API, TLS, compression, ranges, ETags.
 
 ### ~~2.3 — Storage V2 (area 9)~~ — **DONE: `std/kv`**
 
@@ -810,8 +839,8 @@ reseed (it imports `sha256` and `fs` read-only). What a successor should not re-
 
 Plus the layer the breadth pass stopped short of: **the `jc add` command** over
 `manifest` + `registry` + `resolve` + `lockfile` + `cache` (every piece exists and is tested
-end to end; the command is the glue), and **request-body streaming** in `httpd` (a request
-must fit the connection buffer today).
+end to end; the command is the glue). **Request-body streaming in `httpd` is DONE** —
+see §2.2.
 
 ### ~~Service supervision~~ — **DONE: `std/supervise`**
 
