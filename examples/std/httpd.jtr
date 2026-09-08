@@ -50,12 +50,76 @@
 // up front. The chunk framing is written here and decoded by `std/http` — the same module
 // that refuses to DECODE anything ambiguous, so what this emits is what the parser accepts.
 //
+// ─── Streaming a request body IN: the sink, and why it is not a `read` call ──────────
+//
+// A body larger than the connection buffer cannot be handed to a handler whole, and a
+// handler that BLOCKS asking for the next piece would stop the one thread every other
+// connection is polled on — a slow uploader would starve the server, which is the whole
+// failure this design exists to avoid. So a body is PUSHED, not pulled: `route_stream`
+// registers a route with a `BodySink`, and the readiness loop hands the sink whatever
+// arrived, in the poll, and returns. There is no blocking read anywhere and no coroutine to
+// need one.
+//
+// The head is PINNED. While a body streams, the request's head sits at the front of the
+// connection buffer and is never moved, so every accessor on the exchange keeps working and
+// the body window is what is left of the buffer. Each round: read into the window, hand the
+// sink what decoded, slide the undecoded remainder back against the head. When the body
+// ends, whatever follows it in the buffer is the next request and is moved to the front —
+// **that is the pipelining invariant, and it is the same memmove the buffered path does.**
+//
+//   `on_open(ctx, read Exchange) -> i32`   the head is in; 0 accepts, a status refuses
+//   `on_data(ctx, read []u8) -> i32`       one piece; 0 accepts, a status refuses
+//
+// `on_open` takes the exchange by `read`, so a sink can look at the path, the parameters and
+// every header and refuse on any of them — and cannot write a response, because the response
+// belongs to the route's handler, which runs ONCE when the body is complete. A sink that
+// wants to say something says it with a status. `body(x)` is "" for a streamed request (the
+// bytes went to the sink, not to a buffer) and `body_streamed(x)` is how many DECODED bytes
+// there were — the payload, not the chunk framing that carried it.
+//
+// Both framings stream. `Content-Length` delivers exactly that many bytes and not one more,
+// so the bytes after it are the next request and never the body's; a client that promises
+// more than it sends stalls, and the READ timeout — the same one Slowloris meets — closes it
+// with a 408. `Transfer-Encoding: chunked` is decoded by `std/http`'s `chunk_step`, one unit
+// per call over a buffer being refilled, and a malformed chunk size is a `400` and a close
+// rather than a wait for bytes that would never make it valid.
+//
+// ─── Bounds, and what happens to a body nobody reads ─────────────────────────────────
+//
+// `set_max_body` bounds a request body — **counted as bytes RECEIVED, not bytes decoded**,
+// because chunk framing is the client's choice and counting only the payload would let the
+// overhead run forever. A declared `Content-Length` over the bound is `413` before one body
+// byte is waited for; a chunked body that grows past it is `413` mid-stream.
+//
+// **A body a handler does not read** has four answers, and they are different on purpose:
+//
+//   * On an ordinary route, a body that FITS the buffer is parsed as part of the message, so
+//     a handler that ignores it costs nothing and the connection carries on — the bytes were
+//     already consumed, and pipelining is unaffected.
+//   * On an ordinary route, a body that does NOT fit the buffer is `413` and **the connection
+//     is closed**. It is not drained. Draining is work the client chose and the server did
+//     not, and the only bound on how long it would take is the client's own honesty.
+//   * A sink that refuses (`on_open` or `on_data` answering non-zero) gets that status sent
+//     and **the connection closed**, for the same reason: the rest of a body that was
+//     refused is not worth reading.
+//   * A head that does not fit the buffer at all is still `431` — that is a header bound, and
+//     a client told `413` would trim the wrong thing.
+//
+// Every one of those closes LINGERS first, and it has to: closing a socket that still holds
+// unread bytes makes the kernel send a RESET, and the reset destroys the response that was
+// just written to explain the refusal — so the client half way through an upload it should
+// stop sending would see a dropped connection and no reason. `linger_close` discards what has
+// ALREADY arrived, each read gated on a zero-timeout poll and the whole thing capped at
+// `HTTPD_LINGER_READS` bufferfuls. That is still not the drain refused above: its cost is
+// bounded by the server's own numbers, and the client cannot extend it by sending more.
+//
 // ─── What is deliberately absent ──────────────────────────────────────────────────────
 //
-// **No TLS** (area 8). **No request-body streaming**: a request must fit the connection
-// buffer, and one that does not is `431` and a close; a server that accepts uploads larger
-// than memory is a different design. **No HTTP/1.0 keep-alive negotiation beyond the
-// header.** **No compression, no ranges, no ETags** for static files.
+// **No TLS** (area 8). **No body streaming OUT of a handler on demand** — `stream_write` is
+// push, same as in. **No `Expect: 100-continue`**: a client that waits for it gets no answer
+// until the read timeout, which is the honest failure for a thing this server does not
+// implement. **No HTTP/1.0 keep-alive negotiation beyond the header.** **No compression, no
+// ranges, no ETags** for static files.
 //
 // Worked example:  examples/std/httpd_demo.jtr
 // Run the tests:   jestyrc test examples/std/httpd_test.jtr
@@ -99,6 +163,7 @@ pub struct Exchange {
     nhs: usize,
     bbuf: *mut u8,              // the DECODED body when the request was chunked, else null
     blen: usize,
+    streamed: i64,              // body bytes handed to a sink, for a streamed request
     route: i32,                 // the matched route's index, -1 before routing / when none
     params: List(i32),          // 4 per param: name off, name len (in the router's patterns),
                                 //              value off, value len (in `buf`)
@@ -161,6 +226,40 @@ pub fn body(read x: Exchange) -> str {
 @no_alloc @no_os pub fn body_len(read x: Exchange) -> usize {
     if x.bbuf != null { return x.blen }
     return x.req.body.len
+}
+
+// How many body bytes went to this route's sink. Zero for every request that was not
+// streamed — a handler that wants to tell the two apart asks this and `body_len`.
+@no_alloc @no_os pub fn body_streamed(read x: Exchange) -> i64 { return x.streamed }
+
+// ---- body sinks ---------------------------------------------------------------------------
+//
+// The consumer of a streamed request body. `@copy` and fn pointers, the `Handler` shape, for
+// the same reason: a closure that captures cannot be stored in a `List`.
+//
+// Both answers are a STATUS: 0 accepts, anything else is sent as a plain response and the
+// connection is closed. That is one convention for "no" whether the reason is size, type or
+// authorisation, and it keeps the response the handler's to write.
+@copy pub struct BodySink {
+    pub ctx: *mut u8,
+    pub on_open: fn(*mut u8, read Exchange) -> i32,
+    pub on_data: fn(*mut u8, read []u8) -> i32,
+    pub active: bool,
+}
+
+// (`body_sink`, not `sink`: `std/sink` is imported here and a module name is taken.)
+@no_alloc @no_os pub fn body_sink(ctx: *mut u8, on_open: fn(*mut u8, read Exchange) -> i32,
+                                  on_data: fn(*mut u8, read []u8) -> i32) -> BodySink {
+    return BodySink{ ctx: ctx, on_open: on_open, on_data: on_data, active: true }
+}
+
+// A route with no sink still owns an entry, because the sink table is indexed by route id.
+// A fn pointer has no null, so the inactive entry points at two functions that say yes.
+@no_alloc @no_os fn sink_open_none(ctx: *mut u8, read x: Exchange) -> i32 { return 0 }
+@no_alloc @no_os fn sink_data_none(ctx: *mut u8, read d: []u8) -> i32 { return 0 }
+
+@no_alloc @no_os pub fn no_body_sink() -> BodySink {
+    return BodySink{ ctx: null, on_open: &sink_open_none, on_data: &sink_data_none, active: false }
 }
 
 @no_alloc @no_os pub fn matched_route(read x: Exchange) -> i32 { return x.route }
@@ -420,6 +519,7 @@ pub struct Router {
     used: usize,
     routes: List(i32),          // 4 per route: method off, method len, pattern off, pattern len
     handlers: List(Handler),
+    sinks: List(BodySink),      // one per route, inactive unless `add_stream_route` set it
 }
 
 impl Drop for Router {
@@ -429,7 +529,8 @@ impl Drop for Router {
 }
 
 pub fn router(read a: Allocator) -> Router {
-    return Router{ pats: string_new(), used: 0, routes: list.make(i32, a), handlers: list.make(Handler, a) }
+    return Router{ pats: string_new(), used: 0, routes: list.make(i32, a),
+                   handlers: list.make(Handler, a), sinks: list.make(BodySink, a) }
 }
 
 pub fn add_route(mut r: Router, read method: str, read pattern: str, h: Handler) -> i32 {
@@ -443,7 +544,22 @@ pub fn add_route(mut r: Router, read method: str, read pattern: str, h: Handler)
     string_push(r.pats, pattern)
     r.used = r.used + pattern.len
     list.push(Handler, r.handlers, h)
+    list.push(BodySink, r.sinks, no_body_sink())
     return id
+}
+
+// The same route, with a sink for its request body. The sink is consulted only when there IS
+// a body: a `GET` on a streaming route reaches its handler exactly as it would otherwise.
+pub fn add_stream_route(mut r: Router, read method: str, read pattern: str, h: Handler, bs: BodySink) -> i32 {
+    let id: i32 = add_route(r, method, pattern, h)
+    list.set(BodySink, r.sinks, id as usize, bs)
+    return id
+}
+
+@no_alloc @no_os fn sink_for(read r: Router, id: i32) -> BodySink {
+    if id < 0 { return no_body_sink() }
+    if id as usize >= list.len(BodySink, r.sinks) { return no_body_sink() }
+    return list.get(BodySink, r.sinks, id as usize)
 }
 
 @no_alloc @no_os pub fn route_count(read r: Router) -> usize { return list.len(i32, r.routes) / 4 }
@@ -539,6 +655,23 @@ fn find_route(read r: Router, read method: str, read path: str, path_off: usize,
     last: i64,          // clock reading at the last byte received or sent
     served: i64,        // requests answered on this connection
     live: bool,
+    // While a request body streams: the head is PINNED at [0, head_len) and the window
+    // [head_len, have) holds body bytes not yet handed to the sink. Every field here is
+    // `@copy` scalar state on purpose — a `Conn` lives in a raw array, so the exchange (which
+    // owns a `String` and a `List`) cannot live here and is rebuilt when the body ends.
+    streaming: bool,
+    head_len: usize,
+    body_left: i64,     // `Content-Length` bytes still owed, or -1 when the body is chunked
+    chunks: http.Chunks,
+    got: i64,           // body bytes RECEIVED for this message, framing included — the bound
+    fed: i64,           // body bytes DELIVERED to the sink, framing excluded — the payload
+    sk: BodySink,
+}
+
+@no_alloc @no_os fn idle_conn() -> Conn {
+    return Conn{ fd: 0 - 1, buf: null, have: 0, last: 0, served: 0, live: false,
+                 streaming: false, head_len: 0, body_left: 0, chunks: http.chunks_new(),
+                 got: 0, fed: 0, sk: no_body_sink() }
 }
 
 fn conn_at(p: *mut Conn, i: usize) -> Conn {
@@ -570,16 +703,27 @@ fn conn_set(p: *mut Conn, i: usize, c: Conn) {
     read_timeout: i64,      // nanos; a partial request older than this is 408 + close
     idle_timeout: i64,      // nanos; a kept-alive connection quiet this long is closed
     max_requests: i64,      // per connection, then `Connection: close`
+    max_body: i64,          // bytes RECEIVED for one request body; over it is 413 + close
     accepted: i64,
     served: i64,
     rejected: i64,          // connections refused for want of a table slot
     timeouts: i64,
     bad: i64,               // requests refused by the parser
+    oversize: i64,          // request bodies refused with a 413
 }
 
 const HTTPD_HEADERS: usize = 100
 const HTTPD_OUT_CAP: usize = 16384
 const HTTPD_LOG_CAP: usize = 2048
+const HTTPD_LINGER_READS: usize = 16    // bufferfuls discarded before an error close
+const HTTPD_MAX_BODY: i64 = 8388608     // 8 MiB, the default body bound
+
+// What a `feed` round decided. Three answers rather than a bool, because "the body is
+// complete" and "there is nothing more in the buffer yet" are different next steps and a
+// server that conflated them would answer a request whose body had not arrived.
+const FEED_WAIT: i32 = 0
+const FEED_DONE: i32 = 1
+const FEED_CLOSE: i32 = 2
 
 // A server over `clock` and `lg`, with room for `max_conns` connections of `buf_cap` bytes
 // each. `logging` false keeps the logger but never writes to it — the knob a test that wants
@@ -588,7 +732,7 @@ pub fn make(read a: Allocator, take clock: time.Clock, take lg: log.Logger, logg
     var conns: *mut Conn = alloc(Conn, max_conns)
     var i: usize = 0
     for i < max_conns {
-        conn_set(conns, i, Conn{ fd: 0 - 1, buf: null, have: 0, last: 0, served: 0, live: false })
+        conn_set(conns, i, idle_conn())
         i = i + 1
     }
     return Server{ r: router(a), mws: list.make(Handler, a), lis: sysnet.closed(), listening: false,
@@ -597,7 +741,8 @@ pub fn make(read a: Allocator, take clock: time.Clock, take lg: log.Logger, logg
                    lbuf: alloc(u8, HTTPD_LOG_CAP), lcap: HTTPD_LOG_CAP, llen: 0,
                    clock: clock, lg: lg, logging: logging, poller: syspoll.host(),
                    read_timeout: 10000000000, idle_timeout: 30000000000, max_requests: 1000,
-                   accepted: 0, served: 0, rejected: 0, timeouts: 0, bad: 0 }
+                   max_body: HTTPD_MAX_BODY,
+                   accepted: 0, served: 0, rejected: 0, timeouts: 0, bad: 0, oversize: 0 }
 }
 
 pub fn set_timeouts(mut sv: Server, read_ms: i64, idle_ms: i64) {
@@ -607,6 +752,11 @@ pub fn set_timeouts(mut sv: Server, read_ms: i64, idle_ms: i64) {
 
 @no_alloc @no_os pub fn set_max_requests(mut sv: Server, n: i64) { sv.max_requests = n }
 
+// The largest request body this server will take, counted as bytes RECEIVED — see the header:
+// chunk framing is the client's choice, and a bound on the decoded payload alone would leave
+// the overhead unbounded.
+@no_alloc @no_os pub fn set_max_body(mut sv: Server, n: i64) { sv.max_body = n }
+
 pub fn use_middleware(mut sv: Server, h: Handler) {
     list.push(Handler, sv.mws, h)
 }
@@ -615,11 +765,19 @@ pub fn route(mut sv: Server, read method: str, read pattern: str, h: Handler) ->
     return add_route(sv.r, method, pattern, h)
 }
 
+// A route whose request body is STREAMED to `bs` rather than buffered whole. The sink is
+// consulted only when there is a body, so a `GET` on such a route behaves exactly as it would
+// on an ordinary one.
+pub fn route_stream(mut sv: Server, read method: str, read pattern: str, h: Handler, bs: BodySink) -> i32 {
+    return add_stream_route(sv.r, method, pattern, h, bs)
+}
+
 @no_alloc @no_os pub fn accepted(read sv: Server) -> i64 { return sv.accepted }
 @no_alloc @no_os pub fn served(read sv: Server) -> i64 { return sv.served }
 @no_alloc @no_os pub fn rejected(read sv: Server) -> i64 { return sv.rejected }
 @no_alloc @no_os pub fn timeouts(read sv: Server) -> i64 { return sv.timeouts }
 @no_alloc @no_os pub fn bad_requests(read sv: Server) -> i64 { return sv.bad }
+@no_alloc @no_os pub fn oversized_bodies(read sv: Server) -> i64 { return sv.oversize }
 @no_alloc @no_os pub fn is_listening(read sv: Server) -> bool { return sv.listening }
 
 pub fn live_connections(read sv: Server) -> usize {
@@ -654,10 +812,49 @@ fn close_conn(mut sv: Server, i: usize) {
     var s: sysnet.Socket = sysnet.adopt(c.fd)
     sysnet.close_socket(s) catch nothing()
     if c.buf != null { free_ptr(c.buf) }
-    conn_set(sv.conns, i, Conn{ fd: 0 - 1, buf: null, have: 0, last: 0, served: 0, live: false })
+    conn_set(sv.conns, i, idle_conn())
 }
 
 fn nothing() { }
+
+// Close a connection an error response has just been written to, discarding what the client
+// has ALREADY sent first.
+//
+// **Without this the error response is lost.** Closing a socket that still holds unread bytes
+// makes the kernel send a RESET rather than a FIN, and a reset discards whatever the client
+// has not read yet — so a 413 written to a client half way through a 4 MB upload never
+// arrives, and the client sees a dropped connection instead of the reason. That is what
+// nginx's `lingering_close` is for.
+//
+// It is NOT the drain the header refuses. This reads only what is already in the socket, at
+// most `HTTPD_LINGER_READS` bufferfuls, and each read is gated on a ZERO-timeout poll — so
+// the moment the client stops feeding it, or the cap is reached, the connection closes. The
+// cost is bounded by the server's own numbers and not by the client's honesty.
+fn linger_close(mut sv: Server, i: usize) {
+    var c: Conn = conn_at(sv.conns, i)
+    if c.live == false { return }
+    if c.buf != null {
+        var fds: *mut i64 = alloc(i64, 1)
+        var rdy: *mut u8 = alloc(u8, 1)
+        unsafe { (fds + 0).* = c.fd }
+        let sock: sysnet.Socket = sysnet.adopt(c.fd)
+        var cb: []u8 = slice(u8, c.buf, sv.bufcap)
+        var k: usize = 0
+        for k < HTTPD_LINGER_READS {
+            unsafe { (rdy + 0).* = 0 as u8 }
+            if runtime.ask(sv.poller, fds, rdy, 1, 0) <= 0 { break }
+            var r: u8 = 0
+            unsafe { r = (rdy + 0).* }
+            if (r as i32) == 0 { break }
+            let n: usize = sysnet.recv_bytes(sock, cb) catch 0
+            if n == 0 { break }
+            k = k + 1
+        }
+        free_ptr(rdy)
+        free_ptr(fds)
+    }
+    close_conn(sv, i)
+}
 
 // Close the listener and every connection. The server may not start again.
 pub fn stop(mut sv: Server, mut net: sysnet.Net) {
@@ -748,11 +945,11 @@ fn wants_keep_alive(read b: []u8, read hs: []http.Header, read req: http.Request
     return true
 }
 
-// Answer one complete request at the front of connection `i`'s buffer. Returns true when the
-// connection stays open.
-fn answer(mut sv: Server, i: usize, read req: http.Request, nhs: usize) -> bool {
-    var c: Conn = conn_at(sv.conns, i)
-    let t0: i64 = time.read_nanos(sv.clock)
+// The exchange for one request on connection `i`. BOTH paths build it here — the buffered one
+// for its handler, the streaming one for its sink's `on_open` — so what a sink is shown of a
+// request and what the handler is shown are the same view, decided in one place.
+fn build_exchange(mut sv: Server, i: usize, read req: http.Request, nhs: usize, streamed: i64) -> Exchange {
+    let c: Conn = conn_at(sv.conns, i)
     let b: []u8 = slice(u8, c.buf, c.have)
     let hs: []http.Header = slice(http.Header, sv.hs, nhs)
 
@@ -772,12 +969,23 @@ fn answer(mut sv: Server, i: usize, read req: http.Request, nhs: usize) -> bool 
     if c.served + 1 >= sv.max_requests { keep = false }
 
     let pv: str = string_view(sv.r.pats)
-    var x: Exchange = Exchange{ buf: c.buf, have: c.have, req: req, hs: sv.hs, nhs: nhs,
-                                bbuf: null, blen: 0, route: 0 - 1, params: list.make(i32, mem.system_allocator()),
-                                pats: pv.ptr as *mut u8, plen: pv.len,
-                                path: http.span(req.target.off, qoff - req.target.off), query: qspan,
-                                fd: c.fd, status: 0, hdrs: string_new(), sent: false, streaming: false,
-                                bytes_out: 0, keep_alive: keep, obuf: sv.obuf, ocap: sv.ocap }
+    return Exchange{ buf: c.buf, have: c.have, req: req, hs: sv.hs, nhs: nhs,
+                     bbuf: null, blen: 0, streamed: streamed,
+                     route: 0 - 1, params: list.make(i32, mem.system_allocator()),
+                     pats: pv.ptr as *mut u8, plen: pv.len,
+                     path: http.span(req.target.off, qoff - req.target.off), query: qspan,
+                     fd: c.fd, status: 0, hdrs: string_new(), sent: false, streaming: false,
+                     bytes_out: 0, keep_alive: keep, obuf: sv.obuf, ocap: sv.ocap }
+}
+
+// Answer one complete request at the front of connection `i`'s buffer. Returns true when the
+// connection stays open. `streamed` is how many body bytes already went to a sink — zero for
+// every request whose body was buffered.
+fn answer(mut sv: Server, i: usize, read req: http.Request, nhs: usize, streamed: i64) -> bool {
+    var c: Conn = conn_at(sv.conns, i)
+    let t0: i64 = time.read_nanos(sv.clock)
+    let b: []u8 = slice(u8, c.buf, c.have)
+    var x: Exchange = build_exchange(sv, i, req, nhs, streamed)
 
     // A chunked body is decoded once, up front, into its own buffer.
     if req.chunked {
@@ -839,34 +1047,264 @@ fn answer(mut sv: Server, i: usize, read req: http.Request, nhs: usize) -> bool 
     return x.keep_alive
 }
 
-// Parse and answer every complete request in connection `i`'s buffer. Returns true when the
-// connection stays open.
+// ---- streaming a request body in --------------------------------------------------------
+
+// Move `n` consumed body bytes out of the window, keeping the head pinned at [0, head_len).
+// Returns the new `have`. This is the same memmove the buffered path does when it consumes a
+// message, and it is what leaves the buffer sitting exactly at the next request's first byte
+// the moment a body ends.
+@no_alloc @no_os fn slid(buf: *mut u8, cap: usize, head_len: usize, have: usize, n: usize) -> usize {
+    var cb: []u8 = slice(u8, buf, cap)
+    let rest: usize = have - head_len - n
+    var j: usize = 0
+    for j < rest {
+        cb[head_len + j] = cb[head_len + n + j]
+        j = j + 1
+    }
+    return head_len + rest
+}
+
+// The sink of the route this head matches, or the inactive one. Routing happens AGAIN later
+// against the exchange's own parameter list; this pass throws its parameters away, because
+// the buffer they point into is about to be rewritten by the body.
+fn sink_for_head(mut sv: Server, read b: []u8, read h: http.Head) -> BodySink {
+    var qoff: usize = h.target.off + h.target.len
+    var k: usize = h.target.off
+    for k < h.target.off + h.target.len {
+        if (b[k] as i32) == 63 { qoff = k  break }
+        k = k + 1
+    }
+    let m: str = http.span_str(h.method, b)
+    let p: str = http.span_str(http.span(h.target.off, qoff - h.target.off), b)
+    var params: List(i32) = list.make(i32, mem.system_allocator())
+    let id: i32 = find_route(sv.r, m, p, h.target.off, params)
+    let bs: BodySink = sink_for(sv.r, id)
+    list.free(i32, params)
+    return bs
+}
+
+// The head of a request with a body is in and its route has a sink. Show the sink the head,
+// and if it accepts, PIN the head and put the connection into the streaming state.
+fn open_stream(mut sv: Server, i: usize, read h: http.Head, bs: BodySink) -> bool {
+    var req: http.Request = http.empty_request()
+    req.method = h.method
+    req.target = h.target
+    req.minor = h.minor
+    req.headers = h.headers
+    req.body = http.span(h.body_off, 0)
+    req.total = h.body_off
+    var x: Exchange = build_exchange(sv, i, req, h.headers, 0)
+    let v: i32 = bs.on_open(bs.ctx, x)
+    string_free(x.hdrs)
+    list.free(i32, x.params)
+
+    var c: Conn = conn_at(sv.conns, i)
+    if v != 0 {
+        sv.bad = sv.bad + 1
+        send_plain(sv, c.fd, v, reason_for(v))
+        return false
+    }
+    c.streaming = true
+    c.head_len = h.body_off
+    c.body_left = 0 - 1
+    if h.chunked == false { c.body_left = h.length }
+    c.chunks = http.chunks_new()
+    c.got = 0
+    c.fed = 0
+    c.sk = bs
+    conn_set(sv.conns, i, c)
+    return true
+}
+
+// Hand connection `i`'s sink whatever body bytes the buffer holds, then slide what is left
+// back against the pinned head. One call moves exactly what has ARRIVED and then returns to
+// the readiness loop — there is no wait here, which is why a slow uploader costs one buffer
+// and not the thread.
+fn feed(mut sv: Server, i: usize) -> i32 {
+    var c: Conn = conn_at(sv.conns, i)
+    var cb: []u8 = slice(u8, c.buf, sv.bufcap)
+
+    if c.body_left >= 0 {
+        // `Content-Length`: exactly that many bytes and never one more, so the bytes after the
+        // body are the NEXT request's and can never be stolen into this one.
+        var n: usize = c.have - c.head_len
+        if (n as i64) > c.body_left { n = c.body_left as usize }
+        if n > 0 {
+            let v: i32 = c.sk.on_data(c.sk.ctx, cb[c.head_len .. c.head_len + n])
+            if v != 0 {
+                sv.bad = sv.bad + 1
+                send_plain(sv, c.fd, v, reason_for(v))
+                return FEED_CLOSE
+            }
+            c.body_left = c.body_left - (n as i64)
+            c.got = c.got + (n as i64)
+            c.fed = c.fed + (n as i64)
+            c.have = slid(c.buf, sv.bufcap, c.head_len, c.have, n)
+            conn_set(sv.conns, i, c)
+        }
+        if c.body_left == 0 { return FEED_DONE }
+        return FEED_WAIT
+    }
+
+    // `Transfer-Encoding: chunked`, decoded one unit at a time by `std/http` over a window
+    // that is refilled underneath it.
+    for true {
+        var st: http.Chunks = c.chunks
+        var g: http.Span = http.span(0, 0)
+        var used: usize = 0
+        let o: i32 = http.chunk_step(cb[c.head_len .. c.have], 0, st, g, used)
+        if o == http.HTTP_INCOMPLETE {
+            if c.have >= sv.bufcap {
+                // A chunk-size line or a chunk's trailing CRLF that does not fit: waiting
+                // cannot help, because there is nowhere left to put the rest of it.
+                sv.bad = sv.bad + 1
+                send_plain(sv, c.fd, 400, "chunk framing too large")
+                return FEED_CLOSE
+            }
+            return FEED_WAIT
+        }
+        if o != http.HTTP_OK {
+            // A malformed chunk size is a 400 and a close — not a wait for bytes that could
+            // never make it valid.
+            sv.bad = sv.bad + 1
+            send_plain(sv, c.fd, 400, "bad chunked body")
+            return FEED_CLOSE
+        }
+        c.chunks = st
+        c.got = c.got + (used as i64)
+        if c.got > sv.max_body {
+            sv.oversize = sv.oversize + 1
+            send_plain(sv, c.fd, 413, "body too large")
+            return FEED_CLOSE
+        }
+        if g.len > 0 {
+            c.fed = c.fed + (g.len as i64)
+            let v2: i32 = c.sk.on_data(c.sk.ctx, cb[c.head_len + g.off .. c.head_len + g.off + g.len])
+            if v2 != 0 {
+                sv.bad = sv.bad + 1
+                send_plain(sv, c.fd, v2, reason_for(v2))
+                return FEED_CLOSE
+            }
+        }
+        if used > 0 { c.have = slid(c.buf, sv.bufcap, c.head_len, c.have, used) }
+        conn_set(sv.conns, i, c)
+        if http.chunks_done(c.chunks) { return FEED_DONE }
+        if used == 0 { return FEED_WAIT }
+    }
+    return FEED_WAIT
+}
+
+// The body is complete. The head is still PINNED at the front of the buffer, so it is parsed
+// again — which refills the server's shared header array, that another connection may have
+// used while this body was arriving — and answered. `req.total` is the head's length, so
+// `answer`'s consume step moves what follows (a pipelined next request) to the front.
+fn finish_stream(mut sv: Server, i: usize) -> bool {
+    var c: Conn = conn_at(sv.conns, i)
+    let streamed: i64 = c.fed
+    let head_len: usize = c.head_len
+    var hs: []http.Header = slice(http.Header, sv.hs, HTTPD_HEADERS)
+    var h: http.Head = http.empty_head()
+    let o: i32 = http.parse_head(slice(u8, c.buf, head_len), hs, h)
+    if o != http.HTTP_OK {
+        // Unreachable by construction — the same bytes parsed once already — and answered
+        // rather than asserted, because a server that trusts its own invariant silently is one
+        // that cannot say what went wrong.
+        sv.bad = sv.bad + 1
+        send_plain(sv, c.fd, 400, "bad request")
+        return false
+    }
+    var req: http.Request = http.empty_request()
+    req.method = h.method
+    req.target = h.target
+    req.minor = h.minor
+    req.headers = h.headers
+    req.body = http.span(head_len, 0)
+    req.total = head_len
+
+    c.streaming = false
+    c.head_len = 0
+    c.body_left = 0
+    c.chunks = http.chunks_new()
+    c.got = 0
+    c.fed = 0
+    c.sk = no_body_sink()
+    conn_set(sv.conns, i, c)
+    return answer(sv, i, req, h.headers, streamed)
+}
+
+// Refuse a body the buffer cannot hold. See the header: it is 413 and a CLOSE, not a drain —
+// the only bound on how long draining would take is the client's own honesty.
+fn refuse_body(mut sv: Server, fd: i64) -> bool {
+    sv.oversize = sv.oversize + 1
+    send_plain(sv, fd, 413, "body too large")
+    return false
+}
+
+// Parse and answer every complete request in connection `i`'s buffer, feeding a streaming
+// body along the way. Returns true when the connection stays open.
 fn drain(mut sv: Server, i: usize) -> bool {
     for true {
         var c: Conn = conn_at(sv.conns, i)
+        if c.streaming {
+            let s: i32 = feed(sv, i)
+            if s == FEED_CLOSE { return false }
+            if s == FEED_WAIT { return true }
+            if finish_stream(sv, i) == false { return false }
+            continue
+        }
         if c.have == 0 { return true }
-        var req: http.Request = http.empty_request()
         var hs: []http.Header = slice(http.Header, sv.hs, HTTPD_HEADERS)
         let b: []u8 = slice(u8, c.buf, c.have)
-        let o: i32 = http.parse_request(b, hs, req)
-        if o == http.HTTP_INCOMPLETE {
+
+        // The HEAD first, always: a body cannot be routed on, bounded or streamed until the
+        // framing scan has said which of the two framings it obeys.
+        var h: http.Head = http.empty_head()
+        let ho: i32 = http.parse_head(b, hs, h)
+        if ho == http.HTTP_INCOMPLETE {
             if c.have >= sv.bufcap {
-                // A request that fills the whole buffer without completing cannot be
-                // answered by waiting: the buffer IS the bound.
+                // The HEAD alone fills the buffer. Still 431, not 413: that is a header bound,
+                // and a client told 413 would trim the wrong thing.
                 sv.bad = sv.bad + 1
                 send_plain(sv, c.fd, 431, "request too large")
                 return false
             }
             return true
         }
-        if o != http.HTTP_OK {
+        if ho != http.HTTP_OK {
             sv.bad = sv.bad + 1
             var st: i32 = 400
-            if o == http.HTTP_TOO_LARGE { st = 431 }
-            send_plain(sv, c.fd, st, http.outcome_name(o))
+            if ho == http.HTTP_TOO_LARGE { st = 431 }
+            send_plain(sv, c.fd, st, http.outcome_name(ho))
             return false
         }
-        if answer(sv, i, req, req.headers) == false { return false }
+        // A DECLARED length over the bound is refused before one body byte is waited for.
+        if h.length > sv.max_body { return refuse_body(sv, c.fd) }
+
+        var bs: BodySink = no_body_sink()
+        if h.chunked or h.length > 0 { bs = sink_for_head(sv, b, h) }
+        if bs.active {
+            if open_stream(sv, i, h, bs) == false { return false }
+            continue
+        }
+
+        // Not streamed: the whole message has to fit the buffer.
+        var req: http.Request = http.empty_request()
+        let o: i32 = http.body_from_head(b, h, req)
+        if o == http.HTTP_INCOMPLETE {
+            if h.chunked == false and h.length >= 0 {
+                if h.body_off + (h.length as usize) > sv.bufcap { return refuse_body(sv, c.fd) }
+            }
+            if c.have >= sv.bufcap { return refuse_body(sv, c.fd) }
+            return true
+        }
+        if o != http.HTTP_OK {
+            sv.bad = sv.bad + 1
+            var st2: i32 = 400
+            if o == http.HTTP_TOO_LARGE { st2 = 431 }
+            send_plain(sv, c.fd, st2, http.outcome_name(o))
+            return false
+        }
+        if answer(sv, i, req, req.headers, 0) == false { return false }
     }
     return true
 }
@@ -890,15 +1328,26 @@ fn accept_ready(mut sv: Server, mut net: sysnet.Net) {
         return
     }
     let now: i64 = time.read_nanos(sv.clock)
-    conn_set(sv.conns, slot, Conn{ fd: s.fd, buf: alloc(u8, sv.bufcap), have: 0, last: now, served: 0, live: true })
+    var nc: Conn = idle_conn()
+    nc.fd = s.fd
+    nc.buf = alloc(u8, sv.bufcap)
+    nc.last = now
+    nc.live = true
+    conn_set(sv.conns, slot, nc)
 }
 
 fn read_ready(mut sv: Server, i: usize) {
     var c: Conn = conn_at(sv.conns, i)
     if c.have >= sv.bufcap {
-        sv.bad = sv.bad + 1
-        send_plain(sv, c.fd, 431, "request too large")
-        close_conn(sv, i)
+        // `drain` refuses a full buffer itself, so this is only reachable if it ever stopped
+        // doing so. The answer still has to be the right one for what filled it.
+        if c.streaming {
+            refuse_body(sv, c.fd)
+        } else {
+            sv.bad = sv.bad + 1
+            send_plain(sv, c.fd, 431, "request too large")
+        }
+        linger_close(sv, i)
         return
     }
     var cb: []u8 = slice(u8, c.buf, sv.bufcap)
@@ -914,7 +1363,7 @@ fn read_ready(mut sv: Server, i: usize) {
     c.have = c.have + n
     c.last = time.read_nanos(sv.clock)
     conn_set(sv.conns, i, c)
-    if drain(sv, i) == false { close_conn(sv, i) }
+    if drain(sv, i) == false { linger_close(sv, i) }
 }
 
 fn expire(mut sv: Server) {
@@ -927,7 +1376,7 @@ fn expire(mut sv: Server) {
                 if now - c.last > sv.read_timeout {
                     sv.timeouts = sv.timeouts + 1
                     send_plain(sv, c.fd, 408, "request timeout")
-                    close_conn(sv, i)
+                    linger_close(sv, i)
                 }
             } else {
                 if now - c.last > sv.idle_timeout {

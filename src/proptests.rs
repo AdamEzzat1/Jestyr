@@ -2525,6 +2525,16 @@ mod alog_durable {
 /// a middleware that gates one path, three requests on ONE kept-alive connection (the `1`
 /// after "connections accepted"), a streamed body that decodes whole, and the access log.
 /// Client and server take turns in one thread, so the transcript is exact.
+///
+/// The upload section is the REQUEST-body streaming pin. The server's connection buffer is
+/// 1024 bytes and each body is 4000, so `4000` bytes received with `arrived in more than one
+/// piece` is the whole claim: a buffered implementation cannot print both. The same body goes
+/// up twice, once framed by `Content-Length` and once chunk-encoded, and the two report the
+/// SAME checksum — the framing is the client's choice and the sink cannot tell which was
+/// used. `the exchange buffered none of it` is `body_len(x) == 0` inside the handler, and
+/// each `the request pipelined after the body -> hello` is a request that rode in the same
+/// write as the body and was answered from what the buffer held after it: when a streamed
+/// body ends the buffer sits exactly at the next request's first byte.
 #[cfg(all(test, feature = "c-oracle"))]
 mod httpd_service {
     use super::*;
@@ -2547,8 +2557,21 @@ mod httpd_service {
                     GET /admin without a token -> token required\n\
                     200\n\
                     GET /admin with the token -> welcome, admin\n\
+                    -- an upload larger than the connection buffer --\n\
+                    POST /upload (content-length) -> stored\n\
+                    bytes the sink received\n4000\n\
+                    checksum\n437956\n\
+                    arrived in more than one piece\ntrue\n\
+                    and the exchange buffered none of it\ntrue\n\
+                    the request pipelined after the body -> hello\n\
+                    POST /upload (chunked) -> stored\n\
+                    bytes the sink received\n4000\n\
+                    checksum\n437956\n\
+                    arrived in more than one piece\ntrue\n\
+                    and the exchange buffered none of it\ntrue\n\
+                    the request pipelined after the body -> hello\n\
                     -- the access log's last record names the status --\ntrue\n\
-                    requests served\n5";
+                    requests served\n9";
         assert_eq!(out.trim_end(), want, "the httpd demo's transcript changed:\n{out}");
         assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
         assert!(!out.contains("could not"), "the demo must bind its socket:\n{out}");
@@ -20797,8 +20820,12 @@ fn main() -> i32 {
             // and the vulnerabilities are all in messages that are well-formed and mean two
             // different things. Every case in the smuggling test is a message a lenient
             // parser accepts. No socket is involved -- the dangerous half of an HTTP
-            // implementation is a pure function of a byte buffer.
-            ("http_test", 5),
+            // implementation is a pure function of a byte buffer. The last case is the
+            // STREAMING half: a head parsed before its body exists, head-plus-body compared
+            // field for field against the whole-message parse, and a chunked body decoded
+            // through an 8-byte window a byte at a time -- so the incremental reader and the
+            // buffered one cannot end up with two sets of framing rules.
+            ("http_test", 6),
             // Reproducibility is a CLAIM, so the suite builds the same archive twice from
             // deliberately different dirty buffers and compares every byte -- the assertion a
             // `time(0)` in the header fails. The checksum test pins the one detail every tar
@@ -20824,8 +20851,14 @@ fn main() -> i32 {
             // middleware order and `DONE`, keep-alive with PIPELINED requests, a streamed
             // body decoded whole, static files with traversal refused as a 404, the access
             // log record, a smuggling attempt refused and the connection dropped. The
-            // timeout case asserts a lower bound only.
-            ("httpd_test", 8),
+            // timeout case asserts a lower bound only. The last four are REQUEST-BODY
+            // streaming, every one of them against a 512-byte connection buffer and a 4096-
+            // byte body, so nothing passes by fitting: a `Content-Length` body and a chunked
+            // one each arrive in bounded pieces with a pipelined request riding immediately
+            // behind them, a malformed chunk size is a 400 rather than a hang, a body over
+            // `set_max_body` or over the buffer is a 413 and a close, and a sink may refuse
+            // on the head or part way in. The stalled-upload case waits for the read timeout.
+            ("httpd_test", 12),
             // **A real TLS handshake over loopback, the client on a spawned thread.** The
             // verifying case chains to the fixture CA AND checks the hostname; the wrong-
             // hostname case is right CA, wrong name, and must fail; the trust-nothing case

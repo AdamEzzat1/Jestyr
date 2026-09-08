@@ -69,6 +69,67 @@ versions are snapshots, not stability promises.
   here** — a `sh -c` of a simple command usually `exec`s, so the orphan this fixes is a
   Windows symptom, and `setpgid` + `kill(-pgid, …)` are exercised on Linux by CI alone.
 
+- **Request-body streaming in `std/httpd`** — a handler can now read a body larger than the
+  connection buffer, in bounded pieces, without the server ever holding it whole. It is the
+  one thing the HTTP pass deliberately stopped short of; until now a body that did not fit
+  was a `431` and a close.
+
+  The body is **pushed, not pulled**. `route_stream(sv, method, pattern, handler, sink)`
+  registers a route with a `BodySink` — `on_open(ctx, read Exchange) -> i32` when the head is
+  in, `on_data(ctx, read []u8) -> i32` for each piece — and the readiness loop hands the sink
+  whatever arrived, inside the poll, and returns. A pulling API would have to block, and one
+  blocking read on a single-threaded server is one slow uploader starving every other
+  connection. Both answers are a STATUS: `0` accepts, anything else is sent and the
+  connection closed, which keeps the response the route handler's to write. That handler runs
+  ONCE, when the body is complete; `body(x)` is `""` for a streamed request and
+  `body_streamed(x)` is how many decoded bytes there were.
+
+  **The head is pinned and the rules are not duplicated.** `std/http` grew `parse_head`,
+  `body_from_head` and `chunk_step`; `parse_request` IS `parse_head` then `body_from_head`,
+  so there is still exactly one start-line loop, one header loop and one framing scan, and
+  `chunk_step` drives the same `line_end`/`strict_hex` pair `frame_chunked` uses one unit at
+  a time over a window being refilled. A second framing decision is the whole smuggling
+  class, so there isn't one. While a body streams, its head sits at the front of the
+  connection buffer and never moves; each round reads into the window behind it, hands the
+  sink what decoded, and slides the remainder back. **`Content-Length` delivers exactly the
+  declared count and never one byte more**, so the bytes after a body are the next request's
+  — a client that under-delivers stalls into the read timeout and a `408` instead of stealing
+  them. When a body ends the buffer sits exactly at the next request's first byte, by
+  `answer`'s own memmove: the pipelining invariant is the same one, and pinned by a test that
+  sends a `GET` in the same write as a 4096-byte body.
+
+  **Bounded everywhere.** `set_max_body` counts bytes RECEIVED, not decoded, because chunk
+  framing is the client's choice; a declared length over it is a `413` before one body byte is
+  waited for, and a chunked body that grows past it is a `413` mid-stream. A body no route
+  streams and the buffer cannot hold is a `413` and a close — **not a drain**, which is work
+  the client chose and whose only bound is the client's own honesty. A head that does not fit
+  is still `431`: that is a header bound and a client told `413` would trim the wrong thing.
+  A malformed chunk size is a `400` and a close rather than a wait for bytes that could never
+  make it valid.
+
+  **Every error close now LINGERS first**, and it had to: closing a socket that still holds
+  unread bytes makes the kernel send a RESET, and the reset destroys the response that was
+  just written to explain the refusal — so a client half way through an upload saw a dropped
+  connection and no reason. `linger_close` discards only what has ALREADY arrived, each read
+  gated on a zero-timeout poll and the whole loop capped at 16 bufferfuls, so its cost is the
+  server's number and not the client's.
+
+  Five new tests (`http_test` 5→6, `httpd_test` 8→12), all of the server ones against a
+  512-byte connection buffer and a 4096-byte body so nothing passes by fitting; the sink
+  counts pieces and the largest piece, which a buffered implementation cannot satisfy. The
+  `jhttpd` demo grew an upload section: the same 4000-byte body sent twice, `Content-Length`
+  and chunked, reporting the same checksum through a 1024-byte buffer, each with a pipelined
+  request behind it. Not added: `Expect: 100-continue`, and no pull-shaped read API.
+
+- **`httpc.fd` and `httpc.pending`** — the descriptor of a client's connection and how many
+  bytes it is holding past the last response it handed out. `std/httpc` is blocking by design,
+  so `read_response` against a server that stopped answering never returns, and the first
+  draft of the streaming suite detected three of its six mutations as HANGS rather than named
+  failures — a suite whose failure mode is a hang says nothing about what broke. With these
+  two a test can poll first and read only when there is something, counting bytes already
+  buffered because a pipelined answer arrives in the same read as the one before it and never
+  makes the socket readable a second time. All six mutations now fail by name.
+
 - **`std/trace`** — timed, nested segments of work with attributes, exported to whoever is
   listening. A `Tracer` is GIVEN a `time.Clock` and an `Exporter` (`std/log`'s design: no
   ambient tracer, no global), so under `time.manual()` every duration and every id is
