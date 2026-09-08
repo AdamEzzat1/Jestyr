@@ -808,10 +808,52 @@ reseed (it imports `sha256` and `fs` read-only). What a successor should not re-
   1.1.1i). The Linux runner has `libssl-dev`, so the link should hold; the `HMAC()` one-shot
   and `EVP_DigestSign` are 1.1.1 API on both.
 
-Plus the layer the breadth pass stopped short of: **the `jc add` command** over
-`manifest` + `registry` + `resolve` + `lockfile` + `cache` (every piece exists and is tested
-end to end; the command is the glue), and **request-body streaming** in `httpd` (a request
-must fit the connection buffer today).
+Left after that: **request-body streaming** in `httpd` (a request must fit the connection
+buffer today).
+
+### ~~The `jc add` command~~ — **DONE: `std/jcadd`**
+
+The layer the breadth pass stopped short of. `add(f, a, manifest_path, lock_path, registry,
+cache, name, req) -> Report`: read the local manifest, add or update one dependency, resolve
+the WHOLE graph, fetch what is missing through the cache, write the lockfile, re-render the
+manifest canonically. 3 tests, a pinned demo (`jadd`, `examples/std/jcadd_demo.jtr`), a
+`BUILD_OK` line, no reseed. What a successor should not re-derive:
+
+* **It is a library with a thin `main` around it, not a subcommand of `jc`.** `jc` is
+  `examples/std/cgen.jtr`, a closure module: a subcommand there rewrites the bootstrap seed.
+  It would also put the command out of reach of a test — `add`'s interesting property is a
+  claim about a SEQUENCE of steps, not about a process's exit code. `census_cli`, `doc_cli`
+  and `escape_cli` are the same shape. Wiring it into the real driver later is a call site.
+* **The order of the steps IS the atomicity argument.** Everything that can fail happens
+  before anything visible moves: request → manifest → candidate (rendered AND parsed back) →
+  resolution → fetch → lockfile → stage both, then rename both. `registry.fetch` re-hashes
+  against the index's promise, so a tampered archive fails with both files still their
+  original bytes.
+* **The residual window is stated, not hidden.** Two renames are not one atomic act and this
+  tree has no journal. The manifest renames FIRST on purpose: manifest-new/lock-old is the
+  ordinary state a hand-edited dependency leaves, which `lockfile.verify` reports as drift
+  and the next `add` repairs; the other order would leave a lockfile naming a package nothing
+  requires. `manifest_written` / `lock_written` say how far the swap got.
+* **Idempotence is measured, not asserted.** The candidate manifest and the rendered lockfile
+  are compared against the bytes on disk and NEITHER is written when nothing moved — so a
+  second run creates no temporary file at all. `manifest_changed` / `lock_changed` are the
+  answers a caller reads.
+* **The whole graph is resolved, not the new edge**: every dependency of the candidate becomes
+  a root requirement, so `add` can report a conflict the new dependency merely revealed.
+  Splicing the new package's answer into the old lockfile produces a lockfile no single
+  resolution would ever have produced.
+* **A missing manifest is refused** (`ADD_NO_MANIFEST`), never created — inventing a package's
+  own name and version is `jc init`'s job.
+* The suite's atomicity proof injects a failure at BOTH places the sequence can still fail
+  after the candidate exists: a tampered archive (the fetch) and an `fs.read_only()` handle
+  (the staging write). The read-only case is only interesting once the cache is WARM —
+  otherwise the run fails at the fetch instead and proves nothing about the swap.
+* Not built: `jc remove`, `jc update`, `jc init`, unpacking a fetched archive into a working
+  tree, a registry chosen by name rather than handed in, and any concurrency control between
+  two `add`s on one directory.
+* The module is platform-agnostic and reaches the OS only through `fs` and
+  `sysfs.rename_replace`, whose `@cfg` arms the Linux ladder exercises; only Windows has run
+  the suite and demo here.
 
 ### ~~Service supervision~~ — **DONE: `std/supervise`**
 

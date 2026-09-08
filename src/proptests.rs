@@ -2576,6 +2576,86 @@ mod kv_durable {
     }
 }
 
+/// **`jadd` — one dependency added, and a whole graph decided.**
+///
+/// `examples/std/jcadd_demo.jtr` is `std/jcadd`'s consumer. A scratch registry is published
+/// into a temporary tree — three packages at two versions each — and a project whose manifest
+/// names one dependency runs `jc add http ^1.0.0`. The transcript's centre is the third
+/// package: `text` is in the lockfile because `http 1.0.0` requires it and nothing in the
+/// project ever named it, which is the difference between resolving the GRAPH and splicing in
+/// the new edge.
+///
+/// The three newer published versions are the other half. `base 1.1.0`, `text 1.2.0` and
+/// `http 1.5.0` all satisfy their requirements and are all absent from the lockfile, because
+/// minimal version selection takes the lowest that satisfies — so publishing a version cannot
+/// move an existing build. Asserting the lockfile's own `selection-sha256` pins that: the
+/// digest is over the three `pkg` lines, and any different selection changes it.
+///
+/// Then the same command again, and the assertion that it wrote NOTHING — not that it wrote
+/// the same bytes, which a blind rewrite would also satisfy, but that `manifest_written` and
+/// `lock_written` are both false and no `.jcadd` staging file exists.
+#[cfg(all(test, feature = "c-oracle"))]
+mod jcadd_command {
+    use super::*;
+
+    #[test]
+    fn jadd_resolves_a_transitive_dependency_once() {
+        let exe = super::c_oracle::build_exe("examples/std/jcadd_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the add demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jadd --\n\
+                    versions published\n6\n\
+                    the manifest before\n\
+                    jestyr-package/v1\n\
+                    name app\n\
+                    version 0.1.0\n\
+                    dep base ^1.0.0\n\
+                    -- jc add http ^1.0.0 --\n\
+                    status\nok\n\
+                    added, updated\ntrue\nfalse\n\
+                    packages resolved, rounds\n3\n3\n\
+                    archives fetched, already cached\n3\n0\n\
+                    manifest written, lockfile written\ntrue\ntrue\n\
+                    the manifest after\n\
+                    jestyr-package/v1\n\
+                    name app\n\
+                    version 0.1.0\n\
+                    dep base ^1.0.0\n\
+                    dep http ^1.0.0\n\
+                    the lockfile\n\
+                    jestyr-lock/v1\n\
+                    resolver mvs\n\
+                    selection-sha256 13866097f90e27fb92eea623827e9807186f70198651289c0d1fce1118259b7d\n\
+                    pkg base 1.0.0\n\
+                    pkg http 1.0.0\n\
+                    pkg text 1.0.0\n\
+                    text is there because http 1.0.0 requires it; the project never named it\n\
+                    and the three newer versions are absent, which is minimal selection\n\
+                    -- the same command again --\n\
+                    status\nok\n\
+                    added, updated\nfalse\nfalse\n\
+                    manifest changed, lock changed\nfalse\nfalse\n\
+                    archives fetched, already cached\n0\n3\n\
+                    manifest written, lockfile written\nfalse\nfalse\n\
+                    -- the check --\n\
+                    the manifest is the same bytes\ntrue\n\
+                    the lockfile is the same bytes\ntrue\n\
+                    no staging file survived either run\ntrue\ntrue";
+        assert_eq!(out.trim_end(), want, "the add demo's transcript changed:\n{out}");
+
+        // Anti-vacuity: minimal selection is three lines the lockfile does NOT contain, and a
+        // transcript that quietly resolved the newest versions would still match a weaker
+        // assertion about counts.
+        assert!(!out.contains("1.1.0"), "base 1.1.0 must not be selected:\n{out}");
+        assert!(!out.contains("1.2.0"), "text 1.2.0 must not be selected:\n{out}");
+        assert!(!out.contains("1.5.0"), "http 1.5.0 must not be selected:\n{out}");
+
+        assert!(!std::path::Path::new("zz_jadd").exists(), "the demo must clean up after itself");
+    }
+}
+
 /// **`jlivecfg` — a configuration that follows its file, and never half-way.**
 ///
 /// `examples/std/livecfg_demo.jtr` is `std/livecfg`'s consumer. An INI file is edited under
@@ -20736,6 +20816,16 @@ fn main() -> i32 {
             // and a group that reaches the grandchild a `terminate` of the shell left
             // behind — bounded, never a hang.
             ("sandbox_test", 8),
+            // **`jc add` as one command over the whole package substrate.** Six refusals
+            // (a name, a requirement, an absent manifest, one that does not parse, an
+            // unknown package, an unsatisfiable graph) each leaving the manifest byte for
+            // byte what it was; one add that resolves the WHOLE graph — `text` arrives
+            // through `http` and the three newer published versions are absent — with the
+            // lockfile checked against a fresh resolution through `lockfile.verify`, and a
+            // second run that writes nothing at all. Then the atomicity claim, injected at
+            // both places the sequence can still fail after the candidate exists: a
+            // TAMPERED archive (the fetch) and a read-only handle (the staging write).
+            ("jcadd_test", 3),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");
