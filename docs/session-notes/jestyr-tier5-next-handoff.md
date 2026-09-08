@@ -1022,6 +1022,17 @@ is hardest to see, which is what happened and cost an extra CI round trip.
 
 Read these before writing a test. Each cost a real failure.
 
+**Renaming a VARIANT is not like renaming a function, and a grep for the qualified name
+will lie to you.** `core.Result`'s `ok`/`err` were renamed after measuring the blast radius
+with a search for `core.Result` and `core.res_` — which found one file. Six more used the
+variants BARE, in `match r { ok(v) => … }`, where nothing spells the module. The follow-up
+sweep then searched `^import "core"` and missed two files importing it as `../std/core`.
+Two searches, each shaped like the answer I expected. **For a rename that reaches a
+program-wide name space, stop grepping and run the compiler over the whole corpus**
+(`jestyrc check` on all 465 files takes minutes) — then read the failure list against the
+known refusal fixtures, and grep the failures for your change's own diagnostic text to prove
+none of them is yours.
+
 **A suite that can only fail by HANGING has not told you anything.** Three of the six
 mutations against httpd's streaming were first observed as a stuck job, not a named failure:
 `httpc` blocks, so a server that stopped answering never returns, and `io_suites_pass` has no
