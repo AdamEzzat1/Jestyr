@@ -30,16 +30,22 @@
 // or a hung host, and the transcript is exact: `jplugin_keeps_one_plugin_and_survives_it`
 // asserts every line.
 //
-// ─── Why this program runs for about three seconds ────────────────────────────
+// ─── Why this program used to run for three seconds, and does not now ─────────
 //
-// Not because it waits for anything. The timing-out call costs 400ms, and everything else is
-// milliseconds. The tail is the KILLED PLUGIN: `terminate` reaches the `cmd.exe` that
-// `start_piped` started, not the plugin beneath it, so the sleeper is orphaned rather than
-// killed and sleeps out `ECHO_NAP_NANOS`. It was started with this program's own stdout among
-// its inherited handles, so a reader capturing this transcript — a shell's `$(…)`, the
-// pinned test's `Command::output` — sees no end-of-file until the orphan is gone. The output
-// is complete long before that; only the close is late. Killing the whole tree wants a Job
-// object, which `std/sysproc` does not have and which its header already records as absent.
+// Not because it ever waited for anything. The timing-out call costs 400ms and everything
+// else is milliseconds; the tail was the KILLED PLUGIN. `terminate` reached the `cmd.exe`
+// that started the plugin rather than the plugin beneath it, so the sleeper was orphaned and
+// slept out `ECHO_NAP_NANOS` — holding this program's own stdout among its inherited
+// handles, so a reader CAPTURING this transcript (a shell's `$(…)`, the pinned test's
+// `Command::output`) saw no end-of-file until the orphan was gone. The output was complete
+// long before that; only the close was late. `plugin_echo`'s nap had been cut from ten
+// seconds to three to make that bearable, which is a workaround wearing a constant's clothes.
+//
+// `plugin.connect` now starts the plugin in a `sandbox.Group` and the timeout takes the
+// GROUP down, so the orphan is killed with the shell. Measured through a pipe, three runs
+// each: without the group 3.41s at a three-second nap and 10.46s at a ten-second one; with
+// it 0.90s and 1.02s. The nap is back to ten seconds — twenty-five times the budget it must
+// beat — and this program reads in about a second.
 
 import "plugin"
 import "sysproc"
@@ -61,7 +67,7 @@ const DEMO_CAP: usize = 4096
 // `DEMO_TIGHT` is what the connection is re-set to AFTER the plugin has answered once, for
 // the single call that is meant to time out. By then the process is up and a round trip is
 // under a millisecond, so 400ms is roughly four hundred times what the call needs and still
-// a small fraction of the plugin's nap (`ECHO_NAP_NANOS`, three seconds). Both margins are
+// a small fraction of the plugin's nap (`ECHO_NAP_NANOS`, ten seconds). Both margins are
 // wide, which is what makes the `timed-out` line below a property of the plugin rather than
 // a statement about how busy this machine was.
 const DEMO_ROOMY: i64 = 20000000000
@@ -214,6 +220,12 @@ fn main() -> i32 {
     attempt(h2, "-- and then sleeping past the tightened budget --", req[0 .. n9], resp)
     print_str("the plugin was killed")
     print_bool(sysproc.is_signalled(plugin.exit_status(h2)))
+    // **And so was the plugin under it.** `exit_status` above is the SHELL's; this is the
+    // group's, and it is the line that separates "the host stopped waiting" from "the plugin
+    // stopped running". Before the group they were different facts and only the first was
+    // true — see the header on what that cost anything capturing this transcript.
+    print_str("and its whole tree with it")
+    print_bool(plugin.tree_reaped(h2))
     print_str("the host is still standing")
     print_bool(true)
     plugin.hangup(h2)

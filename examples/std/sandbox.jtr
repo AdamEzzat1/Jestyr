@@ -76,8 +76,15 @@
 //
 // ─── What is deliberately not here ────────────────────────────────────────────
 //
-// No pipes (`sysproc.start_piped` has them; a sandboxed AND piped child is a `start_at`
-// variant with handles, owed when a consumer needs it). No resource limits, no user
+// No `start` variant with pipes. That consumer arrived — `std/plugin` needs a child it can
+// both talk to and kill whole — and `sysproc.start_piped_at` is the primitive it wanted, so
+// the piece missing here was never the jail but the ORDER: open the group, start apart, join
+// before the child runs, resume. `open_group` and `join_group` are public for exactly that,
+// and a caller that also wants a jail passes its projection as `start_piped_at`'s
+// `env_extra` — `project` and `SBOX_JAIL_VAR` are public too. A single `start_grouped_piped`
+// here would have to demand a `Jail` from a caller that has no file policy to express.
+//
+// No resource limits, no user
 // switching, no network policy. No `chroot`. No environment REMOVAL — a child gets the
 // parent's whole environment plus the projection, because removing variables is a policy
 // of its own with `PATH` as its first casualty.
@@ -390,7 +397,15 @@ pub struct Group {
 
 @no_alloc @no_os pub fn is_group_live(read g: Group) -> bool { return g.live }
 
-@cfg(windows) fn group_open(mut g: Group) -> bool {
+// Open an empty group. **Public, and the reason is `std/plugin`**: the three steps a group
+// costs — open it, start the child apart, put it in before it runs — are the same three
+// whether or not the child has pipes, and `start_grouped` below can only do the version
+// without them (`sysproc.start_at`). A consumer that needs the piped version composes
+// `open_group` + `sysproc.start_piped_at(.., apart: true)` + `join_group` + `sysproc.resume`
+// in exactly that order, which is what `start_grouped` does under its own single name.
+// Exposing the pieces beats a `start_grouped_piped` that would have to take a `Jail` its
+// caller does not want; the ORDER is the invariant, and it is written here once.
+@cfg(windows) pub fn open_group(mut g: Group) -> bool {
     let h: cptr = CreateJobObjectA(null, null)
     if h == null { return false }
     g.job = h as i64
@@ -399,18 +414,22 @@ pub struct Group {
     return true
 }
 
-@cfg(posix) fn group_open(mut g: Group) -> bool {
+@cfg(posix) pub fn open_group(mut g: Group) -> bool {
     g.job = 0
     g.pgid = 0
     g.live = true
     return true
 }
 
-@cfg(windows) fn group_add(mut g: Group, read c: sysproc.Child) -> bool {
+// Put a child started `apart` into `g`. **On Windows it must still be SUSPENDED**: that is
+// the whole reason `apart` creates it that way, since a child that has already run an
+// instruction may already have spawned a grandchild outside the Job. On POSIX the child
+// made itself a group leader between `fork` and `exec`, so this only records which group.
+@cfg(windows) pub fn join_group(mut g: Group, read c: sysproc.Child) -> bool {
     return AssignProcessToJobObject(g.job as cptr, sysproc.handle_of(c) as cptr) != 0
 }
 
-@cfg(posix) fn group_add(mut g: Group, read c: sysproc.Child) -> bool {
+@cfg(posix) pub fn join_group(mut g: Group, read c: sysproc.Child) -> bool {
     // `start_at(.., apart: true)` already made the child a group leader; its pid IS the
     // group.
     g.pgid = sysproc.pid_of(c)
@@ -530,7 +549,7 @@ pub fn start(mut sp: sysproc.Spawner, read cmd: str, read cwd: str, read j: Jail
 // before it runs its first instruction, so every descendant is in the group too.
 pub fn start_grouped(mut sp: sysproc.Spawner, read cmd: str, read cwd: str, read j: Jail, mut g: Group) -> sysproc.Child !{ SandboxFailed(i32), SandboxRefused, SandboxBusy } {
     if g.live { return err(SandboxBusy) }
-    if group_open(g) == false {
+    if open_group(g) == false {
         let c0: i32 = syserr.last_raw()
         return err(SandboxFailed(c0))
     }
@@ -544,7 +563,7 @@ pub fn start_grouped(mut sp: sysproc.Spawner, read cmd: str, read cwd: str, read
         if sysproc.refused(sp) > turned_away { return err(SandboxRefused) }
         return err(SandboxFailed(code))
     }
-    if group_add(g, ch) == false {
+    if join_group(g, ch) == false {
         // A child that could not be grouped must not be left running ungrouped: that is
         // the one outcome this function exists to rule out.
         let c1: i32 = syserr.last_raw()

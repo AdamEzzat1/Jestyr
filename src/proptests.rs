@@ -2359,10 +2359,17 @@ mod plugin_protocol {
 /// a 485ms outlier over 120 starts, and a 300ms budget lost about one run in fifteen on an
 /// idle machine.
 ///
-/// The demo takes about three seconds, and none of it is waiting: `terminate` reaches the
-/// `cmd.exe` that `start_piped` started rather than the plugin under it, so the sleeper is
-/// orphaned holding the demo's inherited stdout, and `Command::output` below sees no EOF
-/// until its three-second nap ends. The transcript is complete long before that.
+/// **`Command::output` is a PIPE, and that is why this test can time the orphan.** The demo
+/// used to take about three seconds, and none of it was waiting: `terminate` reached the
+/// `cmd.exe` that started the plugin rather than the plugin under it, so the sleeper was
+/// orphaned holding the demo's inherited stdout, and the read below saw no EOF until its nap
+/// ended. `plugin.connect` now starts the plugin in a `sandbox.Group` and the timeout takes
+/// the group down. Measured here through a pipe, three runs each: without the group 3.41s at
+/// a three-second nap and 10.46s at the ten-second one `plugin_echo` now uses; with it 0.90s
+/// and 1.02s. So `ECHO_NAP_NANOS` went back to ten seconds — a margin over the demo's 400ms
+/// budget that no loaded machine can close — and the elapsed time is asserted below, which is
+/// the only assertion here that a re-orphaned plugin would fail. A file redirect would not:
+/// there is no EOF to wait for, and the whole effect vanishes.
 #[cfg(all(test, feature = "c-oracle"))]
 mod plugin_server {
     use super::*;
@@ -2371,7 +2378,9 @@ mod plugin_server {
     fn jplugin_keeps_one_plugin_and_survives_it() {
         let echo = super::c_oracle::build_exe("examples/std/plugin_echo.jtr");
         let host = super::c_oracle::build_exe("examples/std/plugin_server_demo.jtr");
+        let started = std::time::Instant::now();
         let run = std::process::Command::new(&host).arg(&echo).output().unwrap();
+        let elapsed = started.elapsed();
         assert_eq!(run.status.code(), Some(0), "the host must exit cleanly whatever the plugin does");
         let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
 
@@ -2404,6 +2413,7 @@ mod plugin_server {
                     -- and then sleeping past the tightened budget --\n\
                     timed-out\n\
                     the plugin was killed\ntrue\n\
+                    and its whole tree with it\ntrue\n\
                     the host is still standing\ntrue\n\
                     -- a fresh connection after the kill --\n\
                     ok\n#0 A NEW PROCESS\n\
@@ -2437,6 +2447,24 @@ mod plugin_server {
         let timed = out.find("\ntimed-out\n").expect("the timeout line is missing");
         assert!(awake < timed, "the timeout must follow an answer from the same connection:\n{out}");
         assert!(!out.contains("crashed"), "nothing in this transcript crashes:\n{out}");
+
+        // **The orphan gate — the assertion that guards the NAP.** `ECHO_NAP_NANOS` is ten
+        // seconds and the demo kills the sleeper rather than outliving it, so this pipe
+        // reaches EOF in about one second here. Six is the ceiling: far above any machine's
+        // cost for three process starts and a 400ms budget, and far below the ten seconds the
+        // orphan cost — measured, with the group taken out and this nap left in, at 10.46s.
+        //
+        // It is not the only guard and it is not the first to fire: a group that stops being
+        // taken down turns the transcript's `and its whole tree with it` line to `false`
+        // above, which is checked first and says WHY. This one is here because the nap is
+        // sized on the claim that a killed plugin costs its reader nothing, and a claim a
+        // constant is sized on should be a test rather than a comment.
+        assert!(
+            elapsed.as_secs_f64() < 6.0,
+            "the killed plugin held this pipe open for {:.2}s: the timeout reached its shell \
+             and not its tree, so the orphan is still holding the demo's inherited stdout",
+            elapsed.as_secs_f64()
+        );
     }
 }
 
@@ -20759,8 +20787,11 @@ fn main() -> i32 {
             // exit — each told apart by name. The END-TO-END halves — a real plugin,
             // really invoked — are `jhost_survives_every_way_a_plugin_can_fail` (one-shot)
             // and `jplugin_keeps_one_plugin_and_survives_it` (server), because they need a
-            // COMPILED plugin and a `.jtr` suite cannot build one.
-            ("plugin_test", 10),
+            // COMPILED plugin and a `.jtr` suite cannot build one. The eleventh is the group:
+            // a child whose shell keeps a GRANDCHILD, killed past its budget, and the whole
+            // tree confirmed empty inside a bounded wait — the claim `plugin.connect` starts
+            // its child apart for, and the one that used to be false.
+            ("plugin_test", 11),
             // **Most of this suite is adversarial**, which is the right shape for an HTTP
             // parser: the ordinary cases are easy and every implementation gets them right,
             // and the vulnerabilities are all in messages that are well-formed and mean two
