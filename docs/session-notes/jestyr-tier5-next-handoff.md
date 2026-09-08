@@ -8,7 +8,11 @@ defects — one session at a time). §2 is the parallel work (library breadth �
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1371 passed / 0 failed / 3 ignored** (full ladder after the SIX second-wave modules, 671 s;
+**1373 passed / 0 failed / 3 ignored** (full ladder after the TAIL work — `jc add`, httpd
+request-body streaming, plugin adopting sandbox's groups, and the two serial compiler items
+that closed the register's last defects; 747 s. The Jestyr-level suites grew inside
+`io_suites_pass` rather than as new Rust tests: `plugin_test` 10 → 11, `httpd_test` 8 → 12,
+`http_test` 5 → 6, plus `jcadd_test` 3.) Previously **1371** after the SIX second-wave modules, 671 s;
 before them 1364 after A13 and the link-rule fold, and 1359 after HTTP V2, TLS and the
 registry layer). The second wave added six suites to `io_suites_pass`
 (`trace_test` 7, `livecfg_test` 7, `supervise_test` 10, `crypto_test` 5, `sandbox_test` 8,
