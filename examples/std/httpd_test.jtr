@@ -7,6 +7,17 @@
 // static-file cases are all such transcripts; the timeout case is the one that waits, and
 // it asserts a lower bound only.
 //
+// The last four cases are REQUEST-BODY streaming, and every one of them runs against a
+// 512-byte connection buffer with a 4096-byte body: nothing there can pass by fitting. The
+// sink counts the PIECES a body arrived in and the largest of them, which is the pair a
+// buffered implementation cannot satisfy while still reporting the right total.
+//
+// Those four read every response through `resp_within` rather than `httpc.read_response`.
+// `httpc` blocks, so a server that stopped answering would turn each assertion into a hung
+// job instead of a named failure — and a suite whose failure mode is a hang says nothing
+// about what broke. Six mutations were watched failing by name, which is only possible
+// because of that.
+//
 // Run:  jestyrc test examples/std/httpd_test.jtr
 
 import "fs"
@@ -15,7 +26,9 @@ import "httpc"
 import "httpd"
 import "log"
 import "mem"
+import "runtime"
 import "sysnet"
+import "syspoll"
 import "test"
 import "test_report"
 import "time"
@@ -292,6 +305,39 @@ fn chunked_of(read data: str, piece: usize, mut dst: String) {
         i = i + n
     }
     string_push(dst, "0\r\n\r\n")
+}
+
+// ---- reading a response WITHOUT the risk of waiting forever --------------------------------
+//
+// `httpc` is blocking by design, so `read_response` on a socket that will never carry one
+// never returns. That is fine for a passing suite and useless for a failing one: a server
+// that stops answering would turn every assertion below into a hung CI job instead of a
+// named failure. So the streaming cases poll first and call the blocking read only when there
+// is something to read — a closed peer counts, because a close is readable, and so do bytes
+// the client is already HOLDING, because a pipelined answer arrives in the same read as the
+// one before it and would never make the socket readable a second time.
+fn answered(read cl: httpc.Client, ms: i64) -> bool {
+    if httpc.pending(cl) > 0 { return true }
+    var p: runtime.Poller = syspoll.host()
+    var fds: *mut i64 = alloc(i64, 1)
+    var rdy: *mut u8 = alloc(u8, 1)
+    unsafe { (fds + 0).* = httpc.fd(cl) }
+    unsafe { (rdy + 0).* = 0 as u8 }
+    let got: i64 = runtime.ask(p, fds, rdy, 1, ms * 1000000)
+    var r: u8 = 0
+    unsafe { r = (rdy + 0).* }
+    free_ptr(rdy)
+    free_ptr(fds)
+    if got <= 0 { return false }
+    return (r as i32) != 0
+}
+
+// The next response if there is one within `ms`, else `HTTP_INCOMPLETE` — the same answer the
+// client gives for "the peer hung up on me before saying anything", and the right one for
+// "the server never said anything at all".
+fn resp_within(mut cl: httpc.Client, ms: i64) -> i32 {
+    if answered(cl, ms) == false { return http.HTTP_INCOMPLETE }
+    return httpc.read_response(cl)
 }
 
 fn boot(read a: Allocator, mut net: sysnet.Net, logging: bool) -> httpd.Server {
@@ -748,7 +794,7 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
     httpc.send_raw(cl, string_view(msg))
     httpd.serve_for(sv, net, 200)
 
-    test.eq_i64(c, rep, "the upload was answered", httpc.read_response(cl) as i64, http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "the upload was answered", resp_within(cl, 300) as i64, http.HTTP_OK as i64)
     test.eq_i64(c, rep, "with a 200", httpc.status(cl) as i64, 200)
     var got: String = string_new()
     httpc.body(cl, got)
@@ -766,7 +812,7 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
 
     // **The pipelining invariant.** When the body ended the buffer sat exactly at the next
     // request's first byte, so the `GET` that followed it is answered on the same connection.
-    test.eq_i64(c, rep, "the pipelined request was answered too", httpc.read_response(cl) as i64,
+    test.eq_i64(c, rep, "the pipelined request was answered too", resp_within(cl, 300) as i64,
         http.HTTP_OK as i64)
     string_free(got)  got = string_new()
     httpc.body(cl, got)
@@ -812,7 +858,7 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
     httpc.send_raw(cl, string_view(msg))
     httpd.serve_for(sv, net, 200)
 
-    test.eq_i64(c, rep, "the chunked upload was answered", httpc.read_response(cl) as i64,
+    test.eq_i64(c, rep, "the chunked upload was answered", resp_within(cl, 300) as i64,
         http.HTTP_OK as i64)
     test.eq_i64(c, rep, "with a 200", httpc.status(cl) as i64, 200)
     var got: String = string_new()
@@ -828,7 +874,7 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
 
     // The chunk framing bytes are not the body, and the request after the terminator is the
     // next request — the same invariant, over the other framing.
-    test.eq_i64(c, rep, "the pipelined request after the terminator", httpc.read_response(cl) as i64,
+    test.eq_i64(c, rep, "the pipelined request after the terminator", resp_within(cl, 300) as i64,
         http.HTTP_OK as i64)
     string_free(got)  got = string_new()
     httpc.body(cl, got)
@@ -841,10 +887,10 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
     var c2: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
     httpc.send_raw(c2, "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nnope\r\n")
     httpd.serve_for(sv, net, 100)
-    test.eq_i64(c, rep, "a malformed chunk size is ANSWERED", httpc.read_response(c2) as i64,
+    test.eq_i64(c, rep, "a malformed chunk size is ANSWERED", resp_within(c2, 300) as i64,
         http.HTTP_OK as i64)
     test.eq_i64(c, rep, "with a 400", httpc.status(c2) as i64, 400)
-    test.eq_i64(c, rep, "and the connection closed", httpc.read_response(c2) as i64,
+    test.eq_i64(c, rep, "and the connection closed", resp_within(c2, 300) as i64,
         http.HTTP_INCOMPLETE as i64)
     test.eq_i64(c, rep, "counted as a bad request", httpd.bad_requests(sv), 1)
     httpc.hangup(c2)
@@ -881,11 +927,11 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
     httpc.send_raw(cl, "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 4096\r\n\r\n")
     httpd.serve_for(sv, net, 100)
     test.eq_i64(c, rep, "a declared length over the bound is answered at once",
-        httpc.read_response(cl) as i64, http.HTTP_OK as i64)
+        resp_within(cl, 300) as i64, http.HTTP_OK as i64)
     test.eq_i64(c, rep, "with a 413", httpc.status(cl) as i64, 413)
     test.eq_i64(c, rep, "the sink was never opened", ts_get(tally, TS_BYTES), 0 - 1)
     test.eq_i64(c, rep, "counted", httpd.oversized_bodies(sv), 1)
-    test.eq_i64(c, rep, "and the connection closed", httpc.read_response(cl) as i64,
+    test.eq_i64(c, rep, "and the connection closed", resp_within(cl, 300) as i64,
         http.HTTP_INCOMPLETE as i64)
     httpc.hangup(cl)
 
@@ -902,7 +948,7 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
     httpc.send_raw(c2, string_view(msg))
     httpd.serve_for(sv, net, 100)
     test.eq_i64(c, rep, "a chunked body that grows past the bound is answered",
-        httpc.read_response(c2) as i64, http.HTTP_OK as i64)
+        resp_within(c2, 300) as i64, http.HTTP_OK as i64)
     test.eq_i64(c, rep, "with a 413", httpc.status(c2) as i64, 413)
     test.eq_i64(c, rep, "counted", httpd.oversized_bodies(sv), 2)
     test.is_true(c, rep, "and it stopped near the bound, not at the end of the body",
@@ -918,10 +964,10 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
     httpc.send_raw(c3, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3000\r\n\r\n")
     httpd.serve_for(sv, net, 100)
     test.eq_i64(c, rep, "an unstreamed body larger than the buffer is answered",
-        httpc.read_response(c3) as i64, http.HTTP_OK as i64)
+        resp_within(c3, 300) as i64, http.HTTP_OK as i64)
     test.eq_i64(c, rep, "with a 413", httpc.status(c3) as i64, 413)
     test.eq_i64(c, rep, "counted", httpd.oversized_bodies(sv), 3)
-    test.eq_i64(c, rep, "and the connection closed rather than drained", httpc.read_response(c3) as i64,
+    test.eq_i64(c, rep, "and the connection closed rather than drained", resp_within(c3, 300) as i64,
         http.HTTP_INCOMPLETE as i64)
     httpc.hangup(c3)
 
@@ -969,11 +1015,11 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
     var cl: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
     httpc.send_raw(cl, string_view(msg))
     httpd.serve_for(sv, net, 100)
-    test.eq_i64(c, rep, "the refusal is a response", httpc.read_response(cl) as i64, http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "the refusal is a response", resp_within(cl, 300) as i64, http.HTTP_OK as i64)
     test.eq_i64(c, rep, "the status the sink chose", httpc.status(cl) as i64, 401)
     test.eq_i64(c, rep, "no body byte was taken", ts_get(tally, TS_BYTES), 0)
     test.eq_i64(c, rep, "and no request was served", httpd.served(sv), 0)
-    test.eq_i64(c, rep, "the connection is closed", httpc.read_response(cl) as i64,
+    test.eq_i64(c, rep, "the connection is closed", resp_within(cl, 300) as i64,
         http.HTTP_INCOMPLETE as i64)
     httpc.hangup(cl)
 
@@ -984,7 +1030,7 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
     var c2: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
     httpc.send_raw(c2, string_view(msg2))
     httpd.serve_for(sv, net, 200)
-    test.eq_i64(c, rep, "with the token it is accepted", httpc.read_response(c2) as i64,
+    test.eq_i64(c, rep, "with the token it is accepted", resp_within(c2, 300) as i64,
         http.HTTP_OK as i64)
     test.eq_i64(c, rep, "200", httpc.status(c2) as i64, 200)
     test.eq_i64(c, rep, "and the whole body streamed", ts_get(tally, TS_BYTES), 4096)
@@ -998,7 +1044,7 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
     var c3: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
     httpc.send_raw(c3, string_view(msg3))
     httpd.serve_for(sv, net, 200)
-    test.eq_i64(c, rep, "a mid-body refusal is a response", httpc.read_response(c3) as i64,
+    test.eq_i64(c, rep, "a mid-body refusal is a response", resp_within(c3, 300) as i64,
         http.HTTP_OK as i64)
     test.eq_i64(c, rep, "with the sink's status", httpc.status(c3) as i64, 413)
     test.eq_i64(c, rep, "still only one request served", httpd.served(sv), 1)
@@ -1013,7 +1059,7 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
     let t0: i64 = time.read_nanos(clk)
     httpd.serve_for(sv, net, 250)
     let waited: i64 = (time.read_nanos(clk) - t0) / 1000000
-    test.eq_i64(c, rep, "the stalled upload is answered", httpc.read_response(c4) as i64,
+    test.eq_i64(c, rep, "the stalled upload is answered", resp_within(c4, 300) as i64,
         http.HTTP_OK as i64)
     test.eq_i64(c, rep, "with a 408", httpc.status(c4) as i64, 408)
     test.is_true(c, rep, "and not before the read timeout", waited >= 60)

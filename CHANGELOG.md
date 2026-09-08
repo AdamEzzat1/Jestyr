@@ -59,6 +59,15 @@ versions are snapshots, not stability promises.
   and chunked, reporting the same checksum through a 1024-byte buffer, each with a pipelined
   request behind it. Not added: `Expect: 100-continue`, and no pull-shaped read API.
 
+- **`httpc.fd` and `httpc.pending`** — the descriptor of a client's connection and how many
+  bytes it is holding past the last response it handed out. `std/httpc` is blocking by design,
+  so `read_response` against a server that stopped answering never returns, and the first
+  draft of the streaming suite detected three of its six mutations as HANGS rather than named
+  failures — a suite whose failure mode is a hang says nothing about what broke. With these
+  two a test can poll first and read only when there is something, counting bytes already
+  buffered because a pipelined answer arrives in the same read as the one before it and never
+  makes the socket readable a second time. All six mutations now fail by name.
+
 - **`std/trace`** — timed, nested segments of work with attributes, exported to whoever is
   listening. A `Tracer` is GIVEN a `time.Clock` and an `Exporter` (`std/log`'s design: no
   ambient tracer, no global), so under `time.manual()` every duration and every id is
