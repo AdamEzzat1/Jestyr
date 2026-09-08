@@ -674,6 +674,50 @@ mod jc_build_matrix {
         let _ = std::fs::remove_file(std::env::temp_dir().join("jestyr_jc_shadow.c"));
     }
 
+    /// **The same refusal for a VARIANT, which is the door the `fn` rule did not cover.**
+    ///
+    /// A variant enters the program-wide name space by its bare spelling, so
+    /// `enum Verdict { ok, err }` in any module stood in front of the result intrinsics for
+    /// every module that imported it: `std/core` declared exactly that, and importing it
+    /// made a plain `return ok(x)` in the importer fail with *"a fallible function must
+    /// return a result, not a bare value"* — pointing at the `ok(...)` that was already
+    /// what the message asked for. `std/supervise` met it and stopped importing `core`.
+    ///
+    /// **Asserted against the PORT, because that is where the risk is.** A refusal only
+    /// `jestyrc` enforces is an acceptance divergence — `jc` would build what `jestyrc`
+    /// rejects — and this test is what makes the mirror in `escape.jtr` a fact rather than
+    /// a claim. It was watched failing with the mirror removed. The corpus cannot pin this
+    /// rule: no corpus file violates it any more, so a whole-corpus differential passes
+    /// vacuously whether the mirror exists or not.
+    #[test]
+    fn jc_refuses_a_variant_named_for_an_intrinsic() {
+        let jc = super::c_oracle::build_exe("examples/std/cgen.jtr");
+        let src = std::env::temp_dir().join("jestyr_jc_variant.jtr");
+        std::fs::write(
+            &src,
+            "enum Verdict(T, E) { ok(v: T), err(e: E) }\n\
+             fn main() -> i32 { return 0 }\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new(&jc)
+            .arg(src.to_str().unwrap())
+            .arg("build")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "the self-hosted driver BUILT an enum whose variant shadows an intrinsic — the \
+             two compilers now disagree on what a program IS.\nstdout: {}\nstderr: {err}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            err.contains("is named for a compiler intrinsic"),
+            "refused, but not for this reason — the message must survive to the driver: {err}"
+        );
+        let _ = std::fs::remove_file(std::env::temp_dir().join("jestyr_jc_variant.c"));
+    }
+
     #[test]
     fn jc_build_matrix_matches_expectations() {
         let jc = super::c_oracle::build_exe("examples/std/cgen.jtr");

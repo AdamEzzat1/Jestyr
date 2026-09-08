@@ -574,6 +574,41 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// **An enum VARIANT may not be named for a compiler intrinsic either.**
+    ///
+    /// The sibling of [`Self::check_intrinsic_shadowing`], and it exists because that rule
+    /// covered only the `fn` door. A variant reaches the same program-wide bare-name space
+    /// by a different route — `table.variants` is keyed by the bare spelling, with no module
+    /// in the key — so `enum Result(T, E) { ok(v: T), err(e: E) }` in ANY module put `ok`
+    /// and `err` in front of the result intrinsics for every module that imported it.
+    ///
+    /// **The symptom was two modules away from the cause.** `std/core` declared exactly
+    /// that, so `import "core"` beside a fallible function of one's own made a plain
+    /// `return ok(x)` fail with *"a fallible function must return a result, not a bare
+    /// value"* — pointing at the `ok(...)` that was already what the message asked for.
+    /// `std/supervise` hit it and routed around it by not importing `core` at all.
+    ///
+    /// The names are reserved rather than resolved by context: `ok(x)` is syntax here, not
+    /// a library call, and a context-sensitive rule would have to be replicated exactly in
+    /// the self-hosted compiler, which is the divergence class this tree works hardest to
+    /// avoid. `core.Result`'s variants are `success`/`failure` for this reason.
+    fn check_intrinsic_variant(&mut self, e: &crate::ast::EnumDecl) {
+        for v in &e.variants {
+            if crate::cgen::is_intrinsic(&v.name.name) {
+                self.error_help(
+                    v.name.span,
+                    format!(
+                        "variant `{}` of enum `{}` is named for a compiler intrinsic",
+                        v.name.name, e.name.name
+                    ),
+                    "a variant enters the program-wide name space by its bare spelling, so \
+                     this shadows the intrinsic for every module that imports this one — \
+                     rename the variant (`core.Result` uses `success`/`failure`)",
+                );
+            }
+        }
+    }
+
     /// **A `@copy` aggregate may not contain something that owns a resource.**
     ///
     /// `@copy` says "duplicating this value is free". A field that owns something makes
@@ -703,7 +738,10 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            Item::Enum(_) => self.check_copy_containment(item),
+            Item::Enum(e) => {
+                self.check_copy_containment(item);
+                self.check_intrinsic_variant(e);
+            }
             // An `impl`'s method bodies. The comment here used to say they were
             // "escape-checked once their resolution lands (Stage B)"; Stage B is
             // `typeck::register_impls`, which reads signatures only, so in fact
