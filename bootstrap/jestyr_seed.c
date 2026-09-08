@@ -36947,7 +36947,14 @@ void jestyr_emit_err_match(JestyrString* restrict j_sb, Jestyr_Parser j_p, Jesty
     jestyr_rt_str_push(&(*j_sb), JSTR("; "));
     if ((!j_unit_ok))
     {
-        jestyr_emit_ty_c(&((*j_sb)), j_p, j_src, j_c, j_btd.j_a);
+        if ((j_btd.j_kind == 5))
+        {
+            jestyr_emit_ty_c(&((*j_sb)), j_p, j_src, j_c, j_btd.j_a);
+        }
+        else
+        {
+            jestyr_rt_str_push(&(*j_sb), JSTR("int"));
+        }
         jestyr_rt_str_push(&(*j_sb), JSTR(" _cv"));
         jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_m));
         jestyr_rt_str_push(&(*j_sb), JSTR("; "));

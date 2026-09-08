@@ -19598,7 +19598,6 @@ fn main() -> i32 {
         files.sort();
         let mut checked = 0;
         let mut diverged: Vec<String> = Vec::new();
-        let mut expected_still_diverging: Vec<&str> = Vec::new();
         for p in &files {
             let f = p.to_str().unwrap();
             let base = p.file_name().and_then(|s| s.to_str()).unwrap();
@@ -19608,26 +19607,6 @@ fn main() -> i32 {
             let src = std::fs::read_to_string(p).unwrap();
             let got = jestyr_cgen_dump_args(&exe, f, &["test"]);
             let want = rust_cgen_test_dump(&src, None);
-            // **One known divergence, measured to the token and kept on a leash.**
-            // `plugin_test.jtr` writes `catch |e| match e { … }` whose arms produce an
-            // IMPORTED type. With imports unresolved — this golden's own condition — the
-            // reference degrades that type to `int` everywhere and the port agrees on the
-            // try temp (`int _ct63`) but declares the MATCH temp `void _cv64` where the
-            // reference writes `int _cv64`. That single keyword is the whole diff over the
-            // file, and it cannot reach a real build: with imports resolved the type is
-            // known to both. The fix belongs in `cgen.jtr`'s catch lowering, a closure
-            // module, so it is serial work with a reseed — the register carries it.
-            //
-            // The exclusion is asserted to be NECESSARY below, so whoever fixes the
-            // lowering is told to delete it rather than leaving a hole nobody revisits.
-            if base == "plugin_test.jtr" {
-                if got != want {
-                    expected_still_diverging.push("plugin_test.jtr");
-                } else {
-                    checked += 1;
-                }
-                continue;
-            }
             if got != want {
                 diverged.push(f.to_string());
                 if std::env::var("DUMP_DIVERGE").is_ok() {
@@ -19642,12 +19621,6 @@ fn main() -> i32 {
             }
         }
         assert!(diverged.is_empty(), "Jestyr TEST-mode cgen diverged from the reference on: {diverged:?}");
-        assert!(
-            !expected_still_diverging.is_empty(),
-            "`plugin_test.jtr` now agrees in test mode — the `catch |e| match` temp is no \
-             longer typed `void` by the port. DELETE its exclusion above; the exclusion \
-             exists only for as long as the defect does."
-        );
 
         // tests_demo.jtr: the filtered harness (codegen-side filtering — the baked
         // `running N test(s)` count equals the runner count), and `--list` parity.

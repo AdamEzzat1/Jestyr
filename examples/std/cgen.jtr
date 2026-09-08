@@ -12246,7 +12246,13 @@ fn emit_err_match(mut sb: String, read p: parser.Parser, read src: str, read c: 
     string_push(sb, base_c)
     string_push(sb, "; ")
     if !unit_ok {
-        emit_ty_c(sb, p, src, c, btd.a)
+        // **`btd.a` is the ok type ONLY when the base really is a Result (kind 5).**
+        // Without the guard an unresolved base — a call whose module was not loaded, which
+        // is exactly the byte-identity golden's condition — reads `a` off a type that has
+        // no ok member and emits `void _cv`, while the reference degrades the same unknown
+        // to `int`. The sibling form (`catch |e| <expr>`) has always carried this guard;
+        // this one did not, and that one keyword was the whole divergence.
+        if btd.kind == 5 { emit_ty_c(sb, p, src, c, btd.a) } else { string_push(sb, "int") }
         string_push(sb, " _cv")
         push_uint(sb, m as i64)
         string_push(sb, "; ")
