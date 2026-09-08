@@ -2404,12 +2404,17 @@ mod plugin_server {
         assert!(awake < timed, "the timeout must follow an answer from the same connection:\n{out}");
         assert!(!out.contains("crashed"), "nothing in this transcript crashes:\n{out}");
 
-        // **The orphan gate.** `ECHO_NAP_NANOS` is ten seconds and the demo kills the sleeper
-        // rather than outliving it, so this pipe reaches EOF in about one second here. Six is
-        // the ceiling: far above any machine's cost for three process starts and a 400ms
-        // budget, and far below the ten seconds a plugin killed by its shell alone would make
-        // this read wait. A `terminate` that stopped reaching the tree fails HERE and only
-        // here — every line of the transcript above would still be exactly right.
+        // **The orphan gate — the assertion that guards the NAP.** `ECHO_NAP_NANOS` is ten
+        // seconds and the demo kills the sleeper rather than outliving it, so this pipe
+        // reaches EOF in about one second here. Six is the ceiling: far above any machine's
+        // cost for three process starts and a 400ms budget, and far below the ten seconds the
+        // orphan cost — measured, with the group taken out and this nap left in, at 10.46s.
+        //
+        // It is not the only guard and it is not the first to fire: a group that stops being
+        // taken down turns the transcript's `and its whole tree with it` line to `false`
+        // above, which is checked first and says WHY. This one is here because the nap is
+        // sized on the claim that a killed plugin costs its reader nothing, and a claim a
+        // constant is sized on should be a test rather than a comment.
         assert!(
             elapsed.as_secs_f64() < 6.0,
             "the killed plugin held this pipe open for {:.2}s: the timeout reached its shell \

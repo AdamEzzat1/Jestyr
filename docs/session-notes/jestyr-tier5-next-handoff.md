@@ -13,7 +13,8 @@ before them 1364 after A13 and the link-rule fold, and 1359 after HTTP V2, TLS a
 registry layer). The second wave added six suites to `io_suites_pass`
 (`trace_test` 7, `livecfg_test` 7, `supervise_test` 10, `crypto_test` 5, `sandbox_test` 8,
 `plugin_test` 10, the last replacing an entry of 4), six `BUILD_OK` lines to the build
-matrix, and six pinned demo transcripts.
+matrix, and six pinned demo transcripts. (`plugin_test` is 11 since the group landed —
+see its §2 entry.)
 Those commits sit on `claude/tier5-compiler-handoff-75c515`, a fast-forward of the
 package-substrate branch; **not merged to master.** CI was fully green — all four jobs — at
 the substrate branch's head; the Linux ladder has not run since `std/kv`.
@@ -648,12 +649,34 @@ successor should not re-derive:
   in 15 on an IDLE machine — it looked like a miscompile, it was a race. Hence `set_budget`:
   connect roomy, hear from the plugin once, then tighten. A timeout asserted before the
   process is known to be up asserts nothing.
-* **A killed plugin holds the host's stdout.** `terminate` reaches the `cmd.exe` that
-  `start_piped` started, not the plugin under it, so a napping plugin is orphaned WITH the
-  host's inherited handles — anything capturing the host's output (`$(…)`, `Command::output`)
-  waits for the orphan before it sees EOF. A 10-second nap made a 2-second demo take 10
-  seconds to read; the nap is 3s for that reason and no other. A Job object would fix it and
-  `sysproc` has none.
+* ~~**A killed plugin holds the host's stdout.**~~ **CLOSED — the plugin now dies with its
+  whole tree.** The defect was real and worth reading once: `terminate` reaches the `cmd.exe`
+  that started the plugin, not the plugin under it, so a napping plugin was orphaned WITH the
+  host's inherited handles and anything capturing the host's output (`$(…)`,
+  `Command::output`) waited for the orphan before it saw EOF. `plugin.connect` now opens a
+  `sandbox.Group`, starts the child through the new `sysproc.start_piped_at(.., apart: true)`,
+  joins it before it runs and resumes it; every path that ends a connection sweeps the group
+  AFTER the child, so the status a caller reads is still the child's own and the healthy path
+  finds the group already empty. Do not re-derive:
+  * **The sweep goes last, not into the middle of close_input → drain → wait.** Terminating
+    the group first kills a plugin that was about to exit cleanly and rewrites its exit
+    status into a kill. On the timeout path the child is likewise killed first, sweep second.
+  * **`tree_reaped` is a measurement, not an assumption** — was the group CONFIRMED empty
+    inside `PLUGIN_REAP_NANOS` (2s, its own constant because the call budget can be zero and
+    measures a different thing). A group that will not empty is a bounded false, never a wait.
+  * **`apart` cannot be demonstrated by a test, and that is not a defect in the test.**
+    Windows lets a RUNNING process be assigned to a Job and a process inherits its parent's
+    Job at creation, so a child grouped microseconds late still drags in every grandchild born
+    after that — all of them, given how long `cmd.exe` takes to reach its first command.
+    `apart` replaces "in practice" with "always"; deleting it leaves the suite green.
+  * **The nap was a workaround and its removal was measured.** Through a PIPE (a file
+    redirect shows nothing — there is no EOF to wait for), three runs each: without the group
+    3.41s at a 3s nap and 10.46s at a 10s one; with it 0.90s and 1.02s. `ECHO_NAP_NANOS` is
+    back to 10s and `jplugin_keeps_one_plugin_and_survives_it` asserts its `Command::output`
+    finishes under 6s, so the constant's justification is now a test.
+  * **POSIX compiles and is unexercised here.** `sh -c` of a simple command usually `exec`s,
+    so the orphan is a Windows symptom; `setpgid` + `kill(-pgid, …)` run on the Linux ladder
+    alone. `sandbox`'s own group test covers the same POSIX code path.
 * **`decode` checks the CRC before the version.** A corrupt frame can carry any version, and
   "unsupported version" for bit rot sends a caller after a deployment mismatch that never
   happened. That ordering is one of the mutations.
@@ -734,7 +757,7 @@ CHANGELOG to find it.
 | ~~**Service supervision**~~ | **DONE: `std/supervise`** (below) | restart policy, budget window, backoff, `stop_all`, events; no tree |
 | ~~**Sandbox**~~ | **DONE: `std/sandbox`** (§2 entry above) | `sysproc.start_at` is the one primitive; the jail is a `sandbox.Jail` a child reads with `inherited`, NOT a change to `fs.host()` (closure module) |
 | ~~**Config live reload + nesting**~~ | **DONE: `std/livecfg`** (§2 above) | candidate-then-swap; a shadowed file value is not validated; `step`, not `poll` |
-| ~~**`std/plugin` on the pipe transport**~~ | **DONE** (§2 entry above) | `sysstdio` was the missing half — nothing in the tree could read its own stdin; `terminate` still kills the SHELL, not the plugin |
+| ~~**`std/plugin` on the pipe transport**~~ | **DONE** (§2 entry above) | `sysstdio` was the missing half — nothing in the tree could read its own stdin. The SHELL-not-the-plugin kill is CLOSED too: `connect` starts its child in a `sandbox.Group` and every teardown path sweeps it |
 
 ### ~~Trace spans~~ — **DONE: `std/trace`**
 

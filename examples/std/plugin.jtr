@@ -430,7 +430,13 @@ pub fn no_conn() -> Conn {
 // the group exists before the child, the child is created apart — suspended on Windows —
 // and is claimed by the group before it runs an instruction, and only then is it resumed.
 // Any other order has a window in which a grandchild is born outside the group and outlives
-// every kill this module can perform.
+// every kill this module can perform. **That window is closed by construction and not by a
+// test**, and the distinction is recorded because a successor will otherwise delete `apart`
+// and see the suite stay green: Windows lets a running process be assigned to a Job, and a
+// process inherits its parent's Job at creation, so a child grouped a few microseconds late
+// still drags in every grandchild born after that — which, with `cmd.exe` taking tens of
+// milliseconds to reach its first command, is all of them in practice. "In practice" is what
+// `apart` replaces with "always"; a race nobody can force is still a race.
 pub fn connect(mut sp: sysproc.Spawner, take clk: time.Clock, read cmd: str, budget_nanos: i64) -> Conn !{ PluginRefused, PluginNoStart(i32) } {
     if sysproc.can_start(sp) == false {
         // Through the spawner, so its refusal counter sees the attempt the way it would

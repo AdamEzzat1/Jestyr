@@ -531,6 +531,16 @@ fn setup(mut buf: []u8, read text: str) -> usize { return load(buf, text) }
 // whole tree was confirmed gone. Every wait here is BOUNDED: if the group will not empty,
 // `tree_reaped` comes back false after `PLUGIN_REAP_NANOS` and this test FAILS. It does not
 // hang, and a hang would itself be the verdict.
+//
+// **What this does NOT prove is the `apart` half**, and that is worth saying rather than
+// leaving for someone to discover by deleting it and watching the suite stay green. Windows
+// lets a RUNNING process be assigned to a Job, and a process inherits its parent's Job at
+// creation, so a child grouped a moment late still drags in every grandchild born after that
+// moment — which, with `cmd.exe` taking tens of milliseconds to reach its first command, is
+// all of them. `apart` closes the window in between, and a window this suite cannot force
+// open is a window a test cannot demonstrate. Three mutations it DOES catch: a sweep that
+// terminates nothing (the confirmation below), a `join_group` that groups nothing (the
+// liveness above), and a missing `resume` (no marker ever appears).
 @test fn a_timeout_kills_the_plugins_whole_tree_and_not_only_its_shell() -> bool {
     var raw: *mut u8 = alloc(u8, P_T_CAP)
     var rep: []u8 = slice(u8, raw, P_T_CAP)
