@@ -674,6 +674,50 @@ mod jc_build_matrix {
         let _ = std::fs::remove_file(std::env::temp_dir().join("jestyr_jc_shadow.c"));
     }
 
+    /// **The same refusal for a VARIANT, which is the door the `fn` rule did not cover.**
+    ///
+    /// A variant enters the program-wide name space by its bare spelling, so
+    /// `enum Verdict { ok, err }` in any module stood in front of the result intrinsics for
+    /// every module that imported it: `std/core` declared exactly that, and importing it
+    /// made a plain `return ok(x)` in the importer fail with *"a fallible function must
+    /// return a result, not a bare value"* — pointing at the `ok(...)` that was already
+    /// what the message asked for. `std/supervise` met it and stopped importing `core`.
+    ///
+    /// **Asserted against the PORT, because that is where the risk is.** A refusal only
+    /// `jestyrc` enforces is an acceptance divergence — `jc` would build what `jestyrc`
+    /// rejects — and this test is what makes the mirror in `escape.jtr` a fact rather than
+    /// a claim. It was watched failing with the mirror removed. The corpus cannot pin this
+    /// rule: no corpus file violates it any more, so a whole-corpus differential passes
+    /// vacuously whether the mirror exists or not.
+    #[test]
+    fn jc_refuses_a_variant_named_for_an_intrinsic() {
+        let jc = super::c_oracle::build_exe("examples/std/cgen.jtr");
+        let src = std::env::temp_dir().join("jestyr_jc_variant.jtr");
+        std::fs::write(
+            &src,
+            "enum Verdict(T, E) { ok(v: T), err(e: E) }\n\
+             fn main() -> i32 { return 0 }\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new(&jc)
+            .arg(src.to_str().unwrap())
+            .arg("build")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "the self-hosted driver BUILT an enum whose variant shadows an intrinsic — the \
+             two compilers now disagree on what a program IS.\nstdout: {}\nstderr: {err}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            err.contains("is named for a compiler intrinsic"),
+            "refused, but not for this reason — the message must survive to the driver: {err}"
+        );
+        let _ = std::fs::remove_file(std::env::temp_dir().join("jestyr_jc_variant.c"));
+    }
+
     #[test]
     fn jc_build_matrix_matches_expectations() {
         let jc = super::c_oracle::build_exe("examples/std/cgen.jtr");
@@ -2315,10 +2359,17 @@ mod plugin_protocol {
 /// a 485ms outlier over 120 starts, and a 300ms budget lost about one run in fifteen on an
 /// idle machine.
 ///
-/// The demo takes about three seconds, and none of it is waiting: `terminate` reaches the
-/// `cmd.exe` that `start_piped` started rather than the plugin under it, so the sleeper is
-/// orphaned holding the demo's inherited stdout, and `Command::output` below sees no EOF
-/// until its three-second nap ends. The transcript is complete long before that.
+/// **`Command::output` is a PIPE, and that is why this test can time the orphan.** The demo
+/// used to take about three seconds, and none of it was waiting: `terminate` reached the
+/// `cmd.exe` that started the plugin rather than the plugin under it, so the sleeper was
+/// orphaned holding the demo's inherited stdout, and the read below saw no EOF until its nap
+/// ended. `plugin.connect` now starts the plugin in a `sandbox.Group` and the timeout takes
+/// the group down. Measured here through a pipe, three runs each: without the group 3.41s at
+/// a three-second nap and 10.46s at the ten-second one `plugin_echo` now uses; with it 0.90s
+/// and 1.02s. So `ECHO_NAP_NANOS` went back to ten seconds — a margin over the demo's 400ms
+/// budget that no loaded machine can close — and the elapsed time is asserted below, which is
+/// the only assertion here that a re-orphaned plugin would fail. A file redirect would not:
+/// there is no EOF to wait for, and the whole effect vanishes.
 #[cfg(all(test, feature = "c-oracle"))]
 mod plugin_server {
     use super::*;
@@ -2327,7 +2378,9 @@ mod plugin_server {
     fn jplugin_keeps_one_plugin_and_survives_it() {
         let echo = super::c_oracle::build_exe("examples/std/plugin_echo.jtr");
         let host = super::c_oracle::build_exe("examples/std/plugin_server_demo.jtr");
+        let started = std::time::Instant::now();
         let run = std::process::Command::new(&host).arg(&echo).output().unwrap();
+        let elapsed = started.elapsed();
         assert_eq!(run.status.code(), Some(0), "the host must exit cleanly whatever the plugin does");
         let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
 
@@ -2360,6 +2413,7 @@ mod plugin_server {
                     -- and then sleeping past the tightened budget --\n\
                     timed-out\n\
                     the plugin was killed\ntrue\n\
+                    and its whole tree with it\ntrue\n\
                     the host is still standing\ntrue\n\
                     -- a fresh connection after the kill --\n\
                     ok\n#0 A NEW PROCESS\n\
@@ -2393,6 +2447,24 @@ mod plugin_server {
         let timed = out.find("\ntimed-out\n").expect("the timeout line is missing");
         assert!(awake < timed, "the timeout must follow an answer from the same connection:\n{out}");
         assert!(!out.contains("crashed"), "nothing in this transcript crashes:\n{out}");
+
+        // **The orphan gate — the assertion that guards the NAP.** `ECHO_NAP_NANOS` is ten
+        // seconds and the demo kills the sleeper rather than outliving it, so this pipe
+        // reaches EOF in about one second here. Six is the ceiling: far above any machine's
+        // cost for three process starts and a 400ms budget, and far below the ten seconds the
+        // orphan cost — measured, with the group taken out and this nap left in, at 10.46s.
+        //
+        // It is not the only guard and it is not the first to fire: a group that stops being
+        // taken down turns the transcript's `and its whole tree with it` line to `false`
+        // above, which is checked first and says WHY. This one is here because the nap is
+        // sized on the claim that a killed plugin costs its reader nothing, and a claim a
+        // constant is sized on should be a test rather than a comment.
+        assert!(
+            elapsed.as_secs_f64() < 6.0,
+            "the killed plugin held this pipe open for {:.2}s: the timeout reached its shell \
+             and not its tree, so the orphan is still holding the demo's inherited stdout",
+            elapsed.as_secs_f64()
+        );
     }
 }
 
@@ -2453,6 +2525,16 @@ mod alog_durable {
 /// a middleware that gates one path, three requests on ONE kept-alive connection (the `1`
 /// after "connections accepted"), a streamed body that decodes whole, and the access log.
 /// Client and server take turns in one thread, so the transcript is exact.
+///
+/// The upload section is the REQUEST-body streaming pin. The server's connection buffer is
+/// 1024 bytes and each body is 4000, so `4000` bytes received with `arrived in more than one
+/// piece` is the whole claim: a buffered implementation cannot print both. The same body goes
+/// up twice, once framed by `Content-Length` and once chunk-encoded, and the two report the
+/// SAME checksum — the framing is the client's choice and the sink cannot tell which was
+/// used. `the exchange buffered none of it` is `body_len(x) == 0` inside the handler, and
+/// each `the request pipelined after the body -> hello` is a request that rode in the same
+/// write as the body and was answered from what the buffer held after it: when a streamed
+/// body ends the buffer sits exactly at the next request's first byte.
 #[cfg(all(test, feature = "c-oracle"))]
 mod httpd_service {
     use super::*;
@@ -2475,8 +2557,21 @@ mod httpd_service {
                     GET /admin without a token -> token required\n\
                     200\n\
                     GET /admin with the token -> welcome, admin\n\
+                    -- an upload larger than the connection buffer --\n\
+                    POST /upload (content-length) -> stored\n\
+                    bytes the sink received\n4000\n\
+                    checksum\n437956\n\
+                    arrived in more than one piece\ntrue\n\
+                    and the exchange buffered none of it\ntrue\n\
+                    the request pipelined after the body -> hello\n\
+                    POST /upload (chunked) -> stored\n\
+                    bytes the sink received\n4000\n\
+                    checksum\n437956\n\
+                    arrived in more than one piece\ntrue\n\
+                    and the exchange buffered none of it\ntrue\n\
+                    the request pipelined after the body -> hello\n\
                     -- the access log's last record names the status --\ntrue\n\
-                    requests served\n5";
+                    requests served\n9";
         assert_eq!(out.trim_end(), want, "the httpd demo's transcript changed:\n{out}");
         assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
         assert!(!out.contains("could not"), "the demo must bind its socket:\n{out}");
@@ -2573,6 +2668,86 @@ mod kv_durable {
 
         assert!(!std::path::Path::new("zz_jstate.db").exists(), "the demo must clean up after itself");
         assert!(!std::path::Path::new("zz_jstate.snapshot.db").exists(), "the demo must clean up after itself");
+    }
+}
+
+/// **`jadd` — one dependency added, and a whole graph decided.**
+///
+/// `examples/std/jcadd_demo.jtr` is `std/jcadd`'s consumer. A scratch registry is published
+/// into a temporary tree — three packages at two versions each — and a project whose manifest
+/// names one dependency runs `jc add http ^1.0.0`. The transcript's centre is the third
+/// package: `text` is in the lockfile because `http 1.0.0` requires it and nothing in the
+/// project ever named it, which is the difference between resolving the GRAPH and splicing in
+/// the new edge.
+///
+/// The three newer published versions are the other half. `base 1.1.0`, `text 1.2.0` and
+/// `http 1.5.0` all satisfy their requirements and are all absent from the lockfile, because
+/// minimal version selection takes the lowest that satisfies — so publishing a version cannot
+/// move an existing build. Asserting the lockfile's own `selection-sha256` pins that: the
+/// digest is over the three `pkg` lines, and any different selection changes it.
+///
+/// Then the same command again, and the assertion that it wrote NOTHING — not that it wrote
+/// the same bytes, which a blind rewrite would also satisfy, but that `manifest_written` and
+/// `lock_written` are both false and no `.jcadd` staging file exists.
+#[cfg(all(test, feature = "c-oracle"))]
+mod jcadd_command {
+    use super::*;
+
+    #[test]
+    fn jadd_resolves_a_transitive_dependency_once() {
+        let exe = super::c_oracle::build_exe("examples/std/jcadd_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the add demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jadd --\n\
+                    versions published\n6\n\
+                    the manifest before\n\
+                    jestyr-package/v1\n\
+                    name app\n\
+                    version 0.1.0\n\
+                    dep base ^1.0.0\n\
+                    -- jc add http ^1.0.0 --\n\
+                    status\nok\n\
+                    added, updated\ntrue\nfalse\n\
+                    packages resolved, rounds\n3\n3\n\
+                    archives fetched, already cached\n3\n0\n\
+                    manifest written, lockfile written\ntrue\ntrue\n\
+                    the manifest after\n\
+                    jestyr-package/v1\n\
+                    name app\n\
+                    version 0.1.0\n\
+                    dep base ^1.0.0\n\
+                    dep http ^1.0.0\n\
+                    the lockfile\n\
+                    jestyr-lock/v1\n\
+                    resolver mvs\n\
+                    selection-sha256 13866097f90e27fb92eea623827e9807186f70198651289c0d1fce1118259b7d\n\
+                    pkg base 1.0.0\n\
+                    pkg http 1.0.0\n\
+                    pkg text 1.0.0\n\
+                    text is there because http 1.0.0 requires it; the project never named it\n\
+                    and the three newer versions are absent, which is minimal selection\n\
+                    -- the same command again --\n\
+                    status\nok\n\
+                    added, updated\nfalse\nfalse\n\
+                    manifest changed, lock changed\nfalse\nfalse\n\
+                    archives fetched, already cached\n0\n3\n\
+                    manifest written, lockfile written\nfalse\nfalse\n\
+                    -- the check --\n\
+                    the manifest is the same bytes\ntrue\n\
+                    the lockfile is the same bytes\ntrue\n\
+                    no staging file survived either run\ntrue\ntrue";
+        assert_eq!(out.trim_end(), want, "the add demo's transcript changed:\n{out}");
+
+        // Anti-vacuity: minimal selection is three lines the lockfile does NOT contain, and a
+        // transcript that quietly resolved the newest versions would still match a weaker
+        // assertion about counts.
+        assert!(!out.contains("1.1.0"), "base 1.1.0 must not be selected:\n{out}");
+        assert!(!out.contains("1.2.0"), "text 1.2.0 must not be selected:\n{out}");
+        assert!(!out.contains("1.5.0"), "http 1.5.0 must not be selected:\n{out}");
+
+        assert!(!std::path::Path::new("zz_jadd").exists(), "the demo must clean up after itself");
     }
 }
 
@@ -3965,12 +4140,19 @@ fn obligation_extraction_is_total_over_the_corpus() {
 /// assumed, which is what this test keeps true: a new corpus file that violates its
 /// own declared sets fails here *before* enforcement exists to catch it.
 ///
-/// The two permitted unresolved sites are known and honest, not gaps to fix:
-/// `vec.jtr` (a lexer-only fixture calling a `grow` method that is never declared)
-/// and `combinators.jtr` (an `err` variant of the *imported* `core.Result`, which a
-/// single-file census refuses to guess at). The bound is exact so a resolution
-/// regression — the census silently losing the ability to see method or factory
-/// callees — shows up as a count change, in either direction.
+/// The one permitted unresolved site is known and honest, not a gap to fix:
+/// `vec.jtr`, a lexer-only fixture calling a `grow` method that is never declared.
+/// The bound is exact so a resolution regression — the census silently losing the
+/// ability to see method or factory callees — shows up as a count change, in either
+/// direction.
+///
+/// **It was two until `core.Result`'s variants were renamed.** The second was
+/// `combinators.jtr` constructing an `err` that was the *imported* enum's variant
+/// rather than the intrinsic, which a single-file census could not tell apart — and
+/// neither, it turned out, could the compiler: those variants shadowed the intrinsics
+/// program-wide, so importing `core` broke every fallible function in the importing
+/// module. The variants are `success`/`failure` now, and this count dropping to 1 is
+/// that ambiguity leaving the corpus.
 #[test]
 fn error_set_census_is_clean_over_the_corpus() {
     let (mut sites, mut violations, mut unresolved, mut files) = (0usize, 0usize, 0usize, 0usize);
@@ -4012,7 +4194,7 @@ fn error_set_census_is_clean_over_the_corpus() {
         "{violations} error-set violation(s) crept into the corpus — \
          fix the declared sets now, or E3's enforcement lands with a migration attached"
     );
-    assert_eq!(unresolved, 2, "the two known unresolved sites (vec.jtr, combinators.jtr) changed");
+    assert_eq!(unresolved, 1, "the one known unresolved site (vec.jtr) changed");
     eprintln!("ERRSET CENSUS: {sites} sites, {violations} violations, {unresolved} unresolved, {files} files");
 }
 
@@ -19598,7 +19780,6 @@ fn main() -> i32 {
         files.sort();
         let mut checked = 0;
         let mut diverged: Vec<String> = Vec::new();
-        let mut expected_still_diverging: Vec<&str> = Vec::new();
         for p in &files {
             let f = p.to_str().unwrap();
             let base = p.file_name().and_then(|s| s.to_str()).unwrap();
@@ -19608,26 +19789,6 @@ fn main() -> i32 {
             let src = std::fs::read_to_string(p).unwrap();
             let got = jestyr_cgen_dump_args(&exe, f, &["test"]);
             let want = rust_cgen_test_dump(&src, None);
-            // **One known divergence, measured to the token and kept on a leash.**
-            // `plugin_test.jtr` writes `catch |e| match e { … }` whose arms produce an
-            // IMPORTED type. With imports unresolved — this golden's own condition — the
-            // reference degrades that type to `int` everywhere and the port agrees on the
-            // try temp (`int _ct63`) but declares the MATCH temp `void _cv64` where the
-            // reference writes `int _cv64`. That single keyword is the whole diff over the
-            // file, and it cannot reach a real build: with imports resolved the type is
-            // known to both. The fix belongs in `cgen.jtr`'s catch lowering, a closure
-            // module, so it is serial work with a reseed — the register carries it.
-            //
-            // The exclusion is asserted to be NECESSARY below, so whoever fixes the
-            // lowering is told to delete it rather than leaving a hole nobody revisits.
-            if base == "plugin_test.jtr" {
-                if got != want {
-                    expected_still_diverging.push("plugin_test.jtr");
-                } else {
-                    checked += 1;
-                }
-                continue;
-            }
             if got != want {
                 diverged.push(f.to_string());
                 if std::env::var("DUMP_DIVERGE").is_ok() {
@@ -19642,12 +19803,6 @@ fn main() -> i32 {
             }
         }
         assert!(diverged.is_empty(), "Jestyr TEST-mode cgen diverged from the reference on: {diverged:?}");
-        assert!(
-            !expected_still_diverging.is_empty(),
-            "`plugin_test.jtr` now agrees in test mode — the `catch |e| match` temp is no \
-             longer typed `void` by the port. DELETE its exclusion above; the exclusion \
-             exists only for as long as the defect does."
-        );
 
         // tests_demo.jtr: the filtered harness (codegen-side filtering — the baked
         // `running N test(s)` count equals the runner count), and `--list` parity.
@@ -20655,15 +20810,22 @@ fn main() -> i32 {
             // exit — each told apart by name. The END-TO-END halves — a real plugin,
             // really invoked — are `jhost_survives_every_way_a_plugin_can_fail` (one-shot)
             // and `jplugin_keeps_one_plugin_and_survives_it` (server), because they need a
-            // COMPILED plugin and a `.jtr` suite cannot build one.
-            ("plugin_test", 10),
+            // COMPILED plugin and a `.jtr` suite cannot build one. The eleventh is the group:
+            // a child whose shell keeps a GRANDCHILD, killed past its budget, and the whole
+            // tree confirmed empty inside a bounded wait — the claim `plugin.connect` starts
+            // its child apart for, and the one that used to be false.
+            ("plugin_test", 11),
             // **Most of this suite is adversarial**, which is the right shape for an HTTP
             // parser: the ordinary cases are easy and every implementation gets them right,
             // and the vulnerabilities are all in messages that are well-formed and mean two
             // different things. Every case in the smuggling test is a message a lenient
             // parser accepts. No socket is involved -- the dangerous half of an HTTP
-            // implementation is a pure function of a byte buffer.
-            ("http_test", 5),
+            // implementation is a pure function of a byte buffer. The last case is the
+            // STREAMING half: a head parsed before its body exists, head-plus-body compared
+            // field for field against the whole-message parse, and a chunked body decoded
+            // through an 8-byte window a byte at a time -- so the incremental reader and the
+            // buffered one cannot end up with two sets of framing rules.
+            ("http_test", 6),
             // Reproducibility is a CLAIM, so the suite builds the same archive twice from
             // deliberately different dirty buffers and compares every byte -- the assertion a
             // `time(0)` in the header fails. The checksum test pins the one detail every tar
@@ -20689,8 +20851,14 @@ fn main() -> i32 {
             // middleware order and `DONE`, keep-alive with PIPELINED requests, a streamed
             // body decoded whole, static files with traversal refused as a 404, the access
             // log record, a smuggling attempt refused and the connection dropped. The
-            // timeout case asserts a lower bound only.
-            ("httpd_test", 8),
+            // timeout case asserts a lower bound only. The last four are REQUEST-BODY
+            // streaming, every one of them against a 512-byte connection buffer and a 4096-
+            // byte body, so nothing passes by fitting: a `Content-Length` body and a chunked
+            // one each arrive in bounded pieces with a pipelined request riding immediately
+            // behind them, a malformed chunk size is a 400 rather than a hang, a body over
+            // `set_max_body` or over the buffer is a 413 and a close, and a sink may refuse
+            // on the head or part way in. The stalled-upload case waits for the read timeout.
+            ("httpd_test", 12),
             // **A real TLS handshake over loopback, the client on a spawned thread.** The
             // verifying case chains to the fixture CA AND checks the hostname; the wrong-
             // hostname case is right CA, wrong name, and must fail; the trust-nothing case
@@ -20736,6 +20904,16 @@ fn main() -> i32 {
             // and a group that reaches the grandchild a `terminate` of the shell left
             // behind — bounded, never a hang.
             ("sandbox_test", 8),
+            // **`jc add` as one command over the whole package substrate.** Six refusals
+            // (a name, a requirement, an absent manifest, one that does not parse, an
+            // unknown package, an unsatisfiable graph) each leaving the manifest byte for
+            // byte what it was; one add that resolves the WHOLE graph — `text` arrives
+            // through `http` and the three newer published versions are absent — with the
+            // lockfile checked against a fresh resolution through `lockfile.verify`, and a
+            // second run that writes nothing at all. Then the atomicity claim, injected at
+            // both places the sequence can still fail after the candidate exists: a
+            // TAMPERED archive (the fetch) and a read-only handle (the staging write).
+            ("jcadd_test", 3),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

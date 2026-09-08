@@ -41,6 +41,22 @@ pub fn dial(mut net: sysnet.Net, read addr: sysnet.SocketAddr, cap: usize) -> Cl
 }
 
 @no_alloc @no_os pub fn is_open(read c: Client) -> bool { return c.open }
+
+// The connection's descriptor, for a caller that wants to POLL it. This module is blocking by
+// design, and `read_response` on a socket that will never carry one blocks forever — so a
+// test that wants to assert "no answer came" rather than hang on it needs the fd to hand to a
+// poller. It is not a general escape hatch: nothing here reads or writes through it, and the
+// socket stays this client's to close.
+@no_alloc @no_os pub fn fd(read c: Client) -> i64 { return c.sock.fd }
+
+// How many bytes this client is HOLDING past the last response it handed out. A pipelined
+// answer arrives in the same read as the one before it, so a caller polling the socket to
+// decide whether another response is coming would wait for bytes that are already here — this
+// is the other half of that question.
+@no_alloc @no_os pub fn pending(read c: Client) -> usize {
+    if c.resp.total > c.have { return 0 }
+    return c.have - c.resp.total
+}
 @no_alloc @no_os pub fn requests_sent(read c: Client) -> i64 { return c.sent }
 @no_alloc @no_os pub fn responses_read(read c: Client) -> i64 { return c.received }
 

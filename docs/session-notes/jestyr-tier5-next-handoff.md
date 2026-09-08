@@ -8,12 +8,17 @@ defects — one session at a time). §2 is the parallel work (library breadth �
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1371 passed / 0 failed / 3 ignored** (full ladder after the SIX second-wave modules, 671 s;
+**1373 passed / 0 failed / 3 ignored** (full ladder after the TAIL work — `jc add`, httpd
+request-body streaming, plugin adopting sandbox's groups, and the two serial compiler items
+that closed the register's last defects; 747 s. The Jestyr-level suites grew inside
+`io_suites_pass` rather than as new Rust tests: `plugin_test` 10 → 11, `httpd_test` 8 → 12,
+`http_test` 5 → 6, plus `jcadd_test` 3.) Previously **1371** after the SIX second-wave modules, 671 s;
 before them 1364 after A13 and the link-rule fold, and 1359 after HTTP V2, TLS and the
 registry layer). The second wave added six suites to `io_suites_pass`
 (`trace_test` 7, `livecfg_test` 7, `supervise_test` 10, `crypto_test` 5, `sandbox_test` 8,
 `plugin_test` 10, the last replacing an entry of 4), six `BUILD_OK` lines to the build
-matrix, and six pinned demo transcripts.
+matrix, and six pinned demo transcripts. (`plugin_test` is 11 since the group landed —
+see its §2 entry.)
 Those commits sit on `claude/tier5-compiler-handoff-75c515`, a fast-forward of the
 package-substrate branch; **not merged to master.** CI was fully green — all four jobs — at
 the substrate branch's head; the Linux ladder has not run since `std/kv`.
@@ -460,9 +465,9 @@ obvious next layer if the tier wants an end-to-end `jc add`.
 ### ~~2.2 — HTTP V2 (area 6)~~ — **DONE: `std/httpd` + `std/httpc`**
 
 Routing, middleware, keep-alive with pipelining, read and idle timeouts, chunked streaming
-out, static files, an access log, a test client. Eight tests on real loopback sockets, five
-mutations watched failing, the `jhttpd` demo pinned. The long note's §3s has the design.
-What a successor should not re-derive:
+out AND request-body streaming IN, static files, an access log, a test client. Twelve tests
+on real loopback sockets, eleven mutations watched failing, the `jhttpd` demo pinned. The
+long note's §3s has the design. What a successor should not re-derive:
 
 * **One thread, one poll.** `spawn` refuses `mut` params, so a per-connection worker is a
   channel architecture; the readiness loop over `runtime.ask` is smaller and makes the
@@ -478,8 +483,37 @@ What a successor should not re-derive:
   `log` (→ `json`/`writer`) shared a closure with a struct holding a `json.Writer`.
   **CLOSED 2026-09-06** (reference-only; the port was already right — see the register).
   `httpd_test`'s dropped `sysfs` import may go back.
-* Not built: request-body streaming (a request must fit the connection buffer; 431 and a
-  close otherwise), TLS, compression, ranges, ETags.
+* **Request-body streaming is DONE (2026-09-08).** `route_stream(sv, method, pattern,
+  handler, sink)` registers a route whose body is PUSHED to a `BodySink` — `on_open(ctx,
+  read Exchange)` when the head is in, `on_data(ctx, read []u8)` per piece, both answering a
+  STATUS (0 accepts, anything else is sent and the connection closed). Four things not to
+  re-derive:
+  * **Push, not pull.** A `read_body(x, buf)` call would have to block, and one blocking
+    read on a single-threaded server is one slow uploader starving every connection. The
+    sink is fed from inside the poll and the loop returns.
+  * **`std/http` grew `parse_head` + `body_from_head` + `chunk_step`, and `parse_request` IS
+    the first two in order.** There is still exactly one start-line loop, one header loop and
+    one framing scan; a second framing decision is the whole smuggling class. `chunk_step`
+    drives the same `line_end`/`strict_hex` pair `frame_chunked` uses.
+  * **The head is PINNED at [0, head_len) while the body streams** and the window behind it
+    is refilled and slid. When the body ends, `req.total = head_len` and `answer`'s own
+    consume step leaves the buffer exactly at the next request's first byte — the pipelining
+    invariant is not a second implementation. The server's shared header array is refilled by
+    re-parsing the pinned head, because another connection may have used it meanwhile.
+  * **An error close MUST LINGER.** Closing a socket that still holds unread bytes makes the
+    kernel send a RESET, and the reset destroys the response just written to explain the
+    refusal — a 413 to a client half way through an upload simply vanished. `linger_close`
+    discards what has already arrived, each read gated on a ZERO-timeout `runtime.ask` and
+    the loop capped at 16 bufferfuls. This is not the drain the header refuses: its cost is
+    the server's number, not the client's. Three of the six mutations found this.
+* **A socket suite must not be able to hang.** `httpc` blocks, so `read_response` against a
+  server that stopped answering never returns, and three mutations were first detected as
+  hangs rather than named failures. `httpc.fd` + `httpc.pending` were added for this, and
+  the streaming cases read through a `resp_within` helper that polls first — `pending`
+  matters because a pipelined answer arrives in the same read as the one before it and never
+  makes the socket readable a second time.
+* Not built: `Expect: 100-continue` (a client that waits for it gets nothing until the read
+  timeout), a pull-shaped body API, TLS, compression, ranges, ETags.
 
 ### ~~2.3 — Storage V2 (area 9)~~ — **DONE: `std/kv`**
 
@@ -648,12 +682,34 @@ successor should not re-derive:
   in 15 on an IDLE machine — it looked like a miscompile, it was a race. Hence `set_budget`:
   connect roomy, hear from the plugin once, then tighten. A timeout asserted before the
   process is known to be up asserts nothing.
-* **A killed plugin holds the host's stdout.** `terminate` reaches the `cmd.exe` that
-  `start_piped` started, not the plugin under it, so a napping plugin is orphaned WITH the
-  host's inherited handles — anything capturing the host's output (`$(…)`, `Command::output`)
-  waits for the orphan before it sees EOF. A 10-second nap made a 2-second demo take 10
-  seconds to read; the nap is 3s for that reason and no other. A Job object would fix it and
-  `sysproc` has none.
+* ~~**A killed plugin holds the host's stdout.**~~ **CLOSED — the plugin now dies with its
+  whole tree.** The defect was real and worth reading once: `terminate` reaches the `cmd.exe`
+  that started the plugin, not the plugin under it, so a napping plugin was orphaned WITH the
+  host's inherited handles and anything capturing the host's output (`$(…)`,
+  `Command::output`) waited for the orphan before it saw EOF. `plugin.connect` now opens a
+  `sandbox.Group`, starts the child through the new `sysproc.start_piped_at(.., apart: true)`,
+  joins it before it runs and resumes it; every path that ends a connection sweeps the group
+  AFTER the child, so the status a caller reads is still the child's own and the healthy path
+  finds the group already empty. Do not re-derive:
+  * **The sweep goes last, not into the middle of close_input → drain → wait.** Terminating
+    the group first kills a plugin that was about to exit cleanly and rewrites its exit
+    status into a kill. On the timeout path the child is likewise killed first, sweep second.
+  * **`tree_reaped` is a measurement, not an assumption** — was the group CONFIRMED empty
+    inside `PLUGIN_REAP_NANOS` (2s, its own constant because the call budget can be zero and
+    measures a different thing). A group that will not empty is a bounded false, never a wait.
+  * **`apart` cannot be demonstrated by a test, and that is not a defect in the test.**
+    Windows lets a RUNNING process be assigned to a Job and a process inherits its parent's
+    Job at creation, so a child grouped microseconds late still drags in every grandchild born
+    after that — all of them, given how long `cmd.exe` takes to reach its first command.
+    `apart` replaces "in practice" with "always"; deleting it leaves the suite green.
+  * **The nap was a workaround and its removal was measured.** Through a PIPE (a file
+    redirect shows nothing — there is no EOF to wait for), three runs each: without the group
+    3.41s at a 3s nap and 10.46s at a 10s one; with it 0.90s and 1.02s. `ECHO_NAP_NANOS` is
+    back to 10s and `jplugin_keeps_one_plugin_and_survives_it` asserts its `Command::output`
+    finishes under 6s, so the constant's justification is now a test.
+  * **POSIX compiles and is unexercised here.** `sh -c` of a simple command usually `exec`s,
+    so the orphan is a Windows symptom; `setpgid` + `kill(-pgid, …)` run on the Linux ladder
+    alone. `sandbox`'s own group test covers the same POSIX code path.
 * **`decode` checks the CRC before the version.** A corrupt frame can carry any version, and
   "unsupported version" for bit rot sends a caller after a deployment mismatch that never
   happened. That ordering is one of the mutations.
@@ -734,7 +790,7 @@ CHANGELOG to find it.
 | ~~**Service supervision**~~ | **DONE: `std/supervise`** (below) | restart policy, budget window, backoff, `stop_all`, events; no tree |
 | ~~**Sandbox**~~ | **DONE: `std/sandbox`** (§2 entry above) | `sysproc.start_at` is the one primitive; the jail is a `sandbox.Jail` a child reads with `inherited`, NOT a change to `fs.host()` (closure module) |
 | ~~**Config live reload + nesting**~~ | **DONE: `std/livecfg`** (§2 above) | candidate-then-swap; a shadowed file value is not validated; `step`, not `poll` |
-| ~~**`std/plugin` on the pipe transport**~~ | **DONE** (§2 entry above) | `sysstdio` was the missing half — nothing in the tree could read its own stdin; `terminate` still kills the SHELL, not the plugin |
+| ~~**`std/plugin` on the pipe transport**~~ | **DONE** (§2 entry above) | `sysstdio` was the missing half — nothing in the tree could read its own stdin. The SHELL-not-the-plugin kill is CLOSED too: `connect` starts its child in a `sandbox.Group` and every teardown path sweeps it |
 
 ### ~~Trace spans~~ — **DONE: `std/trace`**
 
@@ -808,10 +864,52 @@ reseed (it imports `sha256` and `fs` read-only). What a successor should not re-
   1.1.1i). The Linux runner has `libssl-dev`, so the link should hold; the `HMAC()` one-shot
   and `EVP_DigestSign` are 1.1.1 API on both.
 
-Plus the layer the breadth pass stopped short of: **the `jc add` command** over
-`manifest` + `registry` + `resolve` + `lockfile` + `cache` (every piece exists and is tested
-end to end; the command is the glue), and **request-body streaming** in `httpd` (a request
-must fit the connection buffer today).
+**Both things the breadth pass stopped short of are now done** — the `jc add` command
+(below) and request-body streaming in `httpd` (§2.2).
+
+### ~~The `jc add` command~~ — **DONE: `std/jcadd`**
+
+The layer the breadth pass stopped short of. `add(f, a, manifest_path, lock_path, registry,
+cache, name, req) -> Report`: read the local manifest, add or update one dependency, resolve
+the WHOLE graph, fetch what is missing through the cache, write the lockfile, re-render the
+manifest canonically. 3 tests, a pinned demo (`jadd`, `examples/std/jcadd_demo.jtr`), a
+`BUILD_OK` line, no reseed. What a successor should not re-derive:
+
+* **It is a library with a thin `main` around it, not a subcommand of `jc`.** `jc` is
+  `examples/std/cgen.jtr`, a closure module: a subcommand there rewrites the bootstrap seed.
+  It would also put the command out of reach of a test — `add`'s interesting property is a
+  claim about a SEQUENCE of steps, not about a process's exit code. `census_cli`, `doc_cli`
+  and `escape_cli` are the same shape. Wiring it into the real driver later is a call site.
+* **The order of the steps IS the atomicity argument.** Everything that can fail happens
+  before anything visible moves: request → manifest → candidate (rendered AND parsed back) →
+  resolution → fetch → lockfile → stage both, then rename both. `registry.fetch` re-hashes
+  against the index's promise, so a tampered archive fails with both files still their
+  original bytes.
+* **The residual window is stated, not hidden.** Two renames are not one atomic act and this
+  tree has no journal. The manifest renames FIRST on purpose: manifest-new/lock-old is the
+  ordinary state a hand-edited dependency leaves, which `lockfile.verify` reports as drift
+  and the next `add` repairs; the other order would leave a lockfile naming a package nothing
+  requires. `manifest_written` / `lock_written` say how far the swap got.
+* **Idempotence is measured, not asserted.** The candidate manifest and the rendered lockfile
+  are compared against the bytes on disk and NEITHER is written when nothing moved — so a
+  second run creates no temporary file at all. `manifest_changed` / `lock_changed` are the
+  answers a caller reads.
+* **The whole graph is resolved, not the new edge**: every dependency of the candidate becomes
+  a root requirement, so `add` can report a conflict the new dependency merely revealed.
+  Splicing the new package's answer into the old lockfile produces a lockfile no single
+  resolution would ever have produced.
+* **A missing manifest is refused** (`ADD_NO_MANIFEST`), never created — inventing a package's
+  own name and version is `jc init`'s job.
+* The suite's atomicity proof injects a failure at BOTH places the sequence can still fail
+  after the candidate exists: a tampered archive (the fetch) and an `fs.read_only()` handle
+  (the staging write). The read-only case is only interesting once the cache is WARM —
+  otherwise the run fails at the fetch instead and proves nothing about the swap.
+* Not built: `jc remove`, `jc update`, `jc init`, unpacking a fetched archive into a working
+  tree, a registry chosen by name rather than handed in, and any concurrency control between
+  two `add`s on one directory.
+* The module is platform-agnostic and reaches the OS only through `fs` and
+  `sysfs.rename_replace`, whose `@cfg` arms the Linux ladder exercises; only Windows has run
+  the suite and demo here.
 
 ### ~~Service supervision~~ — **DONE: `std/supervise`**
 
@@ -866,11 +964,11 @@ successor should not re-derive:
 | **Uninitialized memory** | no facility; containers carry fake defaults (`smallvec.jtr:77`). | The hard part is the destructor rule for partially initialised aggregates. |
 | **`\u00XX` below 0x20** | passes through to the emitted C verbatim; C rejects it. | Small; lexer, both sides. |
 | **`check` is quiet on an undeclared bare name** | a typo (`eid` for `id`) passes every front-end check and dies in gcc. | Leniency exists for fn-pointer values and extern symbols; a rule refusing a name found in none of scope/consts/variants/fns/externs/globals is a two-sided `escape` item. |
-| **`catch \|e\| match e { … }` types its temp `void` in the port** (NEW, 2026-09-07) | With imports unresolved — the byte-identity golden's own condition — the reference degrades the result temp of the MATCH form to `int` and the port declares it `void` (`int _ct0 = …; void _cv1;`). `catch \|e\| <expr>` and the bare `catch <expr>` both agree, so it is the match arm's typing alone. | Found twice in one pass: `std/sandbox` met it first and avoided the construct, then `std/plugin` shipped it into an ALREADY-allowlisted file and turned both cgen goldens red. Nothing real miscompiles (with imports resolved the type is known), but a corpus file that is both `@cfg`-bearing and matches over another module's error set cannot satisfy the allowlist gate. Both modules now take the platform's code from `syserr.last_raw()` instead, on an independent reason: a `match` over an IMPORTED error set is exhaustive over names the importing module does not own. **The fix is in `cgen.jtr`'s catch lowering — a closure module, so it is serial work and owes a reseed.** Measured to the token: over the whole of `plugin_test.jtr` the ONLY difference is `void _cv64;` (port) against `int _cv64;` (reference), with the try temp `int _ct63` agreeing. `jestyr_cgen_test_mode_matches_reference` carries a NAMED exclusion for that one file which **asserts the divergence still exists** — fix the lowering and the test fails, telling you to delete the exclusion. |
-| **`core`'s `ok`/`err` shadow the intrinsics** (NEW, 2026-09-07) | Importing `std/core` beside any module that declares a fallible function breaks type-checking: `core.Result`'s variants are named `ok` and `err`, the same names as the result intrinsics, and the variant registration wins. | Found building `std/supervise`, which worked around it by rendering its own numbers rather than importing `core`. Same family as A5 (a `pub fn ok` shadowing the intrinsic, already a compile error) — but a *variant* reaches the name table by a different door than a `fn` does, so A5's refusal never fires. Decide whether the intrinsic names are reserved against variants too; if so it is a two-sided `escape` rule, and `core.Result` needs renamed variants. |
+| **An omitted struct-literal field zero-fills, including a fn POINTER** (NEW, 2026-09-07) | `S{ a: 1 }` for a struct that also declares `b: fn(…) -> i32` compiles clean and leaves `b` null; calling it is a null-pointer jump at runtime. | Found building httpd streaming: a `Conn{…}` literal was not updated when the struct gained a `BodySink`, so **every new connection got a sink of null fn pointers** and nothing said so. A MISSING field is a deliberate feature (§2.8 defaults) and the surplus half was closed in Tier 4 — so this is not "the same bug again", it is the question the defaults design left open: **should omission be allowed for a field with no DECLARED default, when its type has no meaningful zero?** A fn pointer is the clear case (there is no null function); a `*mut u8` is arguably fine. Cheapest honest rule: refuse omission of a fn-pointer-typed field with no default. Two-sided (`escape`), so serial + a reseed. |
+| ~~**`catch \|e\| match e { … }` types its temp `void` in the port**~~ | With imports unresolved the reference degraded the MATCH form's result temp to `int` and the port declared it `void`. | **CLOSED 2026-09-07 (`5ad56de`), port-only, one line.** `catch \|e\| <expr>` guards the type with `if btd.kind == 5 … else int`; the match form read `btd.a` unguarded, and when the base is not a Result that field belongs to a type with no `ok` member. Same guard, same purpose, so the two forms now answer identically for a base neither can resolve. Found twice before it was fixed — `std/sandbox` avoided the construct, `std/plugin` shipped it into an allowlisted file and turned both cgen goldens red. The named exclusion in `jestyr_cgen_test_mode_matches_reference` asserted its own necessity, so fixing the lowering failed that assertion and said to delete it; both are gone. Seed refreshed. |
+| ~~**`core`'s `ok`/`err` shadow the intrinsics**~~ | Importing `std/core` beside any module declaring a fallible function broke type-checking: `core.Result`'s variants entered the program-wide table by bare name and stood in front of the result intrinsics, so a plain `return ok(x)` in the importer was refused for "not returning a result" — pointing at the `ok(...)` that was already what the message asked for. | **CLOSED 2026-09-07 (`53a9b93` + `70a8855`), both sides.** The names are RESERVED and the variants moved: `core.Result` is `success`/`failure`. Resolving by context instead would have bought the names back at the price of a resolution rule two compilers must implement identically. Contained to three files — nothing outside `core` names those variants except `combinators.jtr` (2 sites) and `examples/option.jtr` (its own `Result`). A variant named for an intrinsic is now REFUSED at its declaration, mirrored in `escape.jtr` and **watched failing with the mirror removed** (`jc` built what `jestyrc` rejected). The probe is a temp file, not a corpus file, because no corpus file violates the rule any more and a whole-corpus differential is therefore vacuous for it. The error-set census drops 2 → 1 unresolved: that second site was this ambiguity. Seed refreshed. |
 | **`alog.jtr` header debt** | `alog.Cursor` is move-only by containment; the header does not say so. | A comment, owed on the next change to that file. |
 | **`std/cstring` has no `cstr` view** | a C string cannot be read back as `str`; `tls.protocol` was dropped for it. | Bind `strlen`, build a slice; small. |
-| **`import "core"` shadows the `ok`/`err` intrinsics** | `core.Result`'s variant constructors `ok(v)`/`err(e)` win over the intrinsics in EVERY module linked beside `core`, so a program importing `core` and any module with a fallible fn (`sysproc.start`) fails `check` with "a fallible function must return a result" at the other module's `return ok(…)`. Found by `supervise_demo` reaching for `core.format_i64`. | No corpus program imports `core` beside a fallible module today (`numbers.jtr` imports `core` + `io` only). Either the variants or the intrinsics have to yield; the intrinsic-shadowing rule (A5) refuses a `pub fn ok` but not an enum VARIANT. Two-sided (`escape`). |
 
 ### Known flake
 
@@ -927,6 +1025,41 @@ is hardest to see, which is what happened and cost an extra CI round trip.
 ## §4. THE RULES THIS TREE KEEPS RELEARNING
 
 Read these before writing a test. Each cost a real failure.
+
+**Renaming a VARIANT is not like renaming a function, and a grep for the qualified name
+will lie to you.** `core.Result`'s `ok`/`err` were renamed after measuring the blast radius
+with a search for `core.Result` and `core.res_` — which found one file. Six more used the
+variants BARE, in `match r { ok(v) => … }`, where nothing spells the module. The follow-up
+sweep then searched `^import "core"` and missed two files importing it as `../std/core`.
+Two searches, each shaped like the answer I expected. **For a rename that reaches a
+program-wide name space, stop grepping and run the compiler over the whole corpus**
+(`jestyrc check` on all 465 files takes minutes) — then read the failure list against the
+known refusal fixtures, and grep the failures for your change's own diagnostic text to prove
+none of them is yours.
+
+**A suite that can only fail by HANGING has not told you anything.** Three of the six
+mutations against httpd's streaming were first observed as a stuck job, not a named failure:
+`httpc` blocks, so a server that stopped answering never returns, and `io_suites_pass` has no
+per-suite timeout. The fix was to give the client a readiness query and read only when there
+is something (`httpc.fd`, `httpc.pending`), after which all six failed by name. Before
+trusting a socket or child-process suite, ask what it does when the thing under test simply
+stops — if the answer is "waits forever", its failures are indistinguishable from a slow
+machine.
+
+**A rule with no violator left in the corpus cannot be pinned BY the corpus.** The
+variant-shadowing refusal passed the whole-corpus escape differential the moment it was
+written — and would have passed identically with the port mirror deleted, because the
+rename that motivated the rule had already removed every violating file. A corpus sweep
+measures the corpus, not the rule. The probe has to be a file written for the purpose and
+fed to BOTH compilers, and it has to be watched failing with the mirror removed; doing that
+is what turned "the port surely refuses this too" into a fact (it did not).
+
+**When one defect has two doors, closing one leaves the other open, and the second is
+usually the quieter.** A `pub fn ok` shadowing an intrinsic had been a compile error since
+A5. A VARIANT named `ok` reached the same program-wide name space by a different route and
+was refused by nothing — so `std/core` shipped one, and the symptom surfaced two modules
+away as "a fallible function must return a result", pointing at a `return ok(x)` that was
+already correct. Ask what OTHER declaration forms reach the name space a rule is guarding.
 
 **A branch's own line numbers are not the base's — never splice a file by offset from a
 diff header.** Merging the six second-wave modules by hand, three of them had appended a

@@ -1,9 +1,9 @@
 // std/plugin.jtr — calling code you did not compile, and surviving it.
 //
 // TIER: `sys`. The server mode composes `std/sysproc` (a child beside its parent, with
-// pipes), `std/sysstdio` (the plugin's own streams) and `std/time` (the budget); the
-// one-shot mode composes `std/process`, `std/file` and `std/fs`. The frame uses `std/alog`'s
-// checksum. It binds nothing itself.
+// pipes), `std/sysstdio` (the plugin's own streams), `std/sandbox` (the group the plugin
+// dies with) and `std/time` (the budget); the one-shot mode composes `std/process`,
+// `std/file` and `std/fs`. The frame uses `std/alog`'s checksum. It binds nothing itself.
 //
 // ─── What a plugin protocol is FOR ────────────────────────────────────────────
 //
@@ -90,13 +90,34 @@
 // plugin has been heard from is evidence about the plugin; one that can trip on a cold start
 // is evidence about the machine.
 //
-// What `terminate` reaches is the child `start_piped` started, and on Windows that is
-// `cmd.exe`, not the plugin under it: the shell does not `exec`. The plugin is orphaned
-// with its stdin closed; a well-behaved server exits at that EOF, a wedged one lives until
-// it is not wedged. Killing the whole tree needs a process group or a Job object, and
-// `std/sandbox` now has exactly that (`sysproc.start_at`'s `apart`, `sandbox.terminate_group`)
-// — landed beside this module and NOT yet adopted here. Connecting through a sandbox is the
-// obvious next increment; until it happens, this paragraph is the honest state.
+// **A plugin is killed with its whole tree, not with its shell.** `sysproc.terminate`
+// reaches the child that was started, and on Windows that is `cmd.exe`, not the plugin
+// under it: the shell does not `exec`. Killing only that leaves the plugin ORPHANED, and
+// the damage is not just an escaped process — it was started with the host's own inherited
+// handles, so anything CAPTURING the host's output (a shell's `$(…)`, a test's
+// `Command::output`) waits for the orphan rather than seeing end-of-file. That is a hang
+// whose cause is two modules away from where it is felt, and it was measured: a plugin that
+// napped ten seconds made a two-second demo take ten seconds to READ.
+//
+// So `connect` puts the plugin in a GROUP — `std/sandbox`'s `Group`, which is a Job object
+// on Windows and a process group on POSIX — and every path that ends a connection takes the
+// group down after the child. The order is `open_group`, `sysproc.start_piped_at(.., apart:
+// true)` (created suspended on Windows so no grandchild can be born outside the Job),
+// `join_group`, `sysproc.resume`. `tree_reaped` reports whether the group was CONFIRMED
+// empty within `PLUGIN_REAP_NANOS`, so "the plugin is gone" is a measurement rather than an
+// assumption, and a group that will not empty is a bounded report instead of a wait.
+//
+// **The teardown order is unchanged and the group does not join it in the middle**:
+// `close_input`, drain, `wait`, and only THEN the group. A group terminate before the wait
+// would kill a plugin that was about to exit cleanly and rewrite its exit status into a
+// kill; after the wait it is a sweep, and on the healthy path it finds the group already
+// empty and does nothing at all. On the timeout path the child is killed first for the same
+// reason — the status a caller reads stays the child's — and the sweep immediately follows.
+//
+// The gap this leaves is a plugin whose group cannot be formed at all. Windows can refuse
+// `AssignProcessToJobObject`, and a child that could not be grouped must not be left running
+// ungrouped, so `connect` kills it and reports `PluginNoStart` with the platform's code —
+// the same rule `sandbox.start_grouped` states, for the same reason.
 //
 // The budget bounds READS. A request larger than the pipe's buffer (~64KB on Windows, 4KB on
 // Linux) sent to a plugin that is not reading blocks in `write_all` with no budget at all;
@@ -155,9 +176,13 @@
 // ─── What this does NOT do ────────────────────────────────────────────────────
 //
 // No concurrent calls on one connection (a call is a request then its response, in turn), no
-// plugin-initiated messages, no streaming payloads, and no sandbox: a plugin is a program
-// running with the host's privileges. `sysproc.denied()` and `process.denied()` refuse to run
-// anything at all, which is the only enforcement this tier has. `serve` reads stdin and
+// plugin-initiated messages, no streaming payloads, and no JAIL: the group above bounds a
+// plugin's LIFETIME, not its authority, so a plugin is still a program running with the
+// host's privileges. `sandbox.Jail` is what would fence its files, projected through
+// `start_piped_at`'s `env_extra`, and `connect` does not offer it because a host that wants
+// one has no way to say so without a `Jail` parameter it mostly would not use — an increment
+// with a consumer behind it, not a gap. `sysproc.denied()` and `process.denied()` refuse to
+// run anything at all, which is the only enforcement this tier has. `serve` reads stdin and
 // nothing else, so a plugin cannot be a server AND take arguments for its work — the
 // arguments it was started with are the configuration it gets.
 //
@@ -169,6 +194,7 @@ import "alog"
 import "file"
 import "fs"
 import "process"
+import "sandbox"
 import "str"
 import "syserr"
 import "sysproc"
@@ -225,6 +251,18 @@ pub const PLUGIN_EXIT_TRUNCATED: i32 = 7   // EOF inside a frame
 // How long the host sleeps between readiness checks while a call's budget runs. A floor,
 // not a promise — `time.wait` reports what it really waited, and that is what is charged.
 const PLUGIN_POLL_NANOS: i64 = 1000000
+
+// How long the sweep waits for the plugin's group to empty after it has been terminated.
+//
+// **Its own number rather than the call budget**, for two reasons. The budget can be zero
+// (a `no_conn`, or a host that tightened it to nothing), and a zero-length wait would turn
+// "the tree is gone" into "I did not look". And the two measure different things: the budget
+// is how long a PLUGIN may take to answer, a policy the host chooses per call, while this is
+// how long the PLATFORM takes to finish terminating processes it has already agreed to
+// terminate — a few milliseconds, and two seconds is the ceiling that says "something is
+// wrong" rather than a duration anyone waits for. Charged on the connection's clock, so a
+// suite driving a manual clock spends no real time here either.
+const PLUGIN_REAP_NANOS: i64 = 2000000000
 
 // ---- little-endian, written explicitly -------------------------------------------
 
@@ -361,27 +399,44 @@ const PLUGIN_POLL_NANOS: i64 = 1000000
 // A connection to a running plugin. `@move` because it owns a `sysproc.Child`, which is
 // itself a resource the language refuses to duplicate; `hangup` exactly once, and `is_up`
 // says whether that has happened (or a failure did it first).
+//
+// It owns a `sandbox.Group` too — the plugin AND every process the plugin starts, as one
+// thing to end. `reaped` is what the sweep learned: whether that group was confirmed empty.
 @move pub struct Conn {
     c: sysproc.Child,
+    g: sandbox.Group,
     clk: time.Clock,
     budget: i64,
     calls: i64,
     failures: i64,
     up: bool,
+    reaped: bool,
 }
 
 // A `Conn` that names nothing: what `connect` hands back through `catch`, and what a caller
 // compares against without a separate optional. Every call on it is `PLUGIN_DOWN`.
 pub fn no_conn() -> Conn {
-    return Conn{ c: sysproc.no_child(), clk: time.manual(0), budget: 0, calls: 0, failures: 0, up: false }
+    return Conn{ c: sysproc.no_child(), g: sandbox.no_group(), clk: time.manual(0), budget: 0, calls: 0, failures: 0, up: false, reaped: false }
 }
 
-// Start `cmd` as a plugin server and keep it. `budget_nanos` is what each call may take
-// before the plugin is killed; `clk` is where that time is measured, so a test hands in
-// `time.manual()` and a hung plugin costs nothing real.
+// Start `cmd` as a plugin server, IN ITS OWN GROUP, and keep it. `budget_nanos` is what
+// each call may take before the plugin is killed; `clk` is where that time is measured, so
+// a test hands in `time.manual()` and a hung plugin costs nothing real.
 //
 // The same command semantics as `sysproc.start_piped` — the platform shell — and the same
 // capability gate, refused as `PluginRefused` before anything runs.
+//
+// The four steps below are one sequence and their ORDER is the property (see the header):
+// the group exists before the child, the child is created apart — suspended on Windows —
+// and is claimed by the group before it runs an instruction, and only then is it resumed.
+// Any other order has a window in which a grandchild is born outside the group and outlives
+// every kill this module can perform. **That window is closed by construction and not by a
+// test**, and the distinction is recorded because a successor will otherwise delete `apart`
+// and see the suite stay green: Windows lets a running process be assigned to a Job, and a
+// process inherits its parent's Job at creation, so a child grouped a few microseconds late
+// still drags in every grandchild born after that — which, with `cmd.exe` taking tens of
+// milliseconds to reach its first command, is all of them in practice. "In practice" is what
+// `apart` replaces with "always"; a race nobody can force is still a race.
 pub fn connect(mut sp: sysproc.Spawner, take clk: time.Clock, read cmd: str, budget_nanos: i64) -> Conn !{ PluginRefused, PluginNoStart(i32) } {
     if sysproc.can_start(sp) == false {
         // Through the spawner, so its refusal counter sees the attempt the way it would
@@ -389,16 +444,36 @@ pub fn connect(mut sp: sysproc.Spawner, take clk: time.Clock, read cmd: str, bud
         var none: sysproc.Child = sysproc.start_piped(sp, cmd) catch sysproc.no_child()
         return err(PluginRefused)
     }
+    var g: sandbox.Group = sandbox.no_group()
+    if sandbox.open_group(g) == false {
+        let c0: i32 = syserr.last_raw()
+        return err(PluginNoStart(c0))
+    }
     // **The platform's code is read from the platform, not destructured out of
     // `sysproc`'s error set.** A `match` over an IMPORTED set is exhaustive over names
     // this module does not own, so it breaks the day `sysproc` grows a variant — the
     // reason `std/sandbox` gives for the same choice. `syserr.last_raw()` one frame out
-    // is the same number `start_piped` would have put in `SysProcFailed`. The capability
+    // is the same number `start_piped_at` would have put in `SysProcFailed`. The capability
     // refusal cannot reach here: `can_start` answered it above.
-    var ch: sysproc.Child = sysproc.start_piped(sp, cmd) catch sysproc.no_child()
+    var ch: sysproc.Child = sysproc.start_piped_at(sp, cmd, "", "", true) catch sysproc.no_child()
     let code: i32 = syserr.last_raw()
-    if sysproc.is_live(ch) == false { return err(PluginNoStart(code)) }
-    return ok(Conn{ c: ch, clk: clk, budget: budget_nanos, calls: 0, failures: 0, up: true })
+    if sysproc.is_live(ch) == false {
+        sandbox.release_group(g)
+        return err(PluginNoStart(code))
+    }
+    if sandbox.join_group(g, ch) == false {
+        // **A child that could not be grouped must not be left running ungrouped**: that is
+        // the one outcome this sequence exists to rule out, and it is cheap to rule out here
+        // because on Windows the child is still suspended and has run nothing at all.
+        let c1: i32 = syserr.last_raw()
+        sysproc.terminate(ch)
+        sysproc.wait(ch)
+        sysproc.release(ch)
+        sandbox.release_group(g)
+        return err(PluginNoStart(c1))
+    }
+    sysproc.resume(ch)
+    return ok(Conn{ c: ch, g: g, clk: clk, budget: budget_nanos, calls: 0, failures: 0, up: true, reaped: false })
 }
 
 // Is the plugin still there to be called?
@@ -406,6 +481,24 @@ pub fn connect(mut sp: sysproc.Spawner, take clk: time.Clock, read cmd: str, bud
 @no_alloc @no_os pub fn conn_calls(read h: Conn) -> i64 { return h.calls }
 @no_alloc @no_os pub fn conn_failures(read h: Conn) -> i64 { return h.failures }
 @no_alloc @no_os pub fn budget_of(read h: Conn) -> i64 { return h.budget }
+
+// Is anything from the plugin's process tree still running? True only while the group is
+// open AND holds someone — so it is `false` for a connection that never opened and `false`
+// once the sweep has released the group, which is why the question a caller asks AFTER a
+// kill is `tree_reaped` rather than this one.
+pub fn tree_live(read h: Conn) -> bool {
+    if sandbox.is_group_live(h.g) == false { return false }
+    return sandbox.group_empty(h.g) == false
+}
+
+// Was the plugin's whole tree CONFIRMED gone when the connection ended?
+//
+// This is the difference the group makes, and it is reported rather than assumed: false
+// while the connection is still up, false for one that never opened, and false if the group
+// would not empty within `PLUGIN_REAP_NANOS` — which is a bounded report, never a wait. A
+// host that kills a plugin and then captures its own output wants this to be true; when it
+// is not, something in the tree is holding handles the host will not get back.
+@no_alloc @no_os pub fn tree_reaped(read h: Conn) -> bool { return h.reaped }
 
 // Change what the NEXT call may take. The budget belongs to the connection rather than to
 // the call because it is also what bounds `hangup`'s drain, but a host does not owe every
@@ -453,6 +546,27 @@ fn read_exact(mut h: Conn, mut buf: []u8, mut waited: i64) -> i32 {
     return PLUGIN_RD_OK
 }
 
+// Take the plugin's group down and give it back. **Called after the child has been dealt
+// with, on every path that ends a connection**, so the status a caller reads is still the
+// child's own; this is the sweep for whatever the child left behind. Idempotent: a released
+// group is not live, and a second call returns at once.
+//
+// A group that is ALREADY empty is not terminated — there is nobody to terminate, and the
+// healthy path is exactly that case, so a clean hangup costs one query and nothing else.
+fn sweep_group(mut h: Conn) {
+    if sandbox.is_group_live(h.g) == false { return }
+    var gone: bool = sandbox.group_empty(h.g)
+    if gone == false {
+        sandbox.terminate_group(h.g)
+        // Bounded, and the answer is KEPT: `terminate_group` reports that the platform
+        // accepted the request, not that anyone is gone. See `sandbox.wait_pid_gone` on the
+        // gap between the two.
+        gone = sandbox.wait_group_empty(h.g, h.clk, PLUGIN_REAP_NANOS)
+    }
+    h.reaped = gone
+    sandbox.release_group(h.g)
+}
+
 // The plugin stopped talking mid-call: find out how it ended and name it. EOF with a clean
 // exit is `PLUGIN_BAD_RESPONSE` (it promised an answer and gave none — the one-shot rule); a
 // non-zero exit is `PLUGIN_FAILED` with that code; a signal, or on Windows an NTSTATUS exit
@@ -461,6 +575,7 @@ fn read_exact(mut h: Conn, mut buf: []u8, mut waited: i64) -> i32 {
 fn went_away(mut h: Conn) -> Reply {
     let st: sysproc.Status = sysproc.wait_or_kill(h.c, h.clk, h.budget)
     h.up = false
+    sweep_group(h)
     let code: i32 = sysproc.code_of(st)
     if sysproc.is_signalled(st) { return fail_conn(h, PLUGIN_CRASHED, code, 0) }
     if code < 0 { return fail_conn(h, PLUGIN_CRASHED, code, 0) }
@@ -470,9 +585,16 @@ fn went_away(mut h: Conn) -> Reply {
 
 // The budget is gone: kill it, reap it, and say so. `wait_or_kill` with no budget is one
 // liveness check, the kill, the reap and the release — the composition every timeout wants.
+//
+// **Then the group, and this is the path the group was added for.** The child is the shell;
+// the plugin that ignored its budget is under it, holding whatever handles it inherited from
+// the host. Killing only the shell leaves it there. The child is still killed FIRST so that
+// `exit_status` reports the child's own end rather than the group's, and the sweep follows
+// immediately — no window in which the host has given up but the plugin has not.
 fn give_up(mut h: Conn) -> Reply {
     let st: sysproc.Status = sysproc.wait_or_kill(h.c, h.clk, 0)
     h.up = false
+    sweep_group(h)
     return fail_conn(h, PLUGIN_TIMED_OUT, sysproc.code_of(st), 0)
 }
 
@@ -592,7 +714,13 @@ pub fn call(mut h: Conn, read request: []u8, mut response: []u8) -> Reply {
 // deadlock-free order, bounded by the budget at each step so a plugin that will not leave
 // is killed rather than waited on. Idempotent: a second hangup reports the first's status.
 pub fn hangup(mut h: Conn) -> sysproc.Status {
-    if h.up == false { return sysproc.last_status(h.c) }
+    if h.up == false {
+        // Already down — a failure ended it, or this is the second hangup. The group is
+        // swept anyway, because "down" is a statement about the CONNECTION and a group that
+        // was never released would still be holding a handle.
+        sweep_group(h)
+        return sysproc.last_status(h.c)
+    }
     return end_conn(h)
 }
 
@@ -622,6 +750,9 @@ fn end_conn(mut h: Conn) -> sysproc.Status {
     free_ptr(scratch)
     let st: sysproc.Status = sysproc.wait_or_kill(h.c, h.clk, h.budget)
     h.up = false
+    // Last, never earlier: see the header on why the group terminate follows the wait
+    // instead of joining the sequence in the middle.
+    sweep_group(h)
     return st
 }
 

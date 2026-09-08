@@ -8,8 +8,8 @@
 //   jestyrc run examples/std/numbers.jtr
 //   →  12345      (parse "12345")
 //      -42        (parse "-42")
-//      7          (parse "9999999999999999999" overflows -> err -> default 7)
-//      9          (parse "12x" invalid digit -> err -> default 9)
+//      7          (parse "9999999999999999999" overflows -> failure -> default 7)
+//      9          (parse "12x" invalid digit -> failure -> default 9)
 //      -4271      (format_i64(-4271) printed from the buffer)
 //      -4271      (round-trip: parse(format(-4271)))
 //      3          (format_i64 wrote 3 bytes for 705 -> "705")
@@ -18,7 +18,7 @@ import "core"
 import "io"
 
 fn uo(take r: Result(i64, ParseIntError), take d: i64) -> i64 {
-    match r { ok(v) => v, err(e) => d }
+    match r { success(v) => v, failure(e) => d }
 }
 
 fn main() -> i32 {

@@ -12277,6 +12277,36 @@ fn check_intrinsic_shadowing(mut e: Esc, read src: str, read it: ItemData) {
     string_free(sb)
 }
 
+// **An enum VARIANT may not be named for a compiler intrinsic either.** The sibling of
+// `check_intrinsic_shadowing`, which covered only the `fn` door. A variant reaches the same
+// program-wide bare-name space by another route -- the variant table is keyed by the bare
+// spelling with no module in the key -- so `enum Result { ok, err }` in ANY module stood in
+// front of the result intrinsics for every module that imported it, and a plain
+// `return ok(x)` in the importer was refused for "not returning a result". `std/core`
+// declared exactly that; its variants are `success`/`failure` now. Mirrors
+// `escape::Checker::check_intrinsic_variant`, and runs AFTER the `@copy` containment check
+// on the same item because the P4 golden compares diagnostics in push order.
+fn check_intrinsic_variant(mut e: Esc, read p: Parser, read src: str, read it: ItemData) {
+    var k: i32 = 0
+    for k < it.z {
+        let vb: i32 = it.b + k * 5
+        let ns: i32 = get__list(i32, p.ear, vb as usize)
+        let ne: i32 = get__list(i32, p.ear, (vb + 1) as usize)
+        let nm: str = src[ns as usize .. ne as usize]
+        if is_intrinsic(nm) {
+            var sb: String = string_new()
+            string_push(sb, "variant `")
+            string_push(sb, nm)
+            string_push(sb, "` of enum `")
+            string_push(sb, src[it.x as usize .. it.y as usize])
+            string_push(sb, "` is named for a compiler intrinsic")
+            ediag(e, ns as usize, ne as usize, string_view(sb))
+            string_free(sb)
+        }
+        k = k + 1
+    }
+}
+
 // **A `@copy` aggregate may not contain something non-Copy.** `@copy` says "duplicating
 // this value is free", and a non-Copy field makes that false in one of two ways: a `@move`
 // field (an OS handle) gets DUPLICATED so two copies name one descriptor, or a heap-owning
@@ -12379,7 +12409,10 @@ fn check_items(mut e: Esc, read p: Parser, read c: Checker, read src: str) {
         // order in `check_item` -- the P4 golden compares diagnostics in walk order.
         if it.kind == 3 { check_intrinsic_shadowing(e, src, it)  check_fn(e, p, c, src, it) }  // Fn
         else if it.kind == 4 { check_copy_containment(e, p, c, src, it)  walk_methods(e, p, c, src, it.a, it.b) }   // Struct
-        else if it.kind == 5 { check_copy_containment(e, p, c, src, it) }  // Enum: @copy payloads
+        else if it.kind == 5 {                                           // Enum
+            check_copy_containment(e, p, c, src, it)                      // @copy payloads
+            check_intrinsic_variant(e, p, src, it)                        // a variant named `ok`
+        }
         else if it.kind == 7 {                                           // Impl method bodies
             // The reference's `Item::Impl` arm in `escape::check_item`. Both sides used
             // to skip these on a comment claiming Stage B checked them; it does not, so
@@ -26137,7 +26170,13 @@ fn emit_err_match(mut sb: String, read p: Parser, read src: str, read c: Checker
     string_push(sb, base_c)
     string_push(sb, "; ")
     if !unit_ok {
-        emit_ty_c(sb, p, src, c, btd.a)
+        // **`btd.a` is the ok type ONLY when the base really is a Result (kind 5).**
+        // Without the guard an unresolved base — a call whose module was not loaded, which
+        // is exactly the byte-identity golden's condition — reads `a` off a type that has
+        // no ok member and emits `void _cv`, while the reference degrades the same unknown
+        // to `int`. The sibling form (`catch |e| <expr>`) has always carried this guard;
+        // this one did not, and that one keyword was the whole divergence.
+        if btd.kind == 5 { emit_ty_c(sb, p, src, c, btd.a) } else { string_push(sb, "int") }
         string_push(sb, " _cv")
         push_uint__cgen(sb, m as i64)
         string_push(sb, "; ")

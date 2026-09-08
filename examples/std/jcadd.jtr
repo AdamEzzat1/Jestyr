@@ -1,0 +1,389 @@
+// std/jcadd.jtr — `jc add <name> <req>`: the whole package substrate as one command.
+//
+// TIER: `std` + OS, by dependency. Everything under this already existed and was tested end
+// to end — `semver` orders, `resolve` selects minimally, `manifest` is the format a package
+// declares itself in, `registry` publishes and fetches, `cache` stores by content, `lockfile`
+// witnesses a decision. None of them is a command. This module is the glue: read the local
+// manifest, add or update one dependency, resolve the WHOLE graph, fetch what is missing
+// through the cache, write the lockfile, and re-render the manifest canonically.
+//
+// ─── Why it is a module and not a subcommand of the driver ────────────────────────────
+//
+// `jc` itself is `examples/std/cgen.jtr`, one of the sixteen modules in the self-hosting
+// closure: a subcommand added there rewrites the bootstrap seed, and the seed is a global
+// lock. It would also make the command unreachable from a test — a subcommand can only be
+// exercised by starting a process, and `add`'s interesting property (that a failure leaves
+// nothing half-written) is a claim about a sequence of steps, not about a process's exit
+// code. So the command is a LIBRARY, `add(...) -> Report`, and `jcadd_demo.jtr` is the thin
+// program around it. That is the tree's existing shape for a command — `census_cli`,
+// `doc_cli` and `escape_cli` are each a module with a `main` — and wiring this into the real
+// driver later is a call site, not a redesign.
+//
+// ─── The order of the steps IS the atomicity argument ─────────────────────────────────
+//
+// Everything that can fail happens before anything visible moves:
+//
+//     1. the request        `name` is a package name, `req` is a requirement   — no I/O
+//     2. the local manifest read, parsed; absent is refused, not created
+//     3. the candidate      rendered canonically, and PARSED BACK
+//     4. resolution         the whole graph, from the candidate's dependencies
+//     5. fetching           every selected archive, re-hashed against the index
+//     6. the lockfile       rendered from the same solution
+//     7. the swap           stage both files, then rename them into place
+//
+// A failure at 1–6 has written nothing at all, so the manifest and the lockfile are exactly
+// the bytes they were. That is the `std/livecfg` discipline — build a candidate, swap it in
+// whole or not at all — with the difference that two files move rather than one.
+//
+// **The residual window, stated rather than hidden.** Two renames are not one atomic act,
+// and this tree has no journal. If the process dies between them the manifest is new and the
+// lockfile is old. That order is deliberate: the manifest is the source of truth and the
+// lockfile is a WITNESS (`std/lockfile` argues why at length), so manifest-new/lock-old is
+// exactly the state a repository is in when someone edits a dependency by hand — an ordinary
+// state that `lockfile.verify` reports as drift and the next `add` repairs. The other order
+// would leave a lockfile naming a package nothing requires. When a rename does fail the
+// report says which files moved (`manifest_written` / `lock_written`) rather than claiming
+// the command was atomic.
+//
+// ─── Idempotent by comparison, not by convention ──────────────────────────────────────
+//
+// `add` renders the candidate manifest and the lockfile, compares them to the bytes already
+// on disk, and writes NEITHER when nothing moved. So a second run of the same command is not
+// merely harmless, it does not touch the filesystem: `manifest_changed` and `lock_changed`
+// are both false and no temporary file is created. The fetch step is idempotent for the
+// reason `std/cache` is content-addressed — the second run reports every archive as `cached`.
+//
+// ─── Two decisions a caller could disagree with ───────────────────────────────────────
+//
+// * **The whole graph is resolved, not the new edge.** Every dependency of the candidate
+//   becomes a root requirement, so `add` can report a conflict the new dependency merely
+//   revealed. The alternative — solve for the new package alone and splice its answer in —
+//   produces a lockfile that no single resolution would ever have produced.
+// * **A missing manifest is refused.** A manifest carries the package's own name and version;
+//   inventing them is `jc init`'s job. `ADD_NO_MANIFEST` says so rather than guessing.
+//
+// Deliberately NOT here: removing a dependency, `jc update` (raising a floor is an explicit
+// act — that is the whole point of minimal selection), unpacking a fetched archive into a
+// working tree, a registry chosen by name rather than handed in, and any concurrency control
+// between two `add`s on one directory.
+//
+// Worked example:  jestyrc run  examples/std/jcadd_demo.jtr
+// Run the tests:   jestyrc test examples/std/jcadd_test.jtr
+
+import "cache"
+import "fs"
+import "lockfile"
+import "manifest"
+import "registry"
+import "resolve"
+import "semver"
+import "sysfs"
+
+pub const ADD_OK: i32 = 0
+pub const ADD_NO_MANIFEST: i32 = 1        // no manifest at that path; `add` never creates one
+pub const ADD_BAD_MANIFEST: i32 = 2       // it is there and the format refuses it
+pub const ADD_BAD_REQUEST: i32 = 3        // the name or the requirement given to `add`
+pub const ADD_UNKNOWN_PACKAGE: i32 = 4    // the registry has no package by that name at all
+pub const ADD_UNRESOLVED: i32 = 5         // no version assignment satisfies the graph
+pub const ADD_FETCH_FAILED: i32 = 6       // absent, unreadable, or the digest did not match
+pub const ADD_WRITE_FAILED: i32 = 7       // staging or the swap was refused
+
+@no_alloc @no_os pub fn status_name(s: i32) -> str {
+    if s == ADD_OK { return "ok" }
+    if s == ADD_NO_MANIFEST { return "no manifest" }
+    if s == ADD_BAD_MANIFEST { return "the manifest does not parse" }
+    if s == ADD_BAD_REQUEST { return "not a package name and a requirement" }
+    if s == ADD_UNKNOWN_PACKAGE { return "no such package in the registry" }
+    if s == ADD_UNRESOLVED { return "the requirements cannot all be met" }
+    if s == ADD_FETCH_FAILED { return "an archive could not be fetched" }
+    return "the files could not be written"
+}
+
+// What one `add` did. `detail` names whatever the status is about — the offending package,
+// the malformed request, the manifest's problem — and is empty on success.
+pub struct Report {
+    detail: String,
+    status: i32,
+    at_line: i32,
+    packages: i32,
+    fetched: i32,
+    cached: i32,
+    rounds: i32,
+    skipped: i32,
+    added: bool,
+    updated: bool,
+    exhausted: bool,
+    manifest_changed: bool,
+    lock_changed: bool,
+    manifest_written: bool,
+    lock_written: bool,
+}
+
+impl Drop for Report {
+    fn drop(mut self) {
+        string_free(self.detail)
+    }
+}
+
+@no_alloc @no_os pub fn status(read r: Report) -> i32 { return r.status }
+@no_alloc @no_os pub fn succeeded(read r: Report) -> bool { return r.status == ADD_OK }
+pub fn detail(read r: Report) -> read str { return string_view(r.detail) }
+// The manifest line a parse failure points at; 0 otherwise.
+@no_alloc @no_os pub fn at_line(read r: Report) -> i32 { return r.at_line }
+// Packages in the resolved selection (the lockfile's entry count on success).
+@no_alloc @no_os pub fn packages(read r: Report) -> i32 { return r.packages }
+// Archives newly admitted into the cache, and those already there.
+@no_alloc @no_os pub fn fetched(read r: Report) -> i32 { return r.fetched }
+@no_alloc @no_os pub fn cached(read r: Report) -> i32 { return r.cached }
+@no_alloc @no_os pub fn rounds(read r: Report) -> i32 { return r.rounds }
+// Index entries whose manifest did not parse and were dropped from the solver's view.
+@no_alloc @no_os pub fn skipped(read r: Report) -> i32 { return r.skipped }
+// The dependency was not in the manifest before / was, with a different requirement.
+@no_alloc @no_os pub fn added(read r: Report) -> bool { return r.added }
+@no_alloc @no_os pub fn updated(read r: Report) -> bool { return r.updated }
+// An `ADD_UNRESOLVED` that ran out of iterations rather than finding a real conflict.
+@no_alloc @no_os pub fn exhausted(read r: Report) -> bool { return r.exhausted }
+// Did the candidate differ from the bytes on disk? These are the idempotence answers.
+@no_alloc @no_os pub fn manifest_changed(read r: Report) -> bool { return r.manifest_changed }
+@no_alloc @no_os pub fn lock_changed(read r: Report) -> bool { return r.lock_changed }
+// Did that file actually move? Both false on a run that changed nothing, and the pair a
+// caller reads after `ADD_WRITE_FAILED` to learn how far the swap got.
+@no_alloc @no_os pub fn manifest_written(read r: Report) -> bool { return r.manifest_written }
+@no_alloc @no_os pub fn lock_written(read r: Report) -> bool { return r.lock_written }
+
+fn blank() -> Report {
+    var r: Report = Report{ detail: string_new(), status: ADD_OK, at_line: 0, packages: 0,
+                            fetched: 0, cached: 0, rounds: 0, skipped: 0,
+                            added: false, updated: false, exhausted: false,
+                            manifest_changed: false, lock_changed: false,
+                            manifest_written: false, lock_written: false }
+    return r
+}
+
+// The staging name for `p`. Beside the target rather than in a temp directory, so the rename
+// stays within one filesystem — a cross-device rename is a copy, and a copy is not atomic.
+fn staging(read p: str) -> String {
+    var s: String = string_new()
+    string_push(s, p)
+    string_push(s, ".jcadd")
+    return s
+}
+
+// Add or update the dependency `name` at requirement `req` in the manifest at
+// `manifest_path`, recording the resolution in `lock_path`.
+//
+// `r` is the registry to resolve against and `c` the cache to fetch into; both are handed in
+// rather than named, for the reason `std/resolve` gives — a command that opened its own
+// registry could not be tested without one.
+pub fn add(mut f: fs.Fs, read a: Allocator,
+           read manifest_path: str, read lock_path: str,
+           read r: registry.Registry, read c: cache.Cache,
+           read name: str, read req: str) -> Report {
+    var rp: Report = blank()
+
+    // ---- 1. the request itself, before a single byte is read ---------------------------
+    if manifest.valid_name(name) == false {
+        rp.status = ADD_BAD_REQUEST
+        string_push(rp.detail, name)
+        return rp
+    }
+    let rq: semver.Req = semver.parse_req(req)
+    if semver.req_valid(rq) == false {
+        rp.status = ADD_BAD_REQUEST
+        string_push(rp.detail, req)
+        return rp
+    }
+
+    // ---- 2. the local manifest ---------------------------------------------------------
+    if fs.present(f, manifest_path) == false {
+        rp.status = ADD_NO_MANIFEST
+        string_push(rp.detail, manifest_path)
+        return rp
+    }
+    var text: String = fs.open_text(f, manifest_path)
+    var m: manifest.Manifest = manifest.parse(a, string_view(text))
+    if manifest.parsed(m) == false {
+        rp.status = ADD_BAD_MANIFEST
+        rp.at_line = manifest.problem_line(m)
+        string_push(rp.detail, manifest.problem_name(manifest.problem(m)))
+        string_free(text)
+        return rp
+    }
+
+    // ---- 3. the candidate manifest -----------------------------------------------------
+    //
+    // The dependency replaces its own line IN PLACE when it is already there, so a manifest
+    // a person ordered stays in that order; a new one is appended.
+    var d: manifest.Draft = manifest.draft(a, manifest.name(m), manifest.version(m))
+    var i: usize = 0
+    var already: bool = false
+    for i < manifest.dep_count(m) {
+        if str_eq(manifest.dep_name(m, i), name) {
+            already = true
+            if str_eq(manifest.dep_req(m, i), req) == false { rp.updated = true }
+            manifest.draft_dep(d, name, req)
+        } else {
+            manifest.draft_dep(d, manifest.dep_name(m, i), manifest.dep_req(m, i))
+        }
+        i = i + 1
+    }
+    if already == false {
+        manifest.draft_dep(d, name, req)
+        rp.added = true
+    }
+    var cand: String = manifest.draft_render(a, d)
+    if str_eq(string_view(cand), string_view(text)) == false { rp.manifest_changed = true }
+
+    // The candidate is parsed BACK, and its dependencies — not the original's — are what the
+    // resolver is given. A manifest this command writes is therefore a manifest this command
+    // can read, checked rather than assumed.
+    var cm: manifest.Manifest = manifest.parse(a, string_view(cand))
+    if manifest.parsed(cm) == false {
+        rp.status = ADD_BAD_MANIFEST
+        rp.at_line = manifest.problem_line(cm)
+        string_push(rp.detail, manifest.problem_name(manifest.problem(cm)))
+        string_free(cand)
+        string_free(text)
+        return rp
+    }
+
+    // ---- 4. resolve the whole graph ----------------------------------------------------
+    var skipped: i64 = 0
+    var universe: resolve.Registry = registry.load(f, a, r, skipped)
+    rp.skipped = skipped as i32
+    if resolve.package_index(universe, name) < 0 {
+        rp.status = ADD_UNKNOWN_PACKAGE
+        string_push(rp.detail, name)
+        string_free(cand)
+        string_free(text)
+        return rp
+    }
+    var k: usize = 0
+    for k < manifest.dep_count(cm) {
+        resolve.add_root(universe, manifest.dep_name(cm, k), manifest.dep_req(cm, k))
+        k = k + 1
+    }
+    let sol: resolve.Solution = resolve.solve(a, universe)
+    rp.rounds = resolve.rounds(sol)
+    if resolve.solved(sol) == false {
+        rp.status = ADD_UNRESOLVED
+        rp.exhausted = resolve.budget_exhausted(sol)
+        string_push(rp.detail, resolve.package_name(universe, resolve.conflict_package(sol)))
+        string_free(cand)
+        string_free(text)
+        return rp
+    }
+    let np: usize = resolve.package_count(universe)
+    var q: usize = 0
+    for q < np {
+        if resolve.selected(sol, q as i32) >= 0 { rp.packages = rp.packages + 1 }
+        q = q + 1
+    }
+
+    // ---- 5. fetch what is missing ------------------------------------------------------
+    //
+    // `registry.fetch` re-hashes the archive against the digest the index promised before the
+    // cache sees a byte, so a tampered archive fails HERE — with the manifest and the
+    // lockfile still untouched, which is the property this ordering exists for.
+    var trouble: bool = false
+    var p: usize = 0
+    for p < np {
+        let v: i32 = resolve.selected(sol, p as i32)
+        if v >= 0 {
+            let pn: str = resolve.package_name(universe, p as i32)
+            let pv: str = resolve.version_string(universe, v)
+            var want: String = string_new()
+            if registry.promised_digest(f, a, r, pn, pv, want) == false {
+                trouble = true
+            } else {
+                if cache.has(f, a, c, string_view(want)) {
+                    rp.cached = rp.cached + 1
+                } else {
+                    var got: String = registry.fetch(f, a, r, pn, pv, c)
+                    let gv: str = string_view(got)
+                    if gv.len == 0 {
+                        trouble = true
+                    } else {
+                        rp.fetched = rp.fetched + 1
+                    }
+                    string_free(got)
+                }
+            }
+            string_free(want)
+            if trouble { string_push(rp.detail, pn) }
+        }
+        if trouble { break }
+        p = p + 1
+    }
+    if trouble {
+        rp.status = ADD_FETCH_FAILED
+        string_free(cand)
+        string_free(text)
+        return rp
+    }
+
+    // ---- 6. the lockfile, from the same solution ---------------------------------------
+    var lockt: String = lockfile.render(a, universe, sol)
+    var oldlock: String = string_new()
+    if fs.present(f, lock_path) {
+        string_free(oldlock)
+        oldlock = fs.open_text(f, lock_path)
+    }
+    if str_eq(string_view(lockt), string_view(oldlock)) == false { rp.lock_changed = true }
+    string_free(oldlock)
+
+    // ---- 7. the swap -------------------------------------------------------------------
+    //
+    // Both files are staged first, so a refused write is discovered while nothing has moved.
+    // The manifest renames before the lockfile: see the header on the residual window.
+    if rp.manifest_changed or rp.lock_changed {
+        var mtmp: String = staging(manifest_path)
+        var ltmp: String = staging(lock_path)
+        var staged: bool = true
+        if rp.manifest_changed {
+            if fs.put(f, string_view(mtmp), string_view(cand)) == false { staged = false }
+        }
+        if staged {
+            if rp.lock_changed {
+                if fs.put(f, string_view(ltmp), string_view(lockt)) == false { staged = false }
+            }
+        }
+        if staged == false {
+            fs.erase(f, string_view(mtmp))
+            fs.erase(f, string_view(ltmp))
+            rp.status = ADD_WRITE_FAILED
+        } else {
+            if rp.manifest_changed {
+                var moved: bool = true
+                sysfs.rename_replace(f, a, string_view(mtmp), manifest_path) catch { moved = false }
+                if moved {
+                    rp.manifest_written = true
+                } else {
+                    rp.status = ADD_WRITE_FAILED
+                    fs.erase(f, string_view(mtmp))
+                }
+            }
+            if rp.status == ADD_OK {
+                if rp.lock_changed {
+                    var moved2: bool = true
+                    sysfs.rename_replace(f, a, string_view(ltmp), lock_path) catch { moved2 = false }
+                    if moved2 {
+                        rp.lock_written = true
+                    } else {
+                        rp.status = ADD_WRITE_FAILED
+                        fs.erase(f, string_view(ltmp))
+                    }
+                }
+            } else {
+                fs.erase(f, string_view(ltmp))
+            }
+        }
+        string_free(ltmp)
+        string_free(mtmp)
+    }
+
+    string_free(lockt)
+    string_free(cand)
+    string_free(text)
+    return rp
+}

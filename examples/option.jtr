@@ -13,14 +13,14 @@
 // annotation or `return` type. So `var b: Option(i32) = none` works.)
 
 enum Option(T) { none, some(v: T) }
-enum Result(T, E) { ok(v: T), err(e: E) }
+enum Result(T, E) { success(v: T), failure(e: E) }
 
 fn or_else(o: Option(i32), d: i32) -> i32 {
     match o { some(v) => v, none => d }
 }
 
 fn code(r: Result(i32, i32)) -> i32 {
-    match r { ok(v) => v, err(e) => 0 - e }
+    match r { success(v) => v, failure(e) => 0 - e }
 }
 
 // Option(*mut i32) niche-optimizes to a bare pointer — same source, zero tag.
@@ -34,8 +34,8 @@ fn main() -> i32 {
     print_int(or_else(a, 0))     // 42
     print_int(or_else(b, 7))     // 7
 
-    var ok1: Result(i32, i32) = ok(5)
-    var er1: Result(i32, i32) = err(3)
+    var ok1: Result(i32, i32) = success(5)
+    var er1: Result(i32, i32) = failure(3)
     print_int(code(ok1))         // 5
     print_int(code(er1))         // -3
 

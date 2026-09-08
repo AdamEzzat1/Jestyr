@@ -276,6 +276,138 @@ fn fill(mut buf: []u8, read text: str) -> usize {
     return ok
 }
 
+// The streaming half. A server that reads a body larger than its buffer has to decide the
+// framing before the body exists, and then decode it over a window that keeps moving — and
+// the whole risk of that is a SECOND set of framing rules that disagrees with the first. So
+// what is checked here is agreement: the head parser refuses what the whole-message parser
+// refuses, the two together produce exactly what the whole-message parser produces, and the
+// incremental chunk decoder produces exactly what `decode_chunked` does.
+@test fn a_message_read_a_piece_at_a_time_is_framed_by_the_same_rules() -> bool {
+    var raw: *mut u8 = alloc(u8, H_T_CAP)
+    var rep: []u8 = slice(u8, raw, H_T_CAP)
+    var c: test.Check = test.new()
+
+    var hraw: *mut http.Header = alloc(http.Header, 32)
+    var hs: []http.Header = slice(http.Header, hraw, 32)
+    var braw: *mut u8 = alloc(u8, 1024)
+    var bbuf: []u8 = slice(u8, braw, 1024)
+
+    // **The head, with not one byte of the body.** This is the case a whole-message parser
+    // cannot answer and a streaming server needs answered: the framing is already decided.
+    let n1: usize = fill(bbuf, "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 500\r\n\r\n")
+    var b1: []u8 = bbuf[0 .. n1]
+    var h1: http.Head = http.empty_head()
+    test.eq_i64(c, rep, "the head parses with no body at all", http.parse_head(b1, hs, h1) as i64,
+        http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "and reports the declared length", h1.length, 500)
+    test.is_false(c, rep, "which is not chunked", h1.chunked)
+    test.eq_usize(c, rep, "and where the body will begin", h1.body_off, n1)
+    test.eq_str(c, rep, "the method is a view into the same bytes", http.span_str(h1.method, b1), "POST")
+    var r0: http.Request = http.empty_request()
+    test.eq_i64(c, rep, "while the whole-message parser is still waiting",
+        http.parse_request(b1, hs, r0) as i64, http.HTTP_INCOMPLETE as i64)
+
+    // Head then body must equal the whole-message parse, field for field.
+    let n2: usize = fill(bbuf, "POST /submit?x=1 HTTP/1.1\r\nHost: example.org\r\nContent-Length: 5\r\n\r\nhello")
+    var b2: []u8 = bbuf[0 .. n2]
+    var h2: http.Head = http.empty_head()
+    test.eq_i64(c, rep, "the head of a complete message", http.parse_head(b2, hs, h2) as i64, http.HTTP_OK as i64)
+    var ra: http.Request = http.empty_request()
+    test.eq_i64(c, rep, "and the body framed from that head", http.body_from_head(b2, h2, ra) as i64,
+        http.HTTP_OK as i64)
+    var rb: http.Request = http.empty_request()
+    http.parse_request(b2, hs, rb)
+    test.eq_usize(c, rep, "the two agree on the body offset", ra.body.off, rb.body.off)
+    test.eq_usize(c, rep, "on its length", ra.body.len, rb.body.len)
+    test.eq_usize(c, rep, "and on the whole message", ra.total, rb.total)
+    test.eq_str(c, rep, "which is the body", http.span_str(ra.body, b2), "hello")
+
+    // **The framing scan lives in the head parser**, so the smuggling shapes are refused
+    // before a body is waited for rather than after one has been read.
+    let n3: usize = fill(bbuf, "POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n")
+    test.eq_i64(c, rep, "both framings is ambiguous to the head parser too",
+        http.parse_head(bbuf[0 .. n3], hs, h1) as i64, http.HTTP_AMBIGUOUS as i64)
+    let n4: usize = fill(bbuf, "POST /x HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\n")
+    test.eq_i64(c, rep, "and so is a length that contradicts itself",
+        http.parse_head(bbuf[0 .. n4], hs, h1) as i64, http.HTTP_AMBIGUOUS as i64)
+
+    // **A chunked body over a window that never holds it whole.** Eight bytes of buffer for a
+    // 24-byte encoding, fed a byte at a time and slid down after every unit — the shape a
+    // server uses. The `src >= enc.len` guard is what turns a stuck decoder into a failed
+    // assertion instead of a hang.
+    let enc: str = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"
+    var wraw: *mut u8 = alloc(u8, 8)
+    var win: []u8 = slice(u8, wraw, 8)
+    var dec: String = string_new()
+    var st: http.Chunks = http.chunks_new()
+    var have: usize = 0
+    var src: usize = 0
+    var pieces: i64 = 0
+    var stuck: bool = false
+    for http.chunks_done(st) == false {
+        var g: http.Span = http.span(0, 0)
+        var used: usize = 0
+        let o: i32 = http.chunk_step(win[0 .. have], 0, st, g, used)
+        if o == http.HTTP_INCOMPLETE {
+            if src >= enc.len { stuck = true  break }
+            if have >= 8 { stuck = true  break }
+            win[have] = enc[src] as u8
+            have = have + 1
+            src = src + 1
+            continue
+        }
+        if o != http.HTTP_OK { stuck = true  break }
+        if g.len > 0 {
+            string_push(dec, from_utf8(win[g.off .. g.off + g.len]))
+            pieces = pieces + 1
+        }
+        var j: usize = 0
+        for j < have - used {
+            win[j] = win[used + j]
+            j = j + 1
+        }
+        have = have - used
+    }
+    test.is_false(c, rep, "the incremental decoder never stalled", stuck)
+    test.is_true(c, rep, "it reached the terminator", http.chunks_done(st))
+    test.eq_str(c, rep, "and produced what decode_chunked produces", string_view(dec), "Wikipedia")
+    test.is_true(c, rep, "in more than one piece", pieces > 1)
+    test.eq_usize(c, rep, "consuming every byte of the encoding", src, enc.len)
+    test.eq_usize(c, rep, "and nothing past the message", have, 0)
+
+    // A malformed size is BAD, not INCOMPLETE — the distinction that stops a server waiting
+    // for bytes that could never make it valid.
+    var st2: http.Chunks = http.chunks_new()
+    var g2: http.Span = http.span(0, 0)
+    var u2: usize = 0
+    let n5: usize = fill(bbuf, "zz\r\nnope\r\n")
+    test.eq_i64(c, rep, "a chunk size that is not hex is bad",
+        http.chunk_step(bbuf[0 .. n5], 0, st2, g2, u2) as i64, http.HTTP_BAD as i64)
+    // A bare LF is malformed here for the same reason it is in a header line.
+    var st3: http.Chunks = http.chunks_new()
+    let n6: usize = fill(bbuf, "4\nWiki\r\n")
+    test.eq_i64(c, rep, "and a bare LF is not a line ending",
+        http.chunk_step(bbuf[0 .. n6], 0, st3, g2, u2) as i64, http.HTTP_BAD as i64)
+    // A size line that is here but its data is not yields nothing and consumes nothing.
+    var st4: http.Chunks = http.chunks_new()
+    var g4: http.Span = http.span(0, 0)
+    var u4: usize = 0
+    let n7: usize = fill(bbuf, "4\r\n")
+    http.chunk_step(bbuf[0 .. n7], 0, st4, g4, u4)
+    test.eq_usize(c, rep, "the size line is consumed", u4, 3)
+    test.eq_i64(c, rep, "the data that has not arrived is incomplete",
+        http.chunk_step(bbuf[0 .. n7], 3, st4, g4, u4) as i64, http.HTTP_INCOMPLETE as i64)
+    test.eq_usize(c, rep, "and nothing was consumed for it", u4, 0)
+
+    string_free(dec)
+    free_ptr(wraw)
+    free_ptr(braw)
+    free_ptr(hraw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
 @test fn a_header_value_that_would_split_the_response_is_refused() -> bool {
     var raw: *mut u8 = alloc(u8, H_T_CAP)
     var rep: []u8 = slice(u8, raw, H_T_CAP)

@@ -48,11 +48,18 @@ fn run_child(read mode: str) -> i32 {
 
 // ---- rendering ---------------------------------------------------------------------
 
-// Append `v`'s decimal digits. Not `core.format_i64`: `core` declares `enum Result { ok, err }`,
-// and its variant constructors collide with the `ok`/`err` intrinsics in every fallible
-// function of every module linked beside it — `sysproc.start` stops type-checking the
-// moment `core` is imported. Every value rendered here is a count, a code or a clock
-// reading, none of them negative.
+// Append `v`'s decimal digits, by hand rather than through `core.format_i64`.
+//
+// **The reason this was written by hand is now FIXED, and the note is kept because the
+// defect it describes is the interesting part.** `core` used to declare
+// `enum Result { ok, err }`, and variants enter the program-wide name space by their bare
+// spelling, so those two constructors stood in front of the `ok`/`err` intrinsics in every
+// fallible function of every module linked beside `core` — importing it stopped
+// `sysproc.start` type-checking, two modules from the cause. `core.Result`'s variants are
+// `success`/`failure` now, and a variant named for an intrinsic is refused at its
+// declaration, so this demo could import `core` today. It does not, only because a
+// hand-rolled digit loop is one fewer thing in a transcript test's closure; every value
+// rendered here is a count, a code or a clock reading, none of them negative.
 fn push_num(mut line: String, v: i64) {
     if v >= 10 { push_num(line, v / 10) }
     let d: i64 = v % 10

@@ -7,6 +7,17 @@
 // static-file cases are all such transcripts; the timeout case is the one that waits, and
 // it asserts a lower bound only.
 //
+// The last four cases are REQUEST-BODY streaming, and every one of them runs against a
+// 512-byte connection buffer with a 4096-byte body: nothing there can pass by fitting. The
+// sink counts the PIECES a body arrived in and the largest of them, which is the pair a
+// buffered implementation cannot satisfy while still reporting the right total.
+//
+// Those four read every response through `resp_within` rather than `httpc.read_response`.
+// `httpc` blocks, so a server that stopped answering would turn each assertion into a hung
+// job instead of a named failure — and a suite whose failure mode is a hang says nothing
+// about what broke. Six mutations were watched failing by name, which is only possible
+// because of that.
+//
 // Run:  jestyrc test examples/std/httpd_test.jtr
 
 import "fs"
@@ -15,7 +26,9 @@ import "httpc"
 import "httpd"
 import "log"
 import "mem"
+import "runtime"
 import "sysnet"
+import "syspoll"
 import "test"
 import "test_report"
 import "time"
@@ -110,7 +123,222 @@ fn mw_count(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
     return httpd.HTTPD_NEXT
 }
 
+// ---- body sinks, and the four counters that prove a body streamed ------------------------
+//
+// A sink's context is four `i64` slots in a raw array, because a sink is a fn pointer and a
+// closure that captures cannot be one: [0] bytes seen, [1] their checksum, [2] how many
+// PIECES they arrived in, [3] the largest of those pieces. The last two are the assertions
+// that a whole body did not simply fit — a buffered implementation would pass slots 0 and 1
+// and fail both of these.
+const TS_BYTES: usize = 0
+const TS_SUM: usize = 1
+const TS_PIECES: usize = 2
+const TS_MAX: usize = 3
+
+fn ts_new() -> *mut i64 {
+    var p: *mut i64 = alloc(i64, 4)
+    var i: usize = 0
+    for i < 4 {
+        unsafe { (p + i).* = 0 }
+        i = i + 1
+    }
+    return p
+}
+
+fn ts_get(p: *mut i64, i: usize) -> i64 {
+    var v: i64 = 0
+    unsafe { v = (p + i).* }
+    return v
+}
+
+fn ts_set(p: *mut i64, i: usize, v: i64) {
+    unsafe { (p + i).* = v }
+}
+
+fn tally_open(ctx: *mut u8, read x: httpd.Exchange) -> i32 {
+    var p: *mut i64 = ctx as *mut i64
+    var i: usize = 0
+    for i < 4 {
+        ts_set(p, i, 0)
+        i = i + 1
+    }
+    return 0
+}
+
+fn tally_data(ctx: *mut u8, read d: []u8) -> i32 {
+    var p: *mut i64 = ctx as *mut i64
+    var s: i64 = ts_get(p, TS_SUM)
+    var i: usize = 0
+    for i < d.len {
+        s = s + (d[i] as i64)
+        i = i + 1
+    }
+    ts_set(p, TS_BYTES, ts_get(p, TS_BYTES) + (d.len as i64))
+    ts_set(p, TS_SUM, s)
+    ts_set(p, TS_PIECES, ts_get(p, TS_PIECES) + 1)
+    if (d.len as i64) > ts_get(p, TS_MAX) { ts_set(p, TS_MAX, d.len as i64) }
+    return 0
+}
+
+// A sink that refuses on the HEAD. It answers with a STATUS rather than a response, because
+// the response belongs to the route's handler — which is exactly what never runs here.
+fn gate_open(ctx: *mut u8, read x: httpd.Exchange) -> i32 {
+    var p: *mut i64 = ctx as *mut i64
+    ts_set(p, TS_BYTES, 0)
+    if str_eq(httpd.header(x, "x-token"), "ok") { return 0 }
+    return 401
+}
+
+// A sink that refuses PART WAY IN: it takes at most 600 bytes whatever the framing declared.
+fn small_open(ctx: *mut u8, read x: httpd.Exchange) -> i32 {
+    var p: *mut i64 = ctx as *mut i64
+    ts_set(p, TS_BYTES, 0)
+    return 0
+}
+
+fn small_data(ctx: *mut u8, read d: []u8) -> i32 {
+    var p: *mut i64 = ctx as *mut i64
+    let n: i64 = ts_get(p, TS_BYTES) + (d.len as i64)
+    ts_set(p, TS_BYTES, n)
+    if n > 600 { return 413 }
+    return 0
+}
+
+// The streamed route's handler. It runs ONCE, after the body is complete, and reports what
+// the sink counted beside what the exchange itself holds — which must be nothing.
+fn h_upload(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    var p: *mut i64 = ctx as *mut i64
+    var s: String = string_new()
+    string_push(s, "up:")
+    push_i64(s, httpd.body_streamed(x))
+    string_push(s, "/")
+    push_i64(s, ts_get(p, TS_SUM))
+    string_push(s, " buffered:")
+    push_i64(s, httpd.body_len(x) as i64)
+    httpd.respond(x, 200, "text/plain", string_view(s))
+    string_free(s)
+    return 0
+}
+
 // ---- helpers ------------------------------------------------------------------------------
+
+fn push_i64(mut s: String, v: i64) {
+    if v == 0 {
+        string_push(s, "0")
+        return
+    }
+    var raw: *mut u8 = alloc(u8, 24)
+    var b: []u8 = slice(u8, raw, 24)
+    var n: usize = 0
+    var t: i64 = v
+    for t > 0 {
+        b[n] = (48 + (t % 10)) as u8
+        t = t / 10
+        n = n + 1
+    }
+    var i: usize = 0
+    for i < n / 2 {
+        let tmp: u8 = b[i]
+        b[i] = b[n - 1 - i]
+        b[n - 1 - i] = tmp
+        i = i + 1
+    }
+    string_push(s, from_utf8(b[0 .. n]))
+    free_ptr(raw)
+}
+
+fn push_hex(mut s: String, v: usize) {
+    if v == 0 {
+        string_push(s, "0")
+        return
+    }
+    var raw: *mut u8 = alloc(u8, 24)
+    var b: []u8 = slice(u8, raw, 24)
+    var n: usize = 0
+    var t: usize = v
+    for t > 0 {
+        let d: usize = t % 16
+        if d < 10 { b[n] = (48 + d) as u8 } else { b[n] = (87 + d) as u8 }
+        t = t / 16
+        n = n + 1
+    }
+    var i: usize = 0
+    for i < n / 2 {
+        let tmp: u8 = b[i]
+        b[i] = b[n - 1 - i]
+        b[n - 1 - i] = tmp
+        i = i + 1
+    }
+    string_push(s, from_utf8(b[0 .. n]))
+    free_ptr(raw)
+}
+
+// `n` bytes of a repeating pattern into `dst`, returning the checksum a sink that saw every
+// one of them must report. The checksum is what makes "4096 bytes arrived" into "the RIGHT
+// 4096 bytes arrived, in order".
+fn pattern(n: usize, mut dst: String) -> i64 {
+    var raw: *mut u8 = alloc(u8, n + 1)
+    var b: []u8 = slice(u8, raw, n)
+    var sum: i64 = 0
+    var i: usize = 0
+    for i < n {
+        let v: u8 = (97 + (i % 26)) as u8
+        b[i] = v
+        sum = sum + (v as i64)
+        i = i + 1
+    }
+    string_push(dst, from_utf8(b))
+    free_ptr(raw)
+    return sum
+}
+
+// `data`, chunk-encoded in pieces of `piece` bytes, terminator included.
+fn chunked_of(read data: str, piece: usize, mut dst: String) {
+    var i: usize = 0
+    for i < data.len {
+        var n: usize = piece
+        if i + n > data.len { n = data.len - i }
+        push_hex(dst, n)
+        string_push(dst, "\r\n")
+        string_push(dst, data[i .. i + n])
+        string_push(dst, "\r\n")
+        i = i + n
+    }
+    string_push(dst, "0\r\n\r\n")
+}
+
+// ---- reading a response WITHOUT the risk of waiting forever --------------------------------
+//
+// `httpc` is blocking by design, so `read_response` on a socket that will never carry one
+// never returns. That is fine for a passing suite and useless for a failing one: a server
+// that stops answering would turn every assertion below into a hung CI job instead of a
+// named failure. So the streaming cases poll first and call the blocking read only when there
+// is something to read — a closed peer counts, because a close is readable, and so do bytes
+// the client is already HOLDING, because a pipelined answer arrives in the same read as the
+// one before it and would never make the socket readable a second time.
+fn answered(read cl: httpc.Client, ms: i64) -> bool {
+    if httpc.pending(cl) > 0 { return true }
+    var p: runtime.Poller = syspoll.host()
+    var fds: *mut i64 = alloc(i64, 1)
+    var rdy: *mut u8 = alloc(u8, 1)
+    unsafe { (fds + 0).* = httpc.fd(cl) }
+    unsafe { (rdy + 0).* = 0 as u8 }
+    let got: i64 = runtime.ask(p, fds, rdy, 1, ms * 1000000)
+    var r: u8 = 0
+    unsafe { r = (rdy + 0).* }
+    free_ptr(rdy)
+    free_ptr(fds)
+    if got <= 0 { return false }
+    return (r as i32) != 0
+}
+
+// The next response if there is one within `ms`, else `HTTP_INCOMPLETE` — the same answer the
+// client gives for "the peer hung up on me before saying anything", and the right one for
+// "the server never said anything at all".
+fn resp_within(mut cl: httpc.Client, ms: i64) -> i32 {
+    if answered(cl, ms) == false { return http.HTTP_INCOMPLETE }
+    return httpc.read_response(cl)
+}
 
 fn boot(read a: Allocator, mut net: sysnet.Net, logging: bool) -> httpd.Server {
     var sv: httpd.Server = httpd.make(a, time.host(), quiet_logger(), logging, 4, 8192)
@@ -122,6 +350,24 @@ fn boot(read a: Allocator, mut net: sysnet.Net, logging: bool) -> httpd.Server {
     httpd.route(sv, "GET", "/stream", httpd.handler(null, &h_stream))
     httpd.route(sv, "GET", "/static/*", httpd.handler(null, &h_static))
     httpd.route(sv, "*", "/silent", httpd.handler(null, &h_silent))
+    return sv
+}
+
+// A server whose connection buffer is DELIBERATELY too small for the bodies the streaming
+// tests send: 512 bytes for a 4096-byte upload, so nothing here can pass by accident of
+// fitting. `/echo` is an ordinary route beside the streamed ones, which is how the "a body
+// nobody streams" cases are asked.
+fn boot_stream(read a: Allocator, mut net: sysnet.Net, tally: *mut i64, buf_cap: usize) -> httpd.Server {
+    var sv: httpd.Server = httpd.make(a, time.host(), quiet_logger(), false, 4, buf_cap)
+    httpd.start(sv, net, sysnet.loopback(0), 8)
+    httpd.route(sv, "GET", "/hello", httpd.handler(null, &h_hello))
+    httpd.route(sv, "POST", "/echo", httpd.handler(null, &h_echo))
+    httpd.route_stream(sv, "POST", "/up", httpd.handler(tally as *mut u8, &h_upload),
+                       httpd.body_sink(tally as *mut u8, &tally_open, &tally_data))
+    httpd.route_stream(sv, "POST", "/gate", httpd.handler(tally as *mut u8, &h_upload),
+                       httpd.body_sink(tally as *mut u8, &gate_open, &tally_data))
+    httpd.route_stream(sv, "POST", "/small", httpd.handler(tally as *mut u8, &h_upload),
+                       httpd.body_sink(tally as *mut u8, &small_open, &small_data))
     return sv
 }
 
@@ -508,6 +754,325 @@ fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: s
     test.eq_i64(c, rep, "a prompt request is unaffected", ask(sv, net, "GET", "/hello", "", "", b) as i64, 200)
     string_free(b)
 
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- streamed request bodies -----------------------------------------------------------
+//
+// Every server here has a 512-byte connection buffer and every body is 4096 bytes or more, so
+// "the body arrived" can only be true if it arrived in pieces. The counters in the sink's
+// context say how many pieces and how large the largest was; a buffered implementation fails
+// those two lines and passes the rest, which is why they are here.
+
+@test fn a_content_length_body_larger_than_the_buffer_streams_in_bounded_pieces() -> bool {
+    var raw: *mut u8 = alloc(u8, HD_T_CAP)
+    var rep: []u8 = slice(u8, raw, HD_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var tally: *mut i64 = ts_new()
+    var sv: httpd.Server = boot_stream(a, net, tally, 512)
+
+    var body: String = string_new()
+    let want: i64 = pattern(4096, body)
+
+    var msg: String = string_new()
+    string_push(msg, "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 4096\r\n\r\n")
+    string_push(msg, string_view(body))
+    // **Pipelined**: the next request rides in the SAME write, immediately after the last byte
+    // of the body. If the streaming reader takes one byte too many or one too few, this is the
+    // request that breaks.
+    string_push(msg, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")
+
+    var cl: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    test.is_true(c, rep, "connected", httpc.is_open(cl))
+    httpc.send_raw(cl, string_view(msg))
+    httpd.serve_for(sv, net, 200)
+
+    test.eq_i64(c, rep, "the upload was answered", resp_within(cl, 300) as i64, http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "with a 200", httpc.status(cl) as i64, 200)
+    var got: String = string_new()
+    httpc.body(cl, got)
+    var wantbody: String = string_new()
+    string_push(wantbody, "up:4096/")
+    push_i64(wantbody, want)
+    string_push(wantbody, " buffered:0")
+    test.eq_str(c, rep, "the handler saw the whole body through the sink, and none of it buffered",
+        string_view(got), string_view(wantbody))
+
+    test.eq_i64(c, rep, "every byte reached the sink", ts_get(tally, TS_BYTES), 4096)
+    test.eq_i64(c, rep, "and they were the right bytes, in order", ts_get(tally, TS_SUM), want)
+    test.is_true(c, rep, "it arrived in more than one piece", ts_get(tally, TS_PIECES) > 1)
+    test.is_true(c, rep, "and no piece was larger than the buffer", ts_get(tally, TS_MAX) <= 512)
+
+    // **The pipelining invariant.** When the body ended the buffer sat exactly at the next
+    // request's first byte, so the `GET` that followed it is answered on the same connection.
+    test.eq_i64(c, rep, "the pipelined request was answered too", resp_within(cl, 300) as i64,
+        http.HTTP_OK as i64)
+    string_free(got)  got = string_new()
+    httpc.body(cl, got)
+    test.eq_str(c, rep, "and it is the one that followed the body", string_view(got), "hello")
+    test.eq_i64(c, rep, "two requests served", httpd.served(sv), 2)
+    test.eq_i64(c, rep, "on one connection", httpd.accepted(sv), 1)
+    httpc.hangup(cl)
+    httpd.serve_for(sv, net, 5)
+
+    string_free(wantbody)
+    string_free(got)
+    string_free(msg)
+    string_free(body)
+    free_ptr(tally as *mut u8)
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_chunked_body_is_decoded_as_it_arrives_and_a_bad_size_is_a_400() -> bool {
+    var raw: *mut u8 = alloc(u8, HD_T_CAP)
+    var rep: []u8 = slice(u8, raw, HD_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var tally: *mut i64 = ts_new()
+    var sv: httpd.Server = boot_stream(a, net, tally, 512)
+
+    var body: String = string_new()
+    let want: i64 = pattern(4200, body)
+    var enc: String = string_new()
+    chunked_of(string_view(body), 700, enc)
+
+    var msg: String = string_new()
+    string_push(msg, "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+    string_push(msg, string_view(enc))
+    string_push(msg, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")
+
+    var cl: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.send_raw(cl, string_view(msg))
+    httpd.serve_for(sv, net, 200)
+
+    test.eq_i64(c, rep, "the chunked upload was answered", resp_within(cl, 300) as i64,
+        http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "with a 200", httpc.status(cl) as i64, 200)
+    var got: String = string_new()
+    httpc.body(cl, got)
+    var wantbody: String = string_new()
+    string_push(wantbody, "up:4200/")
+    push_i64(wantbody, want)
+    string_push(wantbody, " buffered:0")
+    test.eq_str(c, rep, "the DECODED body reached the sink whole", string_view(got), string_view(wantbody))
+    test.eq_i64(c, rep, "decoded byte for byte", ts_get(tally, TS_SUM), want)
+    test.is_true(c, rep, "in more than one piece", ts_get(tally, TS_PIECES) > 1)
+    test.is_true(c, rep, "none larger than the buffer", ts_get(tally, TS_MAX) <= 512)
+
+    // The chunk framing bytes are not the body, and the request after the terminator is the
+    // next request — the same invariant, over the other framing.
+    test.eq_i64(c, rep, "the pipelined request after the terminator", resp_within(cl, 300) as i64,
+        http.HTTP_OK as i64)
+    string_free(got)  got = string_new()
+    httpc.body(cl, got)
+    test.eq_str(c, rep, "is the one that followed it", string_view(got), "hello")
+    httpc.hangup(cl)
+    httpd.serve_for(sv, net, 5)
+
+    // **A malformed chunk size is a 400, not a hang.** `zz` can never become a valid size, so
+    // waiting for more bytes would be waiting forever.
+    var c2: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.send_raw(c2, "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nnope\r\n")
+    httpd.serve_for(sv, net, 100)
+    test.eq_i64(c, rep, "a malformed chunk size is ANSWERED", resp_within(c2, 300) as i64,
+        http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "with a 400", httpc.status(c2) as i64, 400)
+    test.eq_i64(c, rep, "and the connection closed", resp_within(c2, 300) as i64,
+        http.HTTP_INCOMPLETE as i64)
+    test.eq_i64(c, rep, "counted as a bad request", httpd.bad_requests(sv), 1)
+    httpc.hangup(c2)
+
+    string_free(wantbody)
+    string_free(got)
+    string_free(msg)
+    string_free(enc)
+    string_free(body)
+    free_ptr(tally as *mut u8)
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_body_over_the_bound_or_the_buffer_is_413_and_the_connection_closes() -> bool {
+    var raw: *mut u8 = alloc(u8, HD_T_CAP)
+    var rep: []u8 = slice(u8, raw, HD_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var tally: *mut i64 = ts_new()
+    var sv: httpd.Server = boot_stream(a, net, tally, 512)
+    httpd.set_max_body(sv, 1000)
+
+    // **A DECLARED length over the bound is refused before one body byte is waited for**, so
+    // the sink is never opened at all. The sentinel is what proves it: `on_open` would have
+    // cleared it.
+    ts_set(tally, TS_BYTES, 0 - 1)
+    var cl: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.send_raw(cl, "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 4096\r\n\r\n")
+    httpd.serve_for(sv, net, 100)
+    test.eq_i64(c, rep, "a declared length over the bound is answered at once",
+        resp_within(cl, 300) as i64, http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "with a 413", httpc.status(cl) as i64, 413)
+    test.eq_i64(c, rep, "the sink was never opened", ts_get(tally, TS_BYTES), 0 - 1)
+    test.eq_i64(c, rep, "counted", httpd.oversized_bodies(sv), 1)
+    test.eq_i64(c, rep, "and the connection closed", resp_within(cl, 300) as i64,
+        http.HTTP_INCOMPLETE as i64)
+    httpc.hangup(cl)
+
+    // A chunked body has no declared length, so its bound is enforced MID-STREAM, on bytes
+    // received rather than bytes decoded.
+    var body: String = string_new()
+    pattern(4200, body)
+    var enc: String = string_new()
+    chunked_of(string_view(body), 700, enc)
+    var msg: String = string_new()
+    string_push(msg, "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+    string_push(msg, string_view(enc))
+    var c2: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.send_raw(c2, string_view(msg))
+    httpd.serve_for(sv, net, 100)
+    test.eq_i64(c, rep, "a chunked body that grows past the bound is answered",
+        resp_within(c2, 300) as i64, http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "with a 413", httpc.status(c2) as i64, 413)
+    test.eq_i64(c, rep, "counted", httpd.oversized_bodies(sv), 2)
+    test.is_true(c, rep, "and it stopped near the bound, not at the end of the body",
+        ts_get(tally, TS_BYTES) < 2000)
+    test.eq_i64(c, rep, "nothing was served", httpd.served(sv), 0)
+    httpc.hangup(c2)
+
+    // **A body nobody streams.** `/echo` is an ordinary route: a body that FITS the buffer is
+    // parsed with the message and a handler may ignore it, but one that does NOT fit is 413
+    // and a close. It is not drained — see the module header.
+    httpd.set_max_body(sv, 100000)
+    var c3: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.send_raw(c3, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3000\r\n\r\n")
+    httpd.serve_for(sv, net, 100)
+    test.eq_i64(c, rep, "an unstreamed body larger than the buffer is answered",
+        resp_within(c3, 300) as i64, http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "with a 413", httpc.status(c3) as i64, 413)
+    test.eq_i64(c, rep, "counted", httpd.oversized_bodies(sv), 3)
+    test.eq_i64(c, rep, "and the connection closed rather than drained", resp_within(c3, 300) as i64,
+        http.HTTP_INCOMPLETE as i64)
+    httpc.hangup(c3)
+
+    // The control: the very same route, with a body that fits, is served.
+    var b: String = string_new()
+    test.eq_i64(c, rep, "a body that fits the buffer is unaffected",
+        ask(sv, net, "POST", "/echo", "", "ping", b) as i64, 200)
+    test.eq_str(c, rep, "and reaches the handler", string_view(b), "echo:ping")
+
+    string_free(b)
+    string_free(msg)
+    string_free(enc)
+    string_free(body)
+    free_ptr(tally as *mut u8)
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_sink_may_refuse_and_a_body_that_never_finishes_times_out() -> bool {
+    var raw: *mut u8 = alloc(u8, HD_T_CAP)
+    var rep: []u8 = slice(u8, raw, HD_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var tally: *mut i64 = ts_new()
+    var sv: httpd.Server = boot_stream(a, net, tally, 512)
+    // The IDLE knob is pushed out of reach so that the one timeout this test counts can only
+    // be the READ one. With both at 60ms a kept-alive connection left over from an earlier
+    // case expires during the stall and the count says 2 — a true number about the wrong
+    // thing.
+    httpd.set_timeouts(sv, 60, 5000)
+
+    var body: String = string_new()
+    pattern(4096, body)
+
+    // **Refused on the head.** The sink looks at a header and says 401; the route's handler
+    // never runs, and the connection closes rather than reading a body that was refused.
+    var msg: String = string_new()
+    string_push(msg, "POST /gate HTTP/1.1\r\nHost: x\r\nContent-Length: 4096\r\n\r\n")
+    string_push(msg, string_view(body))
+    var cl: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.send_raw(cl, string_view(msg))
+    httpd.serve_for(sv, net, 100)
+    test.eq_i64(c, rep, "the refusal is a response", resp_within(cl, 300) as i64, http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "the status the sink chose", httpc.status(cl) as i64, 401)
+    test.eq_i64(c, rep, "no body byte was taken", ts_get(tally, TS_BYTES), 0)
+    test.eq_i64(c, rep, "and no request was served", httpd.served(sv), 0)
+    test.eq_i64(c, rep, "the connection is closed", resp_within(cl, 300) as i64,
+        http.HTTP_INCOMPLETE as i64)
+    httpc.hangup(cl)
+
+    // The same route, with the token: the body streams and the handler runs.
+    var msg2: String = string_new()
+    string_push(msg2, "POST /gate HTTP/1.1\r\nHost: x\r\nX-Token: ok\r\nContent-Length: 4096\r\n\r\n")
+    string_push(msg2, string_view(body))
+    var c2: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.send_raw(c2, string_view(msg2))
+    httpd.serve_for(sv, net, 200)
+    test.eq_i64(c, rep, "with the token it is accepted", resp_within(c2, 300) as i64,
+        http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "200", httpc.status(c2) as i64, 200)
+    test.eq_i64(c, rep, "and the whole body streamed", ts_get(tally, TS_BYTES), 4096)
+    httpc.hangup(c2)
+    httpd.serve_for(sv, net, 5)
+
+    // **Refused part way in.** `/small` takes 600 bytes and then says 413.
+    var msg3: String = string_new()
+    string_push(msg3, "POST /small HTTP/1.1\r\nHost: x\r\nContent-Length: 4096\r\n\r\n")
+    string_push(msg3, string_view(body))
+    var c3: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.send_raw(c3, string_view(msg3))
+    httpd.serve_for(sv, net, 200)
+    test.eq_i64(c, rep, "a mid-body refusal is a response", resp_within(c3, 300) as i64,
+        http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "with the sink's status", httpc.status(c3) as i64, 413)
+    test.eq_i64(c, rep, "still only one request served", httpd.served(sv), 1)
+    httpc.hangup(c3)
+
+    // **A `Content-Length` that lies short.** The server takes exactly what was promised and
+    // never one byte more, so a client that under-delivers stalls — and the READ timeout,
+    // not a stolen next request, is what ends it.
+    var c4: httpc.Client = httpc.dial(net, addr_of(sv), HD_T_CAP)
+    httpc.send_raw(c4, "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 4096\r\n\r\nshort")
+    var clk: time.Clock = time.host()
+    let t0: i64 = time.read_nanos(clk)
+    httpd.serve_for(sv, net, 250)
+    let waited: i64 = (time.read_nanos(clk) - t0) / 1000000
+    test.eq_i64(c, rep, "the stalled upload is answered", resp_within(c4, 300) as i64,
+        http.HTTP_OK as i64)
+    test.eq_i64(c, rep, "with a 408", httpc.status(c4) as i64, 408)
+    test.is_true(c, rep, "and not before the read timeout", waited >= 60)
+    test.eq_i64(c, rep, "counted as a timeout", httpd.timeouts(sv), 1)
+    test.eq_i64(c, rep, "the handler never ran", httpd.served(sv), 1)
+    test.eq_i64(c, rep, "though the sink did see what arrived", ts_get(tally, TS_BYTES), 5)
+    httpc.hangup(c4)
+
+    string_free(msg3)
+    string_free(msg2)
+    string_free(msg)
+    string_free(body)
+    free_ptr(tally as *mut u8)
     httpd.stop(sv, net)
     httpd.free(sv)
     sysnet.shutdown(net)

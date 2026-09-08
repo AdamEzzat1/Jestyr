@@ -1,0 +1,451 @@
+// std/jcadd_test.jtr — every claim `std/jcadd`'s header makes, checked against real files.
+//
+// The module makes three kinds of claim and this suite is organised as three tests, one per
+// kind:
+//
+//   1. **Nothing is guessed.** A request that is not a name and a requirement, a manifest that
+//      is absent, a manifest that does not parse, a package the registry never heard of, and a
+//      requirement graph that cannot be met are each REFUSED by their own status — and every
+//      one of those refusals happens with the manifest and the lockfile untouched.
+//   2. **The whole graph is resolved, and the second run is free.** `add http ^1.0.0` brings
+//      `text` along because `http 1.0.0` requires it and nothing else does; the three newer
+//      published versions are all absent, which is minimal selection; the lockfile agrees with
+//      a fresh resolution through `lockfile.verify`; the manifest on disk is its own canonical
+//      rendering; and running the same command again writes NOTHING.
+//   3. **A failure part-way through moves neither file.** Two injections, at the two places
+//      the sequence can still fail after the candidate exists: a TAMPERED archive (step 5,
+//      `registry.fetch` re-hashes and refuses) and a handle that may read but not write
+//      (step 7, the staging write). In both the manifest is compared byte for byte against
+//      what it was, the lockfile is still absent, and no `.jcadd` staging file survives.
+//
+// Everything runs against a real scratch tree — a published registry, a content-addressed
+// cache, a project directory — for `std/registry`'s reason: this module exists to move files,
+// and a mock filesystem would prove nothing about the property it is built for. The tree is
+// scrubbed at both ends of every test, because a previous run may have died holding it.
+//
+// The read-only injection is only interesting once the cache is WARM: through such a handle
+// `registry.fetch` could not store an archive, and the run would fail at step 5 rather than at
+// step 7. So that case runs after a successful add, with the manifest and the lockfile reset
+// underneath it — the failure is then genuinely the staging write and nothing earlier.
+//
+// Run:  jestyrc test examples/std/jcadd_test.jtr
+
+import "cache"
+import "fs"
+import "jcadd"
+import "lockfile"
+import "manifest"
+import "mem"
+import "registry"
+import "resolve"
+import "sysfs"
+import "test"
+import "test_report"
+
+const JT_CAP: usize = 16384
+
+const JT_DIR: str = "zz_jct"
+const JT_REG: str = "zz_jct/reg"
+const JT_CACHE: str = "zz_jct/cache"
+const JT_MANIFEST: str = "zz_jct/jestyr-package"
+const JT_LOCK: str = "zz_jct/jestyr-lock"
+const JT_MTMP: str = "zz_jct/jestyr-package.jcadd"
+const JT_LTMP: str = "zz_jct/jestyr-lock.jcadd"
+
+// The project's manifest before any `add`. Written verbatim rather than rendered, so the
+// canonical-rendering assertion has something that was not produced by the renderer.
+const JT_BEFORE: str = "jestyr-package/v1\nname app\nversion 0.1.0\ndep base ^1.0.0\n"
+
+const AR_BASE_100: str = "base-1.0.0-archive"
+const AR_BASE_110: str = "base-1.1.0-archive"
+const AR_TEXT_100: str = "text-1.0.0-archive"
+const AR_TEXT_120: str = "text-1.2.0-archive"
+const AR_HTTP_100: str = "http-1.0.0-archive"
+const AR_HTTP_150: str = "http-1.5.0-archive"
+const AR_PIN_100: str = "pin-1.0.0-archive"
+
+fn nothing() { }
+
+// ---- the scratch tree ---------------------------------------------------------------------
+
+fn entry_path(read name: str, read ver: str, read ext: str) -> String {
+    var p: String = string_new()
+    string_push(p, JT_REG)
+    string_push(p, "/")
+    string_push(p, name)
+    string_push(p, "-")
+    string_push(p, ver)
+    string_push(p, ".")
+    string_push(p, ext)
+    return p
+}
+
+fn unpublish(mut h: fs.Fs, read name: str, read ver: str) {
+    var m: String = entry_path(name, ver, "manifest")
+    fs.erase(h, string_view(m))
+    string_free(m)
+    var t: String = entry_path(name, ver, "tar")
+    fs.erase(h, string_view(t))
+    string_free(t)
+}
+
+// Remove the cache entry keyed by `bytes` and the shard directory it lived in.
+fn drop_entry(mut h: fs.Fs, read a: Allocator, read ch: cache.Cache, read bytes: str) {
+    var key: String = cache.key_of(a, bytes)
+    let k: str = string_view(key)
+    let _e: bool = cache.evict(h, a, ch, k)
+    var sh: String = string_new()
+    string_push(sh, JT_CACHE)
+    string_push(sh, "/")
+    string_push(sh, k[0 .. 2])
+    let _d: bool = sysfs.remove_dir(h, a, string_view(sh)) catch false
+    string_free(sh)
+    string_free(key)
+}
+
+fn scrub(mut h: fs.Fs, read a: Allocator) {
+    var ch: cache.Cache = cache.open(a, JT_CACHE)
+    drop_entry(h, a, ch, AR_BASE_100)
+    drop_entry(h, a, ch, AR_BASE_110)
+    drop_entry(h, a, ch, AR_TEXT_100)
+    drop_entry(h, a, ch, AR_TEXT_120)
+    drop_entry(h, a, ch, AR_HTTP_100)
+    drop_entry(h, a, ch, AR_HTTP_150)
+    drop_entry(h, a, ch, AR_PIN_100)
+    unpublish(h, "base", "1.0.0")
+    unpublish(h, "base", "1.1.0")
+    unpublish(h, "text", "1.0.0")
+    unpublish(h, "text", "1.2.0")
+    unpublish(h, "http", "1.0.0")
+    unpublish(h, "http", "1.5.0")
+    unpublish(h, "pin", "1.0.0")
+    fs.erase(h, "zz_jct/reg/index")
+    fs.erase(h, JT_MANIFEST)
+    fs.erase(h, JT_LOCK)
+    fs.erase(h, JT_MTMP)
+    fs.erase(h, JT_LTMP)
+    let _c: bool = sysfs.remove_dir(h, a, JT_CACHE) catch false
+    let _r: bool = sysfs.remove_dir(h, a, JT_REG) catch false
+    let _t: bool = sysfs.remove_dir(h, a, JT_DIR) catch false
+}
+
+fn publish_one(mut h: fs.Fs, read a: Allocator, read r: registry.Registry,
+               read name: str, read ver: str, read dep: str, read dreq: str,
+               read bytes: str) -> bool {
+    var d: manifest.Draft = manifest.draft(a, name, ver)
+    if dep.len > 0 { manifest.draft_dep(d, dep, dreq) }
+    var t: String = manifest.draft_render(a, d)
+    let s: i32 = registry.publish(h, a, r, string_view(t), bytes)
+    string_free(t)
+    return s == registry.PUBLISH_OK
+}
+
+// Three packages at two versions each, plus `pin` — a package whose only version requires a
+// `base 2.x` that was never published, so a graph that names `pin` cannot be met.
+fn populate(mut h: fs.Fs, read a: Allocator, read r: registry.Registry) -> i32 {
+    var n: i32 = 0
+    if publish_one(h, a, r, "base", "1.0.0", "", "", AR_BASE_100) { n = n + 1 }
+    if publish_one(h, a, r, "base", "1.1.0", "", "", AR_BASE_110) { n = n + 1 }
+    if publish_one(h, a, r, "text", "1.0.0", "", "", AR_TEXT_100) { n = n + 1 }
+    if publish_one(h, a, r, "text", "1.2.0", "", "", AR_TEXT_120) { n = n + 1 }
+    if publish_one(h, a, r, "http", "1.0.0", "text", "^1.0.0", AR_HTTP_100) { n = n + 1 }
+    if publish_one(h, a, r, "http", "1.5.0", "text", "^1.2.0", AR_HTTP_150) { n = n + 1 }
+    if publish_one(h, a, r, "pin", "1.0.0", "base", "^2.0.0", AR_PIN_100) { n = n + 1 }
+    return n
+}
+
+fn setup(mut h: fs.Fs, read a: Allocator) -> i32 {
+    scrub(h, a)
+    let _d1: bool = sysfs.make_dir(h, a, JT_DIR) catch false
+    let _d2: bool = sysfs.make_dir(h, a, JT_REG) catch false
+    var r: registry.Registry = registry.open(a, JT_REG)
+    let n: i32 = populate(h, a, r)
+    fs.put(h, JT_MANIFEST, JT_BEFORE)
+    return n
+}
+
+// True when neither staging file is on disk.
+fn no_staging(mut h: fs.Fs) -> bool {
+    if fs.present(h, JT_MTMP) { return false }
+    if fs.present(h, JT_LTMP) { return false }
+    return true
+}
+
+// The bytes of the manifest right now.
+fn manifest_now(mut h: fs.Fs) -> String {
+    return fs.open_text(h, JT_MANIFEST)
+}
+
+// Is `bytes` in the cache? The key IS its digest, so the question needs nothing but the bytes.
+fn cached_bytes(mut h: fs.Fs, read a: Allocator, read ch: cache.Cache, read bytes: str) -> bool {
+    var k: String = cache.key_of(a, bytes)
+    let there: bool = cache.has(h, a, ch, string_view(k))
+    string_free(k)
+    return there
+}
+
+// ---- 1. every refusal, with nothing moved ---------------------------------------------------
+
+@test fn a_request_that_cannot_be_honoured_is_refused_before_anything_moves() -> bool {
+    var raw: *mut u8 = alloc(u8, JT_CAP)
+    var rep: []u8 = slice(u8, raw, JT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+
+    test.eq_i64(c, rep, "seven versions publish", setup(h, a) as i64, 7)
+    var r: registry.Registry = registry.open(a, JT_REG)
+    var ch: cache.Cache = cache.open(a, JT_CACHE)
+
+    // The request itself, before a byte is read.
+    var bad_name: jcadd.Report = jcadd.add(h, a, JT_MANIFEST, JT_LOCK, r, ch, "Not A Name", "^1.0.0")
+    test.eq_i64(c, rep, "a name that is not a name is refused",
+                jcadd.status(bad_name) as i64, jcadd.ADD_BAD_REQUEST as i64)
+    test.eq_str(c, rep, "and the detail is that name", jcadd.detail(bad_name), "Not A Name")
+
+    var bad_req: jcadd.Report = jcadd.add(h, a, JT_MANIFEST, JT_LOCK, r, ch, "http", "^1.2.x")
+    test.eq_i64(c, rep, "a requirement that does not parse is refused",
+                jcadd.status(bad_req) as i64, jcadd.ADD_BAD_REQUEST as i64)
+    test.eq_str(c, rep, "and the detail is that requirement", jcadd.detail(bad_req), "^1.2.x")
+
+    // A missing manifest is refused, and NOT created.
+    fs.erase(h, JT_MANIFEST)
+    var gone: jcadd.Report = jcadd.add(h, a, JT_MANIFEST, JT_LOCK, r, ch, "http", "^1.0.0")
+    test.eq_i64(c, rep, "a missing manifest is refused",
+                jcadd.status(gone) as i64, jcadd.ADD_NO_MANIFEST as i64)
+    test.eq_str(c, rep, "and the detail is the path", jcadd.detail(gone), JT_MANIFEST)
+    test.is_false(c, rep, "and `add` did not create one", fs.present(h, JT_MANIFEST))
+
+    // A manifest that does not parse is refused AT ITS LINE.
+    fs.put(h, JT_MANIFEST, "jestyr-package/v1\nname app\nversion 0.1.0\nwut\n")
+    var broken: jcadd.Report = jcadd.add(h, a, JT_MANIFEST, JT_LOCK, r, ch, "http", "^1.0.0")
+    test.eq_i64(c, rep, "a manifest that does not parse is refused",
+                jcadd.status(broken) as i64, jcadd.ADD_BAD_MANIFEST as i64)
+    test.eq_i64(c, rep, "at the offending line", jcadd.at_line(broken) as i64, 4)
+    test.eq_str(c, rep, "named by the format, not by `add`", jcadd.detail(broken),
+                manifest.problem_name(manifest.MANIFEST_BAD_LINE))
+
+    // A package the registry never heard of.
+    fs.put(h, JT_MANIFEST, JT_BEFORE)
+    var unknown: jcadd.Report = jcadd.add(h, a, JT_MANIFEST, JT_LOCK, r, ch, "nosuch", "^1.0.0")
+    test.eq_i64(c, rep, "an unknown package is refused",
+                jcadd.status(unknown) as i64, jcadd.ADD_UNKNOWN_PACKAGE as i64)
+    test.eq_str(c, rep, "by name", jcadd.detail(unknown), "nosuch")
+
+    // A graph that cannot be met: `pin` needs a `base 2.x` nobody published, and the manifest
+    // already requires `base ^1.0.0`.
+    var stuck: jcadd.Report = jcadd.add(h, a, JT_MANIFEST, JT_LOCK, r, ch, "pin", "^1.0.0")
+    test.eq_i64(c, rep, "an unsatisfiable graph is refused",
+                jcadd.status(stuck) as i64, jcadd.ADD_UNRESOLVED as i64)
+    test.eq_str(c, rep, "reported against the package that has no version left",
+                jcadd.detail(stuck), "base")
+    test.is_false(c, rep, "and that is a real conflict, not a budget",
+                  jcadd.exhausted(stuck))
+
+    // Not one of those six refusals moved anything.
+    var still: String = manifest_now(h)
+    test.eq_str(c, rep, "the manifest is still exactly what it was", string_view(still), JT_BEFORE)
+    test.is_false(c, rep, "no lockfile was written", fs.present(h, JT_LOCK))
+    test.is_true(c, rep, "no staging file was left behind", no_staging(h))
+    string_free(still)
+
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- 2. one add, the whole graph, and a second run that costs nothing ------------------------
+
+@test fn one_add_resolves_the_whole_graph_and_the_next_run_writes_nothing() -> bool {
+    var raw: *mut u8 = alloc(u8, JT_CAP)
+    var rep: []u8 = slice(u8, raw, JT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+
+    test.eq_i64(c, rep, "seven versions publish", setup(h, a) as i64, 7)
+    var r: registry.Registry = registry.open(a, JT_REG)
+    var ch: cache.Cache = cache.open(a, JT_CACHE)
+
+    var one: jcadd.Report = jcadd.add(h, a, JT_MANIFEST, JT_LOCK, r, ch, "http", "^1.0.0")
+    test.eq_i64(c, rep, "the add succeeds", jcadd.status(one) as i64, jcadd.ADD_OK as i64)
+    test.is_true(c, rep, "the dependency was added", jcadd.added(one))
+    test.is_false(c, rep, "not updated", jcadd.updated(one))
+    test.eq_i64(c, rep, "nothing in the index was skipped", jcadd.skipped(one) as i64, 0)
+    // Three packages, though the project names two: `text` arrives through `http 1.0.0`.
+    test.eq_i64(c, rep, "three packages are selected", jcadd.packages(one) as i64, 3)
+    test.eq_i64(c, rep, "three archives were fetched", jcadd.fetched(one) as i64, 3)
+    test.eq_i64(c, rep, "none of them was already cached", jcadd.cached(one) as i64, 0)
+    test.is_true(c, rep, "the manifest moved", jcadd.manifest_written(one))
+    test.is_true(c, rep, "and so did the lockfile", jcadd.lock_written(one))
+    test.is_true(c, rep, "and no staging file survived", no_staging(h))
+
+    // The manifest: the existing dependency kept its place, the new one was appended, and the
+    // bytes on disk are the format's own canonical rendering of themselves.
+    var after: String = manifest_now(h)
+    test.eq_str(c, rep, "the manifest reads as it should", string_view(after),
+                "jestyr-package/v1\nname app\nversion 0.1.0\ndep base ^1.0.0\ndep http ^1.0.0\n")
+    var pm: manifest.Manifest = manifest.parse(a, string_view(after))
+    test.is_true(c, rep, "it parses", manifest.parsed(pm))
+    var canon: String = manifest.render_of(a, pm)
+    test.eq_str(c, rep, "and it is its own canonical rendering",
+                string_view(canon), string_view(after))
+    string_free(canon)
+
+    // The lockfile: three entries at the LOWEST satisfying versions, and it agrees with a
+    // fresh resolution of the same registry through `lockfile.verify`.
+    var lockt: String = fs.open_text(h, JT_LOCK)
+    var lk: lockfile.Lock = lockfile.parse(a, string_view(lockt))
+    test.is_true(c, rep, "the lockfile parses", lockfile.lock_valid(lk))
+    test.eq_usize(c, rep, "with three entries", lockfile.entry_count(lk), 3)
+    test.eq_str(c, rep, "base first", lockfile.entry_name(lk, 0), "base")
+    test.eq_str(c, rep, "at the lowest version that satisfies",
+                lockfile.entry_version(lk, 0), "1.0.0")
+    test.eq_str(c, rep, "then http", lockfile.entry_name(lk, 1), "http")
+    test.eq_str(c, rep, "at 1.0.0, not 1.5.0", lockfile.entry_version(lk, 1), "1.0.0")
+    test.eq_str(c, rep, "then text, which nothing in the project named",
+                lockfile.entry_name(lk, 2), "text")
+    test.eq_str(c, rep, "at 1.0.0, not 1.2.0", lockfile.entry_version(lk, 2), "1.0.0")
+
+    var skipped: i64 = 0
+    var universe: resolve.Registry = registry.load(h, a, r, skipped)
+    resolve.add_root(universe, "base", "^1.0.0")
+    resolve.add_root(universe, "http", "^1.0.0")
+    let fresh: resolve.Solution = resolve.solve(a, universe)
+    test.is_true(c, rep, "a fresh resolution succeeds", resolve.solved(fresh))
+    let v: lockfile.Verdict = lockfile.verify(a, lk, universe, fresh)
+    test.is_true(c, rep, "and the lockfile agrees with it", lockfile.agrees(v))
+
+    // ---- the same command again -----------------------------------------------------------
+    var two: jcadd.Report = jcadd.add(h, a, JT_MANIFEST, JT_LOCK, r, ch, "http", "^1.0.0")
+    test.eq_i64(c, rep, "the second run succeeds", jcadd.status(two) as i64, jcadd.ADD_OK as i64)
+    test.is_false(c, rep, "nothing was added", jcadd.added(two))
+    test.is_false(c, rep, "nothing was updated", jcadd.updated(two))
+    test.is_false(c, rep, "the manifest did not change", jcadd.manifest_changed(two))
+    test.is_false(c, rep, "the lockfile did not change", jcadd.lock_changed(two))
+    test.is_false(c, rep, "so the manifest was not written", jcadd.manifest_written(two))
+    test.is_false(c, rep, "nor the lockfile", jcadd.lock_written(two))
+    test.eq_i64(c, rep, "and nothing was fetched", jcadd.fetched(two) as i64, 0)
+    test.eq_i64(c, rep, "every archive was already cached", jcadd.cached(two) as i64, 3)
+    test.is_true(c, rep, "no staging file was created", no_staging(h))
+
+    var after2: String = manifest_now(h)
+    var lockt2: String = fs.open_text(h, JT_LOCK)
+    test.eq_str(c, rep, "the manifest is the same bytes", string_view(after2), string_view(after))
+    test.eq_str(c, rep, "and so is the lockfile", string_view(lockt2), string_view(lockt))
+
+    // ---- raising a floor is an UPDATE, in place -------------------------------------------
+    var up: jcadd.Report = jcadd.add(h, a, JT_MANIFEST, JT_LOCK, r, ch, "base", "^1.1.0")
+    test.eq_i64(c, rep, "raising base's floor succeeds", jcadd.status(up) as i64, jcadd.ADD_OK as i64)
+    test.is_false(c, rep, "it is not an addition", jcadd.added(up))
+    test.is_true(c, rep, "it is an update", jcadd.updated(up))
+    var after3: String = manifest_now(h)
+    test.eq_str(c, rep, "and base keeps the line it had", string_view(after3),
+                "jestyr-package/v1\nname app\nversion 0.1.0\ndep base ^1.1.0\ndep http ^1.0.0\n")
+    var lockt3: String = fs.open_text(h, JT_LOCK)
+    var lk3: lockfile.Lock = lockfile.parse(a, string_view(lockt3))
+    test.eq_str(c, rep, "the lockfile now names base 1.1.0",
+                lockfile.entry_version(lk3, 0), "1.1.0")
+    test.eq_str(c, rep, "and http did not move", lockfile.entry_version(lk3, 1), "1.0.0")
+    test.eq_i64(c, rep, "with base 1.1.0's archive newly fetched", jcadd.fetched(up) as i64, 1)
+
+    string_free(lockt3)  string_free(after3)
+    string_free(lockt2)  string_free(after2)
+    string_free(lockt)   string_free(after)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- 3. a failure part-way through moves neither file ----------------------------------------
+
+@test fn a_failure_part_way_through_leaves_both_files_as_they_were() -> bool {
+    var raw: *mut u8 = alloc(u8, JT_CAP)
+    var rep: []u8 = slice(u8, raw, JT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+
+    test.eq_i64(c, rep, "seven versions publish", setup(h, a) as i64, 7)
+    var r: registry.Registry = registry.open(a, JT_REG)
+    var ch: cache.Cache = cache.open(a, JT_CACHE)
+
+    // ---- injection one: a tampered archive, discovered at step 5 --------------------------
+    //
+    // `text 1.0.0` is reached only through `http`, so this fails in the middle of the fetch
+    // loop — after the candidate manifest has been rendered and the graph resolved, and
+    // before either file is staged.
+    var tar: String = entry_path("text", "1.0.0", "tar")
+    fs.put(h, string_view(tar), "TAMPERED")
+
+    var bad: jcadd.Report = jcadd.add(h, a, JT_MANIFEST, JT_LOCK, r, ch, "http", "^1.0.0")
+    test.eq_i64(c, rep, "a tampered archive fails the add",
+                jcadd.status(bad) as i64, jcadd.ADD_FETCH_FAILED as i64)
+    test.eq_str(c, rep, "named by the package it belongs to", jcadd.detail(bad), "text")
+    test.is_false(c, rep, "the manifest was not written", jcadd.manifest_written(bad))
+    test.is_false(c, rep, "nor the lockfile", jcadd.lock_written(bad))
+
+    var t1: String = manifest_now(h)
+    test.eq_str(c, rep, "the manifest is byte for byte what it was",
+                string_view(t1), JT_BEFORE)
+    test.is_false(c, rep, "no lockfile appeared", fs.present(h, JT_LOCK))
+    test.is_true(c, rep, "no staging file was left behind", no_staging(h))
+    var tkey: String = cache.key_of(a, "TAMPERED")
+    test.is_false(c, rep, "and the tampered bytes never reached the cache",
+                  cache.has(h, a, ch, string_view(tkey)))
+    string_free(tkey)
+    string_free(t1)
+
+    // Put the real archive back; the same add now succeeds and warms the cache.
+    fs.put(h, string_view(tar), AR_TEXT_100)
+    string_free(tar)
+    var good: jcadd.Report = jcadd.add(h, a, JT_MANIFEST, JT_LOCK, r, ch, "http", "^1.0.0")
+    test.eq_i64(c, rep, "with the archive restored the same add succeeds",
+                jcadd.status(good) as i64, jcadd.ADD_OK as i64)
+    // How the three archives split between "fetched now" and "already there" depends on how
+    // far the failed run got before `text`, which is index order — so the claim asserted is
+    // the one that matters: all three are in the cache, whoever put them there.
+    test.eq_i64(c, rep, "three archives are accounted for",
+                (jcadd.fetched(good) + jcadd.cached(good)) as i64, 3)
+    test.is_true(c, rep, "base's archive is in the cache", cached_bytes(h, a, ch, AR_BASE_100))
+    test.is_true(c, rep, "text's archive is in the cache", cached_bytes(h, a, ch, AR_TEXT_100))
+    test.is_true(c, rep, "http's archive is in the cache", cached_bytes(h, a, ch, AR_HTTP_100))
+
+    // ---- injection two: the staging write refused, at step 7 -------------------------------
+    //
+    // Reset the project to where it started, then run the SAME add through a handle that may
+    // read but not write. Everything up to the swap succeeds — the cache is warm, so the
+    // fetch step finds all three archives without a single write — and the first staging
+    // write is refused.
+    fs.put(h, JT_MANIFEST, JT_BEFORE)
+    fs.erase(h, JT_LOCK)
+    var ro: fs.Fs = fs.read_only()
+
+    var refused: jcadd.Report = jcadd.add(ro, a, JT_MANIFEST, JT_LOCK, r, ch, "http", "^1.0.0")
+    test.eq_i64(c, rep, "a handle that cannot write fails the add",
+                jcadd.status(refused) as i64, jcadd.ADD_WRITE_FAILED as i64)
+    // The discriminator: it got all the way to the swap. A run that failed earlier would not
+    // have decided that both files differ, nor counted three cached archives.
+    test.is_true(c, rep, "having decided the manifest differs", jcadd.manifest_changed(refused))
+    test.is_true(c, rep, "and the lockfile too", jcadd.lock_changed(refused))
+    test.eq_i64(c, rep, "with every archive found already cached",
+                jcadd.cached(refused) as i64, 3)
+    test.eq_i64(c, rep, "and nothing fetched", jcadd.fetched(refused) as i64, 0)
+    test.eq_i64(c, rep, "three packages were resolved", jcadd.packages(refused) as i64, 3)
+    test.is_false(c, rep, "yet the manifest did not move", jcadd.manifest_written(refused))
+    test.is_false(c, rep, "nor the lockfile", jcadd.lock_written(refused))
+    test.is_true(c, rep, "and the handle counted the refusal", fs.refused(ro) > 0)
+
+    var t2: String = manifest_now(h)
+    test.eq_str(c, rep, "the manifest is still what it was", string_view(t2), JT_BEFORE)
+    test.is_false(c, rep, "the lockfile is still absent", fs.present(h, JT_LOCK))
+    test.is_true(c, rep, "and no staging file exists", no_staging(h))
+    string_free(t2)
+
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

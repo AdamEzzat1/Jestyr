@@ -7,6 +7,129 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/jcadd`** — `jc add <name> <req>` as one command over the whole package substrate:
+  read the local manifest, add or update the dependency, resolve the WHOLE graph against the
+  registry, fetch what is missing through the content-addressed cache, write the lockfile, and
+  re-render the manifest canonically. A LIBRARY (`add(...) -> Report`) with a thin `main`
+  around it rather than a subcommand of `jc` — `jc` is `examples/std/cgen.jtr`, a
+  self-hosting closure module, and a subcommand there rewrites the bootstrap seed; the shape
+  is `census_cli`/`doc_cli`/`escape_cli`'s.
+
+  **A failure moves neither file.** Everything that can fail happens before anything visible
+  moves — the request, the manifest, the candidate (rendered AND parsed back, so a manifest
+  this command writes is one it can read), the resolution, the fetch, the lockfile — and only
+  then are both files staged beside their targets and renamed into place. `registry.fetch`
+  re-hashes an archive against the digest the index promised, so a tampered archive fails with
+  both files still their original bytes. The residual window is stated rather than hidden: two
+  renames are not one atomic act, and the manifest renames first because manifest-new/lock-old
+  is the ordinary state a hand-edited dependency leaves, which `lockfile.verify` reports as
+  drift and the next `add` repairs.
+
+  **Idempotence is measured, not conventional**: the candidate and the rendered lockfile are
+  compared against the bytes on disk and neither is written when nothing moved, so a second
+  run creates no temporary file at all. The whole graph is resolved rather than the new edge,
+  so `add` reports a conflict the new dependency merely revealed; a missing manifest is
+  refused (`ADD_NO_MANIFEST`) rather than invented. 3 tests — six refusals each leaving the
+  manifest byte for byte what it was, one add whose lockfile is checked against a fresh
+  resolution through `lockfile.verify`, and the atomicity claim injected at both places the
+  sequence can still fail after the candidate exists (a tampered archive, and an
+  `fs.read_only()` handle over a warm cache). Demo `jadd` (`examples/std/jcadd_demo.jtr`)
+  publishes a scratch registry, adds a dependency whose own dependency resolves transitively,
+  and runs the same command again to show nothing moves; transcript pinned. Not built:
+  `jc remove`, `jc update`, `jc init`, unpacking an archive into a working tree, a registry
+  chosen by name, or concurrency control between two `add`s on one directory.
+
+- **`std/plugin` kills the plugin, not its shell.** `connect` now starts its child in a
+  `sandbox.Group` — a Job object on Windows, a process group on POSIX — and `hangup`, the
+  timeout path and every other path that ends a connection take the GROUP down after the
+  child. `sysproc.terminate` reaches the child that was started, and on Windows that is
+  `cmd.exe` rather than the plugin under it (the shell does not `exec`), so a plugin killed
+  mid-call was orphaned holding the host's inherited handles: anything CAPTURING the host's
+  output waited for the orphan instead of seeing end-of-file. The two modules landed in the
+  same pass and the join was left undone; `plugin.jtr`'s header recorded it as such.
+
+  New: `sysproc.start_piped_at` (`start_piped` plus the three facts a process can only be
+  given at creation — `cwd`, one appended `NAME=value`, and `apart`), with `start_piped`
+  delegating to it rather than keeping a second copy of the pipe-ordering rules;
+  `sandbox.open_group` and `sandbox.join_group` made public, so the four-step order the group
+  depends on — open, start apart, join before the child runs, resume — is written once and
+  composed by a caller that has pipes but no `Jail`; `plugin.tree_reaped` (was the tree
+  CONFIRMED empty, bounded by `PLUGIN_REAP_NANOS`, never a wait) and `plugin.tree_live`.
+
+  **The workaround this removes was a measurement.** `plugin_echo`'s `!sleep` nap had been
+  cut from ten seconds to three because a killed plugin's nap was what its host's reader
+  paid; through a pipe, three runs each, the nap now costs nothing: without the group 3.41s
+  at a three-second nap and 10.46s at a ten-second one, with it 0.90s and 1.02s. The nap is
+  back to ten seconds — twenty-five times the 400ms budget it must beat — and
+  `jplugin_keeps_one_plugin_and_survives_it` asserts the elapsed time of its
+  `Command::output`, the one assertion in that test a re-orphaned plugin would fail.
+  `plugin_test` grows an eleventh test: a plugin whose shell keeps a grandchild, the
+  grandchild waited for so that the kill is a fair experiment, then killed past its budget
+  with the whole tree confirmed gone inside a bounded wait. **POSIX is compiled but not run
+  here** — a `sh -c` of a simple command usually `exec`s, so the orphan this fixes is a
+  Windows symptom, and `setpgid` + `kill(-pgid, …)` are exercised on Linux by CI alone.
+
+- **Request-body streaming in `std/httpd`** — a handler can now read a body larger than the
+  connection buffer, in bounded pieces, without the server ever holding it whole. It is the
+  one thing the HTTP pass deliberately stopped short of; until now a body that did not fit
+  was a `431` and a close.
+
+  The body is **pushed, not pulled**. `route_stream(sv, method, pattern, handler, sink)`
+  registers a route with a `BodySink` — `on_open(ctx, read Exchange) -> i32` when the head is
+  in, `on_data(ctx, read []u8) -> i32` for each piece — and the readiness loop hands the sink
+  whatever arrived, inside the poll, and returns. A pulling API would have to block, and one
+  blocking read on a single-threaded server is one slow uploader starving every other
+  connection. Both answers are a STATUS: `0` accepts, anything else is sent and the
+  connection closed, which keeps the response the route handler's to write. That handler runs
+  ONCE, when the body is complete; `body(x)` is `""` for a streamed request and
+  `body_streamed(x)` is how many decoded bytes there were.
+
+  **The head is pinned and the rules are not duplicated.** `std/http` grew `parse_head`,
+  `body_from_head` and `chunk_step`; `parse_request` IS `parse_head` then `body_from_head`,
+  so there is still exactly one start-line loop, one header loop and one framing scan, and
+  `chunk_step` drives the same `line_end`/`strict_hex` pair `frame_chunked` uses one unit at
+  a time over a window being refilled. A second framing decision is the whole smuggling
+  class, so there isn't one. While a body streams, its head sits at the front of the
+  connection buffer and never moves; each round reads into the window behind it, hands the
+  sink what decoded, and slides the remainder back. **`Content-Length` delivers exactly the
+  declared count and never one byte more**, so the bytes after a body are the next request's
+  — a client that under-delivers stalls into the read timeout and a `408` instead of stealing
+  them. When a body ends the buffer sits exactly at the next request's first byte, by
+  `answer`'s own memmove: the pipelining invariant is the same one, and pinned by a test that
+  sends a `GET` in the same write as a 4096-byte body.
+
+  **Bounded everywhere.** `set_max_body` counts bytes RECEIVED, not decoded, because chunk
+  framing is the client's choice; a declared length over it is a `413` before one body byte is
+  waited for, and a chunked body that grows past it is a `413` mid-stream. A body no route
+  streams and the buffer cannot hold is a `413` and a close — **not a drain**, which is work
+  the client chose and whose only bound is the client's own honesty. A head that does not fit
+  is still `431`: that is a header bound and a client told `413` would trim the wrong thing.
+  A malformed chunk size is a `400` and a close rather than a wait for bytes that could never
+  make it valid.
+
+  **Every error close now LINGERS first**, and it had to: closing a socket that still holds
+  unread bytes makes the kernel send a RESET, and the reset destroys the response that was
+  just written to explain the refusal — so a client half way through an upload saw a dropped
+  connection and no reason. `linger_close` discards only what has ALREADY arrived, each read
+  gated on a zero-timeout poll and the whole loop capped at 16 bufferfuls, so its cost is the
+  server's number and not the client's.
+
+  Five new tests (`http_test` 5→6, `httpd_test` 8→12), all of the server ones against a
+  512-byte connection buffer and a 4096-byte body so nothing passes by fitting; the sink
+  counts pieces and the largest piece, which a buffered implementation cannot satisfy. The
+  `jhttpd` demo grew an upload section: the same 4000-byte body sent twice, `Content-Length`
+  and chunked, reporting the same checksum through a 1024-byte buffer, each with a pipelined
+  request behind it. Not added: `Expect: 100-continue`, and no pull-shaped read API.
+
+- **`httpc.fd` and `httpc.pending`** — the descriptor of a client's connection and how many
+  bytes it is holding past the last response it handed out. `std/httpc` is blocking by design,
+  so `read_response` against a server that stopped answering never returns, and the first
+  draft of the streaming suite detected three of its six mutations as HANGS rather than named
+  failures — a suite whose failure mode is a hang says nothing about what broke. With these
+  two a test can poll first and read only when there is something, counting bytes already
+  buffered because a pipelined answer arrives in the same read as the one before it and never
+  makes the socket readable a second time. All six mutations now fail by name.
+
 - **`std/trace`** — timed, nested segments of work with attributes, exported to whoever is
   listening. A `Tracer` is GIVEN a `time.Clock` and an `Exporter` (`std/log`'s design: no
   ambient tracer, no global), so under `time.manual()` every duration and every id is

@@ -62,6 +62,18 @@
 // view. That is the same shape `std/syswatch`'s `Change` and `std/diag`'s labels take, and it
 // is what lets the parser be `@no_alloc`.
 //
+// ─── A message can be read a piece at a time, and it is the SAME rules ────────
+//
+// A server that streams an upload cannot wait for the whole message before it decides
+// anything, so there are three entry points beside the whole-message ones — and not one of
+// them duplicates a rule. `parse_head` is the start line, the headers and the framing scan,
+// with the body left to the caller; `body_from_head` is the body given that head; and
+// `parse_request` IS the two of them in order, so there is one start-line loop, one header
+// loop and one framing scan in this module and no way for the streaming reading of a message
+// to disagree with the buffered one. `chunk_step` is the same pair (`line_end`, `strict_hex`)
+// that `frame_chunked` uses, advanced one unit at a time over a buffer that is being refilled
+// underneath it.
+//
 // ─── What this does NOT do ────────────────────────────────────────────────────
 //
 // No TLS. No compression. No HTTP/2 or /3 — those are different protocols that share a name.
@@ -220,12 +232,30 @@ pub const HTTP_MAX_HEADERS: usize = 100
     return 0 - 1
 }
 
-// Parse a request out of `buf`, filling `hs` with its headers. Returns one of the outcomes.
-//
-// `req.total` is how many bytes of the buffer the message occupied, so a caller driving a
-// connection knows where the next one begins.
-@no_alloc @no_os pub fn parse_request(read buf: []u8, mut hs: []Header, mut req: Request) -> i32 {
-    req = empty_request()
+// The HEAD of a request: everything before the body, plus the framing decision the body will
+// obey. A server that STREAMS a body has to route on the head while the body is still
+// arriving, and a second start-line loop or a second framing scan would be a second place
+// where framing is decided — the one thing this module exists to prevent. So `parse_request`
+// is this plus the body, and there is exactly one of each loop.
+@copy pub struct Head {
+    pub method: Span,
+    pub target: Span,
+    pub minor: i32,
+    pub headers: usize,           // how many entries of the caller's array are filled
+    pub body_off: usize,          // where the body begins in the buffer
+    pub length: i64,              // the `Content-Length`, or -1 when there is none
+    pub chunked: bool,
+}
+
+@no_alloc @no_os pub fn empty_head() -> Head {
+    return Head{ method: Span{ off: 0, len: 0 }, target: Span{ off: 0, len: 0 }, minor: 1,
+                 headers: 0, body_off: 0, length: 0 - 1, chunked: false }
+}
+
+// Parse a request's head out of `buf`, filling `hs` with its headers. `HTTP_OK` means the
+// start line, every header and the empty line are all here — the body need not be.
+@no_alloc @no_os pub fn parse_head(read buf: []u8, mut hs: []Header, mut h: Head) -> i32 {
+    h = empty_head()
     if buf.len == 0 { return HTTP_INCOMPLETE }
 
     // ---- the start line: METHOD SP TARGET SP HTTP/1.N CRLF ----
@@ -242,7 +272,7 @@ pub const HTTP_MAX_HEADERS: usize = 100
         i = i + 1
     }
     if i == 0 or i >= eol { return HTTP_BAD }
-    req.method = Span{ off: 0, len: i }
+    h.method = Span{ off: 0, len: i }
 
     let tstart: usize = i + 1
     var j: usize = tstart
@@ -254,7 +284,7 @@ pub const HTTP_MAX_HEADERS: usize = 100
         j = j + 1
     }
     if j <= tstart or j >= eol { return HTTP_BAD }
-    req.target = Span{ off: tstart, len: j - tstart }
+    h.target = Span{ off: tstart, len: j - tstart }
 
     // The version. `HTTP/1.` then one digit — this module speaks 1.x and nothing else, and
     // says so rather than guessing at a message it cannot frame.
@@ -263,17 +293,51 @@ pub const HTTP_MAX_HEADERS: usize = 100
     if match_at(buf, vstart, "HTTP/1.") == false { return HTTP_BAD }
     let vd: i32 = buf[vstart + 7] as i32
     if is_digit(vd) == false { return HTTP_BAD }
-    req.minor = vd - 48
+    h.minor = vd - 48
 
     // ---- headers ----
     var n: usize = 0
     var after: usize = 0
     let ho: i32 = parse_headers(buf, hs, eol + 2, n, after)
     if ho != HTTP_OK { return ho }
-    req.headers = n
+    h.headers = n
+    h.body_off = after
 
     // ---- framing, which is where the danger is ----
-    return frame_body(buf, hs, n, after, req)
+    var cl: i64 = 0 - 1
+    var chunked: bool = false
+    let fo: i32 = scan_framing(buf, hs, n, cl, chunked)
+    if fo != HTTP_OK { return fo }
+    h.length = cl
+    h.chunked = chunked
+    return HTTP_OK
+}
+
+// Parse a request out of `buf`, filling `hs` with its headers. Returns one of the outcomes.
+//
+// `req.total` is how many bytes of the buffer the message occupied, so a caller driving a
+// connection knows where the next one begins.
+@no_alloc @no_os pub fn parse_request(read buf: []u8, mut hs: []Header, mut req: Request) -> i32 {
+    var h: Head = empty_head()
+    let o: i32 = parse_head(buf, hs, h)
+    if o != HTTP_OK {
+        req = empty_request()
+        return o
+    }
+    return body_from_head(buf, h, req)
+}
+
+// The rest of a message, for a caller that already has its head. `parse_request` IS
+// `parse_head` and then this, so a server that ROUTED on the head and framed the body
+// afterwards followed the very same rules as one that waited for the whole message — there is
+// no second framing decision for the two to disagree about.
+@no_alloc @no_os pub fn body_from_head(read buf: []u8, read h: Head, mut req: Request) -> i32 {
+    req = empty_request()
+    req.method = h.method
+    req.target = h.target
+    req.minor = h.minor
+    req.headers = h.headers
+    return frame_body(buf, h, req)
 }
 
 // The header section, from `start` to the empty line. Fills `hs`, reports the count through
@@ -378,14 +442,11 @@ pub const HTTP_MAX_HEADERS: usize = 100
     return HTTP_OK
 }
 
-// Decide how long a REQUEST body is. See the header.
-@no_alloc @no_os fn frame_body(read buf: []u8, read hs: []Header, n: usize, at: usize, mut req: Request) -> i32 {
-    var cl: i64 = 0 - 1
-    var chunked: bool = false
-    let fo: i32 = scan_framing(buf, hs, n, cl, chunked)
-    if fo != HTTP_OK { return fo }
-
-    if chunked {
+// Decide how long a REQUEST body is, given a head the framing scan already accepted. See the
+// header.
+@no_alloc @no_os fn frame_body(read buf: []u8, read h: Head, mut req: Request) -> i32 {
+    let at: usize = h.body_off
+    if h.chunked {
         req.chunked = true
         var b: Span = Span{ off: 0, len: 0 }
         var t: usize = 0
@@ -396,7 +457,7 @@ pub const HTTP_MAX_HEADERS: usize = 100
         }
         return co
     }
-    if cl < 0 {
+    if h.length < 0 {
         // No framing headers: the body is empty. For a REQUEST that is the only safe reading —
         // "until the connection closes" is a response-only rule, and applying it to a request
         // would let a client's body run into the next one.
@@ -404,7 +465,7 @@ pub const HTTP_MAX_HEADERS: usize = 100
         req.total = at
         return HTTP_OK
     }
-    let want: usize = cl as usize
+    let want: usize = h.length as usize
     if at + want > buf.len { return HTTP_INCOMPLETE }
     req.body = Span{ off: at, len: want }
     req.total = at + want
@@ -460,6 +521,91 @@ pub const HTTP_MAX_HEADERS: usize = 100
         p = p + 2
     }
     return HTTP_BAD
+}
+
+// ---- a chunked body decoded AS IT ARRIVES -----------------------------------------------
+//
+// `frame_chunked` and `decode_chunked` want the whole encoded body in one buffer. A server
+// streaming an upload does not have it and must never wait for it, so this is the SAME
+// framing rules — `line_end` and `strict_hex`, nothing else — driven one unit at a time over
+// a buffer that is refilled underneath the state.
+//
+// Nothing is copied here either: a step reports the SPAN of the input its data occupies,
+// because chunk data is verbatim in the message. The caller hands that slice on and forgets
+// it, which is what makes a body larger than the buffer possible at all.
+
+pub const CHUNK_SIZE_LINE: i32 = 0     // at a chunk-size line
+pub const CHUNK_DATA: i32 = 1          // inside a chunk's data
+pub const CHUNK_AFTER_DATA: i32 = 2    // at the CRLF that follows a chunk's data
+pub const CHUNK_TRAILER: i32 = 3       // past the zero chunk, walking trailer fields
+pub const CHUNK_DONE: i32 = 4          // the whole body is behind us
+
+@copy pub struct Chunks {
+    pub phase: i32,
+    pub left: usize,                   // data bytes still owed by the current chunk
+}
+
+@no_alloc @no_os pub fn chunks_new() -> Chunks { return Chunks{ phase: CHUNK_SIZE_LINE, left: 0 } }
+@no_alloc @no_os pub fn chunks_done(read st: Chunks) -> bool { return st.phase == CHUNK_DONE }
+
+// Advance over ONE unit of a chunked body in `buf` starting at `at`. `HTTP_OK` means it
+// moved: `used` input bytes were consumed and `got` is the span of DATA among them, which is
+// empty for a size line, for the CRLF after a chunk and for a trailer. `HTTP_INCOMPLETE`
+// means the unit is not all here yet and NOTHING was consumed — read more and call again.
+// `HTTP_BAD` is a malformed size, a missing CRLF, and every other shape that is not going to
+// become valid; `HTTP_TOO_LARGE` is a line past `HTTP_MAX_LINE`.
+@no_alloc @no_os pub fn chunk_step(read buf: []u8, at: usize, mut st: Chunks, mut got: Span, mut used: usize) -> i32 {
+    got = Span{ off: at, len: 0 }
+    used = 0
+    if st.phase == CHUNK_DONE { return HTTP_OK }
+    if at > buf.len { return HTTP_INCOMPLETE }
+
+    if st.phase == CHUNK_DATA {
+        var n: usize = st.left
+        if at + n > buf.len { n = buf.len - at }
+        if n == 0 { return HTTP_INCOMPLETE }
+        got = Span{ off: at, len: n }
+        used = n
+        st.left = st.left - n
+        if st.left == 0 { st.phase = CHUNK_AFTER_DATA }
+        return HTTP_OK
+    }
+    if st.phase == CHUNK_AFTER_DATA {
+        if at + 2 > buf.len { return HTTP_INCOMPLETE }
+        if (buf[at] as i32) != 13 or (buf[at + 1] as i32) != 10 { return HTTP_BAD }
+        used = 2
+        st.phase = CHUNK_SIZE_LINE
+        return HTTP_OK
+    }
+
+    let e: isize = line_end(buf, at)
+    if e == 0 - 1 { return HTTP_INCOMPLETE }
+    if e == 0 - 3 { return HTTP_TOO_LARGE }
+    if e < 0 { return HTTP_BAD }
+    let he: usize = e as usize
+    if st.phase == CHUNK_TRAILER {
+        // An EMPTY line ends the message; anything else is a trailer field, walked past
+        // without interpretation — exactly what `frame_chunked` does.
+        used = he + 2 - at
+        if he == at { st.phase = CHUNK_DONE }
+        return HTTP_OK
+    }
+    // A chunk-size line may carry `;ext` extensions, which are ignored.
+    var sz_end: usize = at
+    for sz_end < he {
+        if (buf[sz_end] as i32) == 59 { break }
+        sz_end = sz_end + 1
+    }
+    let size: i64 = strict_hex(buf, at, sz_end)
+    if size < 0 { return HTTP_BAD }
+    used = he + 2 - at
+    if size == 0 {
+        st.phase = CHUNK_TRAILER
+    } else {
+        st.phase = CHUNK_DATA
+        st.left = size as usize
+    }
+    return HTTP_OK
 }
 
 // ---- responses ------------------------------------------------------------------------------

@@ -52,13 +52,13 @@ fn serial_sumsq(read s: []i64) -> i64 {
 }
 
 fn uo_f(take r: Result(f64, ParseFloatError), take d: f64) -> f64 {
-    match r { ok(v) => v, err(e) => d }
+    match r { success(v) => v, failure(e) => d }
 }
 fn uo_i(take r: Result(i64, ParseIntError), take d: i64) -> i64 {
-    match r { ok(v) => v, err(e) => d }
+    match r { success(v) => v, failure(e) => d }
 }
 fn rej_f(s: str) -> i32 {
-    match core.parse_float(s) { ok(v) => 0, err(e) => 1 }
+    match core.parse_float(s) { success(v) => 0, failure(e) => 1 }
 }
 
 // format x with our deterministic formatter and print the string.
