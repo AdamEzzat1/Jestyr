@@ -46,7 +46,7 @@
 // which the forward-declared instance typedefs make legal).
 
 pub enum Option(T) { none, some(v: T) }
-pub enum Result(T, E) { ok(v: T), err(e: E) }
+pub enum Result(T, E) { success(v: T), failure(e: E) }
 
 // --- Option ---
 
@@ -78,9 +78,9 @@ pub enum Result(T, E) { ok(v: T), err(e: E) }
     match o { some(v) => f(v), none => d }
 }
 
-// Bridge to `Result`: `some(x) -> ok(x)`, `none -> err(e)`.
+// Bridge to `Result`: `some(x) -> success(x)`, `none -> failure(e)`.
 @no_os pub fn opt_ok_or(comptime T: type, comptime E: type, take o: Option(T), take e: E) -> Result(T, E) {
-    match o { some(v) => ok(v), none => err(e) }
+    match o { some(v) => success(v), none => failure(e) }
 }
 
 // The monadic bind: `opt_and_then(some(x), f) == f(x)`, `opt_and_then(none, f) == none`.
@@ -103,35 +103,35 @@ pub enum Result(T, E) { ok(v: T), err(e: E) }
 // --- Result ---
 
 @no_os pub fn res_is_ok(comptime T: type, comptime E: type, read r: Result(T, E)) -> bool {
-    match r { ok(v) => true, err(e) => false }
+    match r { success(v) => true, failure(e) => false }
 }
 
 @no_os pub fn res_is_err(comptime T: type, comptime E: type, read r: Result(T, E)) -> bool {
-    match r { ok(v) => false, err(e) => true }
+    match r { success(v) => false, failure(e) => true }
 }
 
 @no_os pub fn res_unwrap_or(comptime T: type, comptime E: type, take r: Result(T, E), take d: T) -> T {
-    match r { ok(v) => v, err(e) => d }
+    match r { success(v) => v, failure(e) => d }
 }
 
-// The functor map over the ok value; the error passes through unchanged.
+// The functor map over the success value; the error passes through unchanged.
 @no_os pub fn res_map(comptime T: type, comptime U: type, comptime E: type, take r: Result(T, E), f: fn(T) -> U) -> Result(U, E) {
-    match r { ok(v) => ok(f(v)), err(e) => err(e) }
+    match r { success(v) => success(f(v)), failure(e) => failure(e) }
 }
 
-// Map the error value; the ok passes through unchanged.
+// Map the error value; the success passes through unchanged.
 @no_os pub fn res_map_err(comptime T: type, comptime E: type, comptime F: type, take r: Result(T, E), f: fn(E) -> F) -> Result(T, F) {
-    match r { ok(v) => ok(v), err(e) => err(f(e)) }
+    match r { success(v) => success(v), failure(e) => failure(f(e)) }
 }
 
-// Bridge back to `Option`, discarding the error: `ok(x) -> some(x)`, `err(_) -> none`.
+// Bridge back to `Option`, discarding the error: `success(x) -> some(x)`, `failure(_) -> none`.
 @no_os pub fn res_ok(comptime T: type, comptime E: type, take r: Result(T, E)) -> Option(T) {
-    match r { ok(v) => some(v), err(e) => none }
+    match r { success(v) => some(v), failure(e) => none }
 }
 
-// The monadic bind for `Result`: `res_and_then(ok(x), f) == f(x)`, error short-circuits.
+// The monadic bind for `Result`: `res_and_then(success(x), f) == f(x)`, error short-circuits.
 @no_os pub fn res_and_then(comptime T: type, comptime U: type, comptime E: type, take r: Result(T, E), f: fn(T) -> Result(U, E)) -> Result(U, E) {
-    match r { ok(v) => f(v), err(e) => err(e) }
+    match r { success(v) => f(v), failure(e) => failure(e) }
 }
 
 // ── Slice / iterator algorithms over `[]T` ───────────────────────────────────
@@ -249,9 +249,9 @@ pub enum Result(T, E) { ok(v: T), err(e: E) }
 pub enum ParseIntError { empty, invalid_digit, overflow }
 
 // Parse a base-10 `i64` with an optional leading `+`/`-`. Locale-free; only ASCII
-// digits. Returns `err(overflow)` rather than wrapping past the `i64` range.
+// digits. Returns `failure(overflow)` rather than wrapping past the `i64` range.
 @no_os pub fn parse_i64(s: str) -> Result(i64, ParseIntError) {
-    if s.len == 0 { return err(empty) }
+    if s.len == 0 { return failure(empty) }
     var i: usize = 0
     var neg: bool = false
     if s[0] == 45 {
@@ -260,43 +260,43 @@ pub enum ParseIntError { empty, invalid_digit, overflow }
     } else {
         if s[0] == 43 { i = 1 }
     }
-    if i == s.len { return err(empty) }     // a lone sign is not a number
+    if i == s.len { return failure(empty) }     // a lone sign is not a number
     let hi: i64 = 9223372036854775807       // i64::MAX
     let lo: i64 = (0 - hi) - 1              // i64::MIN, without an out-of-range literal
     var acc: i64 = 0                        // accumulate **negatively** so MIN fits
     for i < s.len {
         let b: u8 = s[i]
-        if b < 48 or b > 57 { return err(invalid_digit) }
+        if b < 48 or b > 57 { return failure(invalid_digit) }
         let d: i64 = (b - 48) as i64
         if neg {
-            if acc < (lo + d) / 10 { return err(overflow) }
+            if acc < (lo + d) / 10 { return failure(overflow) }
             acc = acc * 10 - d
         } else {
-            if acc > (hi - d) / 10 { return err(overflow) }
+            if acc > (hi - d) / 10 { return failure(overflow) }
             acc = acc * 10 + d
         }
         i = i + 1
     }
-    return ok(acc)
+    return success(acc)
 }
 
 // Parse a base-10 `u64` with an optional leading `+`. A `-` sign is rejected.
 @no_os pub fn parse_u64(s: str) -> Result(u64, ParseIntError) {
-    if s.len == 0 { return err(empty) }
+    if s.len == 0 { return failure(empty) }
     var i: usize = 0
     if s[0] == 43 { i = 1 }
-    if i == s.len { return err(empty) }
+    if i == s.len { return failure(empty) }
     let umax: u64 = 0 - 1                    // u64::MAX (wraps), no huge literal
     var acc: u64 = 0
     for i < s.len {
         let b: u8 = s[i]
-        if b < 48 or b > 57 { return err(invalid_digit) }
+        if b < 48 or b > 57 { return failure(invalid_digit) }
         let d: u64 = (b - 48) as u64
-        if acc > (umax - d) / 10 { return err(overflow) }
+        if acc > (umax - d) / 10 { return failure(overflow) }
         acc = acc * 10 + d
         i = i + 1
     }
-    return ok(acc)
+    return success(acc)
 }
 
 // The number of base-10 digits in a `u64` (`0` has one digit).
@@ -933,7 +933,7 @@ pub fn par_reduce(read s: []i64, r: Reduction) -> i64 {
 // determinism deliverable: a *bit-reproducible*, correctly-rounded parser.
 //
 // Scope: the **fast path**. Inputs with > 19 significant digits return
-// `err(too_many_digits)` (the rare slow path is future work); everything else is
+// `failure(too_many_digits)` (the rare slow path is future work); everything else is
 // correctly rounded. Validated end-to-end against Rust's correctly-rounded parser
 // (`proptests::lemire`), whose generator emits the table below.
 
@@ -1186,7 +1186,7 @@ pub enum ParseFloatError { pf_empty, pf_invalid, pf_too_many_digits }
 
 @no_os pub fn parse_float(s: str) -> Result(f64, ParseFloatError) {
     let one: u64 = 1
-    if s.len == 0 { return err(pf_empty) }
+    if s.len == 0 { return failure(pf_empty) }
     var i: usize = 0
     var neg: bool = false
     if s[0] == 45 {
@@ -1230,7 +1230,7 @@ pub enum ParseFloatError { pf_empty, pf_invalid, pf_too_many_digits }
             }
         }
     }
-    if seen == false { return err(pf_invalid) }
+    if seen == false { return failure(pf_invalid) }
     var expo: i64 = 0
     if i < s.len {
         let e0: u8 = s[i]
@@ -1255,14 +1255,14 @@ pub enum ParseFloatError { pf_empty, pf_invalid, pf_too_many_digits }
                 ev = ev * 10 + ((d2 - 48) as i64)
                 i = i + 1
             }
-            if any == false { return err(pf_invalid) }
+            if any == false { return failure(pf_invalid) }
             expo = esign * ev
         }
     }
-    if i != s.len { return err(pf_invalid) }         // trailing junk
+    if i != s.len { return failure(pf_invalid) }         // trailing junk
     var sign: u64 = 0
     if neg { sign = one << 63 }
-    if seen_nz == false { return ok(f64_from_bits(sign)) }   // all zeros → ±0
+    if seen_nz == false { return success(f64_from_bits(sign)) }   // all zeros → ±0
     let e: i64 = expo - frac                          // value = (significand) · 10^e
     if nd <= 19 {
         var w: u64 = 0
@@ -1271,9 +1271,9 @@ pub enum ParseFloatError { pf_empty, pf_invalid, pf_too_many_digits }
             w = w * 10 + ((digbuf[j] - 48) as u64)
             j = j + 1
         }
-        return ok(f64_from_bits(lemire_f64(neg, w, e)))
+        return success(f64_from_bits(lemire_f64(neg, w, e)))
     }
-    return ok(f64_from_bits(slow_parse(neg, digbuf, stored, nd, e, sticky)))
+    return success(f64_from_bits(slow_parse(neg, digbuf, stored, nd, e, sticky)))
 }
 
 // ── Shortest correctly-rounded float format — Dragon4 ─────────────────────────

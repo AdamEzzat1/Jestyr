@@ -3965,12 +3965,19 @@ fn obligation_extraction_is_total_over_the_corpus() {
 /// assumed, which is what this test keeps true: a new corpus file that violates its
 /// own declared sets fails here *before* enforcement exists to catch it.
 ///
-/// The two permitted unresolved sites are known and honest, not gaps to fix:
-/// `vec.jtr` (a lexer-only fixture calling a `grow` method that is never declared)
-/// and `combinators.jtr` (an `err` variant of the *imported* `core.Result`, which a
-/// single-file census refuses to guess at). The bound is exact so a resolution
-/// regression — the census silently losing the ability to see method or factory
-/// callees — shows up as a count change, in either direction.
+/// The one permitted unresolved site is known and honest, not a gap to fix:
+/// `vec.jtr`, a lexer-only fixture calling a `grow` method that is never declared.
+/// The bound is exact so a resolution regression — the census silently losing the
+/// ability to see method or factory callees — shows up as a count change, in either
+/// direction.
+///
+/// **It was two until `core.Result`'s variants were renamed.** The second was
+/// `combinators.jtr` constructing an `err` that was the *imported* enum's variant
+/// rather than the intrinsic, which a single-file census could not tell apart — and
+/// neither, it turned out, could the compiler: those variants shadowed the intrinsics
+/// program-wide, so importing `core` broke every fallible function in the importing
+/// module. The variants are `success`/`failure` now, and this count dropping to 1 is
+/// that ambiguity leaving the corpus.
 #[test]
 fn error_set_census_is_clean_over_the_corpus() {
     let (mut sites, mut violations, mut unresolved, mut files) = (0usize, 0usize, 0usize, 0usize);
@@ -4012,7 +4019,7 @@ fn error_set_census_is_clean_over_the_corpus() {
         "{violations} error-set violation(s) crept into the corpus — \
          fix the declared sets now, or E3's enforcement lands with a migration attached"
     );
-    assert_eq!(unresolved, 2, "the two known unresolved sites (vec.jtr, combinators.jtr) changed");
+    assert_eq!(unresolved, 1, "the one known unresolved site (vec.jtr) changed");
     eprintln!("ERRSET CENSUS: {sites} sites, {violations} violations, {unresolved} unresolved, {files} files");
 }
 
