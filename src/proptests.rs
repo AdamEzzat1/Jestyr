@@ -3187,6 +3187,181 @@ mod jagent_command {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn run_cli_env(exe: &std::path::Path, dir: &std::path::Path, var: &str, val: &str, args: &[&str]) -> (i32, String, String) {
+        let out = std::process::Command::new(exe).current_dir(dir).env(var, val).args(args).output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
+            String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n"),
+        )
+    }
+
+    /// **The operator's layer, through the command: `init`, `check`, `jobs`, `config`,
+    /// `doctor`, the discovery order, and `ask`.**
+    ///
+    /// In a scratch directory with nothing in it: `init` writes the starter and prints its
+    /// path; a second `init` exits 1 and leaves an edited file's bytes exactly as they were
+    /// (the claim that matters); `--force` replaces it. `check` and `jobs` read it back;
+    /// `config show` prints the text in force; `config validate` on a broken file exits 1
+    /// with the fault on stderr and nothing on stdout. `doctor` passes on the healthy setup
+    /// with every line in its documented shape and does NOT create the store; on the broken
+    /// file it fails with the fault on stderr; on a `0.0.0.0` bind it warns twice and still
+    /// passes. Discovery: `JAGENT_CONFIG` selects a file, `-c` beats it, and an environment
+    /// path that does not exist is the error the load reports. `ask` answers the summary
+    /// before any run without creating the store, reports no failure after a successful
+    /// run, refuses a request to run something with the history unchanged (`logs` still
+    /// shows one run), and exits 1 on a question it does not know.
+    #[test]
+    fn jagent_cli_init_doctor_and_ask() {
+        let exe = super::c_oracle::build_exe("examples/std/jagent_cli.jtr");
+        let dir = std::env::temp_dir().join(format!("jestyr_jagent_ops_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // init: the starter; a refusal that touches nothing; --force.
+        let (code, out, err) = run_cli(&exe, &dir, &["init"]);
+        assert_eq!(code, 0, "{out}{err}");
+        assert_eq!(out.trim_end(), "jagent: created jagent.ini");
+        let starter = std::fs::read_to_string(dir.join("jagent.ini")).unwrap();
+        assert!(starter.contains("[job.health-check]\nkind = command\ncommand = echo healthy\n"), "{starter}");
+        std::fs::write(dir.join("jagent.ini"), "[job.mine]\ncommand = echo mine\n").unwrap();
+        let (code, out, err) = run_cli(&exe, &dir, &["init"]);
+        assert_eq!(code, 1, "{out}{err}");
+        assert!(err.contains("jagent.ini exists; not replaced"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("jagent.ini")).unwrap(),
+            "[job.mine]\ncommand = echo mine\n",
+            "init must not touch an existing file"
+        );
+        let (code, _, err) = run_cli(&exe, &dir, &["init", "--force"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(std::fs::read_to_string(dir.join("jagent.ini")).unwrap(), starter);
+
+        // check, jobs, config show, config validate.
+        let (code, out, _) = run_cli(&exe, &dir, &["check"]);
+        assert_eq!(code, 0);
+        assert_eq!(out.trim_end(), "config: ok path=jagent.ini jobs=1");
+        let (code, out, _) = run_cli(&exe, &dir, &["jobs"]);
+        assert_eq!(code, 0);
+        assert_eq!(out.trim_end(), "health-check kind=command timeout_ms=10000 interval_ms=0");
+        let (code, out, _) = run_cli(&exe, &dir, &["config", "show"]);
+        assert_eq!(code, 0);
+        assert_eq!(out.trim_end(), starter.trim_end());
+        std::fs::write(dir.join("bad.ini"), "[job.x]\ncommand = echo x\ntimeout_ms = soon\n").unwrap();
+        let (code, out, err) = run_cli(&exe, &dir, &["-c", "bad.ini", "config", "validate"]);
+        assert_eq!(code, 1);
+        assert!(out.is_empty(), "nothing on stdout for a file that did not load: {out}");
+        assert!(err.contains("bad.ini:3:1") && err.contains("not an integer"), "{err}");
+        let (code, _, _) = run_cli(&exe, &dir, &["config", "nonsense"]);
+        assert_eq!(code, 2, "an unknown config subcommand is usage");
+
+        // doctor: healthy, and it creates nothing.
+        let (code, out, err) = run_cli(&exe, &dir, &["doctor"]);
+        assert_eq!(code, 0, "{out}{err}");
+        assert!(
+            out.starts_with(
+                "config: ok path=jagent.ini jobs=1\n\
+                 store: ok path=jagent.db present=false note=created-by-the-first-run\n\
+                 sysproc: ok spawn=true timeout=true tree_reaped=true children=2\n\
+                 http: ok host=127.0.0.1 port=0 bound="
+            ),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(
+                "tls: unsupported requested=false\n\
+                 auth: missing risk=local-only\n\
+                 reload: ok watched=true dir=.\n\
+                 schedule: ok scheduled=0 of=1\n\
+                 limits: kinds=command concurrency=none preview_bytes=240\n\
+                 result: ok warnings=0 errors=0\n"
+            ),
+            "{out}"
+        );
+        assert!(!dir.join("jagent.db").exists(), "doctor must not create the store");
+        let (code, out, err) = run_cli(&exe, &dir, &["-c", "bad.ini", "doctor", "--no-probes"]);
+        assert_eq!(code, 1);
+        assert!(out.starts_with("config: fail path=bad.ini faults=1\nstore: skipped reason=no-config\nsysproc: skipped reason=no-probes\n"), "{out}");
+        assert!(out.ends_with("result: fail warnings=0 errors=1\n"), "{out}");
+        assert!(err.contains("not an integer"), "the fault goes to stderr: {err}");
+        std::fs::write(dir.join("open.ini"), starter.replace("host = 127.0.0.1", "host = 0.0.0.0")).unwrap();
+        let (code, out, _) = run_cli(&exe, &dir, &["-c", "open.ini", "doctor", "--no-probes"]);
+        assert_eq!(code, 0, "a warning is not a failure: {out}");
+        assert!(out.contains("http: ok host=0.0.0.0 port=0 bound=") && out.contains(" warning=remote-bind-unauthenticated\n"), "{out}");
+        assert!(out.contains("\nauth: missing risk=remote-exposed\n"), "{out}");
+        assert!(out.ends_with("result: ok warnings=2 errors=0\n"), "{out}");
+
+        // Discovery: the environment selects a file; -c beats it; a missing one is an error.
+        std::fs::write(dir.join("env.ini"), starter.replace("health-check", "from-env")).unwrap();
+        let (code, out, _) = run_cli_env(&exe, &dir, "JAGENT_CONFIG", "env.ini", &["jobs"]);
+        assert_eq!(code, 0);
+        assert_eq!(out.trim_end(), "from-env kind=command timeout_ms=10000 interval_ms=0", "JAGENT_CONFIG selects the file");
+        let (code, out, _) = run_cli_env(&exe, &dir, "JAGENT_CONFIG", "env.ini", &["-c", "jagent.ini", "jobs"]);
+        assert_eq!(code, 0);
+        assert_eq!(out.trim_end(), "health-check kind=command timeout_ms=10000 interval_ms=0", "-c beats the environment");
+        let (code, _, err) = run_cli_env(&exe, &dir, "JAGENT_CONFIG", "missing.ini", &["check"]);
+        assert_eq!(code, 1);
+        assert!(err.contains("cannot read `missing.ini`"), "{err}");
+
+        // ask: before a run, without creating the store; after one; a refusal; unknown.
+        let (code, out, _) = run_cli(&exe, &dir, &["ask", "check", "my", "machine"]);
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            out,
+            "Configuration jagent.ini is valid: 1 job, generation 1.\n\
+             History jagent.db: no store yet; nothing has run.\n\
+             0 of 1 jobs have run at least once.\n\
+             health-check has never run.\n\
+             TLS is off; the API binds to loopback (127.0.0.1) without authentication.\n\
+             Recommended next action: jagent run health-check\n"
+        );
+        assert!(!dir.join("jagent.db").exists(), "ask must not create the store");
+        let (code, _, err) = run_cli(&exe, &dir, &["run", "health-check"]);
+        assert_eq!(code, 0, "{err}");
+        let (code, out, _) = run_cli(&exe, &dir, &["ask", "what", "failed"]);
+        assert_eq!(code, 0);
+        assert_eq!(out, "No job's last run failed.\nRecommended next action: nothing needs attention; `jagent doctor` is the self-check\n");
+        let (code, out, _) = run_cli(&exe, &dir, &["ask", "please", "run", "rm", "-rf", "/"]);
+        assert_eq!(code, 0);
+        assert!(out.starts_with("I do not run, change or delete anything. To run a configured job: jagent run <name>."), "{out}");
+        let (code, out, _) = run_cli(&exe, &dir, &["logs"]);
+        assert_eq!(code, 0);
+        assert_eq!(out.lines().count(), 1, "one run in the history — the question ran nothing:\n{out}");
+        let (code, out, _) = run_cli(&exe, &dir, &["ask", "what", "is", "the", "weather"]);
+        assert_eq!(code, 1, "a question it does not know is exit 1");
+        assert!(out.starts_with("I can answer: "), "{out}");
+        let (code, _, _) = run_cli(&exe, &dir, &["ask"]);
+        assert_eq!(code, 2, "ask without a question is usage");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The project's build plan names the executable.** `tools/jagent/build.jestyr` is
+    /// evaluated by `jestyrc plan` into the one target it describes; `--build` is exercised
+    /// by hand and by the CTFE build-script test on a fixture, not here, because this ladder
+    /// already links the same source through `c_oracle::build_exe` above.
+    #[test]
+    fn jagent_build_plan_names_the_binary() {
+        let t = std::env::current_exe().unwrap();
+        let profile_dir = t.parent().unwrap().parent().unwrap();
+        let jestyrc = profile_dir.join(format!("jestyrc{}", std::env::consts::EXE_SUFFIX));
+        if !jestyrc.exists() {
+            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+            let mut cmd = std::process::Command::new(cargo);
+            cmd.args(["build", "--bin", "jestyrc"]);
+            if profile_dir.file_name().and_then(|n| n.to_str()) == Some("release") {
+                cmd.arg("--release");
+            }
+            assert!(cmd.status().map(|s| s.success()).unwrap_or(false) && jestyrc.exists(), "no jestyrc binary at {}", jestyrc.display());
+        }
+        let out = std::process::Command::new(&jestyrc).args(["plan", "tools/jagent/build.jestyr"]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
+            "build-plan v1\ntargets 1\ntarget examples/std/jagent_cli.jtr -> jagent\n"
+        );
+    }
 }
 
 /// **`jcrypto` — one message hashed by two SHA-256s, MACed, signed, and tampered with.**
@@ -21226,6 +21401,17 @@ fn main() -> i32 {
             // the scheduler on a manual clock; TLS declared unsupported and `serve` refusing
             // it; and the status/run summaries exact on a manual clock and a fixed wall.
             ("jagent_test", 13),
+            // The operator's layer over the agent: the discovery order (flag, environment,
+            // working directory); `init` writing a starter that loads and refusing to replace
+            // a file whose bytes are then unchanged; `doctor` passing on a healthy scratch
+            // setup WITHOUT creating the store, failing a bad and a missing configuration, a
+            // store a read-only handle cannot open and one whose directory is missing,
+            // warning on a 0.0.0.0 bind and failing a TLS request, and failing its process
+            // probe under a denied spawner (the control that the probe measures); `ask`
+            // summarising from the record, explaining a failure with only the status and
+            // code the record holds, refusing every request to run/change/delete with the
+            // history and job table unchanged, and creating no store when there is none.
+            ("jagent_ops_test", 11),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

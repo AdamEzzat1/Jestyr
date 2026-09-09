@@ -7,7 +7,7 @@
 // test reads the record the agent shipped rather than a subprocess's stdout.
 //
 // The commands are spelled once for both platforms. `echo` and `exit N` mean the same in
-// `cmd.exe` and `sh`; the sleeper is `sleep 2 || ping -n 3 127.0.0.1 > nul` — `sh` has
+// `cmd.exe` and `sh`; the sleeper is `sleep 4 || ping -n 5 127.0.0.1 > nul` — `sh` has
 // `sleep` and never reaches the `||`, `cmd.exe` has no `sleep` and does — so the suite
 // carries no `@cfg` and needs no allowlist entry.
 //

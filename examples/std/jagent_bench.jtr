@@ -31,6 +31,7 @@ import "http"
 import "httpc"
 import "httpd"
 import "jagent"
+import "jagent_ops"
 import "kv"
 import "log"
 import "mem"
@@ -46,6 +47,9 @@ import "writer"
 const JB_ROOT: str = "zz_jagent_bench"
 const JB_STORE: str = "zz_jagent_bench/history.db"
 const JB_GROWTH: str = "zz_jagent_bench/growth.db"
+const JB_STARTER: str = "zz_jagent_bench/starter.ini"
+const JB_DOCTOR: str = "zz_jagent_bench/doctor.ini"
+const JB_OPS: str = "zz_jagent_bench/ops.db"
 const JB_CAP: usize = 16384
 
 fn nothing() { }
@@ -57,6 +61,10 @@ fn quiet_logger() -> log.Logger {
 fn scrub(mut h: fs.Fs, read a: Allocator) {
     fs.erase(h, JB_STORE)
     fs.erase(h, JB_GROWTH)
+    fs.erase(h, JB_STARTER)
+    fs.erase(h, JB_DOCTOR)
+    fs.erase(h, JB_OPS)
+    fs.erase(h, "zz_jagent_bench/growth.db.compact")
     let gone: bool = sysfs.remove_dir(h, a, JB_ROOT) catch false
 }
 
@@ -300,7 +308,190 @@ fn main() -> i32 {
     jagent.free(back)
     jagent.free_serve(ctx)
     free_ptr(cell as *mut u8)
+
+    // ---- the operator's layer (std/jagent_ops) ----
+    print_str("-- jagent_ops --")
+
+    // `init`: the starter written, forced, over the same path.
+    let n_init: i64 = 200
+    let t5: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_init {
+        jagent_ops.init(h, JB_STARTER, true)
+        i = i + 1
+    }
+    report("init (the starter written, forced)", n_init, time.read_nanos(clk) - t5, "us", 1000)
+
+    // Discovery with nothing to find: the three steps, the last a stat.
+    let n_disc: i64 = 10000
+    let t6: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_disc {
+        var p: String = string_new()
+        jagent_ops.discover(h, "", "", p)
+        string_free(p)
+        i = i + 1
+    }
+    report("config discovery (no flag, no env, no jagent.ini)", n_disc, time.read_nanos(clk) - t6, "us", 1000)
+
+    // `config validate` on a large file: the two-pass load, a hundred jobs.
+    var big: String = string_new()
+    many_jobs(big, 100, JB_STORE)
+    var va: jagent.Agent = jagent.make(a, time.host(), quiet_logger())
+    let n_val: i64 = 50
+    let t7: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_val {
+        if i % 2 == 0 {
+            jagent.load_text(va, "big.ini", string_view(big))
+        } else {
+            jagent.load_text(va, "big.ini", "[agent]\nstore = zz_jagent_bench/history.db\n[job.only]\ncommand = echo one\n")
+        }
+        i = i + 1
+    }
+    report("config validate, 100 jobs (load_text)", n_val, time.read_nanos(clk) - t7, "us", 1000)
+    jagent.free(va)
+
+    // `doctor`: without the process probes (load, store open + sync, bind + release,
+    // watch open + close) and with them (+ a child that prints, + a child that is timed out).
+    fs.put(h, JB_DOCTOR, string_view(cfg))
+    let n_doc: i64 = 5
+    let t8: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_doc {
+        var r1: jagent_ops.Report = jagent_ops.doctor(a, h, sp, clk, JB_DOCTOR, false)
+        i = i + 1
+    }
+    report("doctor --no-probes (load, store open+sync, bind+release, watch)", n_doc, time.read_nanos(clk) - t8, "ms", 1000000)
+    let n_doc2: i64 = 3
+    let t9: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_doc2 {
+        var r2: jagent_ops.Report = jagent_ops.doctor(a, h, sp, clk, JB_DOCTOR, true)
+        i = i + 1
+    }
+    report("doctor with probes (+ a child, + a timed-out child and its tree)", n_doc2, time.read_nanos(clk) - t9, "ms", 1000000)
+
+    // A synthetic history — fifty jobs, a thousand records in the agent's own key shape —
+    // for what the summary and the status cost over a store of some size. Written with
+    // `std/kv` directly (a thousand real runs would be a minute of `cmd.exe`).
+    var ops_cfg: String = string_new()
+    many_jobs(ops_cfg, 50, JB_OPS)
+    var st2: kv.Store = kv.closed()
+    kv.open(h, a, JB_OPS, st2) catch nothing()
+    let n_hist: i64 = 1000
+    i = 0
+    for i < n_hist {
+        let seq: i64 = i + 1
+        let j: i64 = i % 50
+        var key: String = string_new()
+        string_push(key, "run:")
+        push_padded(key, seq)
+        var lastk: String = string_new()
+        string_push(lastk, "last:j")
+        push_num(lastk, j)
+        var seqp: String = string_new()
+        push_padded(seqp, seq)
+        var seqv: String = string_new()
+        push_num(seqv, seq)
+        var rec2: String = string_new()
+        string_push(rec2, "{\"seq\":")
+        push_num(rec2, seq)
+        string_push(rec2, ",\"job\":\"j")
+        push_num(rec2, j)
+        if i % 3 == 0 {
+            string_push(rec2, "\",\"status\":\"failure\",\"code\":1,")
+        } else {
+            string_push(rec2, "\",\"status\":\"success\",\"code\":0,")
+        }
+        string_push(rec2, "\"started_at\":1700000000,\"duration_ms\":12,\"out_bytes\":9,\"output\":\"healthy\\r\\n\",\"error\":\"")
+        if i % 3 == 0 { string_push(rec2, "exit code 1") }
+        string_push(rec2, "\"}")
+        var b2: kv.Batch = kv.batch()
+        kv.batch_put(b2, string_view(key), string_view(rec2))
+        kv.batch_put(b2, string_view(lastk), string_view(seqp))
+        kv.batch_put(b2, "seq", string_view(seqv))
+        kv.commit(st2, b2) catch nothing()
+        string_free(rec2)
+        string_free(seqv)
+        string_free(seqp)
+        string_free(lastk)
+        string_free(key)
+        i = i + 1
+    }
+    kv.sync(st2) catch nothing()
+    kv.close(st2)
+
+    var oa: jagent.Agent = jagent.make(a, time.host(), quiet_logger())
+    jagent.load_text(oa, "ops.ini", string_view(ops_cfg))
+    let t10: i64 = time.read_nanos(clk)
+    jagent.open_store(oa, h)
+    report("history open, 1000 records over 50 jobs (the store replayed)", 1, time.read_nanos(clk) - t10, "us", 1000)
+    let n_ask: i64 = 100
+    let t11: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_ask {
+        var ans: String = string_new()
+        jagent_ops.ask(oa, h, a, "check my machine", ans)
+        string_free(ans)
+        i = i + 1
+    }
+    report("ask \"check my machine\", 50 jobs over 1000 records", n_ask, time.read_nanos(clk) - t11, "us", 1000)
+    let t12: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_ask {
+        var stt: String = string_new()
+        jagent.render_status(oa, stt)
+        string_free(stt)
+        i = i + 1
+    }
+    report("status render, 50 jobs with their last runs", n_ask, time.read_nanos(clk) - t12, "us", 1000)
+    let t13: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_ask {
+        var lg: String = string_new()
+        jagent.render_logs(oa, "j7", 20, lg)
+        string_free(lg)
+        i = i + 1
+    }
+    report("logs of one job, filtered from 1000 records", n_ask, time.read_nanos(clk) - t13, "us", 1000)
+    jagent.free(oa)
+    string_free(ops_cfg)
+    string_free(big)
+
     string_free(cfg)
     scrub(h, a)
     return 0
+}
+
+// `[agent]` plus `n` echo jobs `j0..`, the store at `store`.
+fn many_jobs(mut dst: String, n: i64, read store: str) {
+    string_push(dst, "[agent]\nstore = ")
+    string_push(dst, store)
+    string_push(dst, "\n")
+    var i: i64 = 0
+    for i < n {
+        string_push(dst, "[job.j")
+        push_num(dst, i)
+        string_push(dst, "]\ncommand = echo job ")
+        push_num(dst, i)
+        string_push(dst, "\ntimeout_ms = 10000\n")
+        i = i + 1
+    }
+}
+
+// The agent's own sequence spelling: twelve digits, zero-padded.
+fn push_padded(mut dst: String, v: i64) {
+    var digits: i64 = 1
+    var t: i64 = v
+    for t >= 10 {
+        t = t / 10
+        digits = digits + 1
+    }
+    var pad: i64 = 12 - digits
+    for pad > 0 {
+        string_push(dst, "0")
+        pad = pad - 1
+    }
+    push_num(dst, v)
 }

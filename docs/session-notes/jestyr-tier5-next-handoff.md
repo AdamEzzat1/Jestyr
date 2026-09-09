@@ -8,7 +8,15 @@ defects — one session at a time). §2 is the parallel work (library breadth �
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1375 passed / 0 failed / 3 ignored** (full ladder after the EDGE AGENT — `std/jagent`,
+**1375 passed / 2 failed / 3 ignored** (full ladder after the PROJECT SHAPE — `std/jagent_ops`,
+`jagent_ops_test` 11 inside `io_suites_pass`, two more CLI/plan tests; 1500 s on a day the
+machine ran everything ~50% slower. Both failures are LOAD flakes outside the change and both
+passed together on a rerun (167 s): `std/kv_test`'s migration — `swap_in`'s `rename_replace`
+of `.migrate` over the store failed and came back as `KvFailed(-1)` with the errno DROPPED by
+the `catch`, so the reason is unobservable; a Windows sharing violation from an indexer on a
+just-closed file is the likely cause, and keeping the code would make the next one
+diagnosable — and `jplugin`'s 6 s ceiling, its second flake in two ladders. Every jagent test
+was green on the ladder itself.) Previously **1375 / 0 / 3** (full ladder after the EDGE AGENT — `std/jagent`,
 `jagent_cli`, `jagent_test` 13 inside `io_suites_pass`, the pinned demo transcript and the CLI
 test with a real `serve`; 1003 s under load. The first full run had three load flakes —
 `io_suites_pass`, the CLI test, `jplugin`'s 6 s ceiling — and the CLI failure orphaned a
@@ -1011,7 +1019,44 @@ What a successor should not re-derive:
 * **One flake seen once, not reproduced**: the suite's first run after a rebuild reported
   three failures whose names were not captured; fourteen runs since were green. If it
   recurs, the candidates are the three timing cases (the watcher, the 300 ms timeout, the
-  loopback API) — capture the FAIL lines before touching a deadline.
+  loopback API) — capture the FAIL lines before touching a deadline. (Reproduced on the
+  full ladder the same day: three LOAD flakes, fixed by 10 s job timeouts everywhere and a
+  `Reap` guard on the CLI test's `serve` child — §0.)
+
+#### The project shape — **DONE: `std/jagent_ops` + `tools/jagent/` (2026-09-09)**
+
+`jagent` became a project without moving a source file: `tools/jagent/build.jestyr` is the
+build plan (`jestyrc plan … --build` → `./jagent`), `tools/jagent/README.md` the page, and
+`examples/std/jagent_ops.jtr` the operator's layer (discovery, `init`, `doctor`, `ask`) under
+the same thin `jagent_cli.jtr`. 11 more tests (`jagent_ops_test`, registered), a second CLI
+test and the plan pinned. What a successor should not re-derive:
+
+* **A module's imports resolve relative to the importing file** (`src/module.rs`), so a
+  command under `tools/` would need `../../examples/std/…` imports — a spelling nothing in
+  the tree uses and the self-hosted `ml_*` loader has never been asked for. The plan file is
+  the first-class part; the path stays. `jc add` adds a DEPENDENCY, it does not install a
+  tool, so there is no `jc add jagent`.
+* **`doctor` measures and creates nothing**: the process probes run on an agent of their own
+  with no store (`[job.spawn]` echoes, `[job.timeout]` is the sleeper under a 200 ms limit),
+  the address is bound and released, the watcher opened and closed, and an ABSENT store is
+  reported (`present=false note=created-by-the-first-run`) rather than opened, because
+  `kv.open` creates. The suite watches a denied spawner FAIL the probe — the control that
+  the verdict is measured — and a read-only handle fail the store.
+* **`ask` cannot run a job by construction**: it takes no spawner. The refusal branch
+  (`run `, `execute`, `start `, `launch`, `kill`, `delete`, `edit`, `change`) sits AFTER
+  the `why`/`never`/`fail` branches and BEFORE the summary — with it removed, "run
+  health-check now" was answered as a health summary (exit 0), which is the mutant that
+  argued for the order. The environment value is a PARAMETER of `discover`, so the order is
+  a unit test rather than a process test.
+* **`contains` is an intrinsic name** — a test helper called that is refused by the driver
+  (`shadows a compiler intrinsic`); the convention is `has`/`has_text`.
+* **`sandbox` groups are NOT kill-on-close on Windows** (the module says why), so a `serve`
+  that is killed rather than signalled leaves a mid-run command running. The Windows
+  service page says so; a Job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is the fix when the
+  service entry point is built.
+* Not built: `--format json` (hand-rolled argv; text is the contract), a `bench` subcommand,
+  an installer, an SCM entry point (`docs/jagent-windows-service.md` lists what one needs),
+  TLS, auth. The Linux ladder has not run any of it.
 
 ### Compiler defects and gaps — OPEN
 

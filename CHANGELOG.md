@@ -7,6 +7,39 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`jagent` as a project: `std/jagent_ops`, `tools/jagent/`, and seven more commands.**
+  The runner (`std/jagent`) is unchanged in semantics and gains three readers
+  (`sync_store`, `last_record`, `config_text`); the new module `examples/std/jagent_ops.jtr`
+  is the operator's layer and the command is still `examples/std/jagent_cli.jtr`, thin.
+  `tools/jagent/build.jestyr` is the build plan (`jestyrc plan tools/jagent/build.jestyr
+  --build` → `./jagent`), `tools/jagent/README.md` the project page; the sources stay under
+  `examples/std` because a module's imports resolve relative to the importing file.
+  **Discovery**: `-c <path>`, then `$JAGENT_CONFIG`, then `./jagent.ini` — the environment is
+  read once in `main` and handed to `discover` as a value, so the order is a unit test.
+  **`init [--force]`** writes a starter (loopback, port 0, `tls = false`, one health-check
+  job) and refuses to replace a file that exists, with its bytes untouched. **`doctor
+  [--no-probes]`** prints one measured line per subsystem — the configuration loaded, the
+  store opened and synced (an absent store is reported, NOT created), a real child started
+  and a real one timed out with its tree reaped, the address bound and released, the watcher
+  opened, TLS and auth stated — and a `result: ok|fail warnings=N errors=M` line; a
+  `0.0.0.0` bind is two warnings, `tls = true` is an error because `serve` would refuse, a
+  denied spawner fails the probe (the control that it measures). **`ask <question…>`** is a
+  rule-based reader over the configuration, the job table, the history (opened only if the
+  file exists) and the server settings: is it healthy / check my machine, what failed, why
+  did `<job>` fail, what has never run, what next — each ending in the exact `jagent`
+  command to run; it is not given a spawner, so it cannot run a job, and a question that
+  asks it to is answered with the command the operator would type; a failure is explained
+  with the status and code the record holds and nothing more. Also `jobs`, `logs` with no
+  name (every job), `check` / `config validate`, `config show`. 11 tests
+  (`jagent_ops_test`, registered), a second CLI test (`jagent_cli_init_doctor_and_ask`) and
+  the plan pinned (`jagent_build_plan_names_the_binary`); three mutants — a silent `init`
+  overwrite, a doctor that assumes, an `ask` that stops refusing — each watched failing its
+  test. `docs/jagent-systemd.service.example` and `docs/jagent-windows-service.md` say how
+  `serve` would run as a service and that neither is a tested artifact. Not built: a
+  `--format json` mode (the argv parser is hand-rolled; text is the contract), a `bench`
+  subcommand (`jagent_bench.jtr` stays a script), an installer (`jc add` adds
+  dependencies, not tools), an SCM entry point, TLS, auth.
+
 - **`std/jagent` — the edge agent (`jagent`).** Configured jobs, a durable run history and
   a local HTTP API, built from the tier's own parts: `std/sysproc` + `std/sandbox` run a job
   apart inside a process group (so a timeout kills the TREE and reports `tree_reaped` as a

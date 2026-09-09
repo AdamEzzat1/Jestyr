@@ -967,6 +967,42 @@ pub fn close_store(mut ag: Agent) {
 
 pub fn store_is_open(read ag: Agent) -> bool { return kv.is_open(ag.store) }
 
+// Flush the store to the device now. False when it is closed or the sync failed — the
+// question `jagent doctor` asks, separately from whether the file opens.
+pub fn sync_store(mut ag: Agent) -> bool {
+    if kv.is_open(ag.store) == false { return false }
+    var fine: bool = true
+    kv.sync(ag.store) catch { fine = false }
+    return fine
+}
+
+// The last run of `name`, as the JSON record it was stored as, appended to `dst`. False
+// when the store is closed, the job has never run, or its pointer names a record that is
+// not there. The structured form of `render_last`, for a reader that wants the fields
+// (`std/jagent_ops` builds the operator summary from it) rather than the line.
+pub fn last_record(mut ag: Agent, read name: str, mut dst: String) -> bool {
+    if kv.is_open(ag.store) == false { return false }
+    var lk: String = string_new()
+    string_push(lk, KEY_LAST)
+    string_push(lk, name)
+    if kv.has(ag.store, string_view(lk)) == false {
+        string_free(lk)
+        return false
+    }
+    var rk: String = string_new()
+    string_push(rk, KEY_RUN)
+    string_push(rk, kv.get(ag.store, string_view(lk)))
+    string_free(lk)
+    let found: bool = kv.has(ag.store, string_view(rk))
+    if found { string_push(dst, kv.get(ag.store, string_view(rk))) }
+    string_free(rk)
+    return found
+}
+
+// The text of the configuration in force — what `jagent config show` prints. Empty until a
+// load has applied.
+pub fn config_text(read ag: Agent) -> read str { return string_view(ag.src) }
+
 // The sequence number of the last recorded run, 0 when there is none.
 pub fn last_seq(read ag: Agent) -> i64 {
     if kv.is_open(ag.store) == false { return 0 }

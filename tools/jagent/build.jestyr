@@ -1,0 +1,21 @@
+// tools/jagent/build.jestyr — the `jagent` executable, described as a build plan.
+//
+// Run from the repository root:
+//     jestyrc plan tools/jagent/build.jestyr            # print the plan
+//     jestyrc plan tools/jagent/build.jestyr --build    # and produce ./jagent (.exe on Windows)
+//
+// The source stays at `examples/std/jagent_cli.jtr`: a module's imports resolve relative
+// to the file that names them, so the command lives beside the standard library it is
+// built from, and this plan is what gives it a first-class name and a predictable output
+// path. Paths are relative to the directory the build is invoked from — the repository
+// root, for this file.
+
+const targets: i64 = 1
+
+fn source(i: i64) -> str {
+    return "examples/std/jagent_cli.jtr"
+}
+
+fn output(i: i64) -> str {
+    return "jagent"
+}

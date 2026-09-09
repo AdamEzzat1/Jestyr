@@ -4,18 +4,33 @@
 //   jagent [-c <config>] run <job>
 //   jagent [-c <config>] schedule <job>
 //   jagent [-c <config>] status
-//   jagent [-c <config>] logs <job>
+//   jagent [-c <config>] logs [<job>]
+//   jagent [-c <config>] jobs
+//   jagent [-c <config>] check              (also: config validate)
+//   jagent [-c <config>] config show
+//   jagent [-c <config>] doctor [--no-probes]
+//   jagent [-c <config>] ask <question...>
+//   jagent [-c <config>] init [--force]
 //
-// The library is `std/jagent`; this file is the argv, the real clocks, the signal handling
-// and the exit codes around it — `jcadd_demo`'s shape, so the interesting claims live in a
-// module a test can drive. Build it once (`jestyrc build examples/std/jagent_cli.jtr`) and
-// run the binary with arguments; `jestyrc run` forwards none.
+// The runner is `std/jagent` and the operator's layer is `std/jagent_ops`; this file is
+// the argv, the real clocks, the signal handling and the exit codes around them —
+// `jcadd_demo`'s shape, so every interesting claim lives in a module a test can drive.
+// Build it once and run the binary with arguments (`jestyrc run` forwards none):
+//
+//   jestyrc build examples/std/jagent_cli.jtr            # <temp>/jestyr_jagent_cli.exe
+//   jestyrc plan tools/jagent/build.jestyr --build        # ./jagent.exe, from the repo root
+//
+// **Where the configuration comes from**, in order: `-c <path>`; the `JAGENT_CONFIG`
+// environment variable; `jagent.ini` in the working directory. The environment is read
+// once, here, and handed to `jagent_ops.discover` as a value.
 //
 // Results go to stdout; log records go to stderr (logfmt), so a script that reads the
 // output of `jagent status` is not reading the agent's diary.
 //
-// Exit codes: 0 the command succeeded (and, for `run`, the job did); 1 the job failed, does
-// not exist, or the configuration could not be loaded; 2 usage, or a configuration this
+// Exit codes: 0 the command succeeded (and, for `run`, the job did; for `doctor`, no check
+// failed; for `ask`, the question was one it answers); 1 the job failed or does not exist,
+// the configuration could not be loaded, a check failed, `init` found a file it would not
+// replace, or the question was not one this layer knows; 2 usage, or a configuration this
 // build cannot serve (`agent.tls = true`).
 //
 // `serve` binds `agent.host:agent.port` (0 asks the platform; the port is printed), answers
@@ -28,6 +43,7 @@ import "env"
 import "fs"
 import "httpd"
 import "jagent"
+import "jagent_ops"
 import "log"
 import "mem"
 import "service"
@@ -38,12 +54,14 @@ import "sysproc"
 import "time"
 import "writer"
 
-const JC_DEFAULT_CFG: str = "jagent.ini"
-
 fn nothing() { }
 
 fn usage() -> i32 {
-    eprint_str("usage: jagent [-c <config>] serve | run <job> | schedule <job> | status | logs <job>")
+    eprint_str("usage: jagent [-c <config>] <command>")
+    eprint_str("  serve | run <job> | schedule <job> | status | logs [<job>] | jobs")
+    eprint_str("  check | config show | config validate | doctor [--no-probes]")
+    eprint_str("  ask <question...> | init [--force]")
+    eprint_str("the configuration: -c, else $JAGENT_CONFIG, else ./jagent.ini")
     return 2
 }
 
@@ -55,23 +73,6 @@ fn stderr_logger() -> log.Logger {
 fn show(read text: str) {
     let t: str = str.trim_end(text)
     if t.len > 0 { print_str(t) }
-}
-
-// The directory a path sits in, for the watcher: up to the last separator, or `.`.
-fn dir_of(read path: str, mut dst: String) {
-    let slash: isize = str.last_index_of(path, "/")
-    let back: isize = str.last_index_of(path, "\\")
-    var cut: isize = slash
-    if back > cut { cut = back }
-    if cut < 0 {
-        string_push(dst, ".")
-        return
-    }
-    if cut == 0 {
-        string_push(dst, path[0 .. 1])
-        return
-    }
-    string_push(dst, path[0 .. cut as usize])
 }
 
 // Load the configuration or say why not. False means "exit 1".
@@ -93,10 +94,26 @@ fn cmd_status(mut ag: jagent.Agent, mut h: fs.Fs) -> i32 {
     return 0
 }
 
+fn cmd_jobs(mut ag: jagent.Agent) -> i32 {
+    var s: String = string_new()
+    jagent.render_jobs(ag, s)
+    let v: str = string_view(s)
+    if v.len == 0 {
+        print_str("(no jobs configured)")
+    } else {
+        show(v)
+    }
+    string_free(s)
+    return 0
+}
+
+// The last 20 runs of one job, or of every job when no name is given.
 fn cmd_logs(mut ag: jagent.Agent, mut h: fs.Fs, read job: str) -> i32 {
-    if jagent.find_job(ag, job) < 0 {
-        eprint_str("jagent: no such job")
-        return 1
+    if job.len > 0 {
+        if jagent.find_job(ag, job) < 0 {
+            eprint_str("jagent: no such job")
+            return 1
+        }
     }
     if jagent.open_store(ag, h) == false {
         eprint_str("jagent: the history store could not be opened")
@@ -182,6 +199,9 @@ fn cmd_serve(mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> i32 {
         eprint_str("jagent: the history store could not be opened")
         return 1
     }
+    if jagent.host_is_loopback(ag) == false {
+        eprint_str("jagent: warning: agent.host = 0.0.0.0 exposes an unauthenticated API to every interface")
+    }
     var net: sysnet.Net = sysnet.host()
     var sv: httpd.Server = httpd.make(a, time.host(), stderr_logger(), true, 16, 65536)
     var addr: sysnet.SocketAddr = sysnet.loopback(jagent.port(ag) as u16)
@@ -193,7 +213,7 @@ fn cmd_serve(mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> i32 {
         return 1
     }
     var dir: String = string_new()
-    dir_of(cfg, dir)
+    jagent_ops.dir_of(cfg, dir)
     let watching: bool = jagent.watch(ag, h, string_view(dir))
     string_free(dir)
 
@@ -243,6 +263,66 @@ fn cmd_serve(mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> i32 {
     return 1
 }
 
+// `check` / `config validate`: load it, say so, exit by the verdict. The faults are on
+// stderr through `load_or_complain`; this prints the one line a script reads.
+fn cmd_validate(mut ag: jagent.Agent, read cfg: str) -> i32 {
+    var s: String = string_new()
+    string_push(s, "config: ok path=")
+    string_push(s, cfg)
+    string_push(s, " jobs=")
+    push_num(s, jagent.job_count(ag) as i64)
+    print_str(string_view(s))
+    string_free(s)
+    return 0
+}
+
+fn cmd_config_show(mut ag: jagent.Agent) -> i32 {
+    show(jagent.config_text(ag))
+    return 0
+}
+
+fn cmd_doctor(read a: Allocator, mut h: fs.Fs, mut sp: sysproc.Spawner, read cfg: str, probes: bool) -> i32 {
+    var blk: time.Clock = time.host()
+    var r: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, cfg, probes)
+    show(jagent_ops.report_text(r))
+    let f: str = jagent_ops.report_faults(r)
+    if f.len > 0 { eprint_str(str.trim_end(f)) }
+    if jagent_ops.is_ok(r) { return 0 }
+    return 1
+}
+
+fn cmd_ask(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, read question: str) -> i32 {
+    var s: String = string_new()
+    let r: i32 = jagent_ops.ask(ag, h, a, question, s)
+    show(string_view(s))
+    string_free(s)
+    if r == jagent_ops.ASK_ANSWERED or r == jagent_ops.ASK_REFUSED { return 0 }
+    return 1
+}
+
+fn cmd_init(mut h: fs.Fs, read cfg: str, force: bool) -> i32 {
+    let r: i32 = jagent_ops.init(h, cfg, force)
+    var s: String = string_new()
+    string_push(s, "jagent: ")
+    if r == jagent_ops.INIT_CREATED {
+        string_push(s, "created ")
+        string_push(s, cfg)
+        print_str(string_view(s))
+        string_free(s)
+        return 0
+    }
+    if r == jagent_ops.INIT_EXISTS {
+        string_push(s, cfg)
+        string_push(s, " exists; not replaced (pass --force to replace it)")
+    } else {
+        string_push(s, "could not write ")
+        string_push(s, cfg)
+    }
+    eprint_str(string_view(s))
+    string_free(s)
+    return 1
+}
+
 fn push_num(mut s: String, v: i64) {
     if v >= 10 { push_num(s, v / 10) }
     let d: i64 = v % 10
@@ -258,60 +338,112 @@ fn push_num(mut s: String, v: i64) {
     if d == 9 { string_push(s, "9") }
 }
 
+// The words from argv[from] on, joined by single spaces — the question `ask` reads.
+fn join_from(from: i32, mut dst: String) {
+    var i: i32 = from
+    for i < env.argc() {
+        if i > from { string_push(dst, " ") }
+        string_push(dst, env.argv(i))
+        i = i + 1
+    }
+}
+
 fn main() -> i32 {
-    // `-c <config>` may come first; then the command and its argument.
+    // `-c <config>` may come first; then the command and its argument(s).
     var i: i32 = 1
-    var cfg: String = string_new()
-    string_push(cfg, JC_DEFAULT_CFG)
+    var flag: str = ""
     if env.argc() > i + 1 {
         if str_eq(env.argv(i), "-c") {
-            string_free(cfg)
-            cfg = string_new()
-            string_push(cfg, env.argv(i + 1))
+            flag = env.argv(i + 1)
             i = i + 2
         }
     }
-    if env.argc() <= i {
-        string_free(cfg)
-        return usage()
-    }
+    if env.argc() <= i { return usage() }
+    var h: fs.Fs = fs.host()
+    var cfg: String = string_new()
+    jagent_ops.discover(h, flag, env.get(jagent_ops.OPS_ENV_VAR), cfg)
+
     let cmd: str = env.argv(i)
     var arg: str = ""
     if env.argc() > i + 1 { arg = env.argv(i + 1) }
 
-    let a: Allocator = mem.system_allocator()
-    var h: fs.Fs = fs.host()
-    var sp: sysproc.Spawner = sysproc.host()
-    var ag: jagent.Agent = jagent.make(a, time.host(), stderr_logger())
-    var code: i32 = 2
-    var known: bool = false
-    if str_eq(cmd, "status") or str_eq(cmd, "serve") or str_eq(cmd, "run") or str_eq(cmd, "schedule") or str_eq(cmd, "logs") { known = true }
-    if known == false {
-        string_free(cfg)
-        jagent.free(ag)
-        return usage()
-    }
-    if str_eq(cmd, "run") or str_eq(cmd, "schedule") or str_eq(cmd, "logs") {
-        if arg.len == 0 {
+    // The commands that need no loaded configuration.
+    if str_eq(cmd, "init") {
+        var force: bool = false
+        if str_eq(arg, "--force") { force = true }
+        if arg.len > 0 and force == false {
             string_free(cfg)
-            jagent.free(ag)
+            return usage()
+        }
+        let code0: i32 = cmd_init(h, string_view(cfg), force)
+        string_free(cfg)
+        return code0
+    }
+    let a: Allocator = mem.system_allocator()
+    var sp: sysproc.Spawner = sysproc.host()
+    if str_eq(cmd, "doctor") {
+        var probes: bool = true
+        if str_eq(arg, "--no-probes") { probes = false }
+        if arg.len > 0 and probes {
+            string_free(cfg)
+            return usage()
+        }
+        let code1: i32 = cmd_doctor(a, h, sp, string_view(cfg), probes)
+        string_free(cfg)
+        return code1
+    }
+
+    // `config show|validate` is two words; `check` is `config validate`.
+    var sub: str = ""
+    if str_eq(cmd, "config") {
+        sub = arg
+        if str_eq(sub, "show") == false and str_eq(sub, "validate") == false {
+            string_free(cfg)
             return usage()
         }
     }
+    var known: bool = false
+    if str_eq(cmd, "status") or str_eq(cmd, "serve") or str_eq(cmd, "run") or str_eq(cmd, "schedule") { known = true }
+    if str_eq(cmd, "logs") or str_eq(cmd, "jobs") or str_eq(cmd, "check") or str_eq(cmd, "config") or str_eq(cmd, "ask") { known = true }
+    if known == false {
+        string_free(cfg)
+        return usage()
+    }
+    if str_eq(cmd, "run") or str_eq(cmd, "schedule") or str_eq(cmd, "ask") {
+        if arg.len == 0 {
+            string_free(cfg)
+            return usage()
+        }
+    }
+    var ag: jagent.Agent = jagent.make(a, time.host(), stderr_logger())
+    var code: i32 = 2
     if load_or_complain(ag, h, string_view(cfg)) == false {
-        if str_eq(cmd, "status") {
-            // `status` still reports what it can: the faults are the status.
-            code = cmd_status(ag, h)
-            code = 1
-        } else {
-            code = 1
+        // `status` and `ask` still report what they can: the faults are the status.
+        if str_eq(cmd, "status") { cmd_status(ag, h) }
+        if str_eq(cmd, "ask") {
+            var q0: String = string_new()
+            join_from(i + 1, q0)
+            cmd_ask(ag, h, a, string_view(q0))
+            string_free(q0)
         }
         string_free(cfg)
         jagent.free(ag)
-        return code
+        return 1
     }
     if str_eq(cmd, "status") { code = cmd_status(ag, h) }
+    if str_eq(cmd, "jobs") { code = cmd_jobs(ag) }
     if str_eq(cmd, "logs") { code = cmd_logs(ag, h, arg) }
+    if str_eq(cmd, "check") { code = cmd_validate(ag, string_view(cfg)) }
+    if str_eq(cmd, "config") {
+        if str_eq(sub, "validate") { code = cmd_validate(ag, string_view(cfg)) }
+        if str_eq(sub, "show") { code = cmd_config_show(ag) }
+    }
+    if str_eq(cmd, "ask") {
+        var q: String = string_new()
+        join_from(i + 1, q)
+        code = cmd_ask(ag, h, a, string_view(q))
+        string_free(q)
+    }
     if str_eq(cmd, "run") { code = cmd_run(ag, h, sp, arg) }
     if str_eq(cmd, "schedule") { code = cmd_schedule(ag, h, sp, arg) }
     if str_eq(cmd, "serve") {

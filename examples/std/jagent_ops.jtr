@@ -1,0 +1,928 @@
+// std/jagent_ops.jtr — the operator's layer over `std/jagent`: where the configuration is
+// found, a starter file, a self-check, and answers to the questions an operator asks first.
+//
+// TIER: `sys`, by dependency on `std/jagent`. Nothing here runs a job the operator did not
+// name in the configuration, edits a file it was not asked to create, or reports a fact it
+// did not read from the configuration, the history, or a probe it ran. The runner is
+// `std/jagent`; this module is what the `jagent` command puts in front of it.
+//
+// ─── Discovery ──────────────────────────────────────────────────────────────────────
+//
+// The configuration is looked for in one order, and the answer says which step found it:
+// `-c <path>` when given; `JAGENT_CONFIG` when set; `jagent.ini` in the working directory.
+// When none applies the default NAME is still returned, so the error a load then reports
+// names the file that was looked for rather than an empty string. The environment value is
+// a PARAMETER, not a read this module performs, so a test can hand it any value and the
+// command reads it once at the top of `main`.
+//
+// ─── `init` ─────────────────────────────────────────────────────────────────────────
+//
+// A starter configuration with one health-check job and the safe defaults spelled out:
+// loopback, a platform-chosen port, no TLS, a store beside the file. It refuses to replace
+// a file that exists unless told to (`force`), because an operator's edited configuration
+// is not something a starter should be able to overwrite by a slip of the hand.
+//
+// ─── `doctor` ───────────────────────────────────────────────────────────────────────
+//
+// One line per subsystem, `name: verdict key=value…`, and a `result:` line that counts the
+// warnings and errors, so a script can read it and an operator can scan it. Every verdict
+// is MEASURED: the configuration is loaded, the store is opened and synced, a real child is
+// started and a real one is timed out and its tree reaped, the address is bound and
+// released, the watcher is opened and closed. What cannot be measured is said as such
+// (`tls: unsupported`, `auth: missing`). The check mutates nothing the operator owns: a
+// store that does not exist is NOT created (that would be a run's job), the probes run on
+// an agent of their own with no store, and the socket and the watcher are released before
+// the line is written.
+//
+// ─── `ask` ──────────────────────────────────────────────────────────────────────────
+//
+// A rule-based reader, not a model. It matches a handful of question shapes against the
+// configuration, the job table, the history and the server settings, and writes what it
+// found in plain sentences with the exact `jagent` command to run next. It cannot run a
+// job — it is not given a spawner — and a question that asks it to is answered with the
+// command the operator would type. A cause it did not read is a cause it does not name:
+// when the record says `exit code 1`, that is the whole answer.
+//
+// Run the tests:   jestyrc test examples/std/jagent_ops_test.jtr
+// The command:     examples/std/jagent_cli.jtr
+
+import "fs"
+import "httpd"
+import "jagent"
+import "json"
+import "log"
+import "str"
+import "sysfs"
+import "sysnet"
+import "sysproc"
+import "time"
+import "writer"
+
+// ---- discovery ----------------------------------------------------------------------
+
+pub const SRC_FLAG: i32 = 0      // `-c <path>`
+pub const SRC_ENV: i32 = 1       // `JAGENT_CONFIG`
+pub const SRC_CWD: i32 = 2       // `jagent.ini` in the working directory, and it is there
+pub const SRC_DEFAULT: i32 = 3   // nothing applied; the default name, so the error names it
+
+pub const OPS_DEFAULT_CFG: str = "jagent.ini"
+pub const OPS_ENV_VAR: str = "JAGENT_CONFIG"
+
+@no_alloc @no_os pub fn source_name(s: i32) -> str {
+    if s == SRC_FLAG { return "flag" }
+    if s == SRC_ENV { return "env" }
+    if s == SRC_CWD { return "cwd" }
+    if s == SRC_DEFAULT { return "default" }
+    return "?"
+}
+
+// Where the configuration is: `flag` is the `-c` value or "", `envv` the value of
+// `JAGENT_CONFIG` or "". The path is appended to `dst`; the answer says which step chose it.
+// A flag or environment path that does not exist is still the answer — the load reports it.
+pub fn discover(mut h: fs.Fs, read flag: str, read envv: str, mut dst: String) -> i32 {
+    if flag.len > 0 {
+        string_push(dst, flag)
+        return SRC_FLAG
+    }
+    if envv.len > 0 {
+        string_push(dst, envv)
+        return SRC_ENV
+    }
+    string_push(dst, OPS_DEFAULT_CFG)
+    if fs.present(h, OPS_DEFAULT_CFG) { return SRC_CWD }
+    return SRC_DEFAULT
+}
+
+// ---- init --------------------------------------------------------------------------------
+
+pub const INIT_CREATED: i32 = 0
+pub const INIT_EXISTS: i32 = 1   // refused: the file is there and `force` was not given
+pub const INIT_FAILED: i32 = 2   // the write was refused or failed
+
+@no_alloc @no_os pub fn init_name(r: i32) -> str {
+    if r == INIT_CREATED { return "created" }
+    if r == INIT_EXISTS { return "exists" }
+    if r == INIT_FAILED { return "failed" }
+    return "?"
+}
+
+// The starter file. Comments sit on their own lines because `std/ini` reads a value to the
+// end of its line. The one job is the probe every machine can run.
+pub fn starter_text(mut dst: String) {
+    string_push(dst, "# jagent.ini - created by `jagent init`.\n")
+    string_push(dst, "# One [agent] section, then one [job.NAME] section per job. A key jagent does not\n")
+    string_push(dst, "# know is an error that names its line; docs/jagent.md has the whole format.\n")
+    string_push(dst, "\n")
+    string_push(dst, "[agent]\n")
+    string_push(dst, "# 127.0.0.1 keeps the unauthenticated API on this machine; 0.0.0.0 opens it.\n")
+    string_push(dst, "host = 127.0.0.1\n")
+    string_push(dst, "# 0 asks the platform for a port; `jagent serve` prints the one it got.\n")
+    string_push(dst, "port = 0\n")
+    string_push(dst, "# true is refused by this build: std/httpd has no TLS hook yet.\n")
+    string_push(dst, "tls = false\n")
+    string_push(dst, "# The run history, created by the first run.\n")
+    string_push(dst, "store = jagent.db\n")
+    string_push(dst, "\n")
+    string_push(dst, "[job.health-check]\n")
+    string_push(dst, "kind = command\n")
+    string_push(dst, "command = echo healthy\n")
+    string_push(dst, "timeout_ms = 10000\n")
+}
+
+// Write the starter to `path`. An existing file is refused unless `force`; a write the
+// handle refuses, or that fails, is `INIT_FAILED` — the file is then exactly as it was.
+pub fn init(mut h: fs.Fs, read path: str, force: bool) -> i32 {
+    if force == false {
+        if fs.present(h, path) { return INIT_EXISTS }
+    }
+    var t: String = string_new()
+    starter_text(t)
+    let wrote: bool = fs.put(h, path, string_view(t))
+    string_free(t)
+    if wrote { return INIT_CREATED }
+    return INIT_FAILED
+}
+
+// ---- doctor ------------------------------------------------------------------------------
+
+// What the self-check found: the report text, the configuration's faults when it did not
+// load (separately, so the command can put them on stderr), the counts, and what the
+// probes did so a test can check the children were accounted for.
+@move pub struct Report {
+    text: String,
+    faults: String,
+    warnings: i64,
+    errors: i64,
+    children: i64,      // processes the probes started
+    reaped: i64,        // of those, runs whose tree was confirmed reaped
+}
+
+impl Drop for Report {
+    fn drop(mut self) {
+        string_free(self.text)
+        string_free(self.faults)
+    }
+}
+
+pub fn report_text(read r: Report) -> read str { return string_view(r.text) }
+pub fn report_faults(read r: Report) -> read str { return string_view(r.faults) }
+@no_alloc @no_os pub fn warnings(read r: Report) -> i64 { return r.warnings }
+@no_alloc @no_os pub fn errors(read r: Report) -> i64 { return r.errors }
+@no_alloc @no_os pub fn is_ok(read r: Report) -> bool { return r.errors == 0 }
+@no_alloc @no_os pub fn probe_children(read r: Report) -> i64 { return r.children }
+@no_alloc @no_os pub fn probe_reaped(read r: Report) -> i64 { return r.reaped }
+
+// The probes' own configuration: a child that must print, and a child that must be killed.
+// The sleeper is spelled once for both shells — `sh` has `sleep` and never reaches the
+// `||`; `cmd.exe` has no `sleep` and does.
+const DOC_PROBES: str = "[job.spawn]\ncommand = echo jagent-doctor\ntimeout_ms = 10000\n[job.timeout]\ncommand = sleep 4 || ping -n 5 127.0.0.1 > nul\ntimeout_ms = 200\n"
+
+fn quiet_logger() -> log.Logger {
+    return log.make(time.manual(0), writer.to_buffer(), log.LOG_INFO, log.LOG_LOGFMT)
+}
+
+fn push_num(mut s: String, v: i64) {
+    if v < 0 {
+        string_push(s, "-")
+        push_num(s, 0 - v)
+        return
+    }
+    if v >= 10 { push_num(s, v / 10) }
+    let d: i64 = v % 10
+    if d == 0 { string_push(s, "0") }
+    if d == 1 { string_push(s, "1") }
+    if d == 2 { string_push(s, "2") }
+    if d == 3 { string_push(s, "3") }
+    if d == 4 { string_push(s, "4") }
+    if d == 5 { string_push(s, "5") }
+    if d == 6 { string_push(s, "6") }
+    if d == 7 { string_push(s, "7") }
+    if d == 8 { string_push(s, "8") }
+    if d == 9 { string_push(s, "9") }
+}
+
+fn push_bool(mut s: String, v: bool) {
+    if v { string_push(s, "true") } else { string_push(s, "false") }
+}
+
+// `1 job`, `2 jobs`: a count with its noun.
+fn push_count(mut s: String, n: i64, read one: str, read many: str) {
+    push_num(s, n)
+    string_push(s, " ")
+    if n == 1 { string_push(s, one) } else { string_push(s, many) }
+}
+
+// The directory `path` sits in: up to the last separator, `.` when there is none.
+pub fn dir_of(read path: str, mut dst: String) {
+    let slash: isize = str.last_index_of(path, "/")
+    let back: isize = str.last_index_of(path, "\\")
+    var cut: isize = slash
+    if back > cut { cut = back }
+    if cut < 0 {
+        string_push(dst, ".")
+        return
+    }
+    if cut == 0 {
+        string_push(dst, path[0 .. 1])
+        return
+    }
+    string_push(dst, path[0 .. cut as usize])
+}
+
+fn host_text(read ag: jagent.Agent) -> str {
+    if jagent.host_is_loopback(ag) { return "127.0.0.1" }
+    return "0.0.0.0"
+}
+
+// The configuration: does it load, and how many jobs.
+fn doc_config(mut r: Report, mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> bool {
+    let lr: i32 = jagent.load_file(ag, h, cfg)
+    string_push(r.text, "config: ")
+    if lr == jagent.JA_LOADED {
+        string_push(r.text, "ok path=")
+        string_push(r.text, cfg)
+        string_push(r.text, " jobs=")
+        push_num(r.text, jagent.job_count(ag) as i64)
+        string_push(r.text, "\n")
+        return true
+    }
+    string_push(r.text, "fail path=")
+    string_push(r.text, cfg)
+    if lr == jagent.JA_UNREADABLE {
+        string_push(r.text, " reason=cannot-read\n")
+    } else {
+        string_push(r.text, " faults=")
+        push_num(r.text, jagent.fault_count(ag))
+        string_push(r.text, "\n")
+    }
+    string_push(r.faults, jagent.faults(ag))
+    r.errors = r.errors + 1
+    return false
+}
+
+// The store: present and openable and syncable, or absent with its directory there. An
+// absent store is not created here.
+fn doc_store(mut r: Report, mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator) {
+    let sp: str = jagent.store_path(ag)
+    string_push(r.text, "store: ")
+    if fs.present(h, sp) == false {
+        var d: String = string_new()
+        dir_of(sp, d)
+        let dir_there: bool = sysfs.exists(h, a, string_view(d))
+        string_free(d)
+        if dir_there {
+            string_push(r.text, "ok path=")
+            string_push(r.text, sp)
+            string_push(r.text, " present=false note=created-by-the-first-run\n")
+        } else {
+            string_push(r.text, "fail path=")
+            string_push(r.text, sp)
+            string_push(r.text, " reason=directory-missing\n")
+            r.errors = r.errors + 1
+        }
+        return
+    }
+    if jagent.open_store(ag, h) == false {
+        string_push(r.text, "fail path=")
+        string_push(r.text, sp)
+        string_push(r.text, " reason=cannot-open\n")
+        r.errors = r.errors + 1
+        return
+    }
+    let synced: bool = jagent.sync_store(ag)
+    let runs: i64 = jagent.last_seq(ag)
+    jagent.close_store(ag)
+    if synced {
+        string_push(r.text, "ok path=")
+        string_push(r.text, sp)
+        string_push(r.text, " present=true synced=true runs=")
+        push_num(r.text, runs)
+        string_push(r.text, "\n")
+    } else {
+        string_push(r.text, "fail path=")
+        string_push(r.text, sp)
+        string_push(r.text, " reason=cannot-sync\n")
+        r.errors = r.errors + 1
+    }
+}
+
+// The process path: a child that prints, a child that is timed out and its tree reaped.
+// On an agent of its own with no store, so nothing lands in the operator's history.
+fn doc_sysproc(mut r: Report, read a: Allocator, mut sp: sysproc.Spawner, mut blk: time.Clock, probes: bool) {
+    string_push(r.text, "sysproc: ")
+    if probes == false {
+        string_push(r.text, "skipped reason=no-probes\n")
+        return
+    }
+    var pa: jagent.Agent = jagent.make(a, time.host(), quiet_logger())
+    jagent.load_text(pa, "doctor-probes", DOC_PROBES)
+    let before: i64 = sysproc.started(sp)
+    let r1: jagent.Run = jagent.run_job(pa, sp, blk, "spawn")
+    var spawned: bool = r1.status == jagent.RUN_SUCCESS
+    if spawned { spawned = str.has(jagent.last_output(pa), "jagent-doctor") }
+    if r1.tree_reaped { r.reaped = r.reaped + 1 }
+    let r2: jagent.Run = jagent.run_job(pa, sp, blk, "timeout")
+    let timed: bool = r2.status == jagent.RUN_TIMEOUT
+    if r2.tree_reaped { r.reaped = r.reaped + 1 }
+    r.children = r.children + (sysproc.started(sp) - before)
+    jagent.free(pa)
+    let fine: bool = spawned and timed and r1.tree_reaped and r2.tree_reaped
+    if fine { string_push(r.text, "ok") } else { string_push(r.text, "fail") }
+    string_push(r.text, " spawn=")
+    push_bool(r.text, spawned)
+    string_push(r.text, " timeout=")
+    push_bool(r.text, timed)
+    string_push(r.text, " tree_reaped=")
+    push_bool(r.text, r1.tree_reaped and r2.tree_reaped)
+    string_push(r.text, " children=")
+    push_num(r.text, r.children)
+    string_push(r.text, "\n")
+    if fine == false { r.errors = r.errors + 1 }
+}
+
+// The address: bound and released. A bind to every interface is a warning, because the
+// API has no authentication.
+fn doc_http(mut r: Report, read a: Allocator, read ag: jagent.Agent) {
+    string_push(r.text, "http: ")
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = httpd.make(a, time.host(), quiet_logger(), false, 4, 8192)
+    var addr: sysnet.SocketAddr = sysnet.loopback(jagent.port(ag) as u16)
+    if jagent.host_is_loopback(ag) == false { addr = sysnet.any_addr(jagent.port(ag) as u16) }
+    let bound: bool = httpd.start(sv, net, addr, 4)
+    var got: i64 = 0
+    if bound {
+        got = httpd.port(sv) as i64
+        httpd.stop(sv, net)
+    }
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    if bound { string_push(r.text, "ok") } else { string_push(r.text, "fail") }
+    string_push(r.text, " host=")
+    string_push(r.text, host_text(ag))
+    string_push(r.text, " port=")
+    push_num(r.text, jagent.port(ag))
+    if bound {
+        string_push(r.text, " bound=")
+        push_num(r.text, got)
+    } else {
+        string_push(r.text, " reason=cannot-bind")
+        r.errors = r.errors + 1
+    }
+    if jagent.host_is_loopback(ag) == false {
+        string_push(r.text, " warning=remote-bind-unauthenticated")
+        r.warnings = r.warnings + 1
+    }
+    string_push(r.text, "\n")
+}
+
+fn doc_tls(mut r: Report, read ag: jagent.Agent, loaded: bool) {
+    string_push(r.text, "tls: ")
+    if jagent.tls_supported() { string_push(r.text, "supported") } else { string_push(r.text, "unsupported") }
+    if loaded {
+        string_push(r.text, " requested=")
+        push_bool(r.text, jagent.tls_wanted(ag))
+        if jagent.tls_wanted(ag) and jagent.tls_supported() == false {
+            string_push(r.text, " serve=refused")
+            r.errors = r.errors + 1
+        }
+    }
+    string_push(r.text, "\n")
+}
+
+fn doc_auth(mut r: Report, read ag: jagent.Agent, loaded: bool) {
+    string_push(r.text, "auth: missing")
+    if loaded {
+        if jagent.host_is_loopback(ag) {
+            string_push(r.text, " risk=local-only")
+        } else {
+            string_push(r.text, " risk=remote-exposed")
+            r.warnings = r.warnings + 1
+        }
+    }
+    string_push(r.text, "\n")
+}
+
+// The watcher over the configuration's directory: opened and closed.
+fn doc_reload(mut r: Report, mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) {
+    var d: String = string_new()
+    dir_of(cfg, d)
+    let watched: bool = jagent.watch(ag, h, string_view(d))
+    string_push(r.text, "reload: ")
+    if watched { string_push(r.text, "ok") } else { string_push(r.text, "warn") }
+    string_push(r.text, " watched=")
+    push_bool(r.text, watched)
+    string_push(r.text, " dir=")
+    string_push(r.text, string_view(d))
+    string_push(r.text, "\n")
+    string_free(d)
+    if watched == false { r.warnings = r.warnings + 1 }
+}
+
+fn doc_schedule(mut r: Report, read ag: jagent.Agent) {
+    var n: i64 = 0
+    var i: usize = 0
+    let total: usize = jagent.job_count(ag)
+    for i < total {
+        if jagent.job_interval_ms(ag, i) > 0 { n = n + 1 }
+        i = i + 1
+    }
+    string_push(r.text, "schedule: ok scheduled=")
+    push_num(r.text, n)
+    string_push(r.text, " of=")
+    push_num(r.text, total as i64)
+    string_push(r.text, "\n")
+}
+
+fn doc_limits(mut r: Report) {
+    string_push(r.text, "limits: kinds=command concurrency=none preview_bytes=")
+    push_num(r.text, jagent.JAGENT_PREVIEW_CAP as i64)
+    string_push(r.text, "\n")
+}
+
+// The self-check over the configuration at `cfg`. `probes` false skips the process probes
+// (a caller that cannot afford ~300 ms, or a spawner that is denied). The verdicts are in
+// `report_text`; `is_ok` is the exit code.
+pub fn doctor(read a: Allocator, mut h: fs.Fs, mut sp: sysproc.Spawner, mut blk: time.Clock, read cfg: str, probes: bool) -> Report {
+    var r: Report = Report{ text: string_new(), faults: string_new(), warnings: 0, errors: 0, children: 0, reaped: 0 }
+    var ag: jagent.Agent = jagent.make(a, time.host(), quiet_logger())
+    let loaded: bool = doc_config(r, ag, h, cfg)
+    if loaded {
+        doc_store(r, ag, h, a)
+    } else {
+        string_push(r.text, "store: skipped reason=no-config\n")
+    }
+    doc_sysproc(r, a, sp, blk, probes)
+    if loaded {
+        doc_http(r, a, ag)
+    } else {
+        string_push(r.text, "http: skipped reason=no-config\n")
+    }
+    doc_tls(r, ag, loaded)
+    doc_auth(r, ag, loaded)
+    if loaded {
+        doc_reload(r, ag, h, cfg)
+        doc_schedule(r, ag)
+    } else {
+        string_push(r.text, "reload: skipped reason=no-config\n")
+        string_push(r.text, "schedule: skipped reason=no-config\n")
+    }
+    doc_limits(r)
+    jagent.free(ag)
+    string_push(r.text, "result: ")
+    if r.errors == 0 { string_push(r.text, "ok") } else { string_push(r.text, "fail") }
+    string_push(r.text, " warnings=")
+    push_num(r.text, r.warnings)
+    string_push(r.text, " errors=")
+    push_num(r.text, r.errors)
+    string_push(r.text, "\n")
+    return r
+}
+
+// ---- ask -----------------------------------------------------------------------------------
+
+pub const ASK_ANSWERED: i32 = 0
+pub const ASK_UNKNOWN: i32 = 1     // not a question this layer knows; the answer lists them
+pub const ASK_NO_CONFIG: i32 = 2   // no configuration is loaded; the answer says what to run
+pub const ASK_REFUSED: i32 = 3     // asked to run, change or delete something; it did not
+
+@no_alloc @no_os pub fn ask_name(r: i32) -> str {
+    if r == ASK_ANSWERED { return "answered" }
+    if r == ASK_UNKNOWN { return "unknown" }
+    if r == ASK_NO_CONFIG { return "no-config" }
+    if r == ASK_REFUSED { return "refused" }
+    return "?"
+}
+
+// What a job's last run was: read from its record, never inferred.
+@copy struct Last {
+    has: bool,        // a record exists
+    failed: bool,     // failure, timeout or config-error
+    status: i32,
+    seq: i64,
+    code: i64,
+}
+
+fn no_last() -> Last {
+    return Last{ has: false, failed: false, status: jagent.RUN_NO_SUCH_JOB, seq: 0, code: 0 }
+}
+
+fn status_of_name(read s: str) -> i32 {
+    var k: i32 = 0
+    for k < 4 {
+        if str_eq(jagent.status_name(k), s) { return k }
+        k = k + 1
+    }
+    return jagent.RUN_NO_SUCH_JOB
+}
+
+// The last run of `name`, with its error text appended to `why`.
+fn last_of(mut ag: jagent.Agent, read a: Allocator, read name: str, mut why: String) -> Last {
+    var l: Last = no_last()
+    var rec: String = string_new()
+    if jagent.last_record(ag, name, rec) == false {
+        string_free(rec)
+        return l
+    }
+    var d: json.Doc = json.parse(a, string_view(rec))
+    if json.parsed(d) {
+        let root: usize = json.root(d) as usize
+        let st: isize = json.get(d, root, "status")
+        let sq: isize = json.get(d, root, "seq")
+        let cd: isize = json.get(d, root, "code")
+        let er: isize = json.get(d, root, "error")
+        if st >= 0 and sq >= 0 and cd >= 0 {
+            l.has = true
+            l.status = status_of_name(json.as_str(d, st as usize))
+            l.failed = l.status != jagent.RUN_SUCCESS
+            l.seq = json.as_i64(d, sq as usize)
+            l.code = json.as_i64(d, cd as usize)
+            if er >= 0 { string_push(why, json.as_str(d, er as usize)) }
+        }
+    }
+    string_free(rec)
+    return l
+}
+
+// ASCII lower-case of `s`, appended to `dst`, so a question matches however it is typed.
+fn push_lower(mut dst: String, read s: str) {
+    var i: usize = 0
+    for i < s.len {
+        let b: i32 = s[i] as i32
+        if b >= 65 and b <= 90 {
+            // One byte at a time through a slice view, so no table is needed.
+            let lo: i32 = b + 32
+            if lo == 97 { string_push(dst, "a") }
+            if lo == 98 { string_push(dst, "b") }
+            if lo == 99 { string_push(dst, "c") }
+            if lo == 100 { string_push(dst, "d") }
+            if lo == 101 { string_push(dst, "e") }
+            if lo == 102 { string_push(dst, "f") }
+            if lo == 103 { string_push(dst, "g") }
+            if lo == 104 { string_push(dst, "h") }
+            if lo == 105 { string_push(dst, "i") }
+            if lo == 106 { string_push(dst, "j") }
+            if lo == 107 { string_push(dst, "k") }
+            if lo == 108 { string_push(dst, "l") }
+            if lo == 109 { string_push(dst, "m") }
+            if lo == 110 { string_push(dst, "n") }
+            if lo == 111 { string_push(dst, "o") }
+            if lo == 112 { string_push(dst, "p") }
+            if lo == 113 { string_push(dst, "q") }
+            if lo == 114 { string_push(dst, "r") }
+            if lo == 115 { string_push(dst, "s") }
+            if lo == 116 { string_push(dst, "t") }
+            if lo == 117 { string_push(dst, "u") }
+            if lo == 118 { string_push(dst, "v") }
+            if lo == 119 { string_push(dst, "w") }
+            if lo == 120 { string_push(dst, "x") }
+            if lo == 121 { string_push(dst, "y") }
+            if lo == 122 { string_push(dst, "z") }
+        } else {
+            string_push(dst, s[i .. i + 1])
+        }
+        i = i + 1
+    }
+}
+
+// Which configured job the question names, by the longest name it contains, or -1. The
+// longest, so `db-backup` is not answered as `db`.
+fn job_in(read ag: jagent.Agent, read qlow: str) -> i32 {
+    var best: i32 = 0 - 1
+    var best_len: usize = 0
+    var i: usize = 0
+    let n: usize = jagent.job_count(ag)
+    for i < n {
+        let nm: str = jagent.job_name(ag, i)
+        var lo: String = string_new()
+        push_lower(lo, nm)
+        if str.has(qlow, string_view(lo)) {
+            if nm.len > best_len {
+                best = i as i32
+                best_len = nm.len
+            }
+        }
+        string_free(lo)
+        i = i + 1
+    }
+    return best
+}
+
+// The word after `did ` and before ` fail`, for a job the question names that is not
+// configured — so the answer can repeat the name rather than say "some job".
+fn named_after_did(read qlow: str, mut dst: String) {
+    let at: isize = str.index_of(qlow, "did ")
+    if at < 0 { return }
+    let rest: str = qlow[(at as usize) + 4 .. qlow.len]
+    let end: isize = str.index_of(rest, " fail")
+    if end < 0 {
+        string_push(dst, str.trimmed(rest))
+    } else {
+        string_push(dst, str.trimmed(rest[0 .. end as usize]))
+    }
+}
+
+fn push_job_list(read ag: jagent.Agent, mut dst: String) {
+    var i: usize = 0
+    let n: usize = jagent.job_count(ag)
+    for i < n {
+        if i > 0 { string_push(dst, ", ") }
+        string_push(dst, jagent.job_name(ag, i))
+        i = i + 1
+    }
+}
+
+// The one line every answer can end with: the exact command to run next, chosen by the
+// first fact that needs attention.
+fn push_next(mut ag: jagent.Agent, read a: Allocator, mut dst: String, history: bool) {
+    string_push(dst, "Recommended next action: ")
+    var i: usize = 0
+    let n: usize = jagent.job_count(ag)
+    if history {
+        for i < n {
+            var why: String = string_new()
+            let l: Last = last_of(ag, a, jagent.job_name(ag, i), why)
+            string_free(why)
+            if l.has and l.failed {
+                string_push(dst, "jagent logs ")
+                string_push(dst, jagent.job_name(ag, i))
+                string_push(dst, "\n")
+                return
+            }
+            i = i + 1
+        }
+    }
+    i = 0
+    for i < n {
+        var why2: String = string_new()
+        var l2: Last = no_last()
+        if history { l2 = last_of(ag, a, jagent.job_name(ag, i), why2) }
+        string_free(why2)
+        if l2.has == false {
+            string_push(dst, "jagent run ")
+            string_push(dst, jagent.job_name(ag, i))
+            string_push(dst, "\n")
+            return
+        }
+        i = i + 1
+    }
+    if jagent.host_is_loopback(ag) == false {
+        string_push(dst, "set agent.host = 127.0.0.1, or put the API behind something that authenticates\n")
+        return
+    }
+    string_push(dst, "nothing needs attention; `jagent doctor` is the self-check\n")
+}
+
+// Open the history only if it is there — asking must not create a file.
+fn history_open(mut ag: jagent.Agent, mut h: fs.Fs) -> bool {
+    if jagent.store_is_open(ag) { return true }
+    if fs.present(h, jagent.store_path(ag)) == false { return false }
+    return jagent.open_store(ag, h)
+}
+
+fn push_last_line(mut ag: jagent.Agent, read a: Allocator, read name: str, mut dst: String) {
+    var why: String = string_new()
+    let l: Last = last_of(ag, a, name, why)
+    string_push(dst, name)
+    if l.has == false {
+        string_push(dst, " has never run.\n")
+    } else {
+        if l.failed {
+            string_push(dst, " last failed: ")
+            string_push(dst, jagent.status_name(l.status))
+            let w: str = string_view(why)
+            if w.len > 0 {
+                string_push(dst, ", ")
+                string_push(dst, w)
+            }
+            string_push(dst, " (run #")
+            push_num(dst, l.seq)
+            string_push(dst, ").\n")
+        } else {
+            string_push(dst, " last succeeded (run #")
+            push_num(dst, l.seq)
+            string_push(dst, ").\n")
+        }
+    }
+    string_free(why)
+}
+
+fn answer_summary(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, mut dst: String) {
+    string_push(dst, "Configuration ")
+    string_push(dst, jagent.config_name(ag))
+    string_push(dst, " is valid: ")
+    push_count(dst, jagent.job_count(ag) as i64, "job", "jobs")
+    string_push(dst, ", generation ")
+    push_num(dst, jagent.generation(ag))
+    string_push(dst, ".\n")
+    let history: bool = history_open(ag, h)
+    string_push(dst, "History ")
+    string_push(dst, jagent.store_path(ag))
+    if history {
+        string_push(dst, ": ")
+        push_count(dst, jagent.last_seq(ag), "run", "runs")
+        string_push(dst, " recorded.\n")
+    } else {
+        string_push(dst, ": no store yet; nothing has run.\n")
+    }
+    var ran: i64 = 0
+    var i: usize = 0
+    let n: usize = jagent.job_count(ag)
+    if history {
+        for i < n {
+            var why: String = string_new()
+            let l: Last = last_of(ag, a, jagent.job_name(ag, i), why)
+            string_free(why)
+            if l.has { ran = ran + 1 }
+            i = i + 1
+        }
+    }
+    push_num(dst, ran)
+    string_push(dst, " of ")
+    push_num(dst, n as i64)
+    string_push(dst, " jobs have run at least once.\n")
+    i = 0
+    for i < n {
+        if history {
+            push_last_line(ag, a, jagent.job_name(ag, i), dst)
+        } else {
+            string_push(dst, jagent.job_name(ag, i))
+            string_push(dst, " has never run.\n")
+        }
+        i = i + 1
+    }
+    if jagent.tls_wanted(ag) {
+        string_push(dst, "TLS is requested and this build cannot serve it; `jagent serve` will refuse.\n")
+    } else {
+        string_push(dst, "TLS is off; ")
+    }
+    if jagent.host_is_loopback(ag) {
+        if jagent.tls_wanted(ag) == false { string_push(dst, "the API binds to loopback (127.0.0.1) without authentication.\n") }
+    } else {
+        if jagent.tls_wanted(ag) == false { string_push(dst, "the API binds to every interface (0.0.0.0) without authentication.\n") }
+        string_push(dst, "WARNING: anything that reaches this machine can run its jobs.\n")
+    }
+    push_next(ag, a, dst, history)
+}
+
+fn answer_failed(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, mut dst: String) {
+    let history: bool = history_open(ag, h)
+    if history == false {
+        string_push(dst, "No history yet at ")
+        string_push(dst, jagent.store_path(ag))
+        string_push(dst, "; nothing has run, so nothing has failed.\n")
+        push_next(ag, a, dst, false)
+        return
+    }
+    var found: i64 = 0
+    var i: usize = 0
+    let n: usize = jagent.job_count(ag)
+    for i < n {
+        var why: String = string_new()
+        let l: Last = last_of(ag, a, jagent.job_name(ag, i), why)
+        string_free(why)
+        if l.has and l.failed {
+            push_last_line(ag, a, jagent.job_name(ag, i), dst)
+            found = found + 1
+        }
+        i = i + 1
+    }
+    if found == 0 { string_push(dst, "No job's last run failed.\n") }
+    push_next(ag, a, dst, true)
+}
+
+fn answer_why(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, read qlow: str, mut dst: String) {
+    let ji: i32 = job_in(ag, qlow)
+    if ji < 0 {
+        var nm: String = string_new()
+        named_after_did(qlow, nm)
+        let v: str = string_view(nm)
+        if v.len > 0 {
+            string_push(dst, "No job called `")
+            string_push(dst, v)
+            string_push(dst, "` is configured. Configured jobs: ")
+        } else {
+            string_push(dst, "The question names no configured job. Configured jobs: ")
+        }
+        string_free(nm)
+        push_job_list(ag, dst)
+        string_push(dst, ".\n")
+        return
+    }
+    let name: str = jagent.job_name(ag, ji as usize)
+    let history: bool = history_open(ag, h)
+    if history == false {
+        string_push(dst, name)
+        string_push(dst, " has never run: there is no history yet at ")
+        string_push(dst, jagent.store_path(ag))
+        string_push(dst, ".\n")
+        return
+    }
+    var why: String = string_new()
+    let l: Last = last_of(ag, a, name, why)
+    if l.has == false {
+        string_push(dst, name)
+        string_push(dst, " has never run.\nRecommended next action: jagent run ")
+        string_push(dst, name)
+        string_push(dst, "\n")
+    } else {
+        if l.failed {
+            string_push(dst, name)
+            string_push(dst, "'s last run (#")
+            push_num(dst, l.seq)
+            string_push(dst, ") ended ")
+            string_push(dst, jagent.status_name(l.status))
+            let w: str = string_view(why)
+            if w.len > 0 {
+                string_push(dst, ": ")
+                string_push(dst, w)
+            }
+            string_push(dst, ".\nThe record holds no more than that; the command's output is in its log line.\n")
+            string_push(dst, "Recommended next action: jagent logs ")
+            string_push(dst, name)
+            string_push(dst, "\n")
+        } else {
+            string_push(dst, name)
+            string_push(dst, " did not fail: its last run (#")
+            push_num(dst, l.seq)
+            string_push(dst, ") succeeded.\n")
+        }
+    }
+    string_free(why)
+}
+
+fn answer_never(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, mut dst: String) {
+    let history: bool = history_open(ag, h)
+    var found: i64 = 0
+    var i: usize = 0
+    let n: usize = jagent.job_count(ag)
+    for i < n {
+        var never: bool = true
+        if history {
+            var why: String = string_new()
+            let l: Last = last_of(ag, a, jagent.job_name(ag, i), why)
+            string_free(why)
+            never = l.has == false
+        }
+        if never {
+            string_push(dst, jagent.job_name(ag, i))
+            string_push(dst, " has never run.\n")
+            found = found + 1
+        }
+        i = i + 1
+    }
+    if found == 0 { string_push(dst, "Every configured job has run at least once.\n") }
+    push_next(ag, a, dst, history)
+}
+
+fn answer_refused(read ag: jagent.Agent, mut dst: String) {
+    string_push(dst, "I do not run, change or delete anything. To run a configured job: jagent run <name>. Configured jobs: ")
+    push_job_list(ag, dst)
+    string_push(dst, ".\n")
+}
+
+fn answer_unknown(mut dst: String) {
+    string_push(dst, "I can answer: is the agent healthy / check my machine; what failed; why did <job> fail; what jobs have never run; what should I look at next.\n")
+}
+
+// Answer `question` from the configuration in `ag`, the history at its store path (opened
+// only if the file is there), and the server settings. The answer is appended to `dst`.
+// This function is not given a spawner: it cannot run a job, whatever it is asked.
+pub fn ask(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, read question: str, mut dst: String) -> i32 {
+    if jagent.is_valid(ag) == false {
+        string_push(dst, "No configuration is loaded, so there is nothing to report.\nRecommended next action: jagent config validate\n")
+        return ASK_NO_CONFIG
+    }
+    var q: String = string_new()
+    push_lower(q, question)
+    let ql: str = string_view(q)
+    var r: i32 = ASK_ANSWERED
+    if str.has(ql, "why") {
+        answer_why(ag, h, a, ql, dst)
+    } else {
+        if str.has(ql, "never") {
+            answer_never(ag, h, a, dst)
+        } else {
+            if str.has(ql, "fail") {
+                answer_failed(ag, h, a, dst)
+            } else {
+                if str.has(ql, "run ") or str.has(ql, "execute") or str.has(ql, "start ") or str.has(ql, "launch") or str.has(ql, "kill") or str.has(ql, "delete") or str.has(ql, "edit") or str.has(ql, "change") {
+                    answer_refused(ag, dst)
+                    r = ASK_REFUSED
+                } else {
+                    if str.has(ql, "health") or str.has(ql, "check") or str.has(ql, "machine") or str.has(ql, "status") or str.has(ql, "summary") or str.has(ql, "how is") {
+                        answer_summary(ag, h, a, dst)
+                    } else {
+                        if str.has(ql, "next") or str.has(ql, "look") or str.has(ql, "recommend") or str.has(ql, "should") {
+                            push_next(ag, a, dst, history_open(ag, h))
+                        } else {
+                            answer_unknown(dst)
+                            r = ASK_UNKNOWN
+                        }
+                    }
+                }
+            }
+        }
+    }
+    string_free(q)
+    return r
+}

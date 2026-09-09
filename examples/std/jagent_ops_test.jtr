@@ -1,0 +1,557 @@
+// std/jagent_ops_test.jtr — the operator layer's claims, each beside the control that
+// would fail if the implementation were vacuous.
+//
+// `init` must leave a file behind and must NOT replace one; `doctor` must measure (a
+// denied spawner fails the probe; a read-only handle fails the store) and must not create
+// the store it checks; `ask` must read the record (a failed job is reported as failed with
+// the code the record holds and nothing more), must refuse to run what a question names,
+// and must leave the history exactly as it found it.
+//
+// Every case runs against a scratch directory (`zz_jagent_ops`) scrubbed at both ends. The
+// discovery case is the one that touches the working directory — `jagent.ini` there is
+// what the third step of the order means — and it removes what it made.
+//
+// Run:  jestyrc test examples/std/jagent_ops_test.jtr
+
+import "fs"
+import "jagent"
+import "jagent_ops"
+import "log"
+import "mem"
+import "str"
+import "sysfs"
+import "sysproc"
+import "test"
+import "test_report"
+import "time"
+import "writer"
+
+const JO_CAP: usize = 16384
+const JO_ROOT: str = "zz_jagent_ops"
+const JO_CFG: str = "zz_jagent_ops/agent.ini"
+const JO_STORE: str = "zz_jagent_ops/history.db"
+const JO_INIT: str = "zz_jagent_ops/starter.ini"
+
+const JO_GOOD: str = "[agent]\nhost = 127.0.0.1\nport = 0\ntls = false\nstore = zz_jagent_ops/history.db\n\n[job.health-check]\ncommand = echo healthy\ntimeout_ms = 10000\n\n[job.rotate-log]\ncommand = echo rotated\ntimeout_ms = 10000\n"
+
+// The good file plus a job that fails, for the history the answers read.
+const JO_THREE: str = "[agent]\nhost = 127.0.0.1\nport = 0\ntls = false\nstore = zz_jagent_ops/history.db\n\n[job.health-check]\ncommand = echo healthy\ntimeout_ms = 10000\n\n[job.rotate-log]\ncommand = echo rotated\ntimeout_ms = 10000\n\n[job.flaky]\ncommand = exit 3\ntimeout_ms = 10000\n"
+
+const JO_OPEN: str = "[agent]\nhost = 0.0.0.0\nport = 0\nstore = zz_jagent_ops/history.db\n[job.health-check]\ncommand = echo healthy\n"
+
+const JO_TLS: str = "[agent]\ntls = true\nstore = zz_jagent_ops/history.db\n[job.health-check]\ncommand = echo healthy\n"
+
+const JO_BAD: str = "[job.x]\ncommand = echo x\ntimeout_ms = soon\n"
+
+fn nothing() { }
+
+fn has_text(read s: str, read needle: str) -> bool { return str.has(s, needle) }
+
+fn scrub(mut h: fs.Fs, read a: Allocator) {
+    fs.erase(h, JO_CFG)
+    fs.erase(h, JO_STORE)
+    fs.erase(h, "zz_jagent_ops/history.db.compact")
+    fs.erase(h, JO_INIT)
+    fs.erase(h, "zz_jagent_ops/bad.ini")
+    fs.erase(h, "zz_jagent_ops/open.ini")
+    fs.erase(h, "zz_jagent_ops/tls.ini")
+    fs.erase(h, "zz_jagent_ops/nodir.ini")
+    let gone: bool = sysfs.remove_dir(h, a, JO_ROOT) catch false
+}
+
+fn setup(mut h: fs.Fs, read a: Allocator) {
+    scrub(h, a)
+    let made: bool = sysfs.make_dir(h, a, JO_ROOT) catch false
+}
+
+fn quiet_logger() -> log.Logger {
+    return log.make(time.manual(0), writer.to_buffer(), log.LOG_INFO, log.LOG_LOGFMT)
+}
+
+fn agent_with(read a: Allocator, read text: str) -> jagent.Agent {
+    var ag: jagent.Agent = jagent.make(a, time.host(), quiet_logger())
+    jagent.load_text(ag, JO_CFG, text)
+    return ag
+}
+
+// An agent on the three-job file with one success and one failure recorded.
+fn agent_with_history(read a: Allocator, mut h: fs.Fs) -> jagent.Agent {
+    var ag: jagent.Agent = agent_with(a, JO_THREE)
+    jagent.open_store(ag, h)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+    jagent.run_job(ag, sp, blk, "health-check")
+    jagent.run_job(ag, sp, blk, "flaky")
+    return ag
+}
+
+// ---- discovery ------------------------------------------------------------------------------
+
+@test fn discovery_prefers_the_flag_then_the_environment_then_the_working_directory() -> bool {
+    var raw: *mut u8 = alloc(u8, JO_CAP)
+    var rep: []u8 = slice(u8, raw, JO_CAP)
+    var c: test.Check = test.new()
+    var h: fs.Fs = fs.host()
+    fs.erase(h, jagent_ops.OPS_DEFAULT_CFG)
+
+    var p: String = string_new()
+    test.eq_i64(c, rep, "the flag wins", jagent_ops.discover(h, "here.ini", "env.ini", p) as i64, jagent_ops.SRC_FLAG as i64)
+    test.eq_str(c, rep, "and is the path", string_view(p), "here.ini")
+    string_free(p)
+    p = string_new()
+    test.eq_i64(c, rep, "then the environment", jagent_ops.discover(h, "", "env.ini", p) as i64, jagent_ops.SRC_ENV as i64)
+    test.eq_str(c, rep, "its value verbatim", string_view(p), "env.ini")
+    string_free(p)
+    p = string_new()
+    test.eq_i64(c, rep, "with neither and no file, the default name", jagent_ops.discover(h, "", "", p) as i64, jagent_ops.SRC_DEFAULT as i64)
+    test.eq_str(c, rep, "so an error names it", string_view(p), "jagent.ini")
+    string_free(p)
+
+    // The third step means the FILE: put one in the working directory and the answer moves.
+    fs.put(h, jagent_ops.OPS_DEFAULT_CFG, "[job.x]\ncommand = echo x\n")
+    p = string_new()
+    test.eq_i64(c, rep, "a jagent.ini in the working directory", jagent_ops.discover(h, "", "", p) as i64, jagent_ops.SRC_CWD as i64)
+    test.eq_str(c, rep, "is the path", string_view(p), "jagent.ini")
+    string_free(p)
+    p = string_new()
+    test.eq_i64(c, rep, "and the flag still beats it", jagent_ops.discover(h, "other.ini", "", p) as i64, jagent_ops.SRC_FLAG as i64)
+    test.eq_str(c, rep, "verbatim", string_view(p), "other.ini")
+    string_free(p)
+    fs.erase(h, jagent_ops.OPS_DEFAULT_CFG)
+    test.is_false(c, rep, "the working directory is left as it was", fs.present(h, jagent_ops.OPS_DEFAULT_CFG))
+
+    test.eq_str(c, rep, "the names", jagent_ops.source_name(jagent_ops.SRC_ENV), "env")
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- init -----------------------------------------------------------------------------------
+
+@test fn init_writes_a_valid_starter_and_will_not_replace_a_file() -> bool {
+    var raw: *mut u8 = alloc(u8, JO_CAP)
+    var rep: []u8 = slice(u8, raw, JO_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+
+    test.is_false(c, rep, "nothing there yet", fs.present(h, JO_INIT))
+    test.eq_i64(c, rep, "created", jagent_ops.init(h, JO_INIT, false) as i64, jagent_ops.INIT_CREATED as i64)
+    test.is_true(c, rep, "and the file is there", fs.present(h, JO_INIT))
+    var got: String = fs.open_text(h, JO_INIT)
+    var want: String = string_new()
+    jagent_ops.starter_text(want)
+    test.eq_str(c, rep, "with the starter's bytes", string_view(got), string_view(want))
+    string_free(got)
+
+    // The starter LOADS, with the safe defaults it claims.
+    var ag: jagent.Agent = jagent.make(a, time.manual(0), quiet_logger())
+    test.eq_i64(c, rep, "the starter is a valid configuration", jagent.load_file(ag, h, JO_INIT) as i64, jagent.JA_LOADED as i64)
+    test.eq_usize(c, rep, "one job", jagent.job_count(ag), 1)
+    test.eq_str(c, rep, "the health check", jagent.job_name(ag, 0), "health-check")
+    test.eq_str(c, rep, "that echoes", jagent.job_command(ag, 0), "echo healthy")
+    test.is_true(c, rep, "loopback", jagent.host_is_loopback(ag))
+    test.eq_i64(c, rep, "a platform port", jagent.port(ag), 0)
+    test.is_false(c, rep, "no tls", jagent.tls_wanted(ag))
+    test.eq_str(c, rep, "a store beside it", jagent.store_path(ag), "jagent.db")
+    test.eq_str(c, rep, "nothing stops serving it", jagent.serve_refusal(ag), "")
+    jagent.free(ag)
+
+    // An edited file is refused, and its bytes are untouched — the claim that matters.
+    fs.put(h, JO_INIT, "[job.mine]\ncommand = echo mine\n")
+    test.eq_i64(c, rep, "an existing file is refused", jagent_ops.init(h, JO_INIT, false) as i64, jagent_ops.INIT_EXISTS as i64)
+    var after: String = fs.open_text(h, JO_INIT)
+    test.eq_str(c, rep, "and not replaced", string_view(after), "[job.mine]\ncommand = echo mine\n")
+    string_free(after)
+    test.eq_i64(c, rep, "--force replaces it", jagent_ops.init(h, JO_INIT, true) as i64, jagent_ops.INIT_CREATED as i64)
+    var forced: String = fs.open_text(h, JO_INIT)
+    test.eq_str(c, rep, "with the starter", string_view(forced), string_view(want))
+    string_free(forced)
+    string_free(want)
+
+    // A handle that cannot write: failed, and nothing appears.
+    fs.erase(h, JO_INIT)
+    var ro: fs.Fs = fs.read_only()
+    test.eq_i64(c, rep, "a read-only handle fails", jagent_ops.init(ro, JO_INIT, false) as i64, jagent_ops.INIT_FAILED as i64)
+    test.is_false(c, rep, "and writes nothing", fs.present(h, JO_INIT))
+    test.eq_i64(c, rep, "the refusal was counted by the handle", fs.refused(ro), 1)
+    test.eq_str(c, rep, "the names", jagent_ops.init_name(jagent_ops.INIT_EXISTS), "exists")
+
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- doctor ---------------------------------------------------------------------------------
+
+@test fn doctor_passes_on_a_healthy_setup_and_creates_nothing() -> bool {
+    var raw: *mut u8 = alloc(u8, JO_CAP)
+    var rep: []u8 = slice(u8, raw, JO_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    fs.put(h, JO_CFG, JO_GOOD)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+
+    var r: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, JO_CFG, true)
+    let t: str = jagent_ops.report_text(r)
+    test.is_true(c, rep, "ok", jagent_ops.is_ok(r))
+    test.eq_i64(c, rep, "no warnings", jagent_ops.warnings(r), 0)
+    test.eq_i64(c, rep, "no errors", jagent_ops.errors(r), 0)
+    test.is_true(c, rep, "the configuration line", str.has_prefix(t, "config: ok path=zz_jagent_ops/agent.ini jobs=2\n"))
+    test.is_true(c, rep, "the store is absent and NOT created", has_text(t, "\nstore: ok path=zz_jagent_ops/history.db present=false note=created-by-the-first-run\n"))
+    test.is_false(c, rep, "really not created", fs.present(h, JO_STORE))
+    test.is_true(c, rep, "the probes ran and were reaped", has_text(t, "\nsysproc: ok spawn=true timeout=true tree_reaped=true children=2\n"))
+    test.is_true(c, rep, "the address bound", has_text(t, "\nhttp: ok host=127.0.0.1 port=0 bound="))
+    test.is_false(c, rep, "with no warning on loopback", has_text(t, "warning="))
+    test.is_true(c, rep, "tls stated", has_text(t, "\ntls: unsupported requested=false\n"))
+    test.is_true(c, rep, "auth stated", has_text(t, "\nauth: missing risk=local-only\n"))
+    test.is_true(c, rep, "the watcher opened", has_text(t, "\nreload: ok watched=true dir=zz_jagent_ops\n"))
+    test.is_true(c, rep, "the schedule counted", has_text(t, "\nschedule: ok scheduled=0 of=2\n"))
+    test.is_true(c, rep, "the limits", has_text(t, "\nlimits: kinds=command concurrency=none preview_bytes=240\n"))
+    test.is_true(c, rep, "the result line", str.has_suffix(t, "\nresult: ok warnings=0 errors=0\n"))
+    test.eq_str(c, rep, "no faults", jagent_ops.report_faults(r), "")
+    test.eq_i64(c, rep, "two children, both accounted", jagent_ops.probe_children(r), 2)
+    test.eq_i64(c, rep, "both trees reaped", jagent_ops.probe_reaped(r), 2)
+    test.eq_i64(c, rep, "the spawner agrees", sysproc.started(sp), 2)
+
+    // With a store present it is opened, synced and counted, then left as it was.
+    var ag: jagent.Agent = agent_with_history(a, h)
+    jagent.free(ag)
+    var r2: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, JO_CFG, false)
+    let t2: str = jagent_ops.report_text(r2)
+    test.is_true(c, rep, "present, synced, two runs", has_text(t2, "\nstore: ok path=zz_jagent_ops/history.db present=true synced=true runs=2\n"))
+    test.is_true(c, rep, "no probes when asked not to", has_text(t2, "\nsysproc: skipped reason=no-probes\n"))
+    test.eq_i64(c, rep, "and nothing was started", sysproc.started(sp), 2)
+    test.is_true(c, rep, "still ok", jagent_ops.is_ok(r2))
+
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn doctor_reports_a_bad_config_and_a_missing_one() -> bool {
+    var raw: *mut u8 = alloc(u8, JO_CAP)
+    var rep: []u8 = slice(u8, raw, JO_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    fs.put(h, "zz_jagent_ops/bad.ini", JO_BAD)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+
+    var r: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, "zz_jagent_ops/bad.ini", false)
+    let t: str = jagent_ops.report_text(r)
+    test.is_false(c, rep, "not ok", jagent_ops.is_ok(r))
+    test.eq_i64(c, rep, "one error", jagent_ops.errors(r), 1)
+    test.is_true(c, rep, "the configuration failed with its count", str.has_prefix(t, "config: fail path=zz_jagent_ops/bad.ini faults=1\n"))
+    test.is_true(c, rep, "the store check was skipped", has_text(t, "\nstore: skipped reason=no-config\n"))
+    test.is_true(c, rep, "so was the bind", has_text(t, "\nhttp: skipped reason=no-config\n"))
+    test.is_true(c, rep, "the result", str.has_suffix(t, "\nresult: fail warnings=0 errors=1\n"))
+    test.is_true(c, rep, "the fault is carried, with its line", has_text(jagent_ops.report_faults(r), "bad.ini:3:1"))
+    test.is_true(c, rep, "and its reason", has_text(jagent_ops.report_faults(r), "not an integer"))
+
+    var r2: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, "zz_jagent_ops/absent.ini", false)
+    let t2: str = jagent_ops.report_text(r2)
+    test.is_true(c, rep, "a missing file", str.has_prefix(t2, "config: fail path=zz_jagent_ops/absent.ini reason=cannot-read\n"))
+    test.eq_i64(c, rep, "is one error", jagent_ops.errors(r2), 1)
+
+    // The control: the same doctor on the good file passes.
+    fs.put(h, JO_CFG, JO_GOOD)
+    var r3: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, JO_CFG, false)
+    test.is_true(c, rep, "the good file is ok", jagent_ops.is_ok(r3))
+
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn doctor_reports_a_store_that_cannot_open_or_has_no_directory() -> bool {
+    var raw: *mut u8 = alloc(u8, JO_CAP)
+    var rep: []u8 = slice(u8, raw, JO_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    fs.put(h, JO_CFG, JO_GOOD)
+    var ag: jagent.Agent = agent_with_history(a, h)
+    jagent.free(ag)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+
+    // A handle that reads but will not write: the file is there, and it cannot be opened.
+    var ro: fs.Fs = fs.read_only()
+    var r: jagent_ops.Report = jagent_ops.doctor(a, ro, sp, blk, JO_CFG, false)
+    let t: str = jagent_ops.report_text(r)
+    test.is_true(c, rep, "the configuration still loads", str.has_prefix(t, "config: ok path=zz_jagent_ops/agent.ini jobs=2\n"))
+    test.is_true(c, rep, "the store cannot open", has_text(t, "\nstore: fail path=zz_jagent_ops/history.db reason=cannot-open\n"))
+    test.is_false(c, rep, "so the result fails", jagent_ops.is_ok(r))
+    test.eq_i64(c, rep, "one error", jagent_ops.errors(r), 1)
+
+    // The control: the same file through the real handle.
+    var r2: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, JO_CFG, false)
+    test.is_true(c, rep, "opens and syncs through a writable handle", has_text(jagent_ops.report_text(r2), "\nstore: ok path=zz_jagent_ops/history.db present=true synced=true runs=2\n"))
+    test.is_true(c, rep, "ok", jagent_ops.is_ok(r2))
+
+    // A store whose directory does not exist: not created, reported.
+    fs.put(h, "zz_jagent_ops/nodir.ini", "[agent]\nstore = zz_jagent_ops/absent-dir/history.db\n[job.x]\ncommand = echo x\n")
+    var r3: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, "zz_jagent_ops/nodir.ini", false)
+    test.is_true(c, rep, "the directory is missing", has_text(jagent_ops.report_text(r3), "\nstore: fail path=zz_jagent_ops/absent-dir/history.db reason=directory-missing\n"))
+    test.is_false(c, rep, "fails", jagent_ops.is_ok(r3))
+    test.is_false(c, rep, "and nothing was created", fs.present(h, "zz_jagent_ops/absent-dir/history.db"))
+
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn doctor_warns_on_a_remote_bind_and_fails_a_tls_request() -> bool {
+    var raw: *mut u8 = alloc(u8, JO_CAP)
+    var rep: []u8 = slice(u8, raw, JO_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    fs.put(h, "zz_jagent_ops/open.ini", JO_OPEN)
+    fs.put(h, "zz_jagent_ops/tls.ini", JO_TLS)
+    fs.put(h, JO_CFG, JO_GOOD)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+
+    var r: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, "zz_jagent_ops/open.ini", false)
+    let t: str = jagent_ops.report_text(r)
+    test.is_true(c, rep, "the bind is every interface, and warned", has_text(t, "\nhttp: ok host=0.0.0.0 port=0 bound="))
+    test.is_true(c, rep, "with the reason", has_text(t, " warning=remote-bind-unauthenticated\n"))
+    test.is_true(c, rep, "and auth names the exposure", has_text(t, "\nauth: missing risk=remote-exposed\n"))
+    test.eq_i64(c, rep, "two warnings", jagent_ops.warnings(r), 2)
+    test.is_true(c, rep, "still ok: a warning is not an error", jagent_ops.is_ok(r))
+    test.is_true(c, rep, "the result says so", str.has_suffix(t, "\nresult: ok warnings=2 errors=0\n"))
+
+    // The control: loopback carries neither.
+    var r2: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, JO_CFG, false)
+    test.eq_i64(c, rep, "loopback: no warnings", jagent_ops.warnings(r2), 0)
+    test.is_false(c, rep, "and no exposure", has_text(jagent_ops.report_text(r2), "remote"))
+
+    var r3: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, "zz_jagent_ops/tls.ini", false)
+    let t3: str = jagent_ops.report_text(r3)
+    test.is_true(c, rep, "tls requested of a build without it", has_text(t3, "\ntls: unsupported requested=true serve=refused\n"))
+    test.is_false(c, rep, "is a failure, because serve would refuse", jagent_ops.is_ok(r3))
+    test.eq_i64(c, rep, "one error", jagent_ops.errors(r3), 1)
+
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn doctor_measures_the_process_path_rather_than_assuming_it() -> bool {
+    var raw: *mut u8 = alloc(u8, JO_CAP)
+    var rep: []u8 = slice(u8, raw, JO_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    fs.put(h, JO_CFG, JO_GOOD)
+    var blk: time.Clock = time.host()
+
+    // A spawner that refuses: the probe fails, and says which half.
+    var denied: sysproc.Spawner = sysproc.denied()
+    var r: jagent_ops.Report = jagent_ops.doctor(a, h, denied, blk, JO_CFG, true)
+    let t: str = jagent_ops.report_text(r)
+    test.is_true(c, rep, "the probe fails", has_text(t, "\nsysproc: fail spawn=false timeout=false tree_reaped=false children=0\n"))
+    test.is_false(c, rep, "and so does the check", jagent_ops.is_ok(r))
+    test.eq_i64(c, rep, "one error", jagent_ops.errors(r), 1)
+    test.eq_i64(c, rep, "two refusals counted by the spawner", sysproc.refused(denied), 2)
+    test.eq_i64(c, rep, "nothing started", sysproc.started(denied), 0)
+
+    // The control: the real spawner, and the bound of what it costs.
+    var sp: sysproc.Spawner = sysproc.host()
+    let t0: i64 = time.read_nanos(blk)
+    var r2: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, JO_CFG, true)
+    let spent_ms: i64 = (time.read_nanos(blk) - t0) / 1000000
+    test.is_true(c, rep, "the real path passes", has_text(jagent_ops.report_text(r2), "\nsysproc: ok spawn=true timeout=true tree_reaped=true children=2\n"))
+    test.is_true(c, rep, "the timeout probe did not wait for its sleeper", spent_ms < 3500)
+    test.eq_i64(c, rep, "two children", sysproc.started(sp), 2)
+
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- ask ------------------------------------------------------------------------------------
+
+@test fn ask_summarises_the_agent_from_the_record() -> bool {
+    var raw: *mut u8 = alloc(u8, JO_CAP)
+    var rep: []u8 = slice(u8, raw, JO_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    var ag: jagent.Agent = agent_with_history(a, h)
+
+    var s: String = string_new()
+    test.eq_i64(c, rep, "answered", jagent_ops.ask(ag, h, a, "check my machine", s) as i64, jagent_ops.ASK_ANSWERED as i64)
+    test.eq_str(c, rep, "the summary, from the configuration and the history",
+        string_view(s),
+        "Configuration zz_jagent_ops/agent.ini is valid: 3 jobs, generation 1.\nHistory zz_jagent_ops/history.db: 2 runs recorded.\n2 of 3 jobs have run at least once.\nhealth-check last succeeded (run #1).\nrotate-log has never run.\nflaky last failed: failure, exit code 3 (run #2).\nTLS is off; the API binds to loopback (127.0.0.1) without authentication.\nRecommended next action: jagent logs flaky\n")
+    string_free(s)
+
+    s = string_new()
+    test.eq_i64(c, rep, "what failed", jagent_ops.ask(ag, h, a, "What FAILED?", s) as i64, jagent_ops.ASK_ANSWERED as i64)
+    test.eq_str(c, rep, "names the failed job and the code the record holds", string_view(s), "flaky last failed: failure, exit code 3 (run #2).\nRecommended next action: jagent logs flaky\n")
+    test.is_false(c, rep, "and does not report the success as a failure", has_text(string_view(s), "health-check"))
+    string_free(s)
+
+    s = string_new()
+    test.eq_i64(c, rep, "never run", jagent_ops.ask(ag, h, a, "what jobs have never run", s) as i64, jagent_ops.ASK_ANSWERED as i64)
+    test.eq_str(c, rep, "the one that never did", string_view(s), "rotate-log has never run.\nRecommended next action: jagent logs flaky\n")
+    string_free(s)
+
+    s = string_new()
+    test.eq_i64(c, rep, "next", jagent_ops.ask(ag, h, a, "what should I look at next", s) as i64, jagent_ops.ASK_ANSWERED as i64)
+    test.eq_str(c, rep, "the failure first", string_view(s), "Recommended next action: jagent logs flaky\n")
+    string_free(s)
+
+    jagent.free(ag)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn ask_explains_a_failure_with_nothing_the_record_does_not_hold() -> bool {
+    var raw: *mut u8 = alloc(u8, JO_CAP)
+    var rep: []u8 = slice(u8, raw, JO_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    var ag: jagent.Agent = agent_with_history(a, h)
+
+    var s: String = string_new()
+    test.eq_i64(c, rep, "why", jagent_ops.ask(ag, h, a, "why did flaky fail", s) as i64, jagent_ops.ASK_ANSWERED as i64)
+    test.eq_str(c, rep, "the record's status and code, and that it holds no more",
+        string_view(s),
+        "flaky's last run (#2) ended failure: exit code 3.\nThe record holds no more than that; the command's output is in its log line.\nRecommended next action: jagent logs flaky\n")
+    test.is_false(c, rep, "no invented cause", has_text(string_view(s), "because"))
+    string_free(s)
+
+    s = string_new()
+    jagent_ops.ask(ag, h, a, "why did health-check fail?", s)
+    test.eq_str(c, rep, "a job that succeeded did not fail", string_view(s), "health-check did not fail: its last run (#1) succeeded.\n")
+    string_free(s)
+
+    s = string_new()
+    jagent_ops.ask(ag, h, a, "why did rotate-log fail", s)
+    test.eq_str(c, rep, "a job that never ran", string_view(s), "rotate-log has never run.\nRecommended next action: jagent run rotate-log\n")
+    string_free(s)
+
+    s = string_new()
+    test.eq_i64(c, rep, "a job that is not configured is still answered", jagent_ops.ask(ag, h, a, "why did nope fail", s) as i64, jagent_ops.ASK_ANSWERED as i64)
+    test.eq_str(c, rep, "by name, with the list", string_view(s), "No job called `nope` is configured. Configured jobs: health-check, rotate-log, flaky.\n")
+    string_free(s)
+
+    // The longest name wins: `health` is not a job, `health-check` is.
+    s = string_new()
+    jagent_ops.ask(ag, h, a, "why does health-check keep failing", s)
+    test.is_true(c, rep, "matched the whole name", str.has_prefix(string_view(s), "health-check did not fail"))
+    string_free(s)
+
+    jagent.free(ag)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn ask_refuses_to_act_and_leaves_the_history_as_it_found_it() -> bool {
+    var raw: *mut u8 = alloc(u8, JO_CAP)
+    var rep: []u8 = slice(u8, raw, JO_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    var ag: jagent.Agent = agent_with_history(a, h)
+    let before: i64 = jagent.last_seq(ag)
+    let runs: i64 = jagent.runs_total(ag)
+
+    var s: String = string_new()
+    test.eq_i64(c, rep, "a request to run is refused", jagent_ops.ask(ag, h, a, "please run rm -rf /", s) as i64, jagent_ops.ASK_REFUSED as i64)
+    test.eq_str(c, rep, "with the command the operator would type", string_view(s), "I do not run, change or delete anything. To run a configured job: jagent run <name>. Configured jobs: health-check, rotate-log, flaky.\n")
+    string_free(s)
+    s = string_new()
+    test.eq_i64(c, rep, "even for a configured job's name", jagent_ops.ask(ag, h, a, "run health-check now", s) as i64, jagent_ops.ASK_REFUSED as i64)
+    string_free(s)
+    s = string_new()
+    test.eq_i64(c, rep, "or an executable", jagent_ops.ask(ag, h, a, "execute calc.exe", s) as i64, jagent_ops.ASK_REFUSED as i64)
+    string_free(s)
+    s = string_new()
+    test.eq_i64(c, rep, "or a change", jagent_ops.ask(ag, h, a, "delete the flaky job", s) as i64, jagent_ops.ASK_REFUSED as i64)
+    string_free(s)
+    test.eq_i64(c, rep, "the history is as it was", jagent.last_seq(ag), before)
+    test.eq_i64(c, rep, "and nothing ran", jagent.runs_total(ag), runs)
+    test.eq_usize(c, rep, "and the job table is as it was", jagent.job_count(ag), 3)
+
+    s = string_new()
+    test.eq_i64(c, rep, "a question it does not know", jagent_ops.ask(ag, h, a, "what is the weather", s) as i64, jagent_ops.ASK_UNKNOWN as i64)
+    test.is_true(c, rep, "lists what it does", str.has_prefix(string_view(s), "I can answer: "))
+    string_free(s)
+
+    // An agent with nothing loaded says so and points at the validator.
+    var empty: jagent.Agent = jagent.make(a, time.manual(0), quiet_logger())
+    s = string_new()
+    test.eq_i64(c, rep, "no configuration", jagent_ops.ask(empty, h, a, "check my machine", s) as i64, jagent_ops.ASK_NO_CONFIG as i64)
+    test.eq_str(c, rep, "and the way out", string_view(s), "No configuration is loaded, so there is nothing to report.\nRecommended next action: jagent config validate\n")
+    string_free(s)
+    jagent.free(empty)
+
+    jagent.free(ag)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn ask_warns_on_a_remote_bind_and_creates_no_store() -> bool {
+    var raw: *mut u8 = alloc(u8, JO_CAP)
+    var rep: []u8 = slice(u8, raw, JO_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+
+    // No store on disk: the summary says so, and asking does not make one.
+    var ag: jagent.Agent = agent_with(a, JO_OPEN)
+    var s: String = string_new()
+    test.eq_i64(c, rep, "answered", jagent_ops.ask(ag, h, a, "is the agent healthy", s) as i64, jagent_ops.ASK_ANSWERED as i64)
+    test.eq_str(c, rep, "the exposure is named and the store is not there",
+        string_view(s),
+        "Configuration zz_jagent_ops/agent.ini is valid: 1 job, generation 1.\nHistory zz_jagent_ops/history.db: no store yet; nothing has run.\n0 of 1 jobs have run at least once.\nhealth-check has never run.\nTLS is off; the API binds to every interface (0.0.0.0) without authentication.\nWARNING: anything that reaches this machine can run its jobs.\nRecommended next action: jagent run health-check\n")
+    test.is_false(c, rep, "asking created no store", fs.present(h, JO_STORE))
+    test.is_false(c, rep, "and opened none", jagent.store_is_open(ag))
+    string_free(s)
+    jagent.free(ag)
+
+    // The control: loopback, same question, no warning.
+    var ag2: jagent.Agent = agent_with(a, JO_GOOD)
+    s = string_new()
+    jagent_ops.ask(ag2, h, a, "is the agent healthy", s)
+    test.is_false(c, rep, "loopback carries no warning", has_text(string_view(s), "WARNING"))
+    test.is_true(c, rep, "and says where it binds", has_text(string_view(s), "binds to loopback (127.0.0.1)"))
+    string_free(s)
+    jagent.free(ag2)
+
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

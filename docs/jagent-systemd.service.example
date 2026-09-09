@@ -1,0 +1,46 @@
+# docs/jagent-systemd.service.example — the shape a `jagent serve` unit would take.
+#
+# DOCUMENTATION, NOT A TESTED ARTIFACT. `jagent` has run only on Windows so far and no
+# unit has been installed anywhere; this file records the settings the agent's contract
+# implies, so the first Linux installation starts from them rather than from a guess.
+# Copy it to /etc/systemd/system/jagent.service, edit the three paths, then:
+#
+#   systemctl daemon-reload && systemctl enable --now jagent
+#
+# What the agent needs from the unit:
+#   - a working directory: `store = jagent.db` in the configuration is relative to it,
+#     and so is a `-c` path that is not absolute;
+#   - stdout and stderr captured: results go to stdout, the agent's log records
+#     (logfmt, one per run and per reload) go to stderr — journald keeps both;
+#   - SIGTERM on stop: `serve` drains, halts and exits 0 for a clean halt, 1 when any
+#     run failed or was abandoned, 2 when it refused to start (`tls = true`);
+#   - NO restart on exit 2: the configuration must change first, so a restart loop
+#     would only repeat the refusal.
+
+[Unit]
+Description=jagent, the Jestyr edge agent
+After=network.target
+
+[Service]
+Type=simple
+User=jagent
+Group=jagent
+WorkingDirectory=/var/lib/jagent
+Environment=JAGENT_CONFIG=/etc/jagent/agent.ini
+ExecStart=/usr/local/bin/jagent serve
+# `serve` answers SIGTERM by draining, then halting.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# Exit 2 is a refusal (a configuration this build cannot serve); do not loop on it.
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=5
+# The API is unauthenticated: keep `agent.host = 127.0.0.1` unless something in front
+# of it authenticates. These are the ordinary hardening lines; none is required.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/jagent
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
