@@ -2,6 +2,9 @@
 //
 //   jagent [-c <config>] serve
 //   jagent [-c <config>] run <job>
+//   jagent [-c <config>] run group <group>
+//   jagent [-c <config>] groups
+//   jagent [-c <config>] compact
 //   jagent [-c <config>] schedule <job>
 //   jagent [-c <config>] status
 //   jagent [-c <config>] logs [<job>]
@@ -60,9 +63,9 @@ fn nothing() { }
 
 fn usage() -> i32 {
     eprint_str("usage: jagent [-c <config>] <command>")
-    eprint_str("  serve | run <job> | schedule <job> | status | logs [<job>] | jobs")
-    eprint_str("  check | config show | config validate | doctor [--no-probes]")
-    eprint_str("  ask <question...> | init [--force]")
+    eprint_str("  serve | run <job> | run group <group> | schedule <job> | status | logs [<job>]")
+    eprint_str("  jobs | groups | compact | check | config show | config validate")
+    eprint_str("  doctor [--no-probes] | ask <question...> | init [--force]")
     eprint_str("the configuration: -c, else $JAGENT_CONFIG, else ./jagent.ini")
     return 2
 }
@@ -132,6 +135,22 @@ fn cmd_logs(mut ag: jagent.Agent, mut h: fs.Fs, read job: str) -> i32 {
     return 0
 }
 
+// The retention policy, after a run: prune past the bound, compact past the threshold.
+// Says so on stderr when it did something, so the operator's diary has it.
+fn upkeep(mut ag: jagent.Agent, mut h: fs.Fs) {
+    let m: jagent.Maint = jagent.maintain(ag, h)
+    if m.pruned > 0 or m.compacted {
+        var s: String = string_new()
+        string_push(s, "jagent: history pruned=")
+        push_num(s, m.pruned)
+        string_push(s, " compacted=")
+        if m.compacted { string_push(s, "true reclaimed=") } else { string_push(s, "false reclaimed=") }
+        push_num(s, m.reclaimed)
+        eprint_str(string_view(s))
+        string_free(s)
+    }
+}
+
 fn cmd_run(mut ag: jagent.Agent, mut h: fs.Fs, mut sp: sysproc.Spawner, read job: str) -> i32 {
     if jagent.find_job(ag, job) < 0 {
         eprint_str("jagent: no such job")
@@ -146,8 +165,74 @@ fn cmd_run(mut ag: jagent.Agent, mut h: fs.Fs, mut sp: sysproc.Spawner, read job
     jagent.render_run(ag, job, r, s)
     show(string_view(s))
     string_free(s)
+    upkeep(ag, h)
     if r.status == jagent.RUN_SUCCESS { return 0 }
     return 1
+}
+
+// `run group <name>`: every member in order, the summary, exit 1 when any failed.
+fn cmd_run_group(mut ag: jagent.Agent, mut h: fs.Fs, mut sp: sysproc.Spawner, read group: str) -> i32 {
+    if jagent.find_group(ag, group) < 0 {
+        eprint_str("jagent: no such group")
+        return 1
+    }
+    if jagent.open_store(ag, h) == false {
+        eprint_str("jagent: warning: the history store could not be opened; these runs will not be recorded")
+    }
+    var blk: time.Clock = time.host()
+    var s: String = string_new()
+    let bad: i64 = jagent.run_group(ag, sp, blk, group, s)
+    show(string_view(s))
+    string_free(s)
+    upkeep(ag, h)
+    if bad == 0 { return 0 }
+    return 1
+}
+
+fn cmd_groups(mut ag: jagent.Agent) -> i32 {
+    var s: String = string_new()
+    jagent.render_groups(ag, s)
+    let v: str = string_view(s)
+    if v.len == 0 {
+        print_str("(no groups configured)")
+    } else {
+        show(v)
+    }
+    string_free(s)
+    return 0
+}
+
+// `compact`: the history rewritten with only its live records, whatever the threshold.
+fn cmd_compact(mut ag: jagent.Agent, mut h: fs.Fs) -> i32 {
+    if jagent.open_store(ag, h) == false {
+        eprint_str("jagent: the history store could not be opened")
+        return 1
+    }
+    let before_runs: i64 = jagent.history_runs(ag)
+    let dead: i64 = jagent.history_dead_bytes(ag)
+    let m: jagent.Maint = jagent.maintain(ag, h)
+    let reclaimed: i64 = jagent.compact_now(ag, h)
+    if reclaimed < 0 {
+        eprint_str("jagent: the compaction failed; the store is as it was")
+        return 1
+    }
+    var s: String = string_new()
+    string_push(s, "history: runs=")
+    push_num(s, jagent.history_runs(ag))
+    string_push(s, " pruned=")
+    push_num(s, m.pruned)
+    string_push(s, " dead_bytes_before=")
+    push_num(s, dead)
+    string_push(s, " reclaimed=")
+    push_num(s, reclaimed + m.reclaimed)
+    string_push(s, " live_bytes=")
+    push_num(s, jagent.history_live_bytes(ag))
+    string_push(s, " (had ")
+    push_num(s, before_runs)
+    string_push(s, " runs)")
+    print_str(string_view(s))
+    string_free(s)
+    return 0
 }
 
 // Run one job on its interval until a shutdown signal arrives.
@@ -176,6 +261,7 @@ fn cmd_schedule(mut ag: jagent.Agent, mut h: fs.Fs, mut sp: sysproc.Spawner, rea
         jagent.render_run(ag, job, r, s)
         show(string_view(s))
         string_free(s)
+        upkeep(ag, h)
         // Sleep the interval in slices, so a signal is answered within a slice.
         var left: i64 = iv * 1000000
         for left > 0 and sysignal.shutdown_requested(sig) == false {
@@ -291,6 +377,9 @@ fn cmd_serve(mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> i32 {
         }
         unsafe { jagent.poll_config((cell + 0).*, h) }
         unsafe { jagent.tick((cell + 0).*, sp, blk) }
+        // The policy runs between requests, so an API run's record is pruned or compacted
+        // by the next round, never during the answer.
+        unsafe { upkeep((cell + 0).*, h) }
     }
 
     var back: jagent.Agent = unsafe { (cell + 0).* }
@@ -336,9 +425,9 @@ fn cmd_config_show(mut ag: jagent.Agent) -> i32 {
     return 0
 }
 
-fn cmd_doctor(read a: Allocator, mut h: fs.Fs, mut sp: sysproc.Spawner, read cfg: str, probes: bool) -> i32 {
+fn cmd_doctor(read a: Allocator, mut h: fs.Fs, mut sp: sysproc.Spawner, read cfg: str, source: i32, probes: bool) -> i32 {
     var blk: time.Clock = time.host()
-    var r: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, cfg, probes)
+    var r: jagent_ops.Report = jagent_ops.doctor_from(a, h, sp, blk, cfg, source, probes)
     show(jagent_ops.report_text(r))
     let f: str = jagent_ops.report_faults(r)
     if f.len > 0 { eprint_str(str.trim_end(f)) }
@@ -416,11 +505,20 @@ fn main() -> i32 {
     if env.argc() <= i { return usage() }
     var h: fs.Fs = fs.host()
     var cfg: String = string_new()
-    jagent_ops.discover(h, flag, env.get(jagent_ops.OPS_ENV_VAR), cfg)
+    let source: i32 = jagent_ops.discover(h, flag, env.get(jagent_ops.OPS_ENV_VAR), cfg)
 
     let cmd: str = env.argv(i)
     var arg: str = ""
     if env.argc() > i + 1 { arg = env.argv(i + 1) }
+    // `run group <name>`: the second word selects the group form.
+    var group_arg: str = ""
+    if str_eq(cmd, "run") and str_eq(arg, "group") {
+        if env.argc() > i + 2 { group_arg = env.argv(i + 2) }
+        if group_arg.len == 0 {
+            string_free(cfg)
+            return usage()
+        }
+    }
 
     // The commands that need no loaded configuration.
     if str_eq(cmd, "init") {
@@ -443,7 +541,7 @@ fn main() -> i32 {
             string_free(cfg)
             return usage()
         }
-        let code1: i32 = cmd_doctor(a, h, sp, string_view(cfg), probes)
+        let code1: i32 = cmd_doctor(a, h, sp, string_view(cfg), source, probes)
         string_free(cfg)
         return code1
     }
@@ -460,6 +558,7 @@ fn main() -> i32 {
     var known: bool = false
     if str_eq(cmd, "status") or str_eq(cmd, "serve") or str_eq(cmd, "run") or str_eq(cmd, "schedule") { known = true }
     if str_eq(cmd, "logs") or str_eq(cmd, "jobs") or str_eq(cmd, "check") or str_eq(cmd, "config") or str_eq(cmd, "ask") { known = true }
+    if str_eq(cmd, "groups") or str_eq(cmd, "compact") { known = true }
     if known == false {
         string_free(cfg)
         return usage()
@@ -499,7 +598,11 @@ fn main() -> i32 {
         code = cmd_ask(ag, h, a, string_view(q))
         string_free(q)
     }
-    if str_eq(cmd, "run") { code = cmd_run(ag, h, sp, arg) }
+    if str_eq(cmd, "run") {
+        if group_arg.len > 0 { code = cmd_run_group(ag, h, sp, group_arg) } else { code = cmd_run(ag, h, sp, arg) }
+    }
+    if str_eq(cmd, "groups") { code = cmd_groups(ag) }
+    if str_eq(cmd, "compact") { code = cmd_compact(ag, h) }
     if str_eq(cmd, "schedule") { code = cmd_schedule(ag, h, sp, arg) }
     if str_eq(cmd, "serve") {
         // `serve` consumes the agent (it moves into the handlers' cell).

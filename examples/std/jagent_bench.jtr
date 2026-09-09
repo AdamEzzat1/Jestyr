@@ -455,9 +455,147 @@ fn main() -> i32 {
         i = i + 1
     }
     report("logs of one job, filtered from 1000 records", n_ask, time.read_nanos(clk) - t13, "us", 1000)
+    let t14: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_ask {
+        var ans2: String = string_new()
+        jagent_ops.ask(oa, h, a, "what failed", ans2)
+        string_free(ans2)
+        i = i + 1
+    }
+    report("ask \"what failed\", 50 jobs over 1000 records (last pointers)", n_ask, time.read_nanos(clk) - t14, "us", 1000)
+    let t15: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_ask {
+        var ans3: String = string_new()
+        jagent_ops.ask(oa, h, a, "what is risky", ans3)
+        string_free(ans3)
+        i = i + 1
+    }
+    report("ask \"what is risky\", 50 jobs over 1000 records (the risk rules)", n_ask, time.read_nanos(clk) - t15, "us", 1000)
+    let t16: i64 = time.read_nanos(clk)
+    i = 0
+    for i < 10 {
+        var ans4: String = string_new()
+        jagent_ops.ask(oa, h, a, "what failed recently", ans4)
+        string_free(ans4)
+        i = i + 1
+    }
+    report("ask \"what failed recently\" (the last 20 of 1000 records rendered and filtered)", 10, time.read_nanos(clk) - t16, "us", 1000)
     jagent.free(oa)
     string_free(ops_cfg)
     string_free(big)
+
+    // ---- v3: the http-check, the token's cost, a group, retention ----
+    print_str("-- v3 --")
+    // An http-check against this process's own plaintext server, driven between checks
+    // from a spawned thread's point of view... which this single-threaded bench cannot do
+    // for a BLOCKING client. So the check's cost is measured against `std/httpd` served
+    // by a second agent on the same thread? No: `run_job` blocks in `read_response`. The
+    // honest measurement here is the CHEAP half — the URL parse and the connect refusal
+    // — and the docs quote the suite's round trip for the rest.
+    var hc: jagent.Agent = jagent.make(a, time.host(), quiet_logger())
+    jagent.load_text(hc, "hc.ini", "[job.down]\nkind = http-check\nurl = http://127.0.0.1:1/health\ntimeout_ms = 1000\n")
+    let n_hc: i64 = 20
+    let t17: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_hc {
+        jagent.run_job(hc, sp, clk, "down")
+        i = i + 1
+    }
+    report("http-check, connection refused (parse + dial + refusal), unrecorded", n_hc, time.read_nanos(clk) - t17, "us", 1000)
+    jagent.free(hc)
+
+    // The token gate: `/health` with and without a configured token, same server, kept alive.
+    var ta: jagent.Agent = jagent.make(a, time.host(), quiet_logger())
+    jagent.load_text(ta, "t.ini", "[agent]\ntoken = s3cret-token\nstore = zz_jagent_bench/history.db\n[job.only]\ncommand = echo one\n")
+    var tcell: *mut jagent.Agent = alloc(jagent.Agent, 1)
+    unsafe { (tcell + 0).* = ta }
+    var tctx: *mut jagent.Serve = jagent.serve_ctx(tcell, sysproc.host(), time.host())
+    var tnet: sysnet.Net = sysnet.host()
+    var tsv: httpd.Server = httpd.make(a, time.host(), quiet_logger(), false, 4, 8192)
+    httpd.start(tsv, tnet, sysnet.loopback(0), 8)
+    jagent.install(tsv, tctx)
+    let taddr: sysnet.SocketAddr = sysnet.loopback(httpd.port(tsv))
+    var tcl: httpc.Client = httpc.dial(tnet, taddr, JB_CAP)
+    let t18: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_http {
+        httpc.request(tcl, "GET", "/jobs", "Authorization: Bearer s3cret-token\r\n", "")
+        var rounds3: i64 = 0
+        for answered(tcl, 0) == false and rounds3 < 1000 {
+            httpd.serve_for(tsv, tnet, 1)
+            rounds3 = rounds3 + 1
+        }
+        httpc.read_response(tcl)
+        i = i + 1
+    }
+    report("GET /jobs with the bearer token (constant-time compare + routing), kept-alive", n_http, time.read_nanos(clk) - t18, "us", 1000)
+    let t19: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_http {
+        httpc.request(tcl, "GET", "/jobs", "", "")
+        var rounds4: i64 = 0
+        for answered(tcl, 0) == false and rounds4 < 1000 {
+            httpd.serve_for(tsv, tnet, 1)
+            rounds4 = rounds4 + 1
+        }
+        httpc.read_response(tcl)
+        i = i + 1
+    }
+    report("GET /jobs refused 401 (no token), kept-alive", n_http, time.read_nanos(clk) - t19, "us", 1000)
+    httpc.hangup(tcl)
+    httpd.stop(tsv, tnet)
+    httpd.free(tsv)
+    sysnet.shutdown(tnet)
+    var tback: jagent.Agent = unsafe { (tcell + 0).* }
+    jagent.free(tback)
+    jagent.free_serve(tctx)
+    free_ptr(tcell as *mut u8)
+
+    // A group of five trivial jobs, and retention over a store kept at fifty runs.
+    var ga: jagent.Agent = jagent.make(a, time.host(), quiet_logger())
+    jagent.load_text(ga, "g.ini", "[agent]\nstore = zz_jagent_bench/group.db\nhistory_max_runs = 50\ncompact_after_dead_bytes = 4096\n[job.a]\ncommand = exit 0\n[job.b]\ncommand = exit 0\n[job.c]\ncommand = exit 0\n[job.d]\ncommand = exit 0\n[job.e]\ncommand = exit 0\n[group.five]\njobs = a, b, c, d, e\n")
+    jagent.open_store(ga, h)
+    let t20: i64 = time.read_nanos(clk)
+    var gs: String = string_new()
+    jagent.run_group(ga, sp, clk, "five", gs)
+    string_free(gs)
+    report("run group of five trivial command jobs (five runs, five records)", 5, time.read_nanos(clk) - t20, "ms", 1000000)
+    // Fill past the bound, then measure what `maintain` costs when it prunes and compacts.
+    i = 0
+    for i < 12 {
+        var gs2: String = string_new()
+        jagent.run_group(ga, sp, clk, "five", gs2)
+        string_free(gs2)
+        i = i + 1
+    }
+    let t21: i64 = time.read_nanos(clk)
+    let mt: jagent.Maint = jagent.maintain(ga, h)
+    let t_m: i64 = time.read_nanos(clk) - t21
+    var ms: String = string_new()
+    string_push(ms, "maintain over 65 runs with max=50: pruned=")
+    push_num(ms, mt.pruned)
+    string_push(ms, " compacted=")
+    if mt.compacted { string_push(ms, "true") } else { string_push(ms, "false") }
+    string_push(ms, " reclaimed=")
+    push_num(ms, mt.reclaimed)
+    string_push(ms, " bytes in ")
+    push_num(ms, t_m / 1000)
+    string_push(ms, " us; runs now ")
+    push_num(ms, jagent.history_runs(ga))
+    print_str(string_view(ms))
+    string_free(ms)
+    let t22: i64 = time.read_nanos(clk)
+    i = 0
+    for i < 100 {
+        jagent.maintain(ga, h)
+        i = i + 1
+    }
+    report("maintain with nothing to do (the check every serve round pays)", 100, time.read_nanos(clk) - t22, "us", 1000)
+    jagent.free(ga)
+    fs.erase(h, "zz_jagent_bench/group.db")
+    fs.erase(h, "zz_jagent_bench/group.db.compact")
 
     string_free(cfg)
     scrub(h, a)

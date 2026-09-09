@@ -382,6 +382,9 @@ pub fn free(mut ag: Agent) {
     }
 }
 
+// The wall clock as the agent reads it — the seconds a record's `started_at` is compared to.
+pub fn wall_now(read ag: Agent) -> i64 { return ag.wall() }
+
 // Replace the wall clock. A transcript that must not depend on the calendar installs a
 // function returning a constant.
 @no_alloc @no_os pub fn set_wall(mut ag: Agent, f: fn() -> i64) {

@@ -8,7 +8,18 @@ defects — one session at a time). §2 is the parallel work (library breadth �
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1377 passed / 0 failed / 3 ignored** (full ladder after the BEARER TOKEN on `jagent`'s API —
+**1375 passed / 2 failed / 3 ignored** (full ladder after JAGENT V3 — `std/httpds` (httpd over
+TLS), the v3 runner and the operator's layer; `jagent_test` 20, `jagent_ops_test` 13 inside
+`io_suites_pass`; 698 s. Both failures are LOAD flakes in modules this pass did not touch, and
+both passed together on a rerun (3 s): `kv_durable::jstate_survives_a_torn_batch` — `kv_demo`'s
+`compact` came back `-1`, the `rename_replace`-over-a-just-closed-file family recorded below,
+its second sighting on this branch and still undiagnosable because the `catch` drops the
+errno — and the recorded known flake `jstatus_serves_a_connection_without_starving_its_timers`
+(the timer step printed `false`), whose own discriminator is repetition on a quiet machine, not
+isolation. The ladder before it, on the same tree, failed `jc_build_matrix` on the port defect
+recorded in §2b (a local named `served`) and `jplugin`'s ceiling; the rename fixed the first.
+A third full ladder was started after the rerun; its count belongs here when it lands.)
+Previously **1377 passed / 0 failed / 3 ignored** (full ladder after the BEARER TOKEN on `jagent`'s API —
 `jagent_test` 14, `jagent_ops_test` 12 inside `io_suites_pass`, `config.value_is_ct`; 1050 s,
 fully green, the two flakes of the previous run not seen.) Previously
 **1375 passed / 2 failed / 3 ignored** (full ladder after the PROJECT SHAPE — `std/jagent_ops`,
@@ -1080,9 +1091,49 @@ test and the plan pinned. What a successor should not re-derive:
   The test's client runs on a `spawn`ed thread with plain-integer arguments, `tls_test`'s
   shape; the plaintext-at-the-TLS-port control proves the listener is not the plain one.
   Untested on Linux: the `timeval` layout is asserted, not measured.
+* **v3 (2026-09-09, after TLS)**: http-check, cwd/env, retries, groups, retention, the risk
+  rules. What a successor should not re-derive:
+  - **`str.count_of` asserts on multi-byte text**: it slices at byte offsets. A fault
+    message with an ellipsis (`…`) crashed `load_text` at the count of `error[` markers —
+    an afternoon. Runtime strings in `jagent.jtr` are ASCII; comments may hold anything.
+    The weakness belongs to `std/str` and is not fixed there.
+  - **A never-pushed `String` views as a str no slice may touch**, even `[0 .. 0]` — the
+    runtime's boundary check refuses a null base. Guard `s.len == 0` before slicing a
+    value that may be a fresh `string_new()`.
+  - **The bench cannot measure a blocking http-check against a server on its own thread**
+    (`run_job` blocks in `read_response`); the suite's probe server on a `spawn`ed thread is
+    the round trip, the bench measures the connect refusal.
+  - **Exposure is counted ONCE, on the `risk:` line.** The `http:` and `auth:` lines state
+    facts; the tags carry the count, and `ask "what is risky"` speaks the same tags — one
+    vocabulary, `risk_tags`.
+  - **An http-check keeps its URL in the command column** (`job_url` = `job_command`), so
+    the table did not grow a column for one kind; the kind decides how the column reads.
+  - **Retention never deletes a job's latest** (`is_latest_of_any`), so a `last:` pointer
+    cannot dangle and `status` never says "missing record"; the count may exceed the bound
+    by at most the number of jobs. `seq` is a counter: `maintain` does not touch it.
+  - **The retry test's attempt-dependent command is `(mkdir D && exit 3) || echo again`**:
+    `mkdir` fails the second time in BOTH shells, and `exit` inside the group ends the shell
+    with 3 in both. The cwd test's is `type marker.txt || cat marker.txt` (cmd has `type`,
+    sh has `cat`); the env test's is `echo %V%$V` (each shell expands its own spelling).
 * Not built: `--format json` (hand-rolled argv; text is the contract), a `bench` subcommand,
   an installer, an SCM entry point (`docs/jagent-windows-service.md` lists what one needs),
-  non-blocking TLS / keep-alive over TLS, token scopes. The Linux ladder has not run any of it.
+  non-blocking TLS / keep-alive over TLS, token scopes, a resolver, https checks, a group
+  record, age-based retention. The Linux ladder has not run any of it.
+
+#### A port defect the edge agent exposed (2026-09-09) — OPEN, worked around
+
+**The self-hosted compiler's cross-module collision rename reaches a LOCAL.** `httpd` and
+`httpds` both export `fn served(...)`; `httpd.build_exchange_from` had a parameter also
+called `served`. Under `jc build` the parameter's USES were rewritten to `j_served__m3`
+while its declaration stayed `j_served` — `'j_served__m3' undeclared` from gcc — and the
+build matrix reported `FAIL jagent_cli` / `FAIL jagent_bench` (the two programs whose
+closure holds both modules). The reference compiler is unaffected, so this is an
+acceptance divergence: `jestyrc` builds what `jc` cannot. Worked around by naming the
+parameter `answered`; NOT fixed in `cgen.jtr`'s `ml_*` loader. Minimal repro: two modules
+each exporting `pub fn served() -> i64`, a third importing both, and any function in one
+of them with a parameter or local named `served`. The rename must be scoped to item
+names, or the local must shadow. `jplugin`'s 6 s ceiling flaked a THIRD time on the same
+ladder (1375/2/3 in 695 s); it has now flaked on three of four ladders this branch ran.
 
 ### Compiler defects and gaps — OPEN
 
@@ -1110,7 +1161,19 @@ test and the plan pinned. What a successor should not re-derive:
 
 `jstatus_serves_a_connection_without_starving_its_timers`: 1ms timer, 500ms budget. Use
 repetition on a quiet machine; "passes in isolation" is the wrong discriminator; do not
-widen the deadline.
+widen the deadline. Seen again on the jagent v3 ladder (2026-09-09): the step `the timer
+fired, not the socket` printed `false` under a full ladder's load. `sysnet_demo` and the poll
+loop in `std/sysnet` are unchanged since `a935310`, which only ADDED `set_io_timeout`.
+
+`kv_durable::jstate_survives_a_torn_batch` (NEW, 2026-09-09): `kv_demo`'s `compact` printed
+`-1` on the same ladder. The demo's `catch 0 - 1` maps EVERY error to `-1`, so the transcript
+cannot say which; the path already seen is `swap_in`'s `rename_replace` of the rewritten file
+over the just-closed store, which `kv.compact` catches into `swapped = false` and reports as
+`KvFailed(-1)` — the same errno-dropping `catch` that `std/kv_test`'s migration flaked through
+on the project-shape ladder. Two sightings, two entry points, one primitive. The step is the
+one already named there: carry the errno through so a Windows sharing violation can be told
+from anything else. Green on a rerun in 3 s, which for this family means nothing more than
+"the indexer was not looking".
 
 ### Verification owed to a machine not in reach
 

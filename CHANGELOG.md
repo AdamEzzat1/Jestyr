@@ -7,6 +7,35 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`jagent` v3: http-check jobs, cwd and env, retries, groups, retention, a risk-aware
+  `doctor` and a wider `ask`.** The runner (`std/jagent`): `kind = http-check` (a GET through
+  `std/httpc`, success when the status is `expect_status`, the socket bounded by `timeout_ms`,
+  `http://<ipv4-or-localhost>` only — no resolver in the tree, https refused rather than
+  checked in plaintext); `cwd` and one `env` `NAME=value` on a command job
+  (`sysproc.start_piped_at`'s contract); `retries` (0..10) with `backoff_ms` as ONE record
+  carrying `attempts` (spelled only when > 1, so every transcript held); `[group.NAME]` with
+  `jobs = a, b, c` run in order, each its own record, never confused with a job;
+  `history_max_runs` pruning the oldest records but never a job's latest, `seq` never reused,
+  `compact_after_dead_bytes` compacting through `kv.compact`, `maintain` after every run and
+  serve round, `compact_now` for the command. The operator layer (`std/jagent_ops`): the
+  doctor gained `source=`, `groups=`, `dead_bytes=`, a `history:` line, a `jobs:` line and a
+  `risk:` line that is now the ONE place exposure is counted (`remote-bind-without-token`,
+  `token-in-the-clear`, `tls-incomplete`, `never-run:<job>`, `scheduled-never-ran:<job>`,
+  `last-run-failed:<job>`, `scheduled-last-failed:<job>`, `stale:<job>` — a success more than
+  two intervals old — `history-over-max`, `compaction-due`); `ask` answers *what failed
+  recently* (from the records), *what is stale*, *what is risky*, *what changed after reload*,
+  and *how did `<group>` go* / *what failed in* / *what never ran in* a group, still without a
+  spawner and still from the record only (`after N attempts` when the record says so). The
+  command: `run group <name>`, `groups`, `compact`, the upkeep on stderr. Tests:
+  `jagent_test` 15 → 20 (a probe server on a spawned thread for the http-check, a listener
+  that never answers for the timeout, cwd/env with their controls, success after a retry
+  against a first-attempt failure, groups running every member, retention keeping the only
+  run of a job and continuing the counter), `jagent_ops_test` 12 → 13, the CLI test runs a
+  group, prunes and compacts past a bound of two, and asks about the group. Found on the way:
+  `str.count_of` slices at byte offsets and asserts on a multi-byte character; a never-pushed
+  `String` views as a str no slice may touch. Not built: a resolver, https checks, a group
+  record, age-based retention, concurrency.
+
 - **`std/httpds` — `std/httpd` over TLS, and `jagent serve` speaks it.** A module of its
   own so that only a program that wants TLS links OpenSSL. `std/tls` blocks and `httpd` is a
   poll loop, so a TLS connection is served WHOLE on the calling thread — accept, handshake,

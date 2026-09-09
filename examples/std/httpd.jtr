@@ -964,11 +964,17 @@ fn build_exchange(mut sv: Server, i: usize, read req: http.Request, nhs: usize, 
     return build_exchange_from(sv, c.buf, c.have, req, nhs, streamed, c.fd, c.served, null, &no_write)
 }
 
-// The exchange over bytes at `buf[0 .. have]`, whatever transport they came by. `served` is
-// how many requests the connection has answered before this one (the keep-alive bound);
+// The exchange over bytes at `buf[0 .. have]`, whatever transport they came by. `answered`
+// is how many requests the connection has answered before this one (the keep-alive bound);
 // `wctx`/`wfn` the transport hook, null for the descriptor.
+//
+// (The parameter is not called `served`: `httpd.served` and `httpds.served` are two exports
+// of one spelling, and the self-hosted compiler's collision rename reaches a LOCAL of that
+// name at its uses but not its declaration — `j_served__m3` undeclared. Recorded in the
+// Tier 5 next-handoff note as a port defect with this as its repro; the reference
+// compiler is unaffected.)
 fn build_exchange_from(mut sv: Server, buf: *mut u8, have: usize, read req: http.Request, nhs: usize, streamed: i64,
-                       fd: i64, served: i64, wctx: *mut u8, wfn: fn(*mut u8, read []u8) -> bool) -> Exchange {
+                       fd: i64, answered: i64, wctx: *mut u8, wfn: fn(*mut u8, read []u8) -> bool) -> Exchange {
     let b: []u8 = slice(u8, buf, have)
     let hs: []http.Header = slice(http.Header, sv.hs, nhs)
 
@@ -985,7 +991,7 @@ fn build_exchange_from(mut sv: Server, buf: *mut u8, have: usize, read req: http
     }
 
     var keep: bool = wants_keep_alive(b, hs, req)
-    if served + 1 >= sv.max_requests { keep = false }
+    if answered + 1 >= sv.max_requests { keep = false }
 
     let pv: str = string_view(sv.r.pats)
     return Exchange{ buf: buf, have: have, req: req, hs: sv.hs, nhs: nhs,
@@ -1022,7 +1028,7 @@ fn plain_via(mut sv: Server, wctx: *mut u8, wfn: fn(*mut u8, read []u8) -> bool,
 // Answer ONE request that arrived through ANOTHER transport — `std/httpds` reads TLS records
 // into its own buffer and hands the bytes here. `b` is what has arrived so far; `fd` is the
 // descriptor for the access log's sake only (nothing is read from or written to it); every
-// response byte goes through `wfn(wctx, …)`; `served` is how many requests this connection
+// response byte goes through `wfn(wctx, …)`; `answered` is how many requests this connection
 // has answered before, for the keep-alive bound; `full` says the caller's buffer can grow no
 // further, so an incomplete message is refused rather than waited for; `close` forces
 // `Connection: close` on the answer. `consumed` is how
@@ -1031,7 +1037,7 @@ fn plain_via(mut sv: Server, wctx: *mut u8, wfn: fn(*mut u8, read []u8) -> bool,
 // whole: a route registered with a body sink is answered from the buffer, its sink not
 // consulted, and a body over `max_body` is 413 as on the descriptor path.
 pub fn answer_bytes(mut sv: Server, read b: []u8, fd: i64, wctx: *mut u8, wfn: fn(*mut u8, read []u8) -> bool,
-                    served: i64, full: bool, close: bool) -> Answered {
+                    answered: i64, full: bool, close: bool) -> Answered {
     var ans: Answered = Answered{ consumed: 0, keep: false, status: 0 }
     if b.len == 0 { return ans }
     var hs: []http.Header = slice(http.Header, sv.hs, HTTPD_HEADERS)
@@ -1083,7 +1089,7 @@ pub fn answer_bytes(mut sv: Server, read b: []u8, fd: i64, wctx: *mut u8, wfn: f
         return ans
     }
     let t0: i64 = time.read_nanos(sv.clock)
-    var x: Exchange = build_exchange_from(sv, b.ptr as *mut u8, b.len, req, req.headers, 0, fd, served, wctx, wfn)
+    var x: Exchange = build_exchange_from(sv, b.ptr as *mut u8, b.len, req, req.headers, 0, fd, answered, wctx, wfn)
     // `close` forces `Connection: close` on the answer — a transport that serves one
     // request per connection says so on the wire rather than leaving the client to find out.
     if close { x.keep_alive = false }

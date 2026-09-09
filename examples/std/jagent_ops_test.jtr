@@ -208,20 +208,24 @@ fn agent_with_history(read a: Allocator, mut h: fs.Fs) -> jagent.Agent {
     var r: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, JO_CFG, true)
     let t: str = jagent_ops.report_text(r)
     test.is_true(c, rep, "ok", jagent_ops.is_ok(r))
-    test.eq_i64(c, rep, "no warnings", jagent_ops.warnings(r), 0)
+    // Two warnings: the risk rules say two jobs have never run. A warning is not an error.
+    test.eq_i64(c, rep, "two risks, both never-run", jagent_ops.warnings(r), 2)
     test.eq_i64(c, rep, "no errors", jagent_ops.errors(r), 0)
-    test.is_true(c, rep, "the configuration line", str.has_prefix(t, "config: ok path=zz_jagent_ops/agent.ini jobs=2\n"))
+    test.is_true(c, rep, "the configuration line", str.has_prefix(t, "config: ok path=zz_jagent_ops/agent.ini source=flag jobs=2 groups=0\n"))
     test.is_true(c, rep, "the store is absent and NOT created", has_text(t, "\nstore: ok path=zz_jagent_ops/history.db present=false note=created-by-the-first-run\n"))
     test.is_false(c, rep, "really not created", fs.present(h, JO_STORE))
-    test.is_true(c, rep, "the probes ran and were reaped", has_text(t, "\nsysproc: ok spawn=true timeout=true tree_reaped=true children=2\n"))
+    test.is_true(c, rep, "the history against its policy", has_text(t, "\nhistory: ok runs=0 max=0 dead_bytes=0 compact_after=0\n"))
+    test.is_true(c, rep, "the probes ran and were reaped", has_text(t, "\nsysproc: ok spawn=true timeout=true tree_reaped=true children=2 cwd=supported env=supported\n"))
     test.is_true(c, rep, "the address bound", has_text(t, "\nhttp: ok host=127.0.0.1 port=0 bound="))
-    test.is_false(c, rep, "with no warning on loopback", has_text(t, "warning="))
+    test.is_false(c, rep, "with no remote tag on loopback", has_text(t, "remote"))
     test.is_true(c, rep, "tls stated", has_text(t, "\ntls: supported requested=false\n"))
     test.is_true(c, rep, "auth stated", has_text(t, "\nauth: missing risk=local-only\n"))
     test.is_true(c, rep, "the watcher opened", has_text(t, "\nreload: ok watched=true dir=zz_jagent_ops\n"))
     test.is_true(c, rep, "the schedule counted", has_text(t, "\nschedule: ok scheduled=0 of=2\n"))
-    test.is_true(c, rep, "the limits", has_text(t, "\nlimits: kinds=command concurrency=none preview_bytes=240\n"))
-    test.is_true(c, rep, "the result line", str.has_suffix(t, "\nresult: ok warnings=0 errors=0\n"))
+    test.is_true(c, rep, "the job table by kind", has_text(t, "\njobs: ok command=2 http-check=0 groups=0 retrying=0\n"))
+    test.is_true(c, rep, "the limits", has_text(t, "\nlimits: kinds=command,http-check concurrency=none tls=one-request-per-connection preview_bytes=240\n"))
+    test.is_true(c, rep, "the risks, tagged", has_text(t, "\nrisk: warn count=2 never-run:health-check never-run:rotate-log\n"))
+    test.is_true(c, rep, "the result line", str.has_suffix(t, "\nresult: ok warnings=2 errors=0\n"))
     test.eq_str(c, rep, "no faults", jagent_ops.report_faults(r), "")
     test.eq_i64(c, rep, "two children, both accounted", jagent_ops.probe_children(r), 2)
     test.eq_i64(c, rep, "both trees reaped", jagent_ops.probe_reaped(r), 2)
@@ -232,10 +236,12 @@ fn agent_with_history(read a: Allocator, mut h: fs.Fs) -> jagent.Agent {
     jagent.free(ag)
     var r2: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, JO_CFG, false)
     let t2: str = jagent_ops.report_text(r2)
-    test.is_true(c, rep, "present, synced, two runs", has_text(t2, "\nstore: ok path=zz_jagent_ops/history.db present=true synced=true runs=2\n"))
+    test.is_true(c, rep, "present, synced, two runs", has_text(t2, "\nstore: ok path=zz_jagent_ops/history.db present=true synced=true runs=2 dead_bytes="))
     test.is_true(c, rep, "no probes when asked not to", has_text(t2, "\nsysproc: skipped reason=no-probes\n"))
     test.eq_i64(c, rep, "and nothing was started", sysproc.started(sp), 2)
     test.is_true(c, rep, "still ok", jagent_ops.is_ok(r2))
+    test.is_true(c, rep, "with the history read: rotate-log never ran, health-check did", has_text(t2, "\nrisk: warn count=1 never-run:rotate-log\n"))
+    test.is_false(c, rep, "the store was closed again", fs.present(h, "zz_jagent_ops/history.db.compact"))
 
     scrub(h, a)
     let ok: bool = test_report.finish(c, rep)
@@ -298,14 +304,14 @@ fn agent_with_history(read a: Allocator, mut h: fs.Fs) -> jagent.Agent {
     var ro: fs.Fs = fs.read_only()
     var r: jagent_ops.Report = jagent_ops.doctor(a, ro, sp, blk, JO_CFG, false)
     let t: str = jagent_ops.report_text(r)
-    test.is_true(c, rep, "the configuration still loads", str.has_prefix(t, "config: ok path=zz_jagent_ops/agent.ini jobs=2\n"))
+    test.is_true(c, rep, "the configuration still loads", str.has_prefix(t, "config: ok path=zz_jagent_ops/agent.ini source=flag jobs=2 groups=0\n"))
     test.is_true(c, rep, "the store cannot open", has_text(t, "\nstore: fail path=zz_jagent_ops/history.db reason=cannot-open\n"))
     test.is_false(c, rep, "so the result fails", jagent_ops.is_ok(r))
     test.eq_i64(c, rep, "one error", jagent_ops.errors(r), 1)
 
     // The control: the same file through the real handle.
     var r2: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, JO_CFG, false)
-    test.is_true(c, rep, "opens and syncs through a writable handle", has_text(jagent_ops.report_text(r2), "\nstore: ok path=zz_jagent_ops/history.db present=true synced=true runs=2\n"))
+    test.is_true(c, rep, "opens and syncs through a writable handle", has_text(jagent_ops.report_text(r2), "\nstore: ok path=zz_jagent_ops/history.db present=true synced=true runs=2 dead_bytes="))
     test.is_true(c, rep, "ok", jagent_ops.is_ok(r2))
 
     // A store whose directory does not exist: not created, reported.
@@ -336,16 +342,16 @@ fn agent_with_history(read a: Allocator, mut h: fs.Fs) -> jagent.Agent {
 
     var r: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, "zz_jagent_ops/open.ini", false)
     let t: str = jagent_ops.report_text(r)
-    test.is_true(c, rep, "the bind is every interface, and warned", has_text(t, "\nhttp: ok host=0.0.0.0 port=0 bound="))
-    test.is_true(c, rep, "with the reason", has_text(t, " warning=remote-bind-unauthenticated\n"))
+    test.is_true(c, rep, "the bind is every interface", has_text(t, "\nhttp: ok host=0.0.0.0 port=0 bound="))
     test.is_true(c, rep, "and auth names the exposure", has_text(t, "\nauth: missing risk=remote-exposed\n"))
-    test.eq_i64(c, rep, "two warnings", jagent_ops.warnings(r), 2)
+    test.is_true(c, rep, "the risk line names it once, with the job that never ran", has_text(t, "\nrisk: warn count=2 remote-bind-without-token never-run:health-check\n"))
+    test.eq_i64(c, rep, "two warnings, counted on the risk line and nowhere else", jagent_ops.warnings(r), 2)
     test.is_true(c, rep, "still ok: a warning is not an error", jagent_ops.is_ok(r))
     test.is_true(c, rep, "the result says so", str.has_suffix(t, "\nresult: ok warnings=2 errors=0\n"))
 
-    // The control: loopback carries neither.
+    // The control: loopback carries no exposure — only the two jobs that never ran.
     var r2: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, JO_CFG, false)
-    test.eq_i64(c, rep, "loopback: no warnings", jagent_ops.warnings(r2), 0)
+    test.eq_i64(c, rep, "loopback: the never-run risks only", jagent_ops.warnings(r2), 2)
     test.is_false(c, rep, "and no exposure", has_text(jagent_ops.report_text(r2), "remote"))
 
     var r3: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, "zz_jagent_ops/tls.ini", false)
@@ -388,9 +394,9 @@ fn agent_with_history(read a: Allocator, mut h: fs.Fs) -> jagent.Agent {
     var r: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, "zz_jagent_ops/token.ini", false)
     let t: str = jagent_ops.report_text(r)
     test.is_true(c, rep, "bound on every interface", has_text(t, "\nhttp: ok host=0.0.0.0 port=0 bound="))
-    test.is_false(c, rep, "without the warning", has_text(t, "warning="))
     test.is_true(c, rep, "auth is present, with its exemption named", has_text(t, "\nauth: present kind=bearer exempt=GET/health\n"))
-    test.eq_i64(c, rep, "no warnings", jagent_ops.warnings(r), 0)
+    test.is_true(c, rep, "the risk is the token in the clear, not an open bind", has_text(t, "\nrisk: warn count=2 token-in-the-clear never-run:health-check\n"))
+    test.eq_i64(c, rep, "two warnings", jagent_ops.warnings(r), 2)
     test.is_true(c, rep, "ok", jagent_ops.is_ok(r))
     test.is_false(c, rep, "and the secret is not in the report", has_text(t, "s3cret"))
     // The control: the same bind without a token, two warnings.
@@ -429,6 +435,106 @@ fn agent_with_history(read a: Allocator, mut h: fs.Fs) -> jagent.Agent {
     return ok
 }
 
+const JO_V3: str = "[agent]\nstore = zz_jagent_ops/history.db\n[job.health-check]\ncommand = echo healthy\n[job.rotate-log]\ncommand = echo rotated\n[job.flaky]\ncommand = exit 3\n[job.beat]\ncommand = echo beat\ninterval_ms = 1000\n[group.daily]\njobs = health-check, flaky\n"
+
+fn fixed_wall() -> i64 { return 1700000000 }
+fn late_wall() -> i64 { return 1700005000 }
+
+@test fn ask_knows_groups_risks_staleness_and_reloads() -> bool {
+    var raw: *mut u8 = alloc(u8, JO_CAP)
+    var rep: []u8 = slice(u8, raw, JO_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    fs.put(h, JO_CFG, JO_V3)
+    var ag: jagent.Agent = agent_with(a, JO_V3)
+    jagent.set_wall(ag, &fixed_wall)
+    jagent.open_store(ag, h)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+    jagent.run_job(ag, sp, blk, "health-check")
+    jagent.run_job(ag, sp, blk, "flaky")
+
+    var s: String = string_new()
+    test.eq_i64(c, rep, "a group is asked about", jagent_ops.ask(ag, h, a, "how did daily go?", s) as i64, jagent_ops.ASK_ANSWERED as i64)
+    test.eq_str(c, rep, "every member's last run, the counts, the next action",
+        string_view(s),
+        "Group daily: 2 jobs; 1 succeeded last time, 1 failed, 0 never ran.\nhealth-check last succeeded (run #1).\nflaky last failed: failure, exit code 3 (run #2).\nRecommended next action: jagent logs flaky\n")
+    string_free(s)
+    s = string_new()
+    jagent_ops.ask(ag, h, a, "what failed in daily", s)
+    test.eq_str(c, rep, "only the failed member", string_view(s), "Group daily: 2 jobs; 1 succeeded last time, 1 failed, 0 never ran.\nflaky last failed: failure, exit code 3 (run #2).\nRecommended next action: jagent logs flaky\n")
+    string_free(s)
+    s = string_new()
+    jagent_ops.ask(ag, h, a, "what never ran in daily", s)
+    test.eq_str(c, rep, "nothing never ran in it", string_view(s), "Group daily: 2 jobs; 1 succeeded last time, 1 failed, 0 never ran.\nEvery member has run at least once.\nRecommended next action: jagent logs flaky\n")
+    string_free(s)
+
+    s = string_new()
+    test.eq_i64(c, rep, "risks", jagent_ops.ask(ag, h, a, "what is risky", s) as i64, jagent_ops.ASK_ANSWERED as i64)
+    test.eq_str(c, rep, "in rule order, then job order, from the record",
+        string_view(s),
+        "3 risks:\n- rotate-log has never run.\n- flaky's last run failed.\n- beat is scheduled and has never run.\nRecommended next action: jagent logs flaky\n")
+    string_free(s)
+    s = string_new()
+    jagent_ops.ask(ag, h, a, "what is stale", s)
+    test.eq_str(c, rep, "the scheduled job that never ran is the stale one", string_view(s), "- beat is scheduled and has never run.\nRecommended next action: jagent logs flaky\n")
+    string_free(s)
+    s = string_new()
+    jagent_ops.ask(ag, h, a, "what failed recently", s)
+    test.is_true(c, rep, "the failed record among the recent ones", str.has_prefix(string_view(s), "#2 job=flaky status=failure code=3 started_at=1700000000 duration_ms="))
+    test.is_true(c, rep, "with its error, counted", str.has_suffix(string_view(s), " out_bytes=0 output=\"\" error=\"exit code 3\"\n1 failure in the last 2 runs, oldest first.\nRecommended next action: jagent logs flaky\n"))
+    test.is_false(c, rep, "and not the success", has_text(string_view(s), "job=health-check"))
+    string_free(s)
+    s = string_new()
+    jagent_ops.ask(ag, h, a, "what should I check next", s)
+    test.eq_str(c, rep, "`next` outranks `check`", string_view(s), "Recommended next action: jagent logs flaky\n")
+    string_free(s)
+    s = string_new()
+    jagent_ops.ask(ag, h, a, "what changed after reload", s)
+    test.eq_str(c, rep, "the generation and what applied", string_view(s), "Configuration zz_jagent_ops/agent.ini is at generation 1 after 1 load, 0 rejected.\nThe last load applied: 4 jobs, 1 group. A reload resets every schedule; the next scheduled run is one interval after it.\n")
+    string_free(s)
+    jagent.load_text(ag, JO_CFG, "[job.x]\ncommand = echo x\ntimeout_ms = soon\n")
+    s = string_new()
+    jagent_ops.ask(ag, h, a, "what changed after reload", s)
+    test.is_true(c, rep, "a rejected reload is reported with its faults", str.has_prefix(string_view(s), "Configuration zz_jagent_ops/agent.ini is at generation 1 after 2 loads, 1 rejected.\nThe last load was rejected with 1 fault; the configuration in force is the previous one:\n"))
+    test.is_true(c, rep, "the fault itself", has_text(string_view(s), "not an integer"))
+    test.is_true(c, rep, "and the way out", str.has_suffix(string_view(s), "\nRecommended next action: jagent config validate\n"))
+    string_free(s)
+    s = string_new()
+    test.eq_i64(c, rep, "compacting is an action, refused", jagent_ops.ask(ag, h, a, "compact the history", s) as i64, jagent_ops.ASK_REFUSED as i64)
+    test.eq_i64(c, rep, "and nothing moved", jagent.last_seq(ag), 2)
+    string_free(s)
+
+    // The doctor on the same configuration and history: the risk line, the job table.
+    var r: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, JO_CFG, false)
+    let t: str = jagent_ops.report_text(r)
+    test.is_true(c, rep, "the doctor counts the groups", str.has_prefix(t, "config: ok path=zz_jagent_ops/agent.ini source=flag jobs=4 groups=1\n"))
+    test.is_true(c, rep, "and the kinds", has_text(t, "\njobs: ok command=4 http-check=0 groups=1 retrying=0\n"))
+    test.is_true(c, rep, "and tags the same three risks", has_text(t, "\nrisk: warn count=3 never-run:rotate-log last-run-failed:flaky scheduled-never-ran:beat\n"))
+    test.eq_i64(c, rep, "as three warnings", jagent_ops.warnings(r), 3)
+
+    // Staleness: beat runs, then the wall moves on by 5000 s — more than two intervals.
+    jagent.run_job(ag, sp, blk, "beat")
+    jagent.set_wall(ag, &late_wall)
+    s = string_new()
+    jagent_ops.ask(ag, h, a, "what is stale", s)
+    test.eq_str(c, rep, "a success two intervals old is stale", string_view(s), "- beat is scheduled and its last success is more than two intervals old.\nRecommended next action: jagent logs flaky\n")
+    string_free(s)
+    jagent.set_wall(ag, &fixed_wall)
+    s = string_new()
+    jagent_ops.ask(ag, h, a, "what is stale", s)
+    test.eq_str(c, rep, "and with the wall back, nothing is — the control", string_view(s), "Nothing scheduled is stale: every scheduled job's last run succeeded within two intervals.\nRecommended next action: jagent logs flaky\n")
+    string_free(s)
+
+    jagent.free(ag)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
 @test fn doctor_measures_the_process_path_rather_than_assuming_it() -> bool {
     var raw: *mut u8 = alloc(u8, JO_CAP)
     var rep: []u8 = slice(u8, raw, JO_CAP)
@@ -443,7 +549,7 @@ fn agent_with_history(read a: Allocator, mut h: fs.Fs) -> jagent.Agent {
     var denied: sysproc.Spawner = sysproc.denied()
     var r: jagent_ops.Report = jagent_ops.doctor(a, h, denied, blk, JO_CFG, true)
     let t: str = jagent_ops.report_text(r)
-    test.is_true(c, rep, "the probe fails", has_text(t, "\nsysproc: fail spawn=false timeout=false tree_reaped=false children=0\n"))
+    test.is_true(c, rep, "the probe fails", has_text(t, "\nsysproc: fail spawn=false timeout=false tree_reaped=false children=0 cwd=supported env=supported\n"))
     test.is_false(c, rep, "and so does the check", jagent_ops.is_ok(r))
     test.eq_i64(c, rep, "one error", jagent_ops.errors(r), 1)
     test.eq_i64(c, rep, "two refusals counted by the spawner", sysproc.refused(denied), 2)
@@ -454,7 +560,7 @@ fn agent_with_history(read a: Allocator, mut h: fs.Fs) -> jagent.Agent {
     let t0: i64 = time.read_nanos(blk)
     var r2: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, JO_CFG, true)
     let spent_ms: i64 = (time.read_nanos(blk) - t0) / 1000000
-    test.is_true(c, rep, "the real path passes", has_text(jagent_ops.report_text(r2), "\nsysproc: ok spawn=true timeout=true tree_reaped=true children=2\n"))
+    test.is_true(c, rep, "the real path passes", has_text(jagent_ops.report_text(r2), "\nsysproc: ok spawn=true timeout=true tree_reaped=true children=2 cwd=supported env=supported\n"))
     test.is_true(c, rep, "the timeout probe did not wait for its sleeper", spent_ms < 3500)
     test.eq_i64(c, rep, "two children", sysproc.started(sp), 2)
 
@@ -563,7 +669,7 @@ fn agent_with_history(read a: Allocator, mut h: fs.Fs) -> jagent.Agent {
 
     var s: String = string_new()
     test.eq_i64(c, rep, "a request to run is refused", jagent_ops.ask(ag, h, a, "please run rm -rf /", s) as i64, jagent_ops.ASK_REFUSED as i64)
-    test.eq_str(c, rep, "with the command the operator would type", string_view(s), "I do not run, change or delete anything. To run a configured job: jagent run <name>. Configured jobs: health-check, rotate-log, flaky.\n")
+    test.eq_str(c, rep, "with the command the operator would type", string_view(s), "I do not run, change or delete anything. To run a configured job: jagent run <name>; a group: jagent run group <name>. Configured jobs: health-check, rotate-log, flaky.\n")
     string_free(s)
     s = string_new()
     test.eq_i64(c, rep, "even for a configured job's name", jagent_ops.ask(ag, h, a, "run health-check now", s) as i64, jagent_ops.ASK_REFUSED as i64)

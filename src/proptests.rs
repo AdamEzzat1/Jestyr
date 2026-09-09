@@ -2975,6 +2975,8 @@ mod jagent_edge {
              use POST to run a job\n\
              GET /metrics\n200\n\
              counter jagent_config_reloads 1\n\
+             counter jagent_history_compactions 0\n\
+             counter jagent_history_pruned 0\n\
              counter jagent_http_requests 7\n\
              counter jagent_http_unauthorized 0\n\
              gauge jagent_jobs 4\n\
@@ -2987,6 +2989,7 @@ mod jagent_edge {
              histogram jagent_run_ms le +Inf 0\n\
              histogram jagent_run_ms sum 0\n\
              histogram jagent_run_ms count 4\n\
+             counter jagent_run_retries 0\n\
              counter jagent_runs_config_error 0\n\
              counter jagent_runs_failure 1\n\
              counter jagent_runs_no_such_job 1\n\
@@ -3323,9 +3326,10 @@ mod jagent_command {
         assert_eq!(code, 0, "{out}{err}");
         assert!(
             out.starts_with(
-                "config: ok path=jagent.ini jobs=1\n\
+                "config: ok path=jagent.ini source=cwd jobs=1 groups=0\n\
                  store: ok path=jagent.db present=false note=created-by-the-first-run\n\
-                 sysproc: ok spawn=true timeout=true tree_reaped=true children=2\n\
+                 history: ok runs=0 max=0 dead_bytes=0 compact_after=0\n\
+                 sysproc: ok spawn=true timeout=true tree_reaped=true children=2 cwd=supported env=supported\n\
                  http: ok host=127.0.0.1 port=0 bound="
             ),
             "{out}"
@@ -3336,23 +3340,64 @@ mod jagent_command {
                  auth: missing risk=local-only\n\
                  reload: ok watched=true dir=.\n\
                  schedule: ok scheduled=0 of=1\n\
-                 limits: kinds=command concurrency=none preview_bytes=240\n\
-                 result: ok warnings=0 errors=0\n"
+                 jobs: ok command=1 http-check=0 groups=0 retrying=0\n\
+                 limits: kinds=command,http-check concurrency=none tls=one-request-per-connection preview_bytes=240\n\
+                 risk: warn count=1 never-run:health-check\n\
+                 result: ok warnings=1 errors=0\n"
             ),
             "{out}"
         );
         assert!(!dir.join("jagent.db").exists(), "doctor must not create the store");
         let (code, out, err) = run_cli(&exe, &dir, &["-c", "bad.ini", "doctor", "--no-probes"]);
         assert_eq!(code, 1);
-        assert!(out.starts_with("config: fail path=bad.ini faults=1\nstore: skipped reason=no-config\nsysproc: skipped reason=no-probes\n"), "{out}");
-        assert!(out.ends_with("result: fail warnings=0 errors=1\n"), "{out}");
+        assert!(out.starts_with("config: fail path=bad.ini faults=1\nstore: skipped reason=no-config\nhistory: skipped reason=no-config\nsysproc: skipped reason=no-probes\n"), "{out}");
+        assert!(out.ends_with("risk: skipped reason=no-config\nresult: fail warnings=0 errors=1\n"), "{out}");
         assert!(err.contains("not an integer"), "the fault goes to stderr: {err}");
         std::fs::write(dir.join("open.ini"), starter.replace("host = 127.0.0.1", "host = 0.0.0.0")).unwrap();
         let (code, out, _) = run_cli(&exe, &dir, &["-c", "open.ini", "doctor", "--no-probes"]);
         assert_eq!(code, 0, "a warning is not a failure: {out}");
-        assert!(out.contains("http: ok host=0.0.0.0 port=0 bound=") && out.contains(" warning=remote-bind-unauthenticated\n"), "{out}");
+        assert!(out.contains("config: ok path=open.ini source=flag jobs=1 groups=0\n"), "{out}");
+        assert!(out.contains("http: ok host=0.0.0.0 port=0 bound=") && !out.contains("warning="), "the http line states the bind; the risk line counts it: {out}");
         assert!(out.contains("\nauth: missing risk=remote-exposed\n"), "{out}");
+        assert!(out.contains("\nrisk: warn count=2 remote-bind-without-token never-run:health-check\n"), "{out}");
         assert!(out.ends_with("result: ok warnings=2 errors=0\n"), "{out}");
+
+        // v3 through the command: a group, its run, the listing, and the compaction.
+        std::fs::write(
+            dir.join("v3.ini"),
+            "[agent]\nstore = v3.db\nhistory_max_runs = 2\ncompact_after_dead_bytes = 1\n\
+             [job.health-check]\ncommand = echo healthy\n[job.flaky]\ncommand = exit 3\nretries = 1\nbackoff_ms = 10\n\
+             [group.daily]\njobs = health-check, flaky\n",
+        )
+        .unwrap();
+        let (code, out, _) = run_cli(&exe, &dir, &["-c", "v3.ini", "groups"]);
+        assert_eq!(code, 0);
+        assert_eq!(out.trim_end(), "daily jobs=health-check, flaky");
+        let (code, out, err) = run_cli(&exe, &dir, &["-c", "v3.ini", "run", "group", "daily"]);
+        assert_eq!(code, 1, "a group with a failing member exits 1: {out}{err}");
+        assert!(out.starts_with("group=daily jobs=2 success=1 failure=1\n  job=health-check status=success code=0 seq=1 recorded=true "), "{out}");
+        assert!(out.contains("\n  job=flaky status=failure code=3 seq=2 recorded=true ") && out.contains(" attempts=2 "), "the retry is in the record: {out}");
+        let (code, _, _) = run_cli(&exe, &dir, &["-c", "v3.ini", "run", "group", "nope"]);
+        assert_eq!(code, 1, "an unknown group is exit 1");
+        let (code, _, _) = run_cli(&exe, &dir, &["-c", "v3.ini", "run", "group"]);
+        assert_eq!(code, 2, "`run group` without a name is usage");
+        let (code, out, err) = run_cli(&exe, &dir, &["-c", "v3.ini", "run", "health-check"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains(" seq=3 "), "{out}");
+        assert!(err.contains("jagent: history pruned=1 compacted=true"), "the third run pruned #1 past max=2 and compacted past 1 dead byte: {err}");
+        let (code, out, _) = run_cli(&exe, &dir, &["-c", "v3.ini", "logs"]);
+        assert_eq!(code, 0);
+        assert!(!out.contains("#1 job=") && out.contains("#2 job=flaky") && out.contains("#3 job=health-check"), "{out}");
+        let (code, out, _) = run_cli(&exe, &dir, &["-c", "v3.ini", "compact"]);
+        assert_eq!(code, 0);
+        assert!(out.starts_with("history: runs=2 pruned=0 dead_bytes_before=0 reclaimed=0 live_bytes="), "nothing left to reclaim after the run's own upkeep: {out}");
+        let (code, out, _) = run_cli(&exe, &dir, &["-c", "v3.ini", "ask", "how", "did", "daily", "go"]);
+        assert_eq!(code, 0);
+        assert!(out.starts_with("Group daily: 2 jobs; 1 succeeded last time, 1 failed, 0 never ran.\n"), "{out}");
+        assert!(out.ends_with("Recommended next action: jagent logs flaky\n"), "{out}");
+        let (code, out, _) = run_cli(&exe, &dir, &["-c", "v3.ini", "ask", "what", "is", "risky"]);
+        assert_eq!(code, 0);
+        assert!(out.starts_with("1 risk:\n- flaky's last run failed.\n"), "{out}");
 
         // Discovery: the environment selects a file; -c beats it; a missing one is an error.
         std::fs::write(dir.join("env.ini"), starter.replace("health-check", "from-env")).unwrap();
@@ -3386,7 +3431,7 @@ mod jagent_command {
         assert_eq!(out, "No job's last run failed.\nRecommended next action: nothing needs attention; `jagent doctor` is the self-check\n");
         let (code, out, _) = run_cli(&exe, &dir, &["ask", "please", "run", "rm", "-rf", "/"]);
         assert_eq!(code, 0);
-        assert!(out.starts_with("I do not run, change or delete anything. To run a configured job: jagent run <name>."), "{out}");
+        assert!(out.starts_with("I do not run, change or delete anything. To run a configured job: jagent run <name>;"), "{out}");
         let (code, out, _) = run_cli(&exe, &dir, &["logs"]);
         assert_eq!(code, 0);
         assert_eq!(out.lines().count(), 1, "one run in the history — the question ran nothing:\n{out}");
@@ -21487,7 +21532,11 @@ fn main() -> i32 {
             // history and job table unchanged, and creating no store when there is none.
             // (+1: a token is a fact to `doctor` and `ask` — the 0.0.0.0 warnings go —
             // and `****` to `render_config`.)
-            ("jagent_ops_test", 12),
+            // (+1, v3: `ask` about a group, what failed in it, what never ran in it, what is
+            // risky and stale (a success two intervals old, with the wall moved), what failed
+            // recently from the records, what changed after a reload and after a rejected
+            // one; the doctor's group count, kinds and risk line on the same history.)
+            ("jagent_ops_test", 13),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

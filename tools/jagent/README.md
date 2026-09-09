@@ -15,7 +15,7 @@ the reference is [`docs/jagent.md`](../../docs/jagent.md).
 | the build plan | `tools/jagent/build.jestyr` | names the executable and where it lands |
 | the starter configuration | `jagent init` writes it; `examples/std/fixtures/jagent.ini` is the demo's |
 | the TLS listener | `examples/std/httpds.jtr` | `std/httpd` over `std/tls`; only programs that want TLS link OpenSSL |
-| the suites | `examples/std/jagent_test.jtr` (15), `examples/std/jagent_ops_test.jtr` (12) | registered in `io_suites_pass` |
+| the suites | `examples/std/jagent_test.jtr` (20), `examples/std/jagent_ops_test.jtr` (13) | registered in `io_suites_pass` |
 | the command's own tests | `src/proptests.rs`, `jagent_command` | a real `serve`, a real `doctor`, the discovery order |
 
 **Why the sources are not under `tools/`.** A Jestyr module's imports resolve relative to
@@ -56,6 +56,9 @@ files of its own. The smoke test of a built binary:
 ```
 jagent [-c <config>] serve                  the API (https:// when tls = true), the reload, the schedule; SIGINT/SIGTERM stops it
 jagent [-c <config>] run <job>              run one job now, record it, print the summary
+jagent [-c <config>] run group <group>      every member in order, each its own record; the summary
+jagent [-c <config>] groups                 every group and its members
+jagent [-c <config>] compact                apply the retention policy and rewrite the store
 jagent [-c <config>] schedule <job>         run one job on its interval until a signal
 jagent [-c <config>] status                 the configuration, the store, every job with its last run
 jagent [-c <config>] logs [<job>]           the last 20 runs, of one job or of all

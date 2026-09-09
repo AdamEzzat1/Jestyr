@@ -127,11 +127,18 @@ pub fn starter_text(mut dst: String) {
     string_push(dst, "# A bearer token every API request but GET /health must carry. Unset, the API is\n")
     string_push(dst, "# open to whatever reaches the host; `jagent config show` prints it as ****.\n")
     string_push(dst, "# token = \n")
+    string_push(dst, "# TLS: tls = true with tls_cert and tls_key (PEM files) serves https://.\n")
+    string_push(dst, "# Retention: history_max_runs = 1000 keeps the newest thousand runs (and every\n")
+    string_push(dst, "# job's latest); compact_after_dead_bytes = 65536 compacts the store past that.\n")
     string_push(dst, "\n")
     string_push(dst, "[job.health-check]\n")
     string_push(dst, "kind = command\n")
     string_push(dst, "command = echo healthy\n")
     string_push(dst, "timeout_ms = 10000\n")
+    string_push(dst, "# Also for a command job: cwd = <dir>, env = NAME=value, retries = 2, backoff_ms = 250.\n")
+    string_push(dst, "\n")
+    string_push(dst, "# An HTTP probe: kind = http-check, url = http://127.0.0.1:8080/health, expect_status = 200.\n")
+    string_push(dst, "# A group: [group.daily] with jobs = health-check, other-job; run it with `jagent run group daily`.\n")
 }
 
 // Write the starter to `path`. An existing file is refused unless `force`; a write the
@@ -239,15 +246,19 @@ fn host_text(read ag: jagent.Agent) -> str {
     return "0.0.0.0"
 }
 
-// The configuration: does it load, and how many jobs.
-fn doc_config(mut r: Report, mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> bool {
+// The configuration: does it load, where it was found, how many jobs and groups.
+fn doc_config(mut r: Report, mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str, source: i32) -> bool {
     let lr: i32 = jagent.load_file(ag, h, cfg)
     string_push(r.text, "config: ")
     if lr == jagent.JA_LOADED {
         string_push(r.text, "ok path=")
         string_push(r.text, cfg)
+        string_push(r.text, " source=")
+        string_push(r.text, source_name(source))
         string_push(r.text, " jobs=")
         push_num(r.text, jagent.job_count(ag) as i64)
+        string_push(r.text, " groups=")
+        push_num(r.text, jagent.group_count(ag) as i64)
         string_push(r.text, "\n")
         return true
     }
@@ -296,12 +307,15 @@ fn doc_store(mut r: Report, mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocato
     }
     let synced: bool = jagent.sync_store(ag)
     let runs: i64 = jagent.last_seq(ag)
-    jagent.close_store(ag)
+    let dead: i64 = jagent.history_dead_bytes(ag)
+    // Left open: the history line and the risk rules read it; `doctor` closes it at the end.
     if synced {
         string_push(r.text, "ok path=")
         string_push(r.text, sp)
         string_push(r.text, " present=true synced=true runs=")
         push_num(r.text, runs)
+        string_push(r.text, " dead_bytes=")
+        push_num(r.text, dead)
         string_push(r.text, "\n")
     } else {
         string_push(r.text, "fail path=")
@@ -341,7 +355,9 @@ fn doc_sysproc(mut r: Report, read a: Allocator, mut sp: sysproc.Spawner, mut bl
     push_bool(r.text, r1.tree_reaped and r2.tree_reaped)
     string_push(r.text, " children=")
     push_num(r.text, r.children)
-    string_push(r.text, "\n")
+    // `cwd` and `env` are `sysproc.start_piped_at`'s contract, proved by the runner's suite;
+    // stated here as facts about the build, not measured again.
+    string_push(r.text, " cwd=supported env=supported\n")
     if fine == false { r.errors = r.errors + 1 }
 }
 
@@ -373,10 +389,7 @@ fn doc_http(mut r: Report, read a: Allocator, read ag: jagent.Agent) {
         string_push(r.text, " reason=cannot-bind")
         r.errors = r.errors + 1
     }
-    if jagent.host_is_loopback(ag) == false and jagent.token_required(ag) == false {
-        string_push(r.text, " warning=remote-bind-unauthenticated")
-        r.warnings = r.warnings + 1
-    }
+    // What a remote bind exposes is the `risk:` line's to say and count, once.
     string_push(r.text, "\n")
 }
 
@@ -438,10 +451,141 @@ fn doc_auth(mut r: Report, read ag: jagent.Agent, loaded: bool) {
             string_push(r.text, " risk=local-only")
         } else {
             string_push(r.text, " risk=remote-exposed")
-            r.warnings = r.warnings + 1
         }
     }
     string_push(r.text, "\n")
+}
+
+// The history against its policy. The store is open when it was present.
+fn doc_history(mut r: Report, read ag: jagent.Agent) {
+    string_push(r.text, "history: ok runs=")
+    push_num(r.text, jagent.history_runs(ag))
+    string_push(r.text, " max=")
+    push_num(r.text, jagent.history_max_runs(ag))
+    string_push(r.text, " dead_bytes=")
+    push_num(r.text, jagent.history_dead_bytes(ag))
+    string_push(r.text, " compact_after=")
+    push_num(r.text, jagent.compact_after_dead_bytes(ag))
+    string_push(r.text, "\n")
+}
+
+// The job table by kind, and what the build can run.
+fn doc_jobs(mut r: Report, read ag: jagent.Agent) {
+    var cmds: i64 = 0
+    var checks: i64 = 0
+    var retrying: i64 = 0
+    var i: usize = 0
+    let n: usize = jagent.job_count(ag)
+    for i < n {
+        if jagent.job_kind(ag, i) == jagent.JOB_HTTP_CHECK { checks = checks + 1 } else { cmds = cmds + 1 }
+        if jagent.job_retries(ag, i) > 0 { retrying = retrying + 1 }
+        i = i + 1
+    }
+    string_push(r.text, "jobs: ok command=")
+    push_num(r.text, cmds)
+    string_push(r.text, " http-check=")
+    push_num(r.text, checks)
+    string_push(r.text, " groups=")
+    push_num(r.text, jagent.group_count(ag) as i64)
+    string_push(r.text, " retrying=")
+    push_num(r.text, retrying)
+    string_push(r.text, "\n")
+}
+
+// ---- the risk rules ----
+//
+// One vocabulary for `doctor` and `ask`: every rule is a fact read from the configuration
+// or the history, tagged; the doctor prints and counts the tags, `ask` says them in
+// sentences. A job is STALE when it is scheduled, its last run succeeded, and that run
+// started more than two intervals ago by the wall clock — the interval that should have
+// run it again has passed twice.
+
+// Append every risk tag, space-separated; return how many.
+fn risk_tags(mut ag: jagent.Agent, read a: Allocator, history: bool, mut dst: String) -> i64 {
+    var n: i64 = 0
+    if jagent.host_is_loopback(ag) == false {
+        if jagent.token_required(ag) == false {
+            n = n + 1
+            string_push(dst, " remote-bind-without-token")
+        } else {
+            if jagent.tls_wanted(ag) == false {
+                n = n + 1
+                string_push(dst, " token-in-the-clear")
+            }
+        }
+    }
+    if jagent.tls_wanted(ag) {
+        var cert: String = string_new()
+        var key: String = string_new()
+        let both: bool = jagent.tls_cert(ag, cert) and jagent.tls_key(ag, key)
+        string_free(key)
+        string_free(cert)
+        if both == false {
+            n = n + 1
+            string_push(dst, " tls-incomplete")
+        }
+    }
+    let now: i64 = jagent.wall_now(ag)
+    var i: usize = 0
+    let jobs: usize = jagent.job_count(ag)
+    for i < jobs {
+        let name: str = jagent.job_name(ag, i)
+        var why: String = string_new()
+        var l: Last = no_last()
+        if history { l = last_of(ag, a, name, why) }
+        string_free(why)
+        let iv: i64 = jagent.job_interval_ms(ag, i)
+        if l.has == false {
+            n = n + 1
+            if iv > 0 { string_push(dst, " scheduled-never-ran:") } else { string_push(dst, " never-run:") }
+            string_push(dst, name)
+        } else {
+            if l.failed {
+                n = n + 1
+                if iv > 0 { string_push(dst, " scheduled-last-failed:") } else { string_push(dst, " last-run-failed:") }
+                string_push(dst, name)
+            } else {
+                if iv > 0 {
+                    let age_ms: i64 = (now - l.started_at) * 1000
+                    if age_ms > iv * 2 {
+                        n = n + 1
+                        string_push(dst, " stale:")
+                        string_push(dst, name)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if history {
+        let mx: i64 = jagent.history_max_runs(ag)
+        if mx > 0 and jagent.history_runs(ag) > mx {
+            n = n + 1
+            string_push(dst, " history-over-max")
+        }
+        let ca: i64 = jagent.compact_after_dead_bytes(ag)
+        if ca > 0 and jagent.history_dead_bytes(ag) >= ca {
+            n = n + 1
+            string_push(dst, " compaction-due")
+        }
+    }
+    return n
+}
+
+fn doc_risk(mut r: Report, mut ag: jagent.Agent, read a: Allocator, history: bool) {
+    var tags: String = string_new()
+    let n: i64 = risk_tags(ag, a, history, tags)
+    string_push(r.text, "risk: ")
+    if n == 0 {
+        string_push(r.text, "ok count=0\n")
+    } else {
+        string_push(r.text, "warn count=")
+        push_num(r.text, n)
+        string_push(r.text, string_view(tags))
+        string_push(r.text, "\n")
+        r.warnings = r.warnings + n
+    }
+    string_free(tags)
 }
 
 // The watcher over the configuration's directory: opened and closed.
@@ -476,7 +620,7 @@ fn doc_schedule(mut r: Report, read ag: jagent.Agent) {
 }
 
 fn doc_limits(mut r: Report) {
-    string_push(r.text, "limits: kinds=command concurrency=none preview_bytes=")
+    string_push(r.text, "limits: kinds=command,http-check concurrency=none tls=one-request-per-connection preview_bytes=")
     push_num(r.text, jagent.JAGENT_PREVIEW_CAP as i64)
     string_push(r.text, "\n")
 }
@@ -485,13 +629,20 @@ fn doc_limits(mut r: Report) {
 // (a caller that cannot afford ~300 ms, or a spawner that is denied). The verdicts are in
 // `report_text`; `is_ok` is the exit code.
 pub fn doctor(read a: Allocator, mut h: fs.Fs, mut sp: sysproc.Spawner, mut blk: time.Clock, read cfg: str, probes: bool) -> Report {
+    return doctor_from(a, h, sp, blk, cfg, SRC_FLAG, probes)
+}
+
+// `doctor`, told where the configuration was found (the `config:` line says so).
+pub fn doctor_from(read a: Allocator, mut h: fs.Fs, mut sp: sysproc.Spawner, mut blk: time.Clock, read cfg: str, source: i32, probes: bool) -> Report {
     var r: Report = Report{ text: string_new(), faults: string_new(), warnings: 0, errors: 0, children: 0, reaped: 0 }
     var ag: jagent.Agent = jagent.make(a, time.host(), quiet_logger())
-    let loaded: bool = doc_config(r, ag, h, cfg)
+    let loaded: bool = doc_config(r, ag, h, cfg, source)
     if loaded {
         doc_store(r, ag, h, a)
+        doc_history(r, ag)
     } else {
         string_push(r.text, "store: skipped reason=no-config\n")
+        string_push(r.text, "history: skipped reason=no-config\n")
     }
     doc_sysproc(r, a, sp, blk, probes)
     if loaded {
@@ -504,11 +655,19 @@ pub fn doctor(read a: Allocator, mut h: fs.Fs, mut sp: sysproc.Spawner, mut blk:
     if loaded {
         doc_reload(r, ag, h, cfg)
         doc_schedule(r, ag)
+        doc_jobs(r, ag)
     } else {
         string_push(r.text, "reload: skipped reason=no-config\n")
         string_push(r.text, "schedule: skipped reason=no-config\n")
+        string_push(r.text, "jobs: skipped reason=no-config\n")
     }
     doc_limits(r)
+    if loaded {
+        doc_risk(r, ag, a, jagent.store_is_open(ag))
+    } else {
+        string_push(r.text, "risk: skipped reason=no-config\n")
+    }
+    jagent.close_store(ag)
     jagent.free(ag)
     string_push(r.text, "result: ")
     if r.errors == 0 { string_push(r.text, "ok") } else { string_push(r.text, "fail") }
@@ -542,10 +701,12 @@ pub const ASK_REFUSED: i32 = 3     // asked to run, change or delete something; 
     status: i32,
     seq: i64,
     code: i64,
+    started_at: i64,  // wall seconds
+    attempts: i64,    // 0 when the record predates the field
 }
 
 fn no_last() -> Last {
-    return Last{ has: false, failed: false, status: jagent.RUN_NO_SUCH_JOB, seq: 0, code: 0 }
+    return Last{ has: false, failed: false, status: jagent.RUN_NO_SUCH_JOB, seq: 0, code: 0, started_at: 0, attempts: 0 }
 }
 
 fn status_of_name(read s: str) -> i32 {
@@ -572,12 +733,16 @@ fn last_of(mut ag: jagent.Agent, read a: Allocator, read name: str, mut why: Str
         let sq: isize = json.get(d, root, "seq")
         let cd: isize = json.get(d, root, "code")
         let er: isize = json.get(d, root, "error")
+        let at: isize = json.get(d, root, "started_at")
+        let atn: isize = json.get(d, root, "attempts")
         if st >= 0 and sq >= 0 and cd >= 0 {
             l.has = true
             l.status = status_of_name(json.as_str(d, st as usize))
             l.failed = l.status != jagent.RUN_SUCCESS
             l.seq = json.as_i64(d, sq as usize)
             l.code = json.as_i64(d, cd as usize)
+            if at >= 0 { l.started_at = json.as_i64(d, at as usize) }
+            if atn >= 0 { l.attempts = json.as_i64(d, atn as usize) }
             if er >= 0 { string_push(why, json.as_str(d, er as usize)) }
         }
     }
@@ -885,6 +1050,10 @@ fn answer_why(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, read qlow: 
                 string_push(dst, ": ")
                 string_push(dst, w)
             }
+            if l.attempts > 1 {
+                string_push(dst, " after ")
+                push_count(dst, l.attempts, "attempt", "attempts")
+            }
             string_push(dst, ".\nThe record holds no more than that; the command's output is in its log line.\n")
             string_push(dst, "Recommended next action: jagent logs ")
             string_push(dst, name)
@@ -924,13 +1093,276 @@ fn answer_never(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, mut dst: 
 }
 
 fn answer_refused(read ag: jagent.Agent, mut dst: String) {
-    string_push(dst, "I do not run, change or delete anything. To run a configured job: jagent run <name>. Configured jobs: ")
+    string_push(dst, "I do not run, change or delete anything. To run a configured job: jagent run <name>; a group: jagent run group <name>. Configured jobs: ")
     push_job_list(ag, dst)
     string_push(dst, ".\n")
 }
 
 fn answer_unknown(mut dst: String) {
-    string_push(dst, "I can answer: is the agent healthy / check my machine; what failed; why did <job> fail; what jobs have never run; what should I look at next.\n")
+    string_push(dst, "I can answer: is the agent healthy / check my machine; what failed; what failed recently; why did <job> fail; what has never run; what is stale; what is risky; what changed after reload; how did <group> go; what failed in <group>; what should I check next.\n")
+}
+
+// Which configured group the question names, by the longest name it contains, or -1.
+fn group_in(read ag: jagent.Agent, read qlow: str) -> i32 {
+    var best: i32 = 0 - 1
+    var best_len: usize = 0
+    var g: usize = 0
+    let n: usize = jagent.group_count(ag)
+    for g < n {
+        let nm: str = jagent.group_name(ag, g)
+        var lo: String = string_new()
+        push_lower(lo, nm)
+        if str.has(qlow, string_view(lo)) {
+            if nm.len > best_len {
+                best = g as i32
+                best_len = nm.len
+            }
+        }
+        string_free(lo)
+        g = g + 1
+    }
+    return best
+}
+
+// A group, asked about: every member's last run, or only the failed ones, or only the
+// ones that never ran, then the counts and the next action.
+fn answer_group(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, g: usize, mode: i32, mut dst: String) {
+    let history: bool = history_open(ag, h)
+    var fine: i64 = 0
+    var bad: i64 = 0
+    var never: i64 = 0
+    var first_bad: String = string_new()
+    var first_never: String = string_new()
+    var lines: String = string_new()
+    var k: usize = 0
+    let sz: usize = jagent.group_size(ag, g)
+    for k < sz {
+        let name: str = jagent.job_name(ag, jagent.group_job(ag, g, k))
+        var why: String = string_new()
+        var l: Last = no_last()
+        if history { l = last_of(ag, a, name, why) }
+        string_free(why)
+        var show: bool = mode == 0
+        if l.has == false {
+            never = never + 1
+            let fn0: str = string_view(first_never)
+            if fn0.len == 0 { string_push(first_never, name) }
+            if mode == 2 { show = true }
+        } else {
+            if l.failed {
+                bad = bad + 1
+                let fb0: str = string_view(first_bad)
+                if fb0.len == 0 { string_push(first_bad, name) }
+                if mode == 1 { show = true }
+            } else {
+                fine = fine + 1
+            }
+        }
+        if show {
+            if history {
+                push_last_line(ag, a, name, lines)
+            } else {
+                string_push(lines, name)
+                string_push(lines, " has never run.\n")
+            }
+        }
+        k = k + 1
+    }
+    string_push(dst, "Group ")
+    string_push(dst, jagent.group_name(ag, g))
+    string_push(dst, ": ")
+    push_count(dst, sz as i64, "job", "jobs")
+    string_push(dst, "; ")
+    push_num(dst, fine)
+    string_push(dst, " succeeded last time, ")
+    push_num(dst, bad)
+    string_push(dst, " failed, ")
+    push_num(dst, never)
+    string_push(dst, " never ran.\n")
+    let lv: str = string_view(lines)
+    if lv.len > 0 {
+        string_push(dst, lv)
+    } else {
+        if mode == 1 { string_push(dst, "No member's last run failed.\n") }
+        if mode == 2 { string_push(dst, "Every member has run at least once.\n") }
+    }
+    string_free(lines)
+    string_push(dst, "Recommended next action: ")
+    let fb: str = string_view(first_bad)
+    let fnv: str = string_view(first_never)
+    if fb.len > 0 {
+        string_push(dst, "jagent logs ")
+        string_push(dst, fb)
+        string_push(dst, "\n")
+    } else {
+        if fnv.len > 0 {
+            string_push(dst, "jagent run group ")
+            string_push(dst, jagent.group_name(ag, g))
+            string_push(dst, "\n")
+        } else {
+            string_push(dst, "nothing in this group needs attention\n")
+        }
+    }
+    string_free(first_never)
+    string_free(first_bad)
+}
+
+// The last twenty records, the failed ones only — history, not just each job's latest.
+fn answer_failed_recently(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, mut dst: String) {
+    let history: bool = history_open(ag, h)
+    if history == false {
+        string_push(dst, "No history yet at ")
+        string_push(dst, jagent.store_path(ag))
+        string_push(dst, "; nothing has run.\n")
+        return
+    }
+    var logs: String = string_new()
+    let n: usize = jagent.render_logs(ag, "", 20, logs)
+    let lv: str = string_view(logs)
+    var found: i64 = 0
+    var at: usize = 0
+    for at < lv.len {
+        var e: usize = at
+        for e < lv.len {
+            if (lv[e] as i32) == 10 { break }
+            e = e + 1
+        }
+        let line: str = lv[at .. e]
+        if str.has(line, " status=failure ") or str.has(line, " status=timeout ") or str.has(line, " status=config-error ") {
+            string_push(dst, line)
+            string_push(dst, "\n")
+            found = found + 1
+        }
+        at = e + 1
+    }
+    string_free(logs)
+    if found == 0 {
+        string_push(dst, "None of the last ")
+        push_count(dst, n as i64, "run", "runs")
+        string_push(dst, " failed.\n")
+    } else {
+        push_count(dst, found, "failure", "failures")
+        string_push(dst, " in the last ")
+        push_count(dst, n as i64, "run", "runs")
+        string_push(dst, ", oldest first.\n")
+    }
+    push_next(ag, a, dst, true)
+}
+
+// The risk rules, as sentences.
+fn answer_risky(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, mut dst: String) {
+    let history: bool = history_open(ag, h)
+    var tags: String = string_new()
+    let n: i64 = risk_tags(ag, a, history, tags)
+    if n == 0 {
+        string_push(dst, "Nothing the risk rules know of: the API is on loopback or behind a token, TLS is complete or off, every job has run and its last run succeeded, nothing scheduled is stale, the history is within its policy.\n")
+    } else {
+        push_count(dst, n, "risk", "risks")
+        string_push(dst, ":\n")
+        let tv: str = string_view(tags)
+        var at: usize = 1
+        for at < tv.len {
+            var e: usize = at
+            for e < tv.len {
+                if (tv[e] as i32) == 32 { break }
+                e = e + 1
+            }
+            explain_tag(tv[at .. e], dst)
+            at = e + 1
+        }
+    }
+    string_free(tags)
+    push_next(ag, a, dst, history)
+}
+
+fn explain_tag(read tag: str, mut dst: String) {
+    string_push(dst, "- ")
+    if str_eq(tag, "remote-bind-without-token") {
+        string_push(dst, "the API binds to every interface (0.0.0.0) with no token: anything that reaches this machine can run its jobs.\n")
+        return
+    }
+    if str_eq(tag, "token-in-the-clear") {
+        string_push(dst, "the API binds to every interface with a token but no TLS: the token crosses the network in the clear.\n")
+        return
+    }
+    if str_eq(tag, "tls-incomplete") {
+        string_push(dst, "TLS is requested but tls_cert and tls_key are not both set; `jagent serve` will refuse.\n")
+        return
+    }
+    if str_eq(tag, "history-over-max") {
+        string_push(dst, "the history holds more runs than history_max_runs; the next run or `jagent compact` prunes it.\n")
+        return
+    }
+    if str_eq(tag, "compaction-due") {
+        string_push(dst, "the history's dead bytes have reached compact_after_dead_bytes; the next run or `jagent compact` reclaims them.\n")
+        return
+    }
+    let colon: isize = str.index_of(tag, ":")
+    if colon > 0 {
+        let kind: str = tag[0 .. colon as usize]
+        let name: str = tag[(colon as usize) + 1 .. tag.len]
+        string_push(dst, name)
+        if str_eq(kind, "never-run") { string_push(dst, " has never run.\n") }
+        if str_eq(kind, "scheduled-never-ran") { string_push(dst, " is scheduled and has never run.\n") }
+        if str_eq(kind, "last-run-failed") { string_push(dst, "'s last run failed.\n") }
+        if str_eq(kind, "scheduled-last-failed") { string_push(dst, " is scheduled and its last run failed.\n") }
+        if str_eq(kind, "stale") { string_push(dst, " is scheduled and its last success is more than two intervals old.\n") }
+        return
+    }
+    string_push(dst, tag)
+    string_push(dst, "\n")
+}
+
+// Scheduled jobs that are stale or have never run.
+fn answer_stale(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, mut dst: String) {
+    let history: bool = history_open(ag, h)
+    var tags: String = string_new()
+    risk_tags(ag, a, history, tags)
+    let tv: str = string_view(tags)
+    var found: i64 = 0
+    var at: usize = 1
+    for at < tv.len {
+        var e: usize = at
+        for e < tv.len {
+            if (tv[e] as i32) == 32 { break }
+            e = e + 1
+        }
+        let tag: str = tv[at .. e]
+        if str.has_prefix(tag, "stale:") or str.has_prefix(tag, "scheduled-never-ran:") or str.has_prefix(tag, "scheduled-last-failed:") {
+            explain_tag(tag, dst)
+            found = found + 1
+        }
+        at = e + 1
+    }
+    string_free(tags)
+    if found == 0 { string_push(dst, "Nothing scheduled is stale: every scheduled job's last run succeeded within two intervals.\n") }
+    push_next(ag, a, dst, history)
+}
+
+// What the last load did: the generation, the loads, the rejections, the faults.
+fn answer_reload(mut ag: jagent.Agent, mut dst: String) {
+    string_push(dst, "Configuration ")
+    string_push(dst, jagent.config_name(ag))
+    string_push(dst, " is at generation ")
+    push_num(dst, jagent.generation(ag))
+    string_push(dst, " after ")
+    push_count(dst, jagent.loads(ag), "load", "loads")
+    string_push(dst, ", ")
+    push_num(dst, jagent.rejections(ag))
+    string_push(dst, " rejected.\n")
+    if jagent.fault_count(ag) > 0 {
+        string_push(dst, "The last load was rejected with ")
+        push_count(dst, jagent.fault_count(ag), "fault", "faults")
+        string_push(dst, "; the configuration in force is the previous one:\n")
+        string_push(dst, str.trim_end(jagent.faults(ag)))
+        string_push(dst, "\nRecommended next action: jagent config validate\n")
+    } else {
+        string_push(dst, "The last load applied: ")
+        push_count(dst, jagent.job_count(ag) as i64, "job", "jobs")
+        string_push(dst, ", ")
+        push_count(dst, jagent.group_count(ag) as i64, "group", "groups")
+        string_push(dst, ". A reload resets every schedule; the next scheduled run is one interval after it.\n")
+    }
 }
 
 // Answer `question` from the configuration in `ag`, the history at its store path (opened
@@ -945,27 +1377,54 @@ pub fn ask(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, read question:
     push_lower(q, question)
     let ql: str = string_view(q)
     var r: i32 = ASK_ANSWERED
-    if str.has(ql, "why") {
-        answer_why(ag, h, a, ql, dst)
+    // The order is the rule: a named group first (its members are the subject), then the
+    // refusal of anything that asks for an action, then the questions by their key words —
+    // `next` before `check`, because "what should I check next" is the next question.
+    let gi: i32 = group_in(ag, ql)
+    if gi >= 0 and (str.has(ql, "how") or str.has(ql, "go") or str.has(ql, "fail") or str.has(ql, "never") or str.has(ql, "did")) {
+        var mode: i32 = 0
+        if str.has(ql, "fail") { mode = 1 }
+        if str.has(ql, "never") { mode = 2 }
+        answer_group(ag, h, a, gi as usize, mode, dst)
     } else {
-        if str.has(ql, "never") {
-            answer_never(ag, h, a, dst)
+        if str.has(ql, "run ") or str.has(ql, "execute") or str.has(ql, "start ") or str.has(ql, "launch") or str.has(ql, "kill") or str.has(ql, "delete") or str.has(ql, "edit") or str.has(ql, "compact") {
+            answer_refused(ag, dst)
+            r = ASK_REFUSED
         } else {
-            if str.has(ql, "fail") {
-                answer_failed(ag, h, a, dst)
+            if str.has(ql, "why") {
+                answer_why(ag, h, a, ql, dst)
             } else {
-                if str.has(ql, "run ") or str.has(ql, "execute") or str.has(ql, "start ") or str.has(ql, "launch") or str.has(ql, "kill") or str.has(ql, "delete") or str.has(ql, "edit") or str.has(ql, "change") {
-                    answer_refused(ag, dst)
-                    r = ASK_REFUSED
+                if str.has(ql, "never") {
+                    answer_never(ag, h, a, dst)
                 } else {
-                    if str.has(ql, "health") or str.has(ql, "check") or str.has(ql, "machine") or str.has(ql, "status") or str.has(ql, "summary") or str.has(ql, "how is") {
-                        answer_summary(ag, h, a, dst)
+                    if str.has(ql, "reload") or str.has(ql, "changed") or str.has(ql, "generation") {
+                        answer_reload(ag, dst)
                     } else {
-                        if str.has(ql, "next") or str.has(ql, "look") or str.has(ql, "recommend") or str.has(ql, "should") {
-                            push_next(ag, a, dst, history_open(ag, h))
+                        if str.has(ql, "stale") {
+                            answer_stale(ag, h, a, dst)
                         } else {
-                            answer_unknown(dst)
-                            r = ASK_UNKNOWN
+                            if str.has(ql, "risk") {
+                                answer_risky(ag, h, a, dst)
+                            } else {
+                                if str.has(ql, "fail") {
+                                    if str.has(ql, "recent") or str.has(ql, "lately") or str.has(ql, "today") {
+                                        answer_failed_recently(ag, h, a, dst)
+                                    } else {
+                                        answer_failed(ag, h, a, dst)
+                                    }
+                                } else {
+                                    if str.has(ql, "next") or str.has(ql, "look") or str.has(ql, "recommend") or str.has(ql, "should") {
+                                        push_next(ag, a, dst, history_open(ag, h))
+                                    } else {
+                                        if str.has(ql, "health") or str.has(ql, "check") or str.has(ql, "machine") or str.has(ql, "status") or str.has(ql, "summary") or str.has(ql, "how is") {
+                                            answer_summary(ag, h, a, dst)
+                                        } else {
+                                            answer_unknown(dst)
+                                            r = ASK_UNKNOWN
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

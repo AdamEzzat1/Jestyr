@@ -19,7 +19,7 @@ built to grow: one job kind today, a table with the column for the next one.
 | the command | `examples/std/jagent_cli.jtr` |
 | the project: build plan and page | `tools/jagent/build.jestyr`, `tools/jagent/README.md` |
 | the pinned demo | `examples/std/jagent_demo.jtr` (`jagent_runs_records_serves_and_reloads`) |
-| the suites | `examples/std/jagent_test.jtr` (15), `examples/std/jagent_ops_test.jtr` (12) — registered in `io_suites_pass` |
+| the suites | `examples/std/jagent_test.jtr` (20), `examples/std/jagent_ops_test.jtr` (13) — registered in `io_suites_pass` |
 | the TLS listener | `examples/std/httpds.jtr` — `std/httpd` over `std/tls`, one request per connection, every blocking call bounded |
 | the command's own tests | `jagent_cli_runs_status_logs_and_serves` (a real `serve`, killed after), `jagent_cli_init_doctor_and_ask`, `jagent_build_plan_names_the_binary` |
 | the benchmark script | `examples/std/jagent_bench.jtr` |
@@ -85,7 +85,10 @@ jagent ask "check my machine"
 | `jagent [-c cfg] status` | the configuration, the store, every job with its last run | 0; 1 when the file did not load (the faults are printed) |
 | `jagent [-c cfg] run <job>` | run it now, record it, print the summary | 0 when the job succeeded; 1 otherwise, or for a job that does not exist |
 | `jagent [-c cfg] logs [<job>]` | the last 20 runs of one job, or of every job, oldest first | 0; 1 for a job that does not exist |
+| `jagent [-c cfg] run group <group>` | every member in file order, each its own record; the summary and one line per member | 0 when every member succeeded; 1 otherwise, or for a group that does not exist |
 | `jagent [-c cfg] jobs` | the job table, one line each | 0 |
+| `jagent [-c cfg] groups` | every group and its members, in file order | 0 |
+| `jagent [-c cfg] compact` | apply the retention policy, then rewrite the store with only its live records | 0; 1 when the store did not open or the rewrite failed (the store is then as it was) |
 | `jagent [-c cfg] schedule <job>` | run it every `interval_ms` until SIGINT/SIGTERM | 0; 1 when any run failed, or the job has no interval |
 | `jagent [-c cfg] serve` | the API (plain, or TLS when `tls = true`), the reload, the schedule, until SIGINT/SIGTERM | 0 for a clean halt; 1 for a failed/abandoned one; 2 when refused (`tls = true` without both files, or a certificate that does not load) |
 | `jagent [-c cfg] check` | load the configuration and say so: `config: ok path=… jobs=N` | 0; 1 with the faults on stderr and nothing on stdout |
@@ -140,10 +143,46 @@ timeout_ms = 10000
 | `agent.tls_cert`, `agent.tls_key` | the certificate and its private key, PEM files; both required when `tls = true`, else `serve` refuses (exit 2) | unset |
 | `agent.store` | the history file, relative to the working directory, created by the first run | `jagent.db` |
 | `agent.token` | a bearer token every API request but `GET /health` must carry; declared **secret**, so every rendering prints `****` | unset: no gate |
-| `job.NAME.kind` | `command`, the only kind today | `command` |
-| `job.NAME.command` | runs through the platform shell (`cmd.exe /c`, `sh -c`); required, non-empty | — |
-| `job.NAME.timeout_ms` | positive; the job and its whole tree are killed at it | `5000` |
+| `agent.history_max_runs` | keep at most this many run records (the oldest go, never a job's latest); 0 keeps everything | `0` |
+| `agent.compact_after_dead_bytes` | rewrite the store once its dead bytes reach this; 0 never | `0` |
+| `job.NAME.kind` | `command` or `http-check` | `command` |
+| `job.NAME.command` | `command`: runs through the platform shell (`cmd.exe /c`, `sh -c`); required, non-empty | — |
+| `job.NAME.cwd` | `command`: the working directory; unset inherits; one that does not exist fails the run | unset |
+| `job.NAME.env` | `command`: ONE `NAME=value` appended to the inherited environment | unset |
+| `job.NAME.url` | `http-check`: `http://<ipv4-or-localhost>[:port]/path`; required; https is refused, not half-checked | — |
+| `job.NAME.expect_status` | `http-check`: the status that is success, 100..599 | `200` |
+| `job.NAME.timeout_ms` | positive; a command and its whole tree are killed at it; an http-check's socket is bounded by it | `5000` |
 | `job.NAME.interval_ms` | > 0: `serve` and `schedule` run it on that interval | `0` |
+| `job.NAME.retries` | attempts beyond the first, 0..10; one record per run whatever the count | `0` |
+| `job.NAME.backoff_ms` | the wait between attempts, on the caller's clock | `0` |
+| `group.NAME.jobs` | `a, b, c`: configured job names, run in this order by `run group NAME`; a group may not share a name with a job | — |
+
+A v3 file, showing each of them:
+
+```ini
+[agent]
+store = jagent.db
+history_max_runs = 1000
+compact_after_dead_bytes = 65536
+
+[job.site-health]
+kind = http-check
+url = http://127.0.0.1:8080/health
+expect_status = 200
+timeout_ms = 2000
+interval_ms = 60000
+retries = 2
+backoff_ms = 250
+
+[job.backup-home]
+command = ./backup.sh
+cwd = /srv/backup
+env = JAGENT_MODE=prod
+timeout_ms = 300000
+
+[group.daily]
+jobs = site-health, backup-home
+```
 
 **The file declares its own schema.** A load is two passes: the `[job.NAME]` headers are
 scanned first and each one declares its four keys, then `std/ini` applies the file against
@@ -168,32 +207,93 @@ something; identical bytes are `same` and touch nothing. A reload resets every s
 carrying a due time across a reload that may have changed the interval is a rule with more
 cases than callers.
 
+## Job kinds, retries, groups, retention
+
+**`http-check`.** A GET through `std/httpc` whose exit code is the response status. The
+run is `success` when the status is `expect_status`, `failure` with `unexpected status N`
+when it is not, `failure` with `could not connect to host:port` when nothing listens,
+`timeout` when the target accepts and never answers within `timeout_ms` (the socket's
+receive and send are bounded by it, so it cannot hang), and `config-error` when the URL is
+not `http://<ipv4-or-localhost>[:port]/path` — there is no resolver in the tree, so a
+hostname is refused at load rather than answered with a hang, and `https://` is refused
+rather than checked in plaintext. The preview is `status=N expected=M`; the same record
+shape, the same counters; nothing is spawned, so `tree_reaped` is vacuously true.
+
+**`cwd` and `env`** on a command job are the process's at creation — the only time a
+process can be given them (`sysproc.start_piped_at`'s argument). `cwd` unset inherits; one
+that does not exist fails the run with the directory named. `env` is one `NAME=value`
+appended to the inherited block, which is what the standard library offers; the suite
+proves the variable reaches the child and the control shows it does not without.
+
+**Retries.** A job with `retries = N` is attempted up to N+1 times; a failed attempt is
+followed by `backoff_ms` on the caller's clock. **One record per run**: it carries
+`attempts`, the last attempt's status and output, the first attempt's start and the whole
+duration. The summary and the log line spell `attempts=N` only when more than one was
+made, so a single attempt reads exactly as it always did, and `jagent_run_retries` counts
+the retries. `ask "why did X fail"` says `after N attempts` when the record does.
+
+**Groups.** `[group.NAME]` with `jobs = a, b, c` runs its members in file order, each
+recorded as its own run — there is no group record, because a group is a way of asking,
+not a thing that ran. `run group NAME` prints `group=NAME jobs=N success=S failure=F` and
+one run line per member, and exits 1 if any failed. A member that is not a configured
+job, an empty list, a group declared twice, or a group named like a job are faults that
+name their line; `find_group` and `find_job` never answer each other's names.
+
+**Retention.** `history_max_runs` prunes the OLDEST run records beyond the bound that are
+not any job's latest — so `status` and `last:` never point at a missing record — in one
+synced batch; `compact_after_dead_bytes` rewrites the store through `kv.compact` once the
+dead bytes reach it. `seq` is a counter, never a count: numbers are not reused after a
+prune. The policy runs after every `run`, `schedule` iteration and `serve` round
+(`jagent.maintain`), and says on stderr what it did; `jagent compact` applies it and
+rewrites the store whatever the threshold.
+
 ## `doctor`
 
 One line per subsystem, `name: verdict key=value…`, then a result line. Every verdict is
 **measured**, and the check **mutates nothing the operator owns**:
 
 ```
-config: ok path=jagent.ini jobs=1
-store: ok path=jagent.db present=false note=created-by-the-first-run
-sysproc: ok spawn=true timeout=true tree_reaped=true children=2
-http: ok host=127.0.0.1 port=0 bound=60309
+config: ok path=jagent.ini source=cwd jobs=4 groups=1
+store: ok path=jagent.db present=true synced=true runs=12 dead_bytes=2048
+history: ok runs=12 max=1000 dead_bytes=2048 compact_after=65536
+sysproc: ok spawn=true timeout=true tree_reaped=true children=2 cwd=supported env=supported
+http: ok host=0.0.0.0 port=8080 bound=8080
 tls: supported requested=false
-auth: missing risk=local-only
+auth: present kind=bearer exempt=GET/health
 reload: ok watched=true dir=.
-schedule: ok scheduled=0 of=1
-limits: kinds=command concurrency=none preview_bytes=240
-result: ok warnings=0 errors=0
+schedule: ok scheduled=1 of=4
+jobs: ok command=3 http-check=1 groups=1 retrying=1
+limits: kinds=command,http-check concurrency=none tls=one-request-per-connection preview_bytes=240
+risk: warn count=2 token-in-the-clear never-run:rotate-log
+result: ok warnings=2 errors=0
 ```
+
+`source=` is where the configuration was found (`flag`, `env`, `cwd`, `default`). The
+`risk:` line is the one place exposure is counted: every tag is a fact from the
+configuration or the history, and `warnings=` is their number plus the `reload:` warning
+when the watcher could not open. The tags, in the order they are tested:
+
+| tag | when |
+|---|---|
+| `remote-bind-without-token` | `agent.host = 0.0.0.0` and no `agent.token` |
+| `token-in-the-clear` | `0.0.0.0` with a token but `tls = false` |
+| `tls-incomplete` | `tls = true` without both `tls_cert` and `tls_key` |
+| `never-run:<job>`, `scheduled-never-ran:<job>` | no record for the job (the scheduled form when it has an interval) |
+| `last-run-failed:<job>`, `scheduled-last-failed:<job>` | the job's latest record is `failure`, `timeout` or `config-error` |
+| `stale:<job>` | scheduled, last run succeeded, and it started more than two intervals ago by the wall clock |
+| `history-over-max`, `compaction-due` | the history exceeds `history_max_runs`; the dead bytes have reached `compact_after_dead_bytes` |
 
 | line | what was done | fails / warns when |
 |---|---|---|
-| `config` | the file is loaded through the real loader | it cannot be read (`reason=cannot-read`) or has faults (`faults=N`, printed on stderr) — an error; the store, bind, reload and schedule checks are then `skipped reason=no-config` |
-| `store` | a present store is opened, `kv.sync`ed, its run count read, and closed; an absent one is **not created** — its directory is checked instead | `reason=cannot-open`, `cannot-sync`, `directory-missing` — errors |
-| `sysproc` | on an agent of its own with no store: a job that must print `jagent-doctor`, then a job that must be killed at 200 ms with its tree confirmed reaped | any half false — an error; `--no-probes` skips it (`skipped reason=no-probes`) |
-| `http` | `agent.host:agent.port` is bound and released; `bound=` is the port the platform gave | `reason=cannot-bind` — an error; `warning=remote-bind-unauthenticated` on `0.0.0.0` with no token |
+| `config` | the file is loaded through the real loader; `source=` says where it was found | it cannot be read (`reason=cannot-read`) or has faults (`faults=N`, printed on stderr) — an error; the store, history, bind, reload, schedule, jobs and risk lines are then `skipped reason=no-config` |
+| `store` | a present store is opened, `kv.sync`ed, its run count and dead bytes read; an absent one is **not created** — its directory is checked instead | `reason=cannot-open`, `cannot-sync`, `directory-missing` — errors |
+| `history` | the live run records against `history_max_runs`, the dead bytes against `compact_after_dead_bytes` | never by itself; the `risk:` line tags `history-over-max` and `compaction-due` |
+| `sysproc` | on an agent of its own with no store: a job that must print `jagent-doctor`, then a job that must be killed at 200 ms with its tree confirmed reaped; `cwd`/`env` are the build's contract, stated | any half false — an error; `--no-probes` skips it (`skipped reason=no-probes`) |
+| `http` | `agent.host:agent.port` is bound and released; `bound=` is the port the platform gave | `reason=cannot-bind` — an error |
+| `jobs` | the job table by kind, the groups, the jobs with retries | never |
+| `risk` | the rules above, tagged | `warn count=N …` — N warnings |
 | `tls` | what the file asks and, when it asks, whether the certificate and key LOAD (a context is built and freed, nothing bound) | `loaded=false reason=tls_cert-or-tls_key-unset`, or `loaded=false reason=<OpenSSL's words>` — errors, because `serve` would exit 2 |
-| `auth` | whether `agent.token` is set | `present kind=bearer exempt=GET/health` when it is; otherwise `missing` with `risk=remote-exposed` on `0.0.0.0` — a warning — or `risk=local-only` on loopback |
+| `auth` | whether `agent.token` is set | `present kind=bearer exempt=GET/health` when it is; otherwise `missing` with `risk=remote-exposed` on `0.0.0.0` or `risk=local-only` on loopback (the `risk:` line counts the exposure) |
 | `reload` | the watcher over the configuration's directory is opened and closed | `watched=false` — a warning |
 | `schedule` | how many jobs declare an interval | never; the load already refused a bad one |
 | `limits` | the fixed facts a reader should know | never |
@@ -227,10 +327,21 @@ Recommended next action: jagent logs backup-home
 | *is the agent healthy*, *check my machine*, *status*, *summary* | the configuration, the store, every job's last run, the bind |
 | *what failed* | every job whose last run was `failure`, `timeout` or `config-error`, with the status and the error text the record holds |
 | *why did `<job>` fail* | that job's last record: `flaky's last run (#2) ended failure: exit code 3.` and that *the record holds no more than that* — a job that succeeded "did not fail", one that never ran "has never run", a name that is not configured is repeated back with the list |
+| *what failed recently* | the last twenty records, the failed ones only — history, not just each job's latest |
 | *what jobs have never run* | the jobs without a `last:` pointer |
-| *what should I look at next* | the first fact that needs attention: a failed job → `jagent logs <job>`; a job that never ran → `jagent run <job>`; a `0.0.0.0` bind with no token → set the host or set `agent.token`; else `jagent doctor` |
-| anything with *run*, *execute*, *start*, *launch*, *kill*, *delete*, *edit*, *change* | a refusal that names the command: `I do not run, change or delete anything. To run a configured job: jagent run <name>. Configured jobs: …` |
+| *what is stale* | the scheduled jobs that never ran, last failed, or whose last success is more than two intervals old |
+| *what is risky* | the risk rules (the doctor's tags), as sentences |
+| *what changed after reload* | the generation, the loads and rejections, and either what applied or the faults of the rejected load |
+| *how did `<group>` go*, *what failed in `<group>`*, *what never ran in `<group>`* | the group's members: all, the failed, the never-run; the counts; the next action for the group |
+| *what should I check next* | the first fact that needs attention: a failed job → `jagent logs <job>`; a job that never ran → `jagent run <job>`; a `0.0.0.0` bind with no token → set the host or set `agent.token`; else `jagent doctor` |
+| anything with *run*, *execute*, *start*, *launch*, *kill*, *delete*, *edit*, *compact* | a refusal that names the command: `I do not run, change or delete anything. To run a configured job: jagent run <name>; a group: jagent run group <name>. …` |
 | anything else | the list of what it answers, exit 1 |
+
+A group named in the question is the subject before any other rule; the refusal comes
+before the questions; `next` outranks `check`, so "what should I check next" is the next
+question. Every answer comes from the configuration, the job table, the groups, each job's
+last record, the last twenty records, the reload counters and the risk rules — nothing
+else, and nothing invented.
 
 The rules that make it safe are structural, and each has a test that watched a mutant fail:
 
@@ -285,11 +396,15 @@ The demo's `/metrics` after four runs:
 
 ```
 counter jagent_config_reloads 1
+counter jagent_history_compactions 0
+counter jagent_history_pruned 0
 counter jagent_http_requests 7
 counter jagent_http_unauthorized 0
 gauge jagent_jobs 4
 histogram jagent_run_ms le 10 4
 …
+counter jagent_run_retries 0
+counter jagent_runs_config_error 0
 counter jagent_runs_failure 1
 counter jagent_runs_no_such_job 1
 counter jagent_runs_success 3
@@ -470,6 +585,18 @@ were the quieter measurement of the same code.
 | `status`, 50 jobs with their last runs | 1.9–2.5 ms | the same lookups, rendered |
 | `logs <job>`, one job filtered from 1,000 records | 20–25 ms | a scan of every live record, each parsed (~22 µs a record); this one grows with the history |
 | `jagent status` (the whole process, from the shell) | ~90–100 ms | measured by hand with the CLI; the process start and the store replay |
+| **v3 (2026-09-09, one run, the machine quiet)** | | |
+| configuration validate, a hundred jobs (`load_text`) | 6.1 ms | **a regression against v2's 1.3–1.4 ms**: ten declared keys per job instead of four, plus the group scan; 60 µs a job |
+| `ask "what failed"`, 50 jobs over 1,000 records | 1.7 ms | the `last:` pointers |
+| `ask "what is risky"`, 50 jobs over 1,000 records | 1.2 ms | the risk rules over the same pointers |
+| `ask "what failed recently"` | 0.6 ms | the last 20 records rendered and filtered |
+| http-check, connection refused (`127.0.0.1:1`) | **2.0 s** | Windows retries a refused loopback SYN for ~2 s before `connect` fails; the socket timeout bounds the request, not the connect — see the limitation below; on Linux a refusal is immediate |
+| `GET /jobs` with the bearer token, kept-alive | 12.1 ms | the poll tick again; the constant-time compare is not visible against it |
+| `GET /jobs` refused 401 (no token), kept-alive | 12.0 ms | the same tick |
+| `run group` of five trivial command jobs | 62 ms a member | five `cmd.exe` starts, five records |
+| `maintain` over 65 runs with `history_max_runs = 50` | 1.3 ms | 15 records deleted in one synced batch; the compaction did not trigger (2 KB dead against a 4 KB threshold) |
+| `maintain` with nothing to do | 4 µs | the check every `serve` round pays |
+| a trivial command job, this run | 59 ms | the day's quieter figure; the v2 range stands |
 
 **The `/health` figure is the poll's granularity, not the server's work.** The bench drives
 the server with `httpd.serve_for(sv, net, 1)` between requests and Windows rounds a 1 ms
@@ -493,10 +620,23 @@ by the record size per run until a `compact` — which is the shape `std/kv` doc
 
 ## Known limitations
 
-- **One job kind** (`command`). The table has the column; a second kind is a constant, an
-  arm in `execute`, and a check at load.
-- **No concurrency.** A run blocks the API for its duration, bounded by its timeout. Two
-  scheduled jobs due in the same tick run one after the other.
+- **Two job kinds** (`command`, `http-check`). An http-check names its target by IPv4
+  address or `localhost` — no resolver in the tree — and checks `http://` only: `https://`
+  is refused at load rather than checked in plaintext, and a TLS client check is the next
+  kind. The check reads the status and nothing of the body. **Its `connect` is not bounded
+  by `timeout_ms`** — `sysnet` has no non-blocking connect — so a target that black-holes
+  the SYN costs the platform's connect timeout, and a refused loopback port costs Windows'
+  ~2 s of SYN retries (measured; immediate on Linux). The request and the response are
+  bounded, and a target that accepts and never answers is a `timeout` within the budget.
+- **One environment variable per command job**, and no per-job user or jail
+  (`std/sandbox` has the jail; nothing here asks for it).
+- **A group runs its members one after the other**, and a group record is not written; the
+  members' records are the group's history.
+- **Retention prunes by count and compacts by dead bytes**; there is no age-based window,
+  and the pruning scan is linear in the history (it runs only when the bound is exceeded).
+- **No concurrency.** A run blocks the API for its duration, bounded by its timeout — and
+  by its retries: a job with `retries = 10` and a long backoff can hold the API for the sum.
+  Two scheduled jobs due in the same tick run one after the other.
 - **TLS is one request per connection, served whole on the loop, every blocking call
   bounded at 5 s** (above). **One token, one scope**:
   every gated route is all-or-nothing; no per-route scopes, no read-only token, no rotation
@@ -555,11 +695,8 @@ name is a compiler intrinsic; the convention is `has`.
 4. **Concurrent runs**: a run per `sysproc.Child` in a table stepped from the serve loop
    (`std/supervise`'s struct-of-arrays shape), so the API answers while a job runs and two
    due jobs overlap.
-5. **Per-job `cwd`, environment and jail** through `sysproc.start_piped_at` and
-   `sandbox.Jail`.
-6. **Retry and backoff policies** per job, from `std/supervise`'s `Policy`.
-7. **Compaction on a schedule** (`kv.dead_bytes` is the query), a size cap, a retention
-   window, and a per-job index for `logs`.
-8. **A second job kind** — an HTTP probe through `std/httpc` is the obvious one: no shell,
-   no process, a status code as the exit code.
-9. **The Linux ladder**: the suites, the demo and the command have only run on Windows.
+5. **A per-job jail** through `sandbox.Jail`, and a per-job user; a full environment block
+   rather than one variable.
+6. **An https check** (a `tls.Session` client in `execute_http`) and a resolver.
+7. **An age-based retention window** beside the count, and a per-job index for `logs`.
+8. **The Linux ladder**: the suites, the demo and the command have only run on Windows.
