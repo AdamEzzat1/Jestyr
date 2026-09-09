@@ -60,7 +60,7 @@ jagent [-c <config>] status                 the configuration, the store, every 
 jagent [-c <config>] logs [<job>]           the last 20 runs, of one job or of all
 jagent [-c <config>] jobs                   the job table, one line each
 jagent [-c <config>] check                  load the configuration and say so (= config validate)
-jagent [-c <config>] config show            the configuration text in force
+jagent [-c <config>] config show            the configuration text in force, `token = ****`
 jagent [-c <config>] config validate        as `check`
 jagent [-c <config>] doctor [--no-probes]   the self-check, one line per subsystem
 jagent [-c <config>] ask <question...>      the operator's questions, answered from the record

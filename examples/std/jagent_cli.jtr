@@ -199,8 +199,8 @@ fn cmd_serve(mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> i32 {
         eprint_str("jagent: the history store could not be opened")
         return 1
     }
-    if jagent.host_is_loopback(ag) == false {
-        eprint_str("jagent: warning: agent.host = 0.0.0.0 exposes an unauthenticated API to every interface")
+    if jagent.host_is_loopback(ag) == false and jagent.token_required(ag) == false {
+        eprint_str("jagent: warning: agent.host = 0.0.0.0 exposes an unauthenticated API to every interface; set agent.token")
     }
     var net: sysnet.Net = sysnet.host()
     var sv: httpd.Server = httpd.make(a, time.host(), stderr_logger(), true, 16, 65536)
@@ -276,8 +276,12 @@ fn cmd_validate(mut ag: jagent.Agent, read cfg: str) -> i32 {
     return 0
 }
 
+// The text in force, secrets redacted — `agent.token` prints as `****`.
 fn cmd_config_show(mut ag: jagent.Agent) -> i32 {
-    show(jagent.config_text(ag))
+    var s: String = string_new()
+    jagent.render_config(ag, s)
+    show(string_view(s))
+    string_free(s)
     return 0
 }
 

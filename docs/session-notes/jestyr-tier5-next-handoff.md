@@ -8,6 +8,9 @@ defects — one session at a time). §2 is the parallel work (library breadth �
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
+**1377 passed / 0 failed / 3 ignored** (full ladder after the BEARER TOKEN on `jagent`'s API —
+`jagent_test` 14, `jagent_ops_test` 12 inside `io_suites_pass`, `config.value_is_ct`; 1050 s,
+fully green, the two flakes of the previous run not seen.) Previously
 **1375 passed / 2 failed / 3 ignored** (full ladder after the PROJECT SHAPE — `std/jagent_ops`,
 `jagent_ops_test` 11 inside `io_suites_pass`, two more CLI/plan tests; 1500 s on a day the
 machine ran everything ~50% slower. Both failures are LOAD flakes outside the change and both
@@ -1054,9 +1057,20 @@ test and the plan pinned. What a successor should not re-derive:
   that is killed rather than signalled leaves a mid-run command running. The Windows
   service page says so; a Job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is the fix when the
   service entry point is built.
+* **The bearer token (same day)**: `agent.token` declared SECRET in `std/config` — the
+  redaction is a property of the DECLARATION, so `config show`, the faults, `status` and
+  `doctor` cannot print it by forgetting a flag; the agent can only `token_matches`
+  (constant-time, `config.value_is_ct` — new, since `value_is` returns at the first
+  differing byte) and `token_required`. The gate is `httpd.use_middleware`, which runs
+  BEFORE routing, so 401 precedes 404 and the route table is not enumerable without the
+  token. `GET /health` is exempt on purpose (a readiness probe reveals the phase, nothing
+  else). `render_config` redacts by re-rendering the file's own text line by line rather
+  than through `config.render`, so comments and order survive. A mutant that made the
+  middleware always `NEXT` was watched failing the token test. Stated, not solved: the token
+  travels in the clear until `httpd` speaks TLS.
 * Not built: `--format json` (hand-rolled argv; text is the contract), a `bench` subcommand,
   an installer, an SCM entry point (`docs/jagent-windows-service.md` lists what one needs),
-  TLS, auth. The Linux ladder has not run any of it.
+  TLS, token scopes. The Linux ladder has not run any of it.
 
 ### Compiler defects and gaps — OPEN
 

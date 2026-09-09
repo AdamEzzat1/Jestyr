@@ -2944,7 +2944,7 @@ mod jagent_edge {
              -- jagent status --\n\
              config=zz_jagent_demo/agent.ini valid=true generation=1 faults=0\n\
              store=zz_jagent_demo/history.db open=true runs=3\n\
-             server host=127.0.0.1 port=0 tls=false\n\
+             server host=127.0.0.1 port=0 tls=false auth=none\n\
              phase=ready ready=true live=true inflight=0\n\
              jobs=4\n\
              \x20 health-check kind=command timeout_ms=10000 interval_ms=0\n\
@@ -2976,6 +2976,7 @@ mod jagent_edge {
              GET /metrics\n200\n\
              counter jagent_config_reloads 1\n\
              counter jagent_http_requests 7\n\
+             counter jagent_http_unauthorized 0\n\
              gauge jagent_jobs 4\n\
              histogram jagent_run_ms le 10 4\n\
              histogram jagent_run_ms le 100 0\n\
@@ -3130,7 +3131,16 @@ mod jagent_command {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        std::fs::write(dir.join("serve.ini"), base.replace("port = 0", &format!("port = {port}"))).unwrap();
+        // The served file carries a token, so the API's gate is exercised through a real
+        // socket: `/health` open, everything else 401 without the bearer and 200 with it.
+        std::fs::write(dir.join("serve.ini"), base.replace("port = 0", &format!("port = {port}\ntoken = s3cret"))).unwrap();
+        let (code, out, _) = run_cli(&exe, &dir, &["-c", "serve.ini", "config", "show"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("\ntoken = ****\n"), "config show redacts the token: {out}");
+        assert!(!out.contains("s3cret"), "and never prints it: {out}");
+        let (code, out, _) = run_cli(&exe, &dir, &["-c", "serve.ini", "status"]);
+        assert_eq!(code, 0);
+        assert!(out.contains(&format!("server host=127.0.0.1 port={port} tls=false auth=bearer\n")), "{out}");
         // **The served process is killed on EVERY exit from this test, a panic included.**
         // A failed assertion between the spawn and the kill would otherwise leave `jagent
         // serve` running with this harness's pipes inherited, and anything capturing the
@@ -3168,12 +3178,17 @@ mod jagent_command {
         let health = http(port, "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         assert!(health.starts_with("HTTP/1.1 200 "), "{health}");
         assert!(health.ends_with("phase=ready ready=true live=true inflight=0\n"), "{health}");
-        let ran = http(port, "POST /jobs/health-check/run HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let denied = http(port, "POST /jobs/health-check/run HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(denied.starts_with("HTTP/1.1 401 "), "a run without the token is refused:\n{denied}");
+        assert!(denied.contains("WWW-Authenticate: Bearer"), "{denied}");
+        let wrong = http(port, "POST /jobs/health-check/run HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer nope\r\nConnection: close\r\n\r\n");
+        assert!(wrong.starts_with("HTTP/1.1 401 "), "{wrong}");
+        let ran = http(port, "POST /jobs/health-check/run HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\nConnection: close\r\n\r\n");
         assert!(ran.starts_with("HTTP/1.1 200 "), "{ran}");
-        assert!(ran.contains("job=health-check status=success code=0 seq=2 recorded=true"), "a second record, after the CLI's #1:\n{ran}");
-        let missing = http(port, "GET /jobs/nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(ran.contains("job=health-check status=success code=0 seq=2 recorded=true"), "a second record, after the CLI's #1 — the refused calls ran nothing:\n{ran}");
+        let missing = http(port, "GET /jobs/nope HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\nConnection: close\r\n\r\n");
         assert!(missing.starts_with("HTTP/1.1 404 "), "{missing}");
-        let logs = http(port, "GET /logs/health-check HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let logs = http(port, "GET /logs/health-check HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\nConnection: close\r\n\r\n");
         assert!(logs.contains("\n#1 job=health-check") && logs.contains("\n#2 job=health-check"), "{logs}");
 
         child.0.kill().unwrap();
@@ -21400,7 +21415,9 @@ fn main() -> i32 {
             // edit reloaded through the real watcher and a broken edit rejected through it;
             // the scheduler on a manual clock; TLS declared unsupported and `serve` refusing
             // it; and the status/run summaries exact on a manual clock and a fixed wall.
-            ("jagent_test", 13),
+            // (+1: a bearer token gates every route but GET /health — 401 before routing,
+            // constant-time compare, counted, redacted from the rendered configuration.)
+            ("jagent_test", 14),
             // The operator's layer over the agent: the discovery order (flag, environment,
             // working directory); `init` writing a starter that loads and refusing to replace
             // a file whose bytes are then unchanged; `doctor` passing on a healthy scratch
@@ -21411,7 +21428,9 @@ fn main() -> i32 {
             // summarising from the record, explaining a failure with only the status and
             // code the record holds, refusing every request to run/change/delete with the
             // history and job table unchanged, and creating no store when there is none.
-            ("jagent_ops_test", 11),
+            // (+1: a token is a fact to `doctor` and `ask` — the 0.0.0.0 warnings go —
+            // and `****` to `render_config`.)
+            ("jagent_ops_test", 12),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

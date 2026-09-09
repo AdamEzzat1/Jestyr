@@ -43,6 +43,9 @@ const JO_TLS: str = "[agent]\ntls = true\nstore = zz_jagent_ops/history.db\n[job
 
 const JO_BAD: str = "[job.x]\ncommand = echo x\ntimeout_ms = soon\n"
 
+// Every interface, but behind a token.
+const JO_TOKEN: str = "[agent]\nhost = 0.0.0.0\nport = 0\ntoken = s3cret-token\nstore = zz_jagent_ops/history.db\n[job.health-check]\ncommand = echo healthy\n"
+
 fn nothing() { }
 
 fn has_text(read s: str, read needle: str) -> bool { return str.has(s, needle) }
@@ -56,6 +59,7 @@ fn scrub(mut h: fs.Fs, read a: Allocator) {
     fs.erase(h, "zz_jagent_ops/open.ini")
     fs.erase(h, "zz_jagent_ops/tls.ini")
     fs.erase(h, "zz_jagent_ops/nodir.ini")
+    fs.erase(h, "zz_jagent_ops/token.ini")
     let gone: bool = sysfs.remove_dir(h, a, JO_ROOT) catch false
 }
 
@@ -345,6 +349,63 @@ fn agent_with_history(read a: Allocator, mut h: fs.Fs) -> jagent.Agent {
     test.is_true(c, rep, "tls requested of a build without it", has_text(t3, "\ntls: unsupported requested=true serve=refused\n"))
     test.is_false(c, rep, "is a failure, because serve would refuse", jagent_ops.is_ok(r3))
     test.eq_i64(c, rep, "one error", jagent_ops.errors(r3), 1)
+
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_token_is_a_fact_to_doctor_and_ask_and_a_secret_to_show() -> bool {
+    var raw: *mut u8 = alloc(u8, JO_CAP)
+    var rep: []u8 = slice(u8, raw, JO_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    fs.put(h, "zz_jagent_ops/token.ini", JO_TOKEN)
+    fs.put(h, "zz_jagent_ops/open.ini", JO_OPEN)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+
+    // doctor: the same 0.0.0.0 bind that warned twice is clean behind a token.
+    var r: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, "zz_jagent_ops/token.ini", false)
+    let t: str = jagent_ops.report_text(r)
+    test.is_true(c, rep, "bound on every interface", has_text(t, "\nhttp: ok host=0.0.0.0 port=0 bound="))
+    test.is_false(c, rep, "without the warning", has_text(t, "warning="))
+    test.is_true(c, rep, "auth is present, with its exemption named", has_text(t, "\nauth: present kind=bearer exempt=GET/health\n"))
+    test.eq_i64(c, rep, "no warnings", jagent_ops.warnings(r), 0)
+    test.is_true(c, rep, "ok", jagent_ops.is_ok(r))
+    test.is_false(c, rep, "and the secret is not in the report", has_text(t, "s3cret"))
+    // The control: the same bind without a token, two warnings.
+    var r2: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, "zz_jagent_ops/open.ini", false)
+    test.eq_i64(c, rep, "two warnings without it", jagent_ops.warnings(r2), 2)
+    test.is_true(c, rep, "auth missing", has_text(jagent_ops.report_text(r2), "\nauth: missing risk=remote-exposed\n"))
+
+    // ask: the summary names the token and drops the warning.
+    var ag: jagent.Agent = agent_with(a, JO_TOKEN)
+    var s: String = string_new()
+    test.eq_i64(c, rep, "answered", jagent_ops.ask(ag, h, a, "is the agent healthy", s) as i64, jagent_ops.ASK_ANSWERED as i64)
+    test.is_true(c, rep, "with the token as a fact", has_text(string_view(s), "TLS is off; the API binds to every interface (0.0.0.0) with a bearer token.\n"))
+    test.is_false(c, rep, "no warning", has_text(string_view(s), "WARNING"))
+    test.is_false(c, rep, "and no secret", has_text(string_view(s), "s3cret"))
+    test.is_true(c, rep, "the next action is the job that never ran", str.has_suffix(string_view(s), "Recommended next action: jagent run health-check\n"))
+    string_free(s)
+
+    // show: the value is ****, the rest verbatim, the secret nowhere.
+    s = string_new()
+    jagent.render_config(ag, s)
+    test.eq_str(c, rep, "redacted in place",
+        string_view(s),
+        "[agent]\nhost = 0.0.0.0\nport = 0\ntoken = ****\nstore = zz_jagent_ops/history.db\n[job.health-check]\ncommand = echo healthy\n")
+    string_free(s)
+    jagent.free(ag)
+
+    // The starter tells the operator where the token goes.
+    var st: String = string_new()
+    jagent_ops.starter_text(st)
+    test.is_true(c, rep, "the starter carries the hint, commented out", has_text(string_view(st), "\n# token = \n"))
+    string_free(st)
 
     scrub(h, a)
     let ok: bool = test_report.finish(c, rep)

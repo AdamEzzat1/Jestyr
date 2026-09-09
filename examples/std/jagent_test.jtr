@@ -483,9 +483,14 @@ fn resp_within(mut cl: httpc.Client, ms: i64) -> i32 {
 
 // One request on a fresh connection, the server driven in between. -1 when no answer came.
 fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: str, mut dst: String) -> i32 {
+    return ask_with(sv, net, method, path, "", dst)
+}
+
+// `ask` with extra header lines (`Name: v\r\n`), for the token.
+fn ask_with(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: str, read extra: str, mut dst: String) -> i32 {
     var cl: httpc.Client = httpc.dial(net, sysnet.loopback(httpd.port(sv)), JT_CAP)
     if httpc.is_open(cl) == false { return 0 - 1 }
-    httpc.request(cl, method, path, "", "")
+    httpc.request(cl, method, path, extra, "")
     httpd.serve_for(sv, net, 40)
     var st: i32 = 0 - 1
     if resp_within(cl, 10000) == http.HTTP_OK {
@@ -591,6 +596,115 @@ fn boot(read a: Allocator, mut net: sysnet.Net, ctx: *mut jagent.Serve) -> httpd
     jagent.free(back)
     jagent.free_serve(ctx)
     free_ptr(cell as *mut u8)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+const JT_TOKEN: str = "[agent]\nhost = 127.0.0.1\nport = 0\ntoken = s3cret-token\nstore = zz_jagent/history.db\n\n[job.health-check]\ncommand = echo healthy\ntimeout_ms = 10000\n"
+
+const JT_BEARER: str = "Authorization: Bearer s3cret-token\r\n"
+
+@test fn a_bearer_token_gates_every_route_but_health() -> bool {
+    var raw: *mut u8 = alloc(u8, JT_CAP)
+    var rep: []u8 = slice(u8, raw, JT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    var ag: jagent.Agent = agent_with(a, JT_TOKEN)
+    jagent.set_wall(ag, &fixed_wall)
+    test.is_true(c, rep, "the token is required", jagent.token_required(ag))
+    jagent.open_store(ag, h)
+    var cell: *mut jagent.Agent = alloc(jagent.Agent, 1)
+    unsafe { (cell + 0).* = ag }
+    var ctx: *mut jagent.Serve = jagent.serve_ctx(cell, sysproc.host(), time.host())
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = boot(a, net, ctx)
+
+    var b: String = string_new()
+    test.eq_i64(c, rep, "GET /health needs no token", ask(sv, net, "GET", "/health", b) as i64, 200)
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "GET /jobs without one is 401", ask(sv, net, "GET", "/jobs", b) as i64, 401)
+    test.eq_str(c, rep, "and says what it needs", string_view(b), "unauthorized: this API needs `Authorization: Bearer <agent.token>`\n")
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "a wrong token is 401", ask_with(sv, net, "GET", "/jobs", "Authorization: Bearer s3cret-tokeN\r\n", b) as i64, 401)
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "a prefix of the token is 401", ask_with(sv, net, "GET", "/jobs", "Authorization: Bearer s3cret\r\n", b) as i64, 401)
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "the wrong scheme is 401", ask_with(sv, net, "GET", "/jobs", "Authorization: Basic s3cret-token\r\n", b) as i64, 401)
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "an unknown path without a token is 401, not 404", ask(sv, net, "GET", "/nope", b) as i64, 401)
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "a run without a token is 401", ask(sv, net, "POST", "/jobs/health-check/run", b) as i64, 401)
+    var seq0: i64 = 0
+    unsafe { seq0 = jagent.last_seq((cell + 0).*) }
+    test.eq_i64(c, rep, "and nothing ran", seq0, 0)
+
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "the right token is 200", ask_with(sv, net, "GET", "/jobs", JT_BEARER, b) as i64, 200)
+    test.eq_str(c, rep, "with the job table", string_view(b), "health-check kind=command timeout_ms=10000 interval_ms=0\n")
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "and a run with it is 200", ask_with(sv, net, "POST", "/jobs/health-check/run", JT_BEARER, b) as i64, 200)
+    test.is_true(c, rep, "recorded as #1", str.has_prefix(string_view(b), "job=health-check status=success code=0 seq=1 recorded=true"))
+    string_free(b)  b = string_new()
+    test.eq_i64(c, rep, "an unknown path WITH the token is the routing 404", ask_with(sv, net, "GET", "/nope", JT_BEARER, b) as i64, 404)
+
+    var un: i64 = 0
+    unsafe { un = jagent.http_unauthorized((cell + 0).*) }
+    test.eq_i64(c, rep, "six refusals counted", un, 6)
+    var reqs: i64 = 0
+    unsafe { reqs = jagent.http_requests((cell + 0).*) }
+    test.eq_i64(c, rep, "and three routed requests, the refusals not among them", reqs, 3)
+    string_free(b)  b = string_new()
+    ask_with(sv, net, "GET", "/metrics", JT_BEARER, b)
+    test.is_true(c, rep, "the refusals are a metric", contains(string_view(b), "counter jagent_http_unauthorized 6\n"))
+
+    // The token is visible as a FACT and never as a value.
+    string_free(b)  b = string_new()
+    unsafe { jagent.render_status((cell + 0).*, b) }
+    test.is_true(c, rep, "status names the auth", contains(string_view(b), "server host=127.0.0.1 port=0 tls=false auth=bearer\n"))
+    string_free(b)  b = string_new()
+    unsafe { jagent.render_config((cell + 0).*, b) }
+    test.is_true(c, rep, "the rendered configuration redacts it", contains(string_view(b), "\ntoken = ****\n"))
+    test.is_false(c, rep, "and holds the secret nowhere", contains(string_view(b), "s3cret"))
+    test.is_true(c, rep, "while the rest is verbatim", contains(string_view(b), "\ncommand = echo healthy\n"))
+
+    string_free(b)
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    var back: jagent.Agent = unsafe { (cell + 0).* }
+    jagent.free(back)
+    jagent.free_serve(ctx)
+    free_ptr(cell as *mut u8)
+
+    // The control: with no token configured nothing is gated, and an unknown path is 404.
+    var ag2: jagent.Agent = agent_with(a, JT_GOOD)
+    test.is_false(c, rep, "no token in the plain file", jagent.token_required(ag2))
+    var cell2: *mut jagent.Agent = alloc(jagent.Agent, 1)
+    unsafe { (cell2 + 0).* = ag2 }
+    var ctx2: *mut jagent.Serve = jagent.serve_ctx(cell2, sysproc.host(), time.host())
+    var sv2: httpd.Server = boot(a, net, ctx2)
+    var b2: String = string_new()
+    test.eq_i64(c, rep, "GET /jobs is open", ask(sv2, net, "GET", "/jobs", b2) as i64, 200)
+    string_free(b2)  b2 = string_new()
+    test.eq_i64(c, rep, "and an unknown path is 404", ask(sv2, net, "GET", "/nope", b2) as i64, 404)
+    string_free(b2)  b2 = string_new()
+    unsafe { jagent.render_status((cell2 + 0).*, b2) }
+    test.is_true(c, rep, "status says none", contains(string_view(b2), " tls=false auth=none\n"))
+    var un2: i64 = 0
+    unsafe { un2 = jagent.http_unauthorized((cell2 + 0).*) }
+    test.eq_i64(c, rep, "no refusals", un2, 0)
+    string_free(b2)
+    httpd.stop(sv2, net)
+    httpd.free(sv2)
+    sysnet.shutdown(net)
+    var back2: jagent.Agent = unsafe { (cell2 + 0).* }
+    jagent.free(back2)
+    jagent.free_serve(ctx2)
+    free_ptr(cell2 as *mut u8)
+
     scrub(h, a)
     let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
@@ -849,7 +963,7 @@ fn boot(read a: Allocator, mut net: sysnet.Net, ctx: *mut jagent.Serve) -> httpd
     jagent.render_status(ag, s)
     test.eq_str(c, rep, "status before the store opens",
         string_view(s),
-        "config=zz_jagent/agent.ini valid=true generation=1 faults=0\nstore=zz_jagent/history.db open=false runs=0\nserver host=127.0.0.1 port=0 tls=false\nphase=ready ready=true live=true inflight=0\njobs=2\n  health-check kind=command timeout_ms=10000 interval_ms=0\n    last=none (store closed)\n  rotate-log kind=command timeout_ms=10000 interval_ms=0\n    last=none (store closed)\n")
+        "config=zz_jagent/agent.ini valid=true generation=1 faults=0\nstore=zz_jagent/history.db open=false runs=0\nserver host=127.0.0.1 port=0 tls=false auth=none\nphase=ready ready=true live=true inflight=0\njobs=2\n  health-check kind=command timeout_ms=10000 interval_ms=0\n    last=none (store closed)\n  rotate-log kind=command timeout_ms=10000 interval_ms=0\n    last=none (store closed)\n")
 
     jagent.open_store(ag, h)
     let r: jagent.Run = jagent.run_job(ag, sp, blk, "rotate-log")
@@ -867,7 +981,7 @@ fn boot(read a: Allocator, mut net: sysnet.Net, ctx: *mut jagent.Serve) -> httpd
     string_free(s)  s = string_new()
     jagent.render_status(ag, s)
     var want2: String = string_new()
-    string_push(want2, "config=zz_jagent/agent.ini valid=true generation=1 faults=0\nstore=zz_jagent/history.db open=true runs=1\nserver host=127.0.0.1 port=0 tls=false\nphase=ready ready=true live=true inflight=0\njobs=2\n  health-check kind=command timeout_ms=10000 interval_ms=0\n    last=none\n  rotate-log kind=command timeout_ms=10000 interval_ms=0\n    last=#1 job=rotate-log status=success code=0 started_at=1700000000 duration_ms=0 out_bytes=")
+    string_push(want2, "config=zz_jagent/agent.ini valid=true generation=1 faults=0\nstore=zz_jagent/history.db open=true runs=1\nserver host=127.0.0.1 port=0 tls=false auth=none\nphase=ready ready=true live=true inflight=0\njobs=2\n  health-check kind=command timeout_ms=10000 interval_ms=0\n    last=none\n  rotate-log kind=command timeout_ms=10000 interval_ms=0\n    last=#1 job=rotate-log status=success code=0 started_at=1700000000 duration_ms=0 out_bytes=")
     push_num(want2, r.out_bytes)
     string_push(want2, " output=\"rotated")
     if r.out_bytes == 9 { string_push(want2, "\\r") }

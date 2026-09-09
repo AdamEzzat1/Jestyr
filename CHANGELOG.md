@@ -7,6 +7,22 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **A bearer token on `jagent`'s API.** `agent.token`, declared SECRET in `std/config` (so
+  every rendering prints `****` — `config show` says `token = ****`, and there is no accessor
+  for the bytes, only `token_required` and a constant-time `token_matches`), gates every route
+  but `GET /health` through `std/httpd` middleware: 401 with `WWW-Authenticate: Bearer` BEFORE
+  routing, so a caller without it learns nothing about the route table; refusals are counted
+  in `jagent_http_unauthorized` and not as routed requests; a reload picks up a changed token.
+  `std/config` gained `value_is_ct`, a constant-time `value_is` for exactly this comparison.
+  `doctor` reports `auth: present kind=bearer exempt=GET/health` and drops both `0.0.0.0`
+  warnings behind a token; `ask` names it as a fact; `status` says `auth=bearer|none`;
+  `init` writes the key commented out. Tests: `jagent_test` +1 (six refusals, the prefix,
+  the wrong scheme, the unknown path as 401 not 404, then 200 with the token, the counters,
+  the redaction; the control file gates nothing) and `jagent_ops_test` +1; the CLI test's
+  real `serve` now carries a token. A mutant that removed the gate was watched failing.
+  Stated: the token travels in the CLEAR until TLS lands — a remote bind with a token stops
+  a caller, not a listener — so TLS is now the first item in the next steps.
+
 - **`jagent` as a project: `std/jagent_ops`, `tools/jagent/`, and seven more commands.**
   The runner (`std/jagent`) is unchanged in semantics and gains three readers
   (`sync_store`, `last_record`, `config_text`); the new module `examples/std/jagent_ops.jtr`

@@ -245,6 +245,7 @@ const KEY_LAST: str = "last:"
     m_missing: i32,
     m_unrecorded: i32,
     m_http: i32,
+    m_unauth: i32,
     m_reloads: i32,
     m_dur: i32,
     m_jobs: i32,
@@ -312,6 +313,7 @@ pub fn make(read a: Allocator, take clk: time.Clock, take lg: log.Logger) -> Age
         m_missing: metrics.counter(m, "jagent_runs_no_such_job"),
         m_unrecorded: metrics.counter(m, "jagent_runs_unrecorded"),
         m_http: metrics.counter(m, "jagent_http_requests"),
+        m_unauth: metrics.counter(m, "jagent_http_unauthorized"),
         m_reloads: metrics.counter(m, "jagent_config_reloads"),
         m_dur: m_dur,
         m_jobs: metrics.gauge(m, "jagent_jobs"),
@@ -536,6 +538,24 @@ pub fn serve_refusal(read ag: Agent) -> str {
 // The path the history lives at: `agent.store`, `jagent.db` by default.
 pub fn store_path(read ag: Agent) -> read str { return string_view(ag.store_path) }
 
+// Is the API gated by a bearer token? True when `agent.token` is set and non-empty. There
+// is no accessor for the token itself: it is compared (`token_matches`) and rendered as
+// `****`, and that is all that can be done with it.
+pub fn token_required(read ag: Agent) -> bool {
+    if ag.valid == false { return false }
+    let id: i32 = config.by_name(ag.cfg, "agent.token")
+    if id < 0 { return false }
+    if config.is_set(ag.cfg, id) == false { return false }
+    return config.value_is(ag.cfg, id, "") == false
+}
+
+// Does `presented` equal the configured token? Constant-time in the token's length.
+fn token_matches(read ag: Agent, read presented: str) -> bool {
+    let id: i32 = config.by_name(ag.cfg, "agent.token")
+    if id < 0 { return false }
+    return config.value_is_ct(ag.cfg, id, presented)
+}
+
 // ---- loading a configuration ---------------------------------------------------------------
 
 @no_alloc @no_os fn name_byte_ok(b: i32) -> bool {
@@ -640,6 +660,9 @@ fn declare_all(mut cfg: config.Config, read c: Cand) {
     config.declare(cfg, "agent.tls_cert", config.CFG_STR, false)
     config.declare(cfg, "agent.tls_key", config.CFG_STR, false)
     config.declare(cfg, "agent.store", config.CFG_STR, false)
+    // SECRET by declaration: `std/config` renders it as `****` on every path, so nothing
+    // that prints the configuration can print the token by forgetting to.
+    config.declare(cfg, "agent.token", config.CFG_STR, true)
     config.apply(cfg, "agent.host", "127.0.0.1", config.CFG_DEFAULT)
     config.apply(cfg, "agent.port", "0", config.CFG_DEFAULT)
     config.apply(cfg, "agent.tls", "false", config.CFG_DEFAULT)
@@ -999,9 +1022,36 @@ pub fn last_record(mut ag: Agent, read name: str, mut dst: String) -> bool {
     return found
 }
 
-// The text of the configuration in force — what `jagent config show` prints. Empty until a
-// load has applied.
-pub fn config_text(read ag: Agent) -> read str { return string_view(ag.src) }
+// A `key = value` line whose key is one the schema declares secret.
+fn line_is_secret(read line: str) -> bool {
+    let eq: isize = str.index_of(line, "=")
+    if eq < 0 { return false }
+    return str_eq(str.trimmed(line[0 .. eq as usize]), "token")
+}
+
+// The configuration in force, as `jagent config show` prints it: the file's own text, with
+// the value of every line whose key the schema declares secret replaced by `****` —
+// `std/config`'s spelling, so a reader of either sees the same mark. Empty until a load has
+// applied. The file is not re-read: this is the text the agent is running.
+pub fn render_config(read ag: Agent, mut dst: String) {
+    let text: str = string_view(ag.src)
+    var at: usize = 0
+    for at < text.len {
+        var e: usize = at
+        for e < text.len {
+            if (text[e] as i32) == 10 { break }
+            e = e + 1
+        }
+        let line: str = text[at .. e]
+        if line_is_secret(line) {
+            string_push(dst, "token = ****")
+        } else {
+            string_push(dst, line)
+        }
+        if e < text.len { string_push(dst, "\n") }
+        at = e + 1
+    }
+}
 
 // The sequence number of the last recorded run, 0 when there is none.
 pub fn last_seq(read ag: Agent) -> i64 {
@@ -1372,6 +1422,7 @@ pub fn halt(mut ag: Agent) -> i32 { return service.halt(ag.svc, ag.m, ag.clock) 
 pub fn runs_total(read ag: Agent) -> i64 { return metrics.current(ag.m, ag.m_runs) }
 pub fn runs_unrecorded(read ag: Agent) -> i64 { return metrics.current(ag.m, ag.m_unrecorded) }
 pub fn http_requests(read ag: Agent) -> i64 { return metrics.current(ag.m, ag.m_http) }
+pub fn http_unauthorized(read ag: Agent) -> i64 { return metrics.current(ag.m, ag.m_unauth) }
 
 // ---- rendering ---------------------------------------------------------------------------------
 
@@ -1576,6 +1627,8 @@ pub fn render_status(mut ag: Agent, mut dst: String) {
     push_i64(dst, port(ag))
     string_push(dst, " tls=")
     push_bool(dst, tls_wanted(ag))
+    string_push(dst, " auth=")
+    if token_required(ag) { string_push(dst, "bearer") } else { string_push(dst, "none") }
     string_push(dst, "\n")
     render_health(ag, dst)
     string_push(dst, "jobs=")
@@ -1659,6 +1712,32 @@ fn ctx_of(ctx: *mut u8) -> *mut Serve {
 fn count_request(p: *mut Serve) {
     var s: Serve = unsafe { (p + 0).* }
     unsafe { metrics.inc((s.ag + 0).*.m, (s.ag + 0).*.m_http, 1) }
+}
+
+// The gate, as `std/httpd` middleware: it runs BEFORE routing, so a request without the
+// token learns nothing about the route table (401, not 404). With no token configured it
+// passes everything; with one, every request must carry `Authorization: Bearer <token>`
+// except `GET /health` — a readiness probe that reveals only the service's phase, and the
+// one thing a load balancer must be able to ask without a secret. The comparison is
+// constant-time in the token's length; a refusal is counted (`jagent_http_unauthorized`)
+// and never counted as a routed request.
+fn mw_auth(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    let p: *mut Serve = ctx_of(ctx)
+    var s: Serve = unsafe { (p + 0).* }
+    var need: bool = false
+    unsafe { need = token_required((s.ag + 0).*) }
+    if need == false { return httpd.HTTPD_NEXT }
+    if str_eq(httpd.method(x), "GET") and str_eq(httpd.path(x), "/health") { return httpd.HTTPD_NEXT }
+    let h: str = httpd.header(x, "authorization")
+    var fine: bool = false
+    if str.has_prefix(h, "Bearer ") {
+        unsafe { fine = token_matches((s.ag + 0).*, h[7 .. h.len]) }
+    }
+    if fine { return httpd.HTTPD_NEXT }
+    unsafe { metrics.inc((s.ag + 0).*.m, (s.ag + 0).*.m_unauth, 1) }
+    httpd.set_header(x, "WWW-Authenticate", "Bearer realm=\"jagent\"")
+    httpd.respond(x, 401, "text/plain; charset=utf-8", "unauthorized: this API needs `Authorization: Bearer <agent.token>`\n")
+    return httpd.HTTPD_DONE
 }
 
 fn h_health(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
@@ -1803,9 +1882,11 @@ fn h_logs_of(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
 //   GET  /logs/:name        the last 20 runs of one job (404 for an unknown name)
 //
 // Plain text, one fact per line; a client that wants JSON reads the store's records,
-// which already are.
+// which already are. When `agent.token` is set, every route but `GET /health` is behind
+// the bearer-token middleware (`mw_auth`).
 pub fn install(mut sv: httpd.Server, p: *mut Serve) {
     let c: *mut u8 = p as *mut u8
+    httpd.use_middleware(sv, httpd.handler(c, &mw_auth))
     httpd.route(sv, "GET", "/health", httpd.handler(c, &h_health))
     httpd.route(sv, "GET", "/metrics", httpd.handler(c, &h_metrics))
     httpd.route(sv, "GET", "/jobs", httpd.handler(c, &h_jobs))

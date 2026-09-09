@@ -19,7 +19,7 @@ built to grow: one job kind today, a table with the column for the next one.
 | the command | `examples/std/jagent_cli.jtr` |
 | the project: build plan and page | `tools/jagent/build.jestyr`, `tools/jagent/README.md` |
 | the pinned demo | `examples/std/jagent_demo.jtr` (`jagent_runs_records_serves_and_reloads`) |
-| the suites | `examples/std/jagent_test.jtr` (13), `examples/std/jagent_ops_test.jtr` (11) — registered in `io_suites_pass` |
+| the suites | `examples/std/jagent_test.jtr` (14), `examples/std/jagent_ops_test.jtr` (12) — registered in `io_suites_pass` |
 | the command's own tests | `jagent_cli_runs_status_logs_and_serves` (a real `serve`, killed after), `jagent_cli_init_doctor_and_ask`, `jagent_build_plan_names_the_binary` |
 | the benchmark script | `examples/std/jagent_bench.jtr` |
 | the demo configuration | `examples/std/fixtures/jagent.ini` |
@@ -89,7 +89,7 @@ jagent ask "check my machine"
 | `jagent [-c cfg] serve` | the API, the reload, the schedule, until SIGINT/SIGTERM | 0 for a clean halt; 1 for a failed/abandoned one; 2 when refused (`tls = true`) |
 | `jagent [-c cfg] check` | load the configuration and say so: `config: ok path=… jobs=N` | 0; 1 with the faults on stderr and nothing on stdout |
 | `jagent [-c cfg] config validate` | as `check` | as `check` |
-| `jagent [-c cfg] config show` | the configuration text in force | 0; 1 when it did not load |
+| `jagent [-c cfg] config show` | the configuration text in force, secrets redacted (`token = ****`) | 0; 1 when it did not load |
 | `jagent [-c cfg] doctor [--no-probes]` | the self-check, one line per subsystem (below) | 0 when no check failed; 1 otherwise |
 | `jagent [-c cfg] ask <question…>` | the operator's questions, answered from the record (below) | 0 answered (a refusal is an answer); 1 for a question it does not know, or no configuration |
 | `jagent [-c cfg] init [--force]` | write the starter configuration | 0 created; 1 the file exists (untouched) or could not be written |
@@ -137,6 +137,7 @@ timeout_ms = 10000
 | `agent.port` | 0 asks the platform; `serve` prints the port it got | `0` |
 | `agent.tls` | `true` is REFUSED — see "Security" | `false` |
 | `agent.store` | the history file, relative to the working directory, created by the first run | `jagent.db` |
+| `agent.token` | a bearer token every API request but `GET /health` must carry; declared **secret**, so every rendering prints `****` | unset: no gate |
 | `job.NAME.kind` | `command`, the only kind today | `command` |
 | `job.NAME.command` | runs through the platform shell (`cmd.exe /c`, `sh -c`); required, non-empty | — |
 | `job.NAME.timeout_ms` | positive; the job and its whole tree are killed at it | `5000` |
@@ -188,9 +189,9 @@ result: ok warnings=0 errors=0
 | `config` | the file is loaded through the real loader | it cannot be read (`reason=cannot-read`) or has faults (`faults=N`, printed on stderr) — an error; the store, bind, reload and schedule checks are then `skipped reason=no-config` |
 | `store` | a present store is opened, `kv.sync`ed, its run count read, and closed; an absent one is **not created** — its directory is checked instead | `reason=cannot-open`, `cannot-sync`, `directory-missing` — errors |
 | `sysproc` | on an agent of its own with no store: a job that must print `jagent-doctor`, then a job that must be killed at 200 ms with its tree confirmed reaped | any half false — an error; `--no-probes` skips it (`skipped reason=no-probes`) |
-| `http` | `agent.host:agent.port` is bound and released; `bound=` is the port the platform gave | `reason=cannot-bind` — an error; `warning=remote-bind-unauthenticated` on `0.0.0.0` |
+| `http` | `agent.host:agent.port` is bound and released; `bound=` is the port the platform gave | `reason=cannot-bind` — an error; `warning=remote-bind-unauthenticated` on `0.0.0.0` with no token |
 | `tls` | what this build can do, and what the file asks | `requested=true serve=refused` — an error, because `serve` exits 2 |
-| `auth` | there is none; where that leaves the API | `risk=remote-exposed` on `0.0.0.0` — a warning; `risk=local-only` on loopback |
+| `auth` | whether `agent.token` is set | `present kind=bearer exempt=GET/health` when it is; otherwise `missing` with `risk=remote-exposed` on `0.0.0.0` — a warning — or `risk=local-only` on loopback |
 | `reload` | the watcher over the configuration's directory is opened and closed | `watched=false` — a warning |
 | `schedule` | how many jobs declare an interval | never; the load already refused a bad one |
 | `limits` | the fixed facts a reader should know | never |
@@ -225,7 +226,7 @@ Recommended next action: jagent logs backup-home
 | *what failed* | every job whose last run was `failure`, `timeout` or `config-error`, with the status and the error text the record holds |
 | *why did `<job>` fail* | that job's last record: `flaky's last run (#2) ended failure: exit code 3.` and that *the record holds no more than that* — a job that succeeded "did not fail", one that never ran "has never run", a name that is not configured is repeated back with the list |
 | *what jobs have never run* | the jobs without a `last:` pointer |
-| *what should I look at next* | the first fact that needs attention: a failed job → `jagent logs <job>`; a job that never ran → `jagent run <job>`; a `0.0.0.0` bind → set the host or authenticate; else `jagent doctor` |
+| *what should I look at next* | the first fact that needs attention: a failed job → `jagent logs <job>`; a job that never ran → `jagent run <job>`; a `0.0.0.0` bind with no token → set the host or set `agent.token`; else `jagent doctor` |
 | anything with *run*, *execute*, *start*, *launch*, *kill*, *delete*, *edit*, *change* | a refusal that names the command: `I do not run, change or delete anything. To run a configured job: jagent run <name>. Configured jobs: …` |
 | anything else | the list of what it answers, exit 1 |
 
@@ -264,6 +265,16 @@ a source of it.
 Anything else is `std/httpd`'s own 404, a non-HTTP request its 400 (and the connection is
 closed); neither reaches the agent, and `jagent_http_requests` counts only the routed ones.
 
+**With `agent.token` set, every route but `GET /health` is behind a bearer token.** The gate
+is `std/httpd` middleware, so it runs *before* routing: a request without
+`Authorization: Bearer <token>` is answered 401 with `WWW-Authenticate: Bearer` whatever
+its path, and learns nothing about the route table. The comparison is constant-time in the
+token's length (`config.value_is_ct`), a refusal is counted in `jagent_http_unauthorized`
+and not in `jagent_http_requests`, and `GET /health` stays open because a readiness probe
+reveals only the service's phase and is the one thing a load balancer must be able to ask
+without a secret. A token is picked up by the reload like any other setting: change the
+file and the next request is judged by the new one.
+
 A run requested over the API is executed on the server's thread: **the API is quiet for that
 job's duration, bounded by its timeout**. That is the reason a timeout is required to be
 positive, and the reason there is no concurrency yet (see below).
@@ -273,6 +284,7 @@ The demo's `/metrics` after four runs:
 ```
 counter jagent_config_reloads 1
 counter jagent_http_requests 7
+counter jagent_http_unauthorized 0
 gauge jagent_jobs 4
 histogram jagent_run_ms le 10 4
 …
@@ -377,21 +389,32 @@ than signalled leaves a mid-run command running.
 
 ## Security model, TLS and authentication
 
-The API is **unauthenticated**. Bind it to `127.0.0.1` (the default, and what `init`
-writes) and it is reachable by whatever runs on the box; bind it to `0.0.0.0` and it is
-reachable by whatever reaches the box. Nothing in the API can change the configuration or run
-a command that is not already in the file, but `POST /jobs/:name/run` runs one, so on an
-open interface it must sit behind something that authenticates. `doctor` counts a `0.0.0.0`
-bind as two warnings (`http` and `auth`), `serve` prints a warning to stderr before it binds,
-and `ask`'s summary carries a `WARNING:` line. Commands run with the agent's own user,
-environment and working directory; there is no per-job sandbox yet (`std/sandbox` has the
-jail; nothing here asks for it). `ask` cannot run anything, and `doctor` runs only its own
-two probe commands.
+The API is **open unless `agent.token` is set**. Bind it to `127.0.0.1` (the default, and
+what `init` writes) and it is reachable by whatever runs on the box; bind it to `0.0.0.0`
+and it is reachable by whatever reaches the box. Nothing in the API can change the
+configuration or run a command that is not already in the file, but `POST /jobs/:name/run`
+runs one, so on an open interface it must carry a token. Without one, `doctor` counts a
+`0.0.0.0` bind as two warnings (`http` and `auth`), `serve` prints a warning to stderr
+before it binds, and `ask`'s summary carries a `WARNING:` line; with one, all three report
+the token as a fact and the warnings go. Commands run with the agent's own user, environment
+and working directory; there is no per-job sandbox yet (`std/sandbox` has the jail; nothing
+here asks for it). `ask` cannot run anything, and `doctor` runs only its own two probe
+commands.
 
-**No token auth yet, and no placeholder for one.** The schema declares no auth key on
-purpose: a key that is accepted and ignored would read as protection. The next increment is
-a bearer token checked by `std/httpd` middleware and declared secret through `std/config`,
-so `config show` redacts it.
+**The token is a secret by declaration.** `agent.token` is declared secret in `std/config`,
+which renders it as `****` on every path — so `config show` prints `token = ****`, the
+faults, the status and the doctor's report never hold its bytes, and there is no accessor
+that returns them: the agent can *compare* the token (`token_matches`, constant-time) and
+*report that one is set* (`token_required`), and that is all. The token lives in the
+configuration file, so the file's permissions are the token's; `init` writes the key
+commented out with that said beside it.
+
+**Plaintext HTTP carries the token in the clear.** A bearer token over an unencrypted
+connection is readable by anyone on the path, which on loopback is the machine's own
+processes and on `0.0.0.0` is the network. Until TLS lands (below), a remote bind with a
+token is protected against a *caller* who lacks it, not against a *listener*; the honest
+deployment for a token over the network is a TLS-terminating proxy in front of `serve`, or
+loopback plus an SSH tunnel.
 
 **TLS is not served, and `tls = true` is refused rather than faked.** `std/tls` exists and
 works (a real handshake over loopback, `tls_test`), but `std/httpd` reads its sockets through
@@ -458,7 +481,9 @@ by the record size per run until a `compact` — which is the shape `std/kv` doc
   arm in `execute`, and a check at load.
 - **No concurrency.** A run blocks the API for its duration, bounded by its timeout. Two
   scheduled jobs due in the same tick run one after the other.
-- **No TLS, no authentication** (above). **No `--format json`.** **No `bench` subcommand**:
+- **No TLS**, so the bearer token travels in the clear (above). **One token, one scope**:
+  every gated route is all-or-nothing; no per-route scopes, no read-only token, no rotation
+  without a reload of the file. **No `--format json`.** **No `bench` subcommand**:
   `jagent_bench.jtr` is a script, and folding it into the command would move measurement
   code into the binary for a number an operator reads once.
 - **No user or system configuration directory**; `-c`, `$JAGENT_CONFIG`, `./jagent.ini`.
@@ -502,12 +527,13 @@ name is a compiler intrinsic; the convention is `has`.
 
 ## Next steps toward a production-grade edge agent
 
-1. **A token on the API**: `std/httpd` middleware answering 401 without a bearer the file
-   names, declared secret through `std/config` so `config show` redacts it; `doctor`'s
-   `auth:` line becomes `present`.
-2. **TLS in `std/httpd`**: a `tls.Session` per connection, read/write through it instead of
+1. **TLS in `std/httpd`**: a `tls.Session` per connection, read/write through it instead of
    `sysnet`, and the `tls_cert`/`tls_key` keys the schema already declares. `tls_supported()`
-   becomes true and nothing in this agent changes.
+   becomes true and nothing in this agent changes — and the bearer token stops travelling in
+   the clear, which is the reason this is now first.
+2. **Token scopes**: a read-only token beside the full one, so a dashboard can read `/logs`
+   without being able to `POST …/run`; the middleware already has the request, so a scope is
+   a second declared secret and a method check.
 3. **A service entry point** on Windows (`docs/jagent-windows-service.md` lists the four
    parts) and a Job object with kill-on-close for it; a first Linux install from the unit.
 4. **Concurrent runs**: a run per `sysproc.Child` in a table stepped from the serve loop

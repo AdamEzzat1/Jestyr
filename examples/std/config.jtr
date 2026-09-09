@@ -315,6 +315,33 @@ pub fn value_is(read c: Config, id: i32, read s: str) -> bool {
     return true
 }
 
+// `value_is` for a SECRET: the same answer, in time that does not depend on where the first
+// differing byte is. Every byte of the longer of the two is visited and the differences are
+// OR-ed together, so a caller comparing a presented token against a declared one cannot be
+// walked byte by byte through the timing of its refusals. Still exact: a length mismatch is
+// a mismatch, folded in the same way rather than answered early.
+pub fn value_is_ct(read c: Config, id: i32, read s: str) -> bool {
+    if !live(c, id) { return false }
+    if !is_set(c, id) { return false }
+    let st: i32 = list.get(i32, c.vs, id as usize)
+    let en: i32 = list.get(i32, c.ve, id as usize)
+    let vlen: usize = (en - st) as usize
+    var span: usize = vlen
+    if s.len > span { span = s.len }
+    var diff: i32 = 0
+    if vlen != s.len { diff = 1 }
+    var i: usize = 0
+    for i < span {
+        var a: i32 = 0
+        var b: i32 = 0
+        if i < vlen { a = list.get(u8, c.vb, (st as usize) + i) as i32 }
+        if i < s.len { b = s[i] as i32 }
+        diff = diff | (a ^ b)
+        i = i + 1
+    }
+    return diff == 0
+}
+
 pub fn origin_name(o: i32) -> str {
     if o == CFG_DEFAULT { return "default" }
     if o == CFG_FILE { return "file" }

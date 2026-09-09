@@ -15,7 +15,11 @@
 #   - SIGTERM on stop: `serve` drains, halts and exits 0 for a clean halt, 1 when any
 #     run failed or was abandoned, 2 when it refused to start (`tls = true`);
 #   - NO restart on exit 2: the configuration must change first, so a restart loop
-#     would only repeat the refusal.
+#     would only repeat the refusal;
+#   - the API's bearer token is `agent.token` IN THE CONFIGURATION FILE, so the file's
+#     permissions are the token's: owned by the service user, mode 0600. Until `httpd`
+#     speaks TLS the token crosses the network in the clear on a 0.0.0.0 bind — keep
+#     `agent.host = 127.0.0.1` and put a TLS proxy or an SSH tunnel in front.
 
 [Unit]
 Description=jagent, the Jestyr edge agent

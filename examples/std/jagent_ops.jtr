@@ -122,6 +122,9 @@ pub fn starter_text(mut dst: String) {
     string_push(dst, "tls = false\n")
     string_push(dst, "# The run history, created by the first run.\n")
     string_push(dst, "store = jagent.db\n")
+    string_push(dst, "# A bearer token every API request but GET /health must carry. Unset, the API is\n")
+    string_push(dst, "# open to whatever reaches the host; `jagent config show` prints it as ****.\n")
+    string_push(dst, "# token = \n")
     string_push(dst, "\n")
     string_push(dst, "[job.health-check]\n")
     string_push(dst, "kind = command\n")
@@ -368,7 +371,7 @@ fn doc_http(mut r: Report, read a: Allocator, read ag: jagent.Agent) {
         string_push(r.text, " reason=cannot-bind")
         r.errors = r.errors + 1
     }
-    if jagent.host_is_loopback(ag) == false {
+    if jagent.host_is_loopback(ag) == false and jagent.token_required(ag) == false {
         string_push(r.text, " warning=remote-bind-unauthenticated")
         r.warnings = r.warnings + 1
     }
@@ -390,7 +393,12 @@ fn doc_tls(mut r: Report, read ag: jagent.Agent, loaded: bool) {
 }
 
 fn doc_auth(mut r: Report, read ag: jagent.Agent, loaded: bool) {
-    string_push(r.text, "auth: missing")
+    string_push(r.text, "auth: ")
+    if loaded and jagent.token_required(ag) {
+        string_push(r.text, "present kind=bearer exempt=GET/health\n")
+        return
+    }
+    string_push(r.text, "missing")
     if loaded {
         if jagent.host_is_loopback(ag) {
             string_push(r.text, " risk=local-only")
@@ -665,8 +673,8 @@ fn push_next(mut ag: jagent.Agent, read a: Allocator, mut dst: String, history: 
         }
         i = i + 1
     }
-    if jagent.host_is_loopback(ag) == false {
-        string_push(dst, "set agent.host = 127.0.0.1, or put the API behind something that authenticates\n")
+    if jagent.host_is_loopback(ag) == false and jagent.token_required(ag) == false {
+        string_push(dst, "set agent.host = 127.0.0.1, or set agent.token so the API needs a bearer token\n")
         return
     }
     string_push(dst, "nothing needs attention; `jagent doctor` is the self-check\n")
@@ -753,12 +761,19 @@ fn answer_summary(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, mut dst
     if jagent.tls_wanted(ag) {
         string_push(dst, "TLS is requested and this build cannot serve it; `jagent serve` will refuse.\n")
     } else {
-        string_push(dst, "TLS is off; ")
+        string_push(dst, "TLS is off; the API binds to ")
+        if jagent.host_is_loopback(ag) {
+            string_push(dst, "loopback (127.0.0.1)")
+        } else {
+            string_push(dst, "every interface (0.0.0.0)")
+        }
+        if jagent.token_required(ag) {
+            string_push(dst, " with a bearer token.\n")
+        } else {
+            string_push(dst, " without authentication.\n")
+        }
     }
-    if jagent.host_is_loopback(ag) {
-        if jagent.tls_wanted(ag) == false { string_push(dst, "the API binds to loopback (127.0.0.1) without authentication.\n") }
-    } else {
-        if jagent.tls_wanted(ag) == false { string_push(dst, "the API binds to every interface (0.0.0.0) without authentication.\n") }
+    if jagent.host_is_loopback(ag) == false and jagent.token_required(ag) == false {
         string_push(dst, "WARNING: anything that reaches this machine can run its jobs.\n")
     }
     push_next(ag, a, dst, history)
