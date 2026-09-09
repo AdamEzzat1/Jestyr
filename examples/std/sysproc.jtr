@@ -144,10 +144,11 @@ import "time"
 //
 // POSIX and Windows names are all distinct here, so unlike `std/sysnet` there is no
 // same-name pair to unify. The one binding that MUST match another module exactly is
-// `WaitForSingleObject`: `std/syswatch` already declares it, typeck keys its function
-// table on the BARE name, and a second declaration with a different signature would type
-// -check `syswatch`'s call sites against THIS module's idea of it. Same spelling, same
-// types, deliberately.
+// `WaitForSingleObject`: `std/syswatch` declares it too (now under the alias `watch_wait`,
+// since a second BARE binding in one program is a duplicate definition — `std/jagent`
+// was the first program to link both), typeck keys its function table on the C symbol's
+// signature, and a declaration with a different one would type-check `syswatch`'s call
+// sites against THIS module's idea of it. Same spelling, same types, deliberately.
 //
 // The pin is `extern_signature_agreement::one_c_symbol_has_one_signature_across_the_whole
 // _std_corpus`, which sweeps EVERY extern in `examples/std` rather than this one pair, so
@@ -1641,9 +1642,11 @@ const SPROC_CREATE_SUSPENDED: i32 = 4
 // anonymous pipe cannot be opened overlapped. On POSIX a pipe is a descriptor like any
 // other and `poll` answers, bound under the SAME signature `std/syspoll` binds it with,
 // deliberately: one C symbol, one signature, corpus-wide (the sweep named in the
-// platform section above is what holds that).
+// platform section above is what holds that). It is bound under the ALIAS `pipe_poll`,
+// because a second BARE binding in one program is a duplicate definition and `std/jagent`
+// was the first program to link both modules.
 @cfg(windows) extern "windows.h" fn PeekNamedPipe(h: cptr, buf: cptr, n: u32, got: cptr, avail: cptr, left: cptr) -> i32
-@cfg(posix) extern "poll.h" fn poll(fds: cptr, n: u64, timeout_ms: i32) -> i32
+@cfg(posix) extern "poll.h" fn pipe_poll = "poll"(fds: cptr, n: u64, timeout_ms: i32) -> i32
 
 // Would a read on `h` return WITHOUT blocking? True when bytes are waiting AND when the
 // other end is gone — a read then returns EOF at once, which is `std/syspoll`'s definition
@@ -1672,7 +1675,7 @@ const SPROC_CREATE_SUSPENDED: i32 = 4
     let fw: *mut i32 = pfd as *mut i32
     unsafe { (fw + 0).* = h as i32 }
     unsafe { (pfd + 4).* = 1 as u8 }
-    let rc: i32 = poll(pfd as cptr, 1, 0)
+    let rc: i32 = pipe_poll(pfd as cptr, 1, 0)
     free_ptr(pfd)
     if rc == 0 { return false }
     return true

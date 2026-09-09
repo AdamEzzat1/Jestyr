@@ -1,0 +1,251 @@
+// examples/std/jagent_demo.jtr — `jagent`: configured jobs, a durable history, and the
+// API that reports them — the whole agent driven in one process, on a clock it was handed.
+//
+//   jestyrc run examples/std/jagent_demo.jtr
+//
+// This is `std/jagent` used the way `jagent_cli.jtr` uses it, minus the argv and the real
+// clock: the agent runs on `time.manual()` and a fixed wall clock, so every duration is 0
+// and every `started_at` is the one number the demo chose, and the transcript can be
+// asserted to the line by `jagent_runs_records_serves_and_reloads`. The children are real
+// — `echo healthy` and `exit 3` really run through the shell — and the API is a real
+// `std/httpd` on a loopback socket, asked through a real `std/httpc`.
+//
+// The sections are the CLI's commands in order: load, `run` (a success, a failure, a job
+// that does not exist and writes nothing), the schedule, `status`, `logs`, then `serve`'s
+// API, a reload that fails and keeps the jobs whole, the TLS refusal, and the shutdown that
+// says why it stopped.
+
+import "fs"
+import "http"
+import "httpc"
+import "httpd"
+import "jagent"
+import "log"
+import "mem"
+import "runtime"
+import "service"
+import "str"
+import "sysfs"
+import "sysnet"
+import "syspoll"
+import "sysproc"
+import "time"
+import "writer"
+
+const JD_ROOT: str = "zz_jagent_demo"
+const JD_CFG: str = "zz_jagent_demo/agent.ini"
+const JD_STORE: str = "zz_jagent_demo/history.db"
+const JD_CAP: usize = 16384
+
+const JD_GOOD: str = "[agent]\nhost = 127.0.0.1\nport = 0\ntls = false\nstore = zz_jagent_demo/history.db\n\n[job.health-check]\ncommand = echo healthy\ntimeout_ms = 10000\n\n[job.rotate-log]\ncommand = echo rotated\ntimeout_ms = 10000\n\n[job.flaky]\ncommand = exit 3\ntimeout_ms = 10000\n\n[job.beat]\ncommand = echo beat\ntimeout_ms = 10000\ninterval_ms = 500\n"
+
+fn nothing() { }
+
+fn fixed_wall() -> i64 { return 1700000000 }
+
+fn quiet_logger() -> log.Logger {
+    return log.make(time.manual(0), writer.to_buffer(), log.LOG_INFO, log.LOG_LOGFMT)
+}
+
+// Print a rendered block, one line per `print_str` — the render ends with a newline and
+// `print_str` adds its own.
+fn show(read text: str) {
+    print_str(str.trim_end(text))
+}
+
+fn scrub(mut h: fs.Fs, read a: Allocator) {
+    fs.erase(h, JD_CFG)
+    fs.erase(h, JD_STORE)
+    let gone: bool = sysfs.remove_dir(h, a, JD_ROOT) catch false
+}
+
+// ---- the API, asked in-process ------------------------------------------------------------
+
+fn answered(read cl: httpc.Client, ms: i64) -> bool {
+    if httpc.pending(cl) > 0 { return true }
+    var p: runtime.Poller = syspoll.host()
+    var fds: *mut i64 = alloc(i64, 1)
+    var rdy: *mut u8 = alloc(u8, 1)
+    unsafe { (fds + 0).* = httpc.fd(cl) }
+    unsafe { (rdy + 0).* = 0 as u8 }
+    let got: i64 = runtime.ask(p, fds, rdy, 1, ms * 1000000)
+    var r: u8 = 0
+    unsafe { r = (rdy + 0).* }
+    free_ptr(rdy)
+    free_ptr(fds)
+    if got <= 0 { return false }
+    return (r as i32) != 0
+}
+
+// One request, printed as `METHOD path`, the status, and the body.
+fn ask(mut sv: httpd.Server, mut net: sysnet.Net, read method: str, read path: str) {
+    var line: String = string_new()
+    string_push(line, method)
+    string_push(line, " ")
+    string_push(line, path)
+    print_str(string_view(line))
+    string_free(line)
+    var cl: httpc.Client = httpc.dial(net, sysnet.loopback(httpd.port(sv)), JD_CAP)
+    httpc.request(cl, method, path, "", "")
+    httpd.serve_for(sv, net, 40)
+    var body: String = string_new()
+    var st: i32 = 0 - 1
+    if answered(cl, 3000) {
+        if httpc.read_response(cl) == http.HTTP_OK {
+            st = httpc.status(cl)
+            httpc.body(cl, body)
+        }
+    }
+    httpc.hangup(cl)
+    httpd.serve_for(sv, net, 5)
+    print_int(st)
+    let v: str = string_view(body)
+    if v.len > 0 { show(v) }
+    string_free(body)
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h, a)
+    let made: bool = sysfs.make_dir(h, a, JD_ROOT) catch false
+    fs.put(h, JD_CFG, JD_GOOD)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+
+    print_str("-- jagent --")
+    var ag: jagent.Agent = jagent.make(a, time.manual(1000000000), quiet_logger())
+    jagent.set_wall(ag, &fixed_wall)
+    print_str("config")
+    print_str(JD_CFG)
+    print_str(jagent.load_name(jagent.load_file(ag, h, JD_CFG)))
+    show(jagent.last_log(ag))
+    print_str("jobs")
+    var s: String = string_new()
+    jagent.render_jobs(ag, s)
+    show(string_view(s))
+    print_str("store opened")
+    print_bool(jagent.open_store(ag, h))
+
+    // ---- run ----
+    print_str("-- jagent run health-check --")
+    let r1: jagent.Run = jagent.run_job(ag, sp, blk, "health-check")
+    string_free(s)  s = string_new()
+    jagent.render_run(ag, "health-check", r1, s)
+    show(string_view(s))
+    show(jagent.last_log(ag))
+
+    print_str("-- jagent run flaky --")
+    let r2: jagent.Run = jagent.run_job(ag, sp, blk, "flaky")
+    string_free(s)  s = string_new()
+    jagent.render_run(ag, "flaky", r2, s)
+    show(string_view(s))
+
+    // A job nobody configured: refused, and NOTHING is written.
+    print_str("-- jagent run nope --")
+    let r3: jagent.Run = jagent.run_job(ag, sp, blk, "nope")
+    string_free(s)  s = string_new()
+    jagent.render_run(ag, "nope", r3, s)
+    show(string_view(s))
+    print_str("the history is still at")
+    print_int(jagent.last_seq(ag) as i32)
+
+    // ---- the schedule ----
+    //
+    // `beat` declares an interval; on the manual clock it is due exactly 500ms after the
+    // load, and a tick before that runs nothing.
+    print_str("-- the schedule --")
+    print_str("at t+0 the beat is not due; jobs run")
+    print_int(jagent.tick(ag, sp, blk) as i32)
+    jagent.advance(ag, 500000000)
+    print_str("at t+500ms it runs; jobs run")
+    print_int(jagent.tick(ag, sp, blk) as i32)
+
+    // ---- status and logs ----
+    print_str("-- jagent status --")
+    string_free(s)  s = string_new()
+    jagent.render_status(ag, s)
+    show(string_view(s))
+
+    print_str("-- jagent logs health-check --")
+    string_free(s)  s = string_new()
+    jagent.render_logs(ag, "health-check", 20, s)
+    show(string_view(s))
+
+    // ---- serve ----
+    //
+    // The agent moves into a cell the handlers reach by address; from here on it is asked
+    // through the cell, exactly as `jagent serve` does.
+    print_str("-- jagent serve --")
+    var cell: *mut jagent.Agent = alloc(jagent.Agent, 1)
+    unsafe { (cell + 0).* = ag }
+    var ctx: *mut jagent.Serve = jagent.serve_ctx(cell, sysproc.host(), time.host())
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = httpd.make(a, time.host(), quiet_logger(), false, 4, 8192)
+    httpd.start(sv, net, sysnet.loopback(0), 8)
+    jagent.install(sv, ctx)
+    print_str("listening on loopback")
+    print_bool(httpd.is_listening(sv))
+    ask(sv, net, "GET", "/health")
+    ask(sv, net, "GET", "/jobs/flaky")
+    ask(sv, net, "POST", "/jobs/health-check/run")
+    ask(sv, net, "GET", "/logs/health-check")
+    ask(sv, net, "GET", "/jobs/nope")
+    ask(sv, net, "GET", "/jobs/health-check/run")
+    ask(sv, net, "GET", "/metrics")
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    var back: jagent.Agent = unsafe { (cell + 0).* }
+    jagent.free_serve(ctx)
+    free_ptr(cell as *mut u8)
+
+    // ---- a reload that fails ----
+    //
+    // The file is rewritten with a timeout that is a word beside a job that is fine.
+    // Nothing lands; the four jobs stand and the fault points at its line.
+    print_str("-- a reload that fails keeps the jobs whole --")
+    fs.put(h, JD_CFG, "[job.health-check]\ncommand = echo healthy\ntimeout_ms = soon\n[job.rotate-log]\ncommand = echo rotated\n")
+    print_str(jagent.load_name(jagent.reload(back, h)))
+    print_str("faults")
+    print_int(jagent.fault_count(back) as i32)
+    show(jagent.faults(back))
+    print_str("jobs still configured")
+    print_int(jagent.job_count(back) as i32)
+    print_str("generation")
+    print_int(jagent.generation(back) as i32)
+
+    // ---- tls ----
+    print_str("-- tls is refused, not faked --")
+    fs.put(h, JD_CFG, "[agent]\ntls = true\nstore = zz_jagent_demo/history.db\n[job.health-check]\ncommand = echo healthy\n")
+    print_str(jagent.load_name(jagent.reload(back, h)))
+    print_str("serve would refuse because")
+    print_str(jagent.serve_refusal(back))
+
+    // ---- shutdown ----
+    print_str("-- shutdown --")
+    jagent.begin_drain(back)
+    print_str("a draining agent refuses a run")
+    let r4: jagent.Run = jagent.run_job(back, sp, blk, "health-check")
+    print_str(jagent.status_name(r4.status))
+    // `failed`, not `clean`: the flaky job failed, and `std/service` ranks a failed unit
+    // above everything else — the reason an operator wants first.
+    print_str("and it stopped because (one job failed, and failure outranks clean)")
+    print_str(service.exit_name(jagent.halt(back)))
+    string_free(s)  s = string_new()
+    jagent.render_health(back, s)
+    show(string_view(s))
+
+    print_str("-- the check --")
+    // Three through this spawner; the fourth run came through the API, whose `Serve`
+    // context holds a spawner of its own.
+    print_str("children started here, runs recorded in all")
+    print_int(sysproc.started(sp) as i32)
+    print_int(jagent.last_seq(back) as i32)
+    jagent.free(back)
+    string_free(s)
+    scrub(h, a)
+    print_str("no scratch left behind")
+    print_bool(fs.present(h, JD_STORE) == false)
+    return 0
+}

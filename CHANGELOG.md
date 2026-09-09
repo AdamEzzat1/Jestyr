@@ -7,6 +7,41 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/jagent` — the edge agent (`jagent`).** Configured jobs, a durable run history and
+  a local HTTP API, built from the tier's own parts: `std/sysproc` + `std/sandbox` run a job
+  apart inside a process group (so a timeout kills the TREE and reports `tree_reaped` as a
+  measurement), `std/kv` keeps the history (three keys per run in ONE batch — the record,
+  the job's `last:` pointer, the `seq` counter — so a crash can never leave them
+  disagreeing), `std/httpd` serves `/health`, `/metrics`, `/jobs`, `/jobs/:name`,
+  `POST /jobs/:name/run`, `/logs`, `/logs/:name`, `std/config` + `std/ini` read the file and
+  `std/syswatch` reloads it, `std/service` answers the two health questions and
+  `std/metrics` the counters. The command is `examples/std/jagent_cli.jtr`:
+  `jagent [-c cfg] serve | run <job> | schedule <job> | status | logs <job>`; a library with
+  a thin `main` around it, `jcadd`'s shape.
+
+  **The file declares its own schema**: `[job.NAME]` headers are scanned first and each
+  declares its four keys (`kind`, `command`, `timeout_ms`, `interval_ms`), then `std/ini`
+  applies the file — so a key nobody declared is a fault that names its line, and a load
+  applies whole or not at all (`std/livecfg`'s rule; a bad reload keeps every job and the
+  generation). A job that does not exist writes no history; a store that cannot open leaves a
+  run `recorded=false` and counted; **a run is `kv.sync`ed before it is reported recorded**,
+  because the CLI test's first `serve` was killed and the run it had answered `recorded=true`
+  was not in the file — `std/kv` leaves the flush to its caller. **TLS is refused, not faked**: `std/httpd` has no hook for
+  a `tls.Session`, so `agent.tls = true` exits 2 with the reason and `tls_supported()` is
+  false. 13 tests (`jagent_test`, registered), a pinned demo (`jagent_demo`,
+  `jagent_runs_records_serves_and_reloads`), the command's own test with a real `serve` on a
+  chosen port (`jagent_cli_runs_status_logs_and_serves`), a bench script (`jagent_bench`) with
+  its numbers in `docs/jagent.md`. Not built: TLS, authentication, concurrent runs, per-job
+  cwd/env/jail, retries; the Linux ladder has not run it.
+
+- **Four extern aliases, for four collisions no program had reached.** `std/jagent` is the
+  first program to link `sysnet`, `sysproc`, `syswatch` and `service` together, and an
+  extern's bare name is reserved program-wide: `service.accept` collided with `sysnet`'s
+  `accept(2)`, `syswatch`'s `close` and `WaitForSingleObject` with `sysnet`'s and `sysproc`'s,
+  `sysproc`'s `poll` with `syspoll`'s. Each second binder now uses the declared-alias form
+  (`sys_accept`, `watch_close`, `watch_wait`, `pipe_poll`); the C symbols, every consumer and
+  the extern-signature sweep are unchanged.
+
 - **`std/jcadd`** — `jc add <name> <req>` as one command over the whole package substrate:
   read the local manifest, add or update the dependency, resolve the WHOLE graph against the
   registry, fetch what is missing through the content-addressed cache, write the lockfile, and

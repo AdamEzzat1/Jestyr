@@ -79,6 +79,9 @@ BUILD_OK httpd_demo
 BUILD_OK impl_body_calls
 BUILD_OK ini_demo
 BUILD_OK intern_demo
+BUILD_OK jagent_bench
+BUILD_OK jagent_cli
+BUILD_OK jagent_demo
 BUILD_OK jcadd_demo
 BUILD_OK kv_demo
 BUILD_OK lexer

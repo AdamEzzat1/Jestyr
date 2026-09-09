@@ -1,0 +1,326 @@
+// examples/std/jagent_cli.jtr — `jagent`, the command.
+//
+//   jagent [-c <config>] serve
+//   jagent [-c <config>] run <job>
+//   jagent [-c <config>] schedule <job>
+//   jagent [-c <config>] status
+//   jagent [-c <config>] logs <job>
+//
+// The library is `std/jagent`; this file is the argv, the real clocks, the signal handling
+// and the exit codes around it — `jcadd_demo`'s shape, so the interesting claims live in a
+// module a test can drive. Build it once (`jestyrc build examples/std/jagent_cli.jtr`) and
+// run the binary with arguments; `jestyrc run` forwards none.
+//
+// Results go to stdout; log records go to stderr (logfmt), so a script that reads the
+// output of `jagent status` is not reading the agent's diary.
+//
+// Exit codes: 0 the command succeeded (and, for `run`, the job did); 1 the job failed, does
+// not exist, or the configuration could not be loaded; 2 usage, or a configuration this
+// build cannot serve (`agent.tls = true`).
+//
+// `serve` binds `agent.host:agent.port` (0 asks the platform; the port is printed), answers
+// the API, re-reads the configuration when its directory changes, runs any job whose
+// `interval_ms` has come due, and stops on SIGINT or SIGTERM — draining first, then halting
+// with the reason `std/service` computed. A run requested over the API is executed on the
+// server's thread, so the API is quiet for that job's duration, bounded by its timeout.
+
+import "env"
+import "fs"
+import "httpd"
+import "jagent"
+import "log"
+import "mem"
+import "service"
+import "str"
+import "sysignal"
+import "sysnet"
+import "sysproc"
+import "time"
+import "writer"
+
+const JC_DEFAULT_CFG: str = "jagent.ini"
+
+fn nothing() { }
+
+fn usage() -> i32 {
+    eprint_str("usage: jagent [-c <config>] serve | run <job> | schedule <job> | status | logs <job>")
+    return 2
+}
+
+// A logger to stderr, so stdout carries only the command's answer.
+fn stderr_logger() -> log.Logger {
+    return log.make(time.host(), writer.to_stderr(), log.LOG_INFO, log.LOG_LOGFMT)
+}
+
+fn show(read text: str) {
+    let t: str = str.trim_end(text)
+    if t.len > 0 { print_str(t) }
+}
+
+// The directory a path sits in, for the watcher: up to the last separator, or `.`.
+fn dir_of(read path: str, mut dst: String) {
+    let slash: isize = str.last_index_of(path, "/")
+    let back: isize = str.last_index_of(path, "\\")
+    var cut: isize = slash
+    if back > cut { cut = back }
+    if cut < 0 {
+        string_push(dst, ".")
+        return
+    }
+    if cut == 0 {
+        string_push(dst, path[0 .. 1])
+        return
+    }
+    string_push(dst, path[0 .. cut as usize])
+}
+
+// Load the configuration or say why not. False means "exit 1".
+fn load_or_complain(mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> bool {
+    let r: i32 = jagent.load_file(ag, h, cfg)
+    if r == jagent.JA_LOADED { return true }
+    eprint_str("jagent: the configuration could not be loaded")
+    let f: str = jagent.faults(ag)
+    if f.len > 0 { eprint_str(str.trim_end(f)) }
+    return false
+}
+
+fn cmd_status(mut ag: jagent.Agent, mut h: fs.Fs) -> i32 {
+    jagent.open_store(ag, h)
+    var s: String = string_new()
+    jagent.render_status(ag, s)
+    show(string_view(s))
+    string_free(s)
+    return 0
+}
+
+fn cmd_logs(mut ag: jagent.Agent, mut h: fs.Fs, read job: str) -> i32 {
+    if jagent.find_job(ag, job) < 0 {
+        eprint_str("jagent: no such job")
+        return 1
+    }
+    if jagent.open_store(ag, h) == false {
+        eprint_str("jagent: the history store could not be opened")
+        return 1
+    }
+    var s: String = string_new()
+    let n: usize = jagent.render_logs(ag, job, 20, s)
+    if n == 0 {
+        print_str("(no runs recorded)")
+    } else {
+        show(string_view(s))
+    }
+    string_free(s)
+    return 0
+}
+
+fn cmd_run(mut ag: jagent.Agent, mut h: fs.Fs, mut sp: sysproc.Spawner, read job: str) -> i32 {
+    if jagent.find_job(ag, job) < 0 {
+        eprint_str("jagent: no such job")
+        return 1
+    }
+    if jagent.open_store(ag, h) == false {
+        eprint_str("jagent: warning: the history store could not be opened; this run will not be recorded")
+    }
+    var blk: time.Clock = time.host()
+    let r: jagent.Run = jagent.run_job(ag, sp, blk, job)
+    var s: String = string_new()
+    jagent.render_run(ag, job, r, s)
+    show(string_view(s))
+    string_free(s)
+    if r.status == jagent.RUN_SUCCESS { return 0 }
+    return 1
+}
+
+// Run one job on its interval until a shutdown signal arrives.
+fn cmd_schedule(mut ag: jagent.Agent, mut h: fs.Fs, mut sp: sysproc.Spawner, read job: str) -> i32 {
+    let ji: i32 = jagent.find_job(ag, job)
+    if ji < 0 {
+        eprint_str("jagent: no such job")
+        return 1
+    }
+    let iv: i64 = jagent.job_interval_ms(ag, ji as usize)
+    if iv <= 0 {
+        eprint_str("jagent: this job declares no `interval_ms`; nothing to schedule")
+        return 1
+    }
+    if jagent.open_store(ag, h) == false {
+        eprint_str("jagent: warning: the history store could not be opened; runs will not be recorded")
+    }
+    var sig: sysignal.Signals = sysignal.host()
+    sysignal.arm_shutdown(sig)
+    var blk: time.Clock = time.host()
+    var failures: i64 = 0
+    for sysignal.shutdown_requested(sig) == false {
+        let r: jagent.Run = jagent.run_job(ag, sp, blk, job)
+        if r.status != jagent.RUN_SUCCESS { failures = failures + 1 }
+        var s: String = string_new()
+        jagent.render_run(ag, job, r, s)
+        show(string_view(s))
+        string_free(s)
+        // Sleep the interval in slices, so a signal is answered within a slice.
+        var left: i64 = iv * 1000000
+        for left > 0 and sysignal.shutdown_requested(sig) == false {
+            var sl: i64 = 200000000
+            if sl > left { sl = left }
+            left = left - time.wait(blk, sl)
+        }
+    }
+    eprint_str("jagent: schedule stopped by signal")
+    if failures > 0 { return 1 }
+    return 0
+}
+
+fn cmd_serve(mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> i32 {
+    let a: Allocator = mem.system_allocator()
+    let why: str = jagent.serve_refusal(ag)
+    if why.len > 0 {
+        eprint_str("jagent: refusing to serve")
+        eprint_str(why)
+        return 2
+    }
+    if jagent.open_store(ag, h) == false {
+        eprint_str("jagent: the history store could not be opened")
+        return 1
+    }
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = httpd.make(a, time.host(), stderr_logger(), true, 16, 65536)
+    var addr: sysnet.SocketAddr = sysnet.loopback(jagent.port(ag) as u16)
+    if jagent.host_is_loopback(ag) == false { addr = sysnet.any_addr(jagent.port(ag) as u16) }
+    if httpd.start(sv, net, addr, 16) == false {
+        eprint_str("jagent: could not bind the address")
+        httpd.free(sv)
+        sysnet.shutdown(net)
+        return 1
+    }
+    var dir: String = string_new()
+    dir_of(cfg, dir)
+    let watching: bool = jagent.watch(ag, h, string_view(dir))
+    string_free(dir)
+
+    var line: String = string_new()
+    string_push(line, "jagent: listening on ")
+    if jagent.host_is_loopback(ag) { string_push(line, "127.0.0.1:") } else { string_push(line, "0.0.0.0:") }
+    push_num(line, httpd.port(sv) as i64)
+    string_push(line, " (config ")
+    string_push(line, cfg)
+    if watching { string_push(line, ", watched)") } else { string_push(line, ", not watched)") }
+    print_str(string_view(line))
+    string_free(line)
+
+    // The agent moves into a cell; every handler and this loop reach it by address.
+    var cell: *mut jagent.Agent = alloc(jagent.Agent, 1)
+    unsafe { (cell + 0).* = ag }
+    var ctx: *mut jagent.Serve = jagent.serve_ctx(cell, sysproc.host(), time.host())
+    jagent.install(sv, ctx)
+    var sig: sysignal.Signals = sysignal.host()
+    sysignal.arm_shutdown(sig)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+
+    for sysignal.shutdown_requested(sig) == false {
+        httpd.serve_for(sv, net, 200)
+        unsafe { jagent.poll_config((cell + 0).*, h) }
+        unsafe { jagent.tick((cell + 0).*, sp, blk) }
+    }
+
+    var back: jagent.Agent = unsafe { (cell + 0).* }
+    jagent.begin_drain(back)
+    let why2: i32 = jagent.halt(back)
+    var bye: String = string_new()
+    string_push(bye, "jagent: stopped on ")
+    string_push(bye, sysignal.signal_name(sysignal.caught(sig)))
+    string_push(bye, ", ")
+    string_push(bye, service.exit_name(why2))
+    print_str(string_view(bye))
+    string_free(bye)
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    jagent.free(back)
+    jagent.free_serve(ctx)
+    free_ptr(cell as *mut u8)
+    if why2 == service.SVC_CLEAN { return 0 }
+    return 1
+}
+
+fn push_num(mut s: String, v: i64) {
+    if v >= 10 { push_num(s, v / 10) }
+    let d: i64 = v % 10
+    if d == 0 { string_push(s, "0") }
+    if d == 1 { string_push(s, "1") }
+    if d == 2 { string_push(s, "2") }
+    if d == 3 { string_push(s, "3") }
+    if d == 4 { string_push(s, "4") }
+    if d == 5 { string_push(s, "5") }
+    if d == 6 { string_push(s, "6") }
+    if d == 7 { string_push(s, "7") }
+    if d == 8 { string_push(s, "8") }
+    if d == 9 { string_push(s, "9") }
+}
+
+fn main() -> i32 {
+    // `-c <config>` may come first; then the command and its argument.
+    var i: i32 = 1
+    var cfg: String = string_new()
+    string_push(cfg, JC_DEFAULT_CFG)
+    if env.argc() > i + 1 {
+        if str_eq(env.argv(i), "-c") {
+            string_free(cfg)
+            cfg = string_new()
+            string_push(cfg, env.argv(i + 1))
+            i = i + 2
+        }
+    }
+    if env.argc() <= i {
+        string_free(cfg)
+        return usage()
+    }
+    let cmd: str = env.argv(i)
+    var arg: str = ""
+    if env.argc() > i + 1 { arg = env.argv(i + 1) }
+
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var sp: sysproc.Spawner = sysproc.host()
+    var ag: jagent.Agent = jagent.make(a, time.host(), stderr_logger())
+    var code: i32 = 2
+    var known: bool = false
+    if str_eq(cmd, "status") or str_eq(cmd, "serve") or str_eq(cmd, "run") or str_eq(cmd, "schedule") or str_eq(cmd, "logs") { known = true }
+    if known == false {
+        string_free(cfg)
+        jagent.free(ag)
+        return usage()
+    }
+    if str_eq(cmd, "run") or str_eq(cmd, "schedule") or str_eq(cmd, "logs") {
+        if arg.len == 0 {
+            string_free(cfg)
+            jagent.free(ag)
+            return usage()
+        }
+    }
+    if load_or_complain(ag, h, string_view(cfg)) == false {
+        if str_eq(cmd, "status") {
+            // `status` still reports what it can: the faults are the status.
+            code = cmd_status(ag, h)
+            code = 1
+        } else {
+            code = 1
+        }
+        string_free(cfg)
+        jagent.free(ag)
+        return code
+    }
+    if str_eq(cmd, "status") { code = cmd_status(ag, h) }
+    if str_eq(cmd, "logs") { code = cmd_logs(ag, h, arg) }
+    if str_eq(cmd, "run") { code = cmd_run(ag, h, sp, arg) }
+    if str_eq(cmd, "schedule") { code = cmd_schedule(ag, h, sp, arg) }
+    if str_eq(cmd, "serve") {
+        // `serve` consumes the agent (it moves into the handlers' cell).
+        code = cmd_serve(ag, h, string_view(cfg))
+        string_free(cfg)
+        return code
+    }
+    string_free(cfg)
+    jagent.free(ag)
+    return code
+}

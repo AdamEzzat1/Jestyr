@@ -1,0 +1,1780 @@
+// std/jagent.jtr — `jagent`, an edge agent: configured jobs, a durable run history, and
+// a local HTTP API for what it knows.
+//
+// TIER: `sys`, by dependency. Jobs run through `std/sysproc` (inside a `std/sandbox`
+// group, so a timed-out job's whole process tree goes with it), history lives in `std/kv`,
+// the API is `std/httpd`, configuration is `std/config` + `std/ini` with the file watched
+// through `std/syswatch`. Everything the agent touches outside itself is GIVEN to it — an
+// allocator, a `time.Clock`, a `log.Logger`, an `fs.Fs`, a `sysproc.Spawner` — so a test
+// hands over its own and reads back exactly what happened.
+//
+// ─── What it is ──────────────────────────────────────────────────────────────────────
+//
+// A small operational agent for one machine: a few named jobs in an INI file, each a
+// shell command with a timeout; `run` executes one and records the outcome durably;
+// `serve` exposes health, metrics, the job table and the run history over loopback HTTP,
+// runs jobs on request, reloads the file when it changes, and runs any job that declares
+// an interval on that schedule. The smallest thing that can grow into a runner for a
+// homelab or a build box, built from parts the tree already had.
+//
+// ─── The configuration is a SCHEMA the file itself declares ───────────────────────────
+//
+// `std/config` refuses a key nobody declared, and the job names are the file's to choose.
+// So a load is two passes: the section headers are scanned first and every `[job.NAME]`
+// declares its four keys (`kind`, `command`, `timeout_ms`, `interval_ms`), then `ini.load`
+// applies the file against that schema. A typo in a key is therefore an ERROR that names
+// its line, not a setting that silently does nothing — which is the property `std/ini`
+// exists for, and it holds for keys the module never saw coming.
+//
+// **A reload applies whole or not at all**, `std/livecfg`'s rule: the new file builds a
+// CANDIDATE configuration and job table, and only a candidate with zero faults replaces
+// the current one. A file with three good jobs and one bad line changes nothing; the
+// faults are kept and rendered with `file:line:col` through `std/diag`, and the previous
+// jobs keep running. `generation` counts the loads that changed something.
+//
+// ─── A run is one atomic history record, or none ──────────────────────────────────────
+//
+// Every run writes THREE keys in ONE `kv` batch — the record (`run:<seq>`), the job's
+// latest pointer (`last:<name>`), and the sequence counter (`seq`) — so a crash can never
+// leave the counter ahead of the records or a job pointing at a run that was never
+// written. A job that does not exist writes nothing: there is no run to record, and a
+// history entry for a name nobody configured would be a lie the next `status` repeats.
+// A store that could not be opened does not stop a run from happening — the operator
+// asked for it — but the run reports `recorded=false` and the agent counts it, because a
+// silently unrecorded run is the failure a history exists to prevent.
+//
+// The record is JSON (`std/json`'s writer, its one escape table), so the output preview
+// can hold anything a command printed, newlines included, and the reader parses it back
+// with the same module rather than a second grammar.
+//
+// ─── A timeout kills the TREE ──────────────────────────────────────────────────────────
+//
+// A command runs through the platform shell, so the child `sysproc` holds is `cmd.exe` or
+// `sh` and the work is under it. Killing the shell alone orphans the work — the defect
+// `std/plugin` recorded and closed — so a job starts `apart` inside a `sandbox.Group`,
+// joins it before it runs an instruction, and a timeout terminates the child, then the
+// group, and waits (bounded) for the group to empty. `Run.tree_reaped` reports whether it
+// did; it is a measurement, never an assumption.
+//
+// The output is drained WHILE the child runs, gated on `sysproc.output_ready`, because a
+// child that fills its pipe blocks and a parent waiting for it to exit never drains — the
+// deadlock `std/sysproc`'s header describes. The wait is charged to a clock the caller can
+// SPEND (`blk`), separate from the agent's own clock, for `std/supervise`'s reason: a test
+// runs the agent on `time.manual()` so every timestamp and duration it records is a number
+// the test chose, while the children are real processes that need real time.
+//
+// ─── What it does NOT do ───────────────────────────────────────────────────────────────
+//
+// **No TLS.** `std/tls` exists and `std/httpd` does not speak it — the server reads its
+// sockets through `std/sysnet` directly and has no hook for a session in between. So
+// `agent.tls = true` is honoured by REFUSING to serve, with a reason (`serve_refusal`),
+// rather than by serving plaintext under a setting that says otherwise. `tls_supported`
+// answers false so a caller can ask before trying.
+//
+// **One job kind.** `kind = command` is the only value accepted today; the kind is a
+// column in the job table and a check at load time, so a second kind is a new constant,
+// a new arm in `execute`, and nothing else. No retries, no concurrency (a run blocks the
+// API for its duration, bounded by its timeout — stated, and the reason the timeout is
+// required to be positive), no job dependencies, no per-job environment or working
+// directory (`sysproc.start_piped_at` offers both; nothing here asks for them yet).
+//
+// Worked example:  examples/std/jagent_demo.jtr     (the transcript is pinned)
+// The command:     examples/std/jagent_cli.jtr      (`jagent serve|run|schedule|status|logs`)
+// Run the tests:   jestyrc test examples/std/jagent_test.jtr
+
+import "config"
+import "diag"
+import "fs"
+import "httpd"
+import "ini"
+import "json"
+import "kv"
+import "list"
+import "log"
+import "mem"
+import "metrics"
+import "sandbox"
+import "service"
+import "sink"
+import "str"
+import "sysproc"
+import "syswatch"
+import "time"
+
+// The wall clock, for the ONE thing this module records that a monotonic counter cannot
+// give: when a run started, as something a human can read back next week. ISO C's
+// `time(NULL)`, aliased because `time` is the clock module's name. Replaceable through
+// `set_wall`, so a transcript can pin it.
+extern "time.h" fn wall_seconds = "time"(t: cptr) -> i64
+
+// ---- outcomes -----------------------------------------------------------------------
+
+// How a run ended. The first four are RECORDED statuses; the fifth never reaches the
+// store, because a job nobody configured has no history to write into.
+pub const RUN_SUCCESS: i32 = 0
+pub const RUN_FAILURE: i32 = 1        // a non-zero exit, a signal, or a start that failed
+pub const RUN_TIMEOUT: i32 = 2        // killed at `timeout_ms`, tree and all
+pub const RUN_CONFIG_ERROR: i32 = 3   // the job exists but cannot be run as written
+pub const RUN_NO_SUCH_JOB: i32 = 4    // not recorded
+
+@no_alloc @no_os pub fn status_name(s: i32) -> str {
+    if s == RUN_SUCCESS { return "success" }
+    if s == RUN_FAILURE { return "failure" }
+    if s == RUN_TIMEOUT { return "timeout" }
+    if s == RUN_CONFIG_ERROR { return "config-error" }
+    if s == RUN_NO_SUCH_JOB { return "no-such-job" }
+    return "?"
+}
+
+// Job kinds. One today; the table has the column so the second costs an arm, not a
+// redesign.
+pub const JOB_COMMAND: i32 = 0
+pub const JOB_UNKNOWN: i32 = 1
+
+@no_alloc @no_os pub fn kind_name(k: i32) -> str {
+    if k == JOB_COMMAND { return "command" }
+    return "unknown"
+}
+
+// What a load or a reload did.
+pub const JA_LOADED: i32 = 0       // applied; the generation advanced
+pub const JA_SAME: i32 = 1         // the same bytes as the current configuration; nothing moved
+pub const JA_REJECTED: i32 = 2     // faults; the previous configuration stands
+pub const JA_UNREADABLE: i32 = 3   // no file; the previous configuration stands
+pub const JA_QUIET: i32 = 4        // `poll_config`: the watcher reported nothing
+
+@no_alloc @no_os pub fn load_name(r: i32) -> str {
+    if r == JA_LOADED { return "loaded" }
+    if r == JA_SAME { return "same" }
+    if r == JA_REJECTED { return "rejected" }
+    if r == JA_UNREADABLE { return "unreadable" }
+    if r == JA_QUIET { return "quiet" }
+    return "?"
+}
+
+// ---- sizes ----------------------------------------------------------------------------
+
+// How much of a command's output a history record keeps. A record is a summary; the
+// whole output of a job is the job's business (redirect it), and a store that grew by
+// megabytes per run would be the wrong shape for the history of a box.
+pub const JAGENT_PREVIEW_CAP: usize = 240
+// One read of a job's pipe.
+const JAGENT_CHUNK: usize = 4096
+// A rendered configuration value may be this long — a command line, in practice.
+const JAGENT_VALUE_CAP: usize = 4096
+// A rendered fault, a history record, a status line.
+const JAGENT_LINE_CAP: usize = 8192
+// How long a timed-out job's tree is given to empty after the kill. Its own number, not
+// the job's timeout: it bounds a sweep, and the job's budget is already spent.
+const JAGENT_REAP_NANOS: i64 = 2000000000
+// The slice a drain sleeps for when nothing is ready — `sysproc`'s own floor.
+const JAGENT_POLL_NANOS: i64 = 1000000
+// How many drain rounds `poll_config` allows the watcher before giving up on convergence.
+const JAGENT_DRAIN_ROUNDS: usize = 16
+// The default job timeout, when the file does not say.
+const JAGENT_DEFAULT_TIMEOUT_MS: i64 = 5000
+// The history keys.
+const KEY_SEQ: str = "seq"
+const KEY_RUN: str = "run:"
+const KEY_LAST: str = "last:"
+
+// ---- one run ---------------------------------------------------------------------------
+
+// What a run reported. `@copy`: scalars only; the output preview and the error text live
+// on the agent (`last_output`, `last_error`) because a struct may not hold a `str` and a
+// `String` field would make this move-only for no reason.
+@copy pub struct Run {
+    pub status: i32,
+    pub code: i32,            // the exit code when there is one; the signal when killed
+    pub seq: i64,             // the history sequence number, 0 when not recorded
+    pub started_at: i64,      // wall-clock seconds
+    pub duration_ms: i64,     // on the agent's clock
+    pub out_bytes: i64,       // every byte the command wrote, not just the preview
+    pub recorded: bool,
+    pub tree_reaped: bool,    // true when the process group was CONFIRMED empty afterwards
+}
+
+@no_alloc @no_os pub fn no_run() -> Run {
+    return Run{ status: RUN_NO_SUCH_JOB, code: 0, seq: 0, started_at: 0, duration_ms: 0,
+                out_bytes: 0, recorded: false, tree_reaped: false }
+}
+
+// ---- the agent --------------------------------------------------------------------------
+
+@move pub struct Agent {
+    a: Allocator,
+    clock: time.Clock,
+    wall: fn() -> i64,
+    lg: log.Logger,
+    lraw: *mut u8,            // the last log record, rendered — a test reads it here
+    llen: usize,
+    m: metrics.Registry,
+    svc: service.Service,
+    // configuration
+    cfg: config.Config,
+    src: String,              // the text of the current configuration
+    cfg_name: String,         // its file name, for diagnostics
+    faults: String,           // every fault of the LAST load, rendered
+    fault_count: i64,
+    valid: bool,              // has a configuration ever been applied?
+    generation: i64,
+    loads: i64,
+    rejections: i64,
+    // the job table: name and command bytes in two arenas, one column per fact
+    names: String,
+    nofs: List(i32),
+    nlen: List(i32),
+    cmds: String,
+    cofs: List(i32),
+    clen: List(i32),
+    kinds: List(i32),
+    timeouts: List(i64),      // ms
+    intervals: List(i64),     // ms; 0 = not scheduled
+    due: List(i64),           // the next scheduled start, on the agent's clock
+    // history
+    store: kv.Store,
+    store_path: String,
+    // the watcher over the configuration's directory
+    w: syswatch.Watcher,
+    // metric ids
+    m_runs: i32,
+    m_ok: i32,
+    m_fail: i32,
+    m_timeout: i32,
+    m_cfgerr: i32,
+    m_missing: i32,
+    m_unrecorded: i32,
+    m_http: i32,
+    m_reloads: i32,
+    m_dur: i32,
+    m_jobs: i32,
+    // what the last run left behind
+    preview: String,
+    why: String,
+    last_status: i32,
+}
+
+impl Drop for Agent {
+    fn drop(mut self) {
+        string_free(self.src)
+        string_free(self.cfg_name)
+        string_free(self.faults)
+        string_free(self.names)
+        string_free(self.cmds)
+        string_free(self.store_path)
+        string_free(self.preview)
+        string_free(self.why)
+    }
+}
+
+fn host_wall() -> i64 {
+    return wall_seconds(null)
+}
+
+fn nothing() { }
+
+// An agent with no configuration and no store. `clk` is the agent's own clock — every
+// timestamp and duration it records comes from it; `lg` receives one record per run and
+// per reload. The service is READY from the start: `run` is work, and a `make` that
+// needed a second call before it would accept any would make the CLI's `run` a two-step.
+pub fn make(read a: Allocator, take clk: time.Clock, take lg: log.Logger) -> Agent {
+    var m: metrics.Registry = metrics.make(a)
+    var svc: service.Service = service.make(m)
+    var c: time.Clock = clk
+    service.ready(svc, c)
+    var bounds: *mut i64 = alloc(i64, 6)
+    unsafe { (bounds + 0).* = 10 }
+    unsafe { (bounds + 1).* = 100 }
+    unsafe { (bounds + 2).* = 1000 }
+    unsafe { (bounds + 3).* = 10000 }
+    unsafe { (bounds + 4).* = 60000 }
+    unsafe { (bounds + 5).* = 600000 }
+    let bs: []i64 = slice(i64, bounds, 6)
+    let m_dur: i32 = metrics.histogram(m, "jagent_run_ms", bs)
+    free_ptr(bounds as *mut u8)
+    return Agent{
+        a: a, clock: c, wall: &host_wall, lg: lg,
+        lraw: alloc(u8, JAGENT_LINE_CAP), llen: 0,
+        m: m, svc: svc,
+        cfg: config.make(a), src: string_new(), cfg_name: string_new(), faults: string_new(),
+        fault_count: 0, valid: false, generation: 0, loads: 0, rejections: 0,
+        names: string_new(), nofs: list.make(i32, a), nlen: list.make(i32, a),
+        cmds: string_new(), cofs: list.make(i32, a), clen: list.make(i32, a),
+        kinds: list.make(i32, a), timeouts: list.make(i64, a), intervals: list.make(i64, a),
+        due: list.make(i64, a),
+        store: kv.closed(), store_path: string_new(),
+        w: syswatch.closed(),
+        m_runs: metrics.counter(m, "jagent_runs_total"),
+        m_ok: metrics.counter(m, "jagent_runs_success"),
+        m_fail: metrics.counter(m, "jagent_runs_failure"),
+        m_timeout: metrics.counter(m, "jagent_runs_timeout"),
+        m_cfgerr: metrics.counter(m, "jagent_runs_config_error"),
+        m_missing: metrics.counter(m, "jagent_runs_no_such_job"),
+        m_unrecorded: metrics.counter(m, "jagent_runs_unrecorded"),
+        m_http: metrics.counter(m, "jagent_http_requests"),
+        m_reloads: metrics.counter(m, "jagent_config_reloads"),
+        m_dur: m_dur,
+        m_jobs: metrics.gauge(m, "jagent_jobs"),
+        preview: string_new(), why: string_new(), last_status: RUN_NO_SUCH_JOB,
+    }
+}
+
+// Release everything `Drop` cannot: the store, the watcher, the registry, the logger,
+// the configuration. The agent is unusable afterwards.
+pub fn free(mut ag: Agent) {
+    close_store(ag)
+    syswatch.close_watch(ag.w) catch nothing()
+    config.free(ag.cfg)
+    metrics.free(ag.m)
+    log.free(ag.lg)
+    if ag.lraw != null {
+        free_ptr(ag.lraw)
+        ag.lraw = null
+    }
+}
+
+// Replace the wall clock. A transcript that must not depend on the calendar installs a
+// function returning a constant.
+@no_alloc @no_os pub fn set_wall(mut ag: Agent, f: fn() -> i64) {
+    ag.wall = f
+}
+
+// The agent's clock, read and moved — `advance` is how a test on a manual clock reaches a
+// scheduled job's due time.
+pub fn now(mut ag: Agent) -> i64 { return time.read_nanos(ag.clock) }
+pub fn advance(mut ag: Agent, by: i64) -> bool { return time.advance(ag.clock, by) }
+
+// ---- small renderers ---------------------------------------------------------------------
+
+fn push_i64(mut s: String, v: i64) {
+    var raw: *mut u8 = alloc(u8, 24)
+    var b: []u8 = slice(u8, raw, 24)
+    var sk: sink.Sink = sink.new()
+    sink.put_i64(sk, b, v)
+    string_push(s, sink.view(sk, b))
+    free_ptr(raw)
+}
+
+fn push_bool(mut s: String, v: bool) {
+    if v { string_push(s, "true") } else { string_push(s, "false") }
+}
+
+// A history sequence number as twelve zero-padded digits, so the keys sort as the runs
+// happened and a `run:` prefix scan reads them in order.
+fn push_seq(mut s: String, v: i64) {
+    var raw: *mut u8 = alloc(u8, 24)
+    var b: []u8 = slice(u8, raw, 24)
+    var sk: sink.Sink = sink.new()
+    sink.put_i64(sk, b, v)
+    let d: str = sink.view(sk, b)
+    var k: usize = d.len
+    for k < 12 {
+        string_push(s, "0")
+        k = k + 1
+    }
+    string_push(s, d)
+    free_ptr(raw)
+}
+
+// A value as a JSON string — the one escape table in the tree, so a preview with a quote
+// or a newline is one field on one line wherever it is rendered.
+fn push_quoted(mut s: String, read v: str) {
+    let cap: usize = v.len * 6 + 8
+    var raw: *mut u8 = alloc(u8, cap)
+    var b: []u8 = slice(u8, raw, cap)
+    var sk: sink.Sink = sink.new()
+    var w: json.Writer = json.writer()
+    json.put_str(w, sk, b, v)
+    string_push(s, sink.view(sk, b))
+    free_ptr(raw)
+}
+
+// Decimal digits only; -1 for anything else (a `seq` value that is not a number is damage).
+@no_alloc @no_os fn parse_i64(read s: str) -> i64 {
+    if s.len == 0 { return 0 - 1 }
+    var acc: i64 = 0
+    var i: usize = 0
+    for i < s.len {
+        let d: i32 = s[i] as i32
+        if d < 48 { return 0 - 1 }
+        if d > 57 { return 0 - 1 }
+        acc = acc * 10 + ((d - 48) as i64)
+        i = i + 1
+    }
+    return acc
+}
+
+// The 1-based line and column of byte `off` in `text`.
+@no_alloc @no_os fn line_of(read text: str, off: usize) -> i64 {
+    var ln: i64 = 1
+    var i: usize = 0
+    for i < off and i < text.len {
+        if (text[i] as i32) == 10 { ln = ln + 1 }
+        i = i + 1
+    }
+    return ln
+}
+
+@no_alloc @no_os fn col_of(read text: str, off: usize) -> i64 {
+    var col: i64 = 1
+    var i: usize = 0
+    for i < off and i < text.len {
+        if (text[i] as i32) == 10 { col = 1 } else { col = col + 1 }
+        i = i + 1
+    }
+    return col
+}
+
+// The current value of `id`, rendered into `dst`. False when it would not fit.
+fn value_of(read c: config.Config, id: i32, mut dst: String) -> bool {
+    var raw: *mut u8 = alloc(u8, JAGENT_VALUE_CAP)
+    var b: []u8 = slice(u8, raw, JAGENT_VALUE_CAP)
+    var sk: sink.Sink = sink.new()
+    config.render_value(sk, b, c, id)
+    let over: bool = sink.overflowed(sk)
+    if over == false { string_push(dst, sink.view(sk, b)) }
+    free_ptr(raw)
+    return over == false
+}
+
+// ---- the job table ----------------------------------------------------------------------
+
+@no_alloc @no_os pub fn job_count(read ag: Agent) -> usize {
+    return list.len(i32, ag.kinds)
+}
+
+pub fn job_name(read ag: Agent, i: usize) -> read str {
+    let v: str = string_view(ag.names)
+    if i >= job_count(ag) { return v[0 .. 0] }
+    let o: usize = list.get(i32, ag.nofs, i) as usize
+    let n: usize = list.get(i32, ag.nlen, i) as usize
+    return v[o .. o + n]
+}
+
+pub fn job_command(read ag: Agent, i: usize) -> read str {
+    let v: str = string_view(ag.cmds)
+    if i >= job_count(ag) { return v[0 .. 0] }
+    let o: usize = list.get(i32, ag.cofs, i) as usize
+    let n: usize = list.get(i32, ag.clen, i) as usize
+    return v[o .. o + n]
+}
+
+pub fn job_kind(read ag: Agent, i: usize) -> i32 {
+    if i >= job_count(ag) { return JOB_UNKNOWN }
+    return list.get(i32, ag.kinds, i)
+}
+
+pub fn job_timeout_ms(read ag: Agent, i: usize) -> i64 {
+    if i >= job_count(ag) { return 0 }
+    return list.get(i64, ag.timeouts, i)
+}
+
+pub fn job_interval_ms(read ag: Agent, i: usize) -> i64 {
+    if i >= job_count(ag) { return 0 }
+    return list.get(i64, ag.intervals, i)
+}
+
+// When job `i` is next due on the agent's clock, or -1 when it is not scheduled.
+pub fn job_due(read ag: Agent, i: usize) -> i64 {
+    if i >= job_count(ag) { return 0 - 1 }
+    if list.get(i64, ag.intervals, i) <= 0 { return 0 - 1 }
+    return list.get(i64, ag.due, i)
+}
+
+// The index of the job called `name`, or -1. A linear scan: an agent has a handful of
+// jobs, and the name is compared once per request.
+pub fn find_job(read ag: Agent, read name: str) -> i32 {
+    var i: usize = 0
+    let n: usize = job_count(ag)
+    for i < n {
+        if str_eq(job_name(ag, i), name) { return i as i32 }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ---- the agent section --------------------------------------------------------------------
+
+fn agent_int(read ag: Agent, read key: str) -> i64 {
+    return config.get_int(ag.cfg, config.by_name(ag.cfg, key))
+}
+
+fn agent_bool(read ag: Agent, read key: str) -> bool {
+    return config.get_bool(ag.cfg, config.by_name(ag.cfg, key))
+}
+
+// `agent.port`; 0 asks the platform for one.
+pub fn port(read ag: Agent) -> i64 { return agent_int(ag, "agent.port") }
+
+// Does `agent.host` name the loopback interface? False means every interface (`0.0.0.0`);
+// anything else was refused at load.
+pub fn host_is_loopback(read ag: Agent) -> bool {
+    let id: i32 = config.by_name(ag.cfg, "agent.host")
+    return config.value_is(ag.cfg, id, "0.0.0.0") == false
+}
+
+pub fn tls_wanted(read ag: Agent) -> bool { return agent_bool(ag, "agent.tls") }
+
+// Whether this build can serve TLS. It cannot — see the header — and the answer is a
+// function rather than a constant so a build that grows the hook changes exactly one
+// place and every caller learns.
+@no_alloc @no_os pub fn tls_supported() -> bool { return false }
+
+// Why `serve` would refuse to start, or "" when it would not. Asked by the CLI before it
+// binds a socket, so a configuration that asks for something the agent cannot honour is
+// refused with the reason rather than served under a different contract.
+pub fn serve_refusal(read ag: Agent) -> str {
+    if ag.valid == false { return "no valid configuration is loaded" }
+    if tls_wanted(ag) {
+        if tls_supported() == false {
+            return "agent.tls = true, but this build cannot serve TLS: std/httpd has no TLS hook (docs/jagent.md)"
+        }
+    }
+    return ""
+}
+
+// The path the history lives at: `agent.store`, `jagent.db` by default.
+pub fn store_path(read ag: Agent) -> read str { return string_view(ag.store_path) }
+
+// ---- loading a configuration ---------------------------------------------------------------
+
+@no_alloc @no_os fn name_byte_ok(b: i32) -> bool {
+    if b >= 48 and b <= 57 { return true }
+    if b >= 65 and b <= 90 { return true }
+    if b >= 97 and b <= 122 { return true }
+    if b == 45 or b == 95 { return true }
+    return false
+}
+
+fn fault_at(mut faults: String, read fname: str, read text: str, off: usize, read msg: str) {
+    string_push(faults, "error[E-JAGENT]: ")
+    string_push(faults, msg)
+    string_push(faults, "\n  --> ")
+    string_push(faults, fname)
+    string_push(faults, ":")
+    push_i64(faults, line_of(text, off))
+    string_push(faults, ":")
+    push_i64(faults, col_of(text, off))
+    string_push(faults, "\n")
+}
+
+// A candidate job table, built while the file is scanned and thrown away if it is not
+// applied. Name bytes in `names`, one row per `[job.NAME]` header, plus the header's byte
+// offset so a fault found later can point at it.
+struct Cand {
+    names: String,
+    nofs: List(i32),
+    nlen: List(i32),
+    hdr: List(i32),
+}
+
+fn cand_name(read c: Cand, i: usize) -> read str {
+    let v: str = string_view(c.names)
+    let o: usize = list.get(i32, c.nofs, i) as usize
+    let n: usize = list.get(i32, c.nlen, i) as usize
+    return v[o .. o + n]
+}
+
+// Pass one: the section headers. Every `[job.NAME]` becomes a row; a header that is not a
+// job is `std/ini`'s to judge. A name is refused for a byte outside `[A-Za-z0-9_-]`, because
+// the name is also a URL segment and a history key, and for being a duplicate, because
+// two sections of one name would race for one set of keys.
+fn scan_jobs(read text: str, read fname: str, mut c: Cand, mut faults: String, read a: Allocator) {
+    var at: usize = 0
+    for at <= text.len {
+        var e: usize = at
+        for e < text.len {
+            if (text[e] as i32) == 10 { break }
+            e = e + 1
+        }
+        let line: str = str.trimmed(text[at .. e])
+        if line.len >= 2 {
+            if (line[0] as i32) == 91 and (line[line.len - 1] as i32) == 93 {
+                let inner: str = line[1 .. line.len - 1]
+                if str.has_prefix(inner, "job.") {
+                    let nm: str = inner[4 .. inner.len]
+                    var fine: bool = nm.len > 0
+                    if fine == false {
+                        fault_at(faults, fname, text, at, "a job section needs a name: `[job.NAME]`")
+                    }
+                    var i: usize = 0
+                    for i < nm.len {
+                        if name_byte_ok(nm[i] as i32) == false {
+                            if fine {
+                                fault_at(faults, fname, text, at, "a job name may hold only letters, digits, `-` and `_`")
+                            }
+                            fine = false
+                        }
+                        i = i + 1
+                    }
+                    if fine {
+                        var k: usize = 0
+                        let n: usize = list.len(i32, c.nofs)
+                        for k < n {
+                            if str_eq(cand_name(c, k), nm) {
+                                fault_at(faults, fname, text, at, "this job is declared twice")
+                                fine = false
+                            }
+                            k = k + 1
+                        }
+                    }
+                    if fine {
+                        let v0: str = string_view(c.names)
+                        list.push(i32, c.nofs, v0.len as i32)
+                        list.push(i32, c.nlen, nm.len as i32)
+                        list.push(i32, c.hdr, at as i32)
+                        string_push(c.names, nm)
+                    }
+                }
+            }
+        }
+        at = e + 1
+    }
+}
+
+// The schema: the agent section, and four keys per job, with their defaults.
+fn declare_all(mut cfg: config.Config, read c: Cand) {
+    config.declare(cfg, "agent.host", config.CFG_STR, false)
+    config.declare(cfg, "agent.port", config.CFG_INT, false)
+    config.declare(cfg, "agent.tls", config.CFG_BOOL, false)
+    config.declare(cfg, "agent.tls_cert", config.CFG_STR, false)
+    config.declare(cfg, "agent.tls_key", config.CFG_STR, false)
+    config.declare(cfg, "agent.store", config.CFG_STR, false)
+    config.apply(cfg, "agent.host", "127.0.0.1", config.CFG_DEFAULT)
+    config.apply(cfg, "agent.port", "0", config.CFG_DEFAULT)
+    config.apply(cfg, "agent.tls", "false", config.CFG_DEFAULT)
+    config.apply(cfg, "agent.store", "jagent.db", config.CFG_DEFAULT)
+    var t: String = string_new()
+    push_i64(t, JAGENT_DEFAULT_TIMEOUT_MS)
+    var i: usize = 0
+    let n: usize = list.len(i32, c.nofs)
+    for i < n {
+        declare_job_key(cfg, c, i, "kind", config.CFG_STR, "command")
+        declare_job_key(cfg, c, i, "command", config.CFG_STR, "")
+        declare_job_key(cfg, c, i, "timeout_ms", config.CFG_INT, string_view(t))
+        declare_job_key(cfg, c, i, "interval_ms", config.CFG_INT, "0")
+        i = i + 1
+    }
+    string_free(t)
+}
+
+// Declare `job.<name>.<leaf>` of kind `k`, with `dflt` as its default when non-empty.
+fn declare_job_key(mut cfg: config.Config, read c: Cand, i: usize, read leaf: str, k: i32, read dflt: str) {
+    var key: String = string_new()
+    string_push(key, "job.")
+    string_push(key, cand_name(c, i))
+    string_push(key, ".")
+    string_push(key, leaf)
+    config.declare(cfg, string_view(key), k, false)
+    if dflt.len > 0 { config.apply(cfg, string_view(key), dflt, config.CFG_DEFAULT) }
+    string_free(key)
+}
+
+// Every `std/ini` problem, rendered with a caret against the file's own text.
+fn render_ini_faults(read a: Allocator, read fname: str, read text: str, read x: ini.Ini, mut faults: String) -> i64 {
+    let total: usize = ini.problem_count(x)
+    if total == 0 { return 0 }
+    var m: diag.SourceMap = diag.map_new(a)
+    let fid: diag.FileId = diag.add_file(m, fname, text)
+    var raw: *mut u8 = alloc(u8, JAGENT_LINE_CAP)
+    var b: []u8 = slice(u8, raw, JAGENT_LINE_CAP)
+    var i: usize = 0
+    for i < total {
+        let sp: diag.Span = diag.span(fid, ini.problem_start(x, i), ini.problem_end(x, i))
+        var d: diag.Diagnostic = diag.new_error(a, "E-INI", ini.code_name(ini.problem_code(x, i)))
+        let cf: i32 = ini.problem_cfg(x, i)
+        if cf >= 0 {
+            diag.primary(d, sp, config.outcome_name(cf))
+        } else {
+            diag.primary(d, sp, "here")
+        }
+        var sk: sink.Sink = sink.new()
+        diag.render(sk, b, m, d, diag.plain())
+        if sink.overflowed(sk) == false { string_push(faults, sink.view(sk, b)) }
+        i = i + 1
+    }
+    free_ptr(raw)
+    return total as i64
+}
+
+// The one key of job `i` in `c`, looked up in `cfg`.
+fn job_key(read c: Cand, i: usize, read leaf: str, read cfg: config.Config) -> i32 {
+    var k: String = string_new()
+    string_push(k, "job.")
+    string_push(k, cand_name(c, i))
+    string_push(k, ".")
+    string_push(k, leaf)
+    let id: i32 = config.by_name(cfg, string_view(k))
+    string_free(k)
+    return id
+}
+
+// Pass three: what the schema cannot say. A command must be present and non-empty, a
+// kind must be one this agent runs, a timeout must be positive (a zero timeout is a job
+// that is always killed, and a job that blocks the API for ever is what the timeout
+// exists to rule out), an interval may not be negative, and the host must be one the
+// server can bind.
+fn check_semantics(read c: Cand, read cfg: config.Config, read fname: str, read text: str, mut faults: String) -> i64 {
+    var n_faults: i64 = 0
+    let hid: i32 = config.by_name(cfg, "agent.host")
+    var host_ok: bool = false
+    if config.value_is(cfg, hid, "127.0.0.1") { host_ok = true }
+    if config.value_is(cfg, hid, "localhost") { host_ok = true }
+    if config.value_is(cfg, hid, "0.0.0.0") { host_ok = true }
+    if host_ok == false {
+        fault_at(faults, fname, text, 0, "agent.host must be 127.0.0.1, localhost or 0.0.0.0")
+        n_faults = n_faults + 1
+    }
+    let pid: i32 = config.by_name(cfg, "agent.port")
+    let pv: i64 = config.get_int(cfg, pid)
+    if pv < 0 or pv > 65535 {
+        fault_at(faults, fname, text, 0, "agent.port must be 0..65535")
+        n_faults = n_faults + 1
+    }
+    var i: usize = 0
+    let n: usize = list.len(i32, c.nofs)
+    for i < n {
+        let hdr: usize = list.get(i32, c.hdr, i) as usize
+        let kid: i32 = job_key(c, i, "kind", cfg)
+        if config.value_is(cfg, kid, "command") == false {
+            fault_at(faults, fname, text, hdr, "unknown job kind; only `command` is supported")
+            n_faults = n_faults + 1
+        }
+        let cid: i32 = job_key(c, i, "command", cfg)
+        var has_cmd: bool = config.is_set(cfg, cid)
+        if has_cmd {
+            if config.value_is(cfg, cid, "") { has_cmd = false }
+        }
+        if has_cmd == false {
+            fault_at(faults, fname, text, hdr, "a command job needs a non-empty `command`")
+            n_faults = n_faults + 1
+        }
+        let tid: i32 = job_key(c, i, "timeout_ms", cfg)
+        if config.get_int(cfg, tid) <= 0 {
+            fault_at(faults, fname, text, hdr, "`timeout_ms` must be positive")
+            n_faults = n_faults + 1
+        }
+        let iid: i32 = job_key(c, i, "interval_ms", cfg)
+        if config.get_int(cfg, iid) < 0 {
+            fault_at(faults, fname, text, hdr, "`interval_ms` may not be negative")
+            n_faults = n_faults + 1
+        }
+        i = i + 1
+    }
+    return n_faults
+}
+
+// Replace the live job table from the applied candidate. Scheduled jobs start their
+// first interval NOW, on the agent's clock — a reload resets every schedule, which is
+// stated rather than hidden: the alternative, carrying a due time across a reload that
+// may have changed the interval, is a rule with more cases than callers.
+fn adopt(mut ag: Agent, read c: Cand) {
+    let t: i64 = time.read_nanos(ag.clock)
+    string_free(ag.names)
+    ag.names = string_new()
+    string_free(ag.cmds)
+    ag.cmds = string_new()
+    list.truncate(i32, ag.nofs, 0)
+    list.truncate(i32, ag.nlen, 0)
+    list.truncate(i32, ag.cofs, 0)
+    list.truncate(i32, ag.clen, 0)
+    list.truncate(i32, ag.kinds, 0)
+    list.truncate(i64, ag.timeouts, 0)
+    list.truncate(i64, ag.intervals, 0)
+    list.truncate(i64, ag.due, 0)
+    var i: usize = 0
+    let n: usize = list.len(i32, c.nofs)
+    for i < n {
+        let nm: str = cand_name(c, i)
+        let v0: str = string_view(ag.names)
+        list.push(i32, ag.nofs, v0.len as i32)
+        list.push(i32, ag.nlen, nm.len as i32)
+        string_push(ag.names, nm)
+        let v1: str = string_view(ag.cmds)
+        let start: usize = v1.len
+        value_of(ag.cfg, job_key(c, i, "command", ag.cfg), ag.cmds)
+        let v2: str = string_view(ag.cmds)
+        list.push(i32, ag.cofs, start as i32)
+        list.push(i32, ag.clen, (v2.len - start) as i32)
+        list.push(i32, ag.kinds, JOB_COMMAND)
+        list.push(i64, ag.timeouts, config.get_int(ag.cfg, job_key(c, i, "timeout_ms", ag.cfg)))
+        let iv: i64 = config.get_int(ag.cfg, job_key(c, i, "interval_ms", ag.cfg))
+        list.push(i64, ag.intervals, iv)
+        list.push(i64, ag.due, t + iv * 1000000)
+        i = i + 1
+    }
+    metrics.set_gauge(ag.m, ag.m_jobs, n as i64)
+    string_free(ag.store_path)
+    ag.store_path = string_new()
+    value_of(ag.cfg, config.by_name(ag.cfg, "agent.store"), ag.store_path)
+}
+
+fn note_load(mut ag: Agent, r: i32, faults: i64) {
+    if log.begin(ag.lg, log.LOG_INFO, "config") {
+        log.kv_str(ag.lg, "file", string_view(ag.cfg_name))
+        log.kv_str(ag.lg, "outcome", load_name(r))
+        log.kv_i64(ag.lg, "jobs", job_count(ag) as i64)
+        log.kv_i64(ag.lg, "faults", faults)
+        log.kv_i64(ag.lg, "generation", ag.generation)
+        ship_log(ag)
+    }
+}
+
+// Load a configuration from `text`, named `fname` for diagnostics. The candidate is built
+// whole — schema, file, semantic checks — and applied only when it has no faults; the
+// faults of the last load are kept either way (`faults`, `fault_count`). Identical bytes
+// to the current configuration answer `JA_SAME` and touch nothing.
+pub fn load_text(mut ag: Agent, read fname: str, read text: str) -> i32 {
+    if ag.valid {
+        if str_eq(string_view(ag.src), text) { return JA_SAME }
+    }
+    string_free(ag.cfg_name)
+    ag.cfg_name = string_new()
+    string_push(ag.cfg_name, fname)
+
+    var faults: String = string_new()
+    var c: Cand = Cand{ names: string_new(), nofs: list.make(i32, ag.a), nlen: list.make(i32, ag.a), hdr: list.make(i32, ag.a) }
+    scan_jobs(text, fname, c, faults, ag.a)
+    var cfg: config.Config = config.make(ag.a)
+    declare_all(cfg, c)
+    var x: ini.Ini = ini.make(ag.a)
+    ini.load(x, cfg, text, config.CFG_FILE)
+    var n_faults: i64 = render_ini_faults(ag.a, fname, text, x, faults)
+    let vf: str = string_view(faults)
+    if vf.len > 0 { n_faults = n_faults + 1 }
+    n_faults = check_semantics(c, cfg, fname, text, faults)
+    // Every fault above is one rendered block; count them by their marker rather than
+    // by summing three sources that could each miss one.
+    n_faults = str.count_of(string_view(faults), "error[") as i64
+    ini.free(x)
+
+    string_free(ag.faults)
+    ag.faults = faults
+    ag.fault_count = n_faults
+    ag.loads = ag.loads + 1
+    if n_faults > 0 {
+        config.free(cfg)
+        string_free(c.names)
+        ag.rejections = ag.rejections + 1
+        note_load(ag, JA_REJECTED, n_faults)
+        return JA_REJECTED
+    }
+    config.free(ag.cfg)
+    ag.cfg = cfg
+    adopt(ag, c)
+    string_free(c.names)
+    string_free(ag.src)
+    ag.src = string_new()
+    string_push(ag.src, text)
+    ag.valid = true
+    ag.generation = ag.generation + 1
+    metrics.inc(ag.m, ag.m_reloads, 1)
+    note_load(ag, JA_LOADED, 0)
+    return JA_LOADED
+}
+
+// Load the file at `path` through `f`. An absent file is `JA_UNREADABLE` and changes
+// nothing.
+pub fn load_file(mut ag: Agent, mut f: fs.Fs, read path: str) -> i32 {
+    if fs.present(f, path) == false {
+        string_free(ag.cfg_name)
+        ag.cfg_name = string_new()
+        string_push(ag.cfg_name, path)
+        string_free(ag.faults)
+        ag.faults = string_new()
+        string_push(ag.faults, "error[E-JAGENT]: cannot read `")
+        string_push(ag.faults, path)
+        string_push(ag.faults, "`\n")
+        ag.fault_count = 1
+        ag.loads = ag.loads + 1
+        ag.rejections = ag.rejections + 1
+        return JA_UNREADABLE
+    }
+    var text: String = fs.open_text(f, path)
+    let r: i32 = load_text(ag, path, string_view(text))
+    string_free(text)
+    return r
+}
+
+// Re-read the file the current configuration came from.
+pub fn reload(mut ag: Agent, mut f: fs.Fs) -> i32 {
+    var p: String = string_new()
+    string_push(p, string_view(ag.cfg_name))
+    let r: i32 = load_file(ag, f, string_view(p))
+    string_free(p)
+    return r
+}
+
+pub fn is_valid(read ag: Agent) -> bool { return ag.valid }
+pub fn generation(read ag: Agent) -> i64 { return ag.generation }
+pub fn loads(read ag: Agent) -> i64 { return ag.loads }
+pub fn rejections(read ag: Agent) -> i64 { return ag.rejections }
+pub fn fault_count(read ag: Agent) -> i64 { return ag.fault_count }
+pub fn faults(read ag: Agent) -> read str { return string_view(ag.faults) }
+pub fn config_name(read ag: Agent) -> read str { return string_view(ag.cfg_name) }
+
+// ---- watching the configuration --------------------------------------------------------------
+
+// Watch `dir` — the directory the configuration file sits in — so `poll_config` can
+// re-read the file when anything under it changes. False when the watcher could not open.
+pub fn watch(mut ag: Agent, mut f: fs.Fs, read dir: str) -> bool {
+    syswatch.close_watch(ag.w) catch nothing()
+    ag.w = syswatch.open_dir(f, ag.a, dir) catch syswatch.closed()
+    return syswatch.is_open(ag.w)
+}
+
+pub fn watching(read ag: Agent) -> bool { return syswatch.is_open(ag.w) }
+
+// One pass: drain the watcher (bounded, never blocking) and re-read the file if it
+// reported anything. A closed watcher answers `JA_QUIET` for ever; a change to some other
+// file under the directory answers `JA_SAME`, the cheap re-read.
+pub fn poll_config(mut ag: Agent, mut f: fs.Fs) -> i32 {
+    if syswatch.is_open(ag.w) == false { return JA_QUIET }
+    var evraw: *mut syswatch.Change = alloc(syswatch.Change, 8)
+    var evs: []syswatch.Change = slice(syswatch.Change, evraw, 8)
+    var nraw: *mut u8 = alloc(u8, 512)
+    var names: []u8 = slice(u8, nraw, 512)
+    var seen: usize = 0
+    var got: usize = 1
+    var rounds: usize = 0
+    for got > 0 and rounds < JAGENT_DRAIN_ROUNDS {
+        got = syswatch.drain(ag.w, evs, names) catch 0
+        seen = seen + got
+        rounds = rounds + 1
+    }
+    free_ptr(nraw)
+    free_ptr(evraw as *mut u8)
+    if seen == 0 { return JA_QUIET }
+    return reload(ag, f)
+}
+
+// ---- the store ------------------------------------------------------------------------------
+
+// Open the history at `store_path` (creating it), through `f`. False when it could not be
+// opened — a read-only or denied handle, a file that is not a store — and every run until
+// it is reports `recorded=false`.
+pub fn open_store(mut ag: Agent, mut f: fs.Fs) -> bool {
+    if kv.is_open(ag.store) { return true }
+    let sp: str = string_view(ag.store_path)
+    if sp.len == 0 { return false }
+    kv.open(f, ag.a, sp, ag.store) catch nothing()
+    return kv.is_open(ag.store)
+}
+
+pub fn close_store(mut ag: Agent) {
+    if kv.is_open(ag.store) { kv.close(ag.store) }
+}
+
+pub fn store_is_open(read ag: Agent) -> bool { return kv.is_open(ag.store) }
+
+// The sequence number of the last recorded run, 0 when there is none.
+pub fn last_seq(read ag: Agent) -> i64 {
+    if kv.is_open(ag.store) == false { return 0 }
+    if kv.has(ag.store, KEY_SEQ) == false { return 0 }
+    let v: i64 = parse_i64(kv.get(ag.store, KEY_SEQ))
+    if v < 0 { return 0 }
+    return v
+}
+
+// ---- running a job ---------------------------------------------------------------------------
+
+// The preview of the last run's output, and the last run's error text (empty when there
+// was none). Views into the agent, valid until the next run.
+pub fn last_output(read ag: Agent) -> read str { return string_view(ag.preview) }
+pub fn last_error(read ag: Agent) -> read str { return string_view(ag.why) }
+
+fn set_error(mut ag: Agent, read msg: str) {
+    string_free(ag.why)
+    ag.why = string_new()
+    string_push(ag.why, msg)
+}
+
+fn ship_log(mut ag: Agent) {
+    var lb: []u8 = slice(u8, ag.lraw, JAGENT_LINE_CAP)
+    var s: sink.Sink = sink.new()
+    log.end(ag.lg, s, lb)
+    ag.llen = sink.written(s)
+}
+
+// The last record the agent's logger shipped, as rendered. What a buffered writer
+// received; a test reads it here.
+pub fn last_log(read ag: Agent) -> str {
+    let lb: []u8 = slice(u8, ag.lraw, JAGENT_LINE_CAP)
+    return from_utf8(lb[0 .. ag.llen])
+}
+
+fn note_run(mut ag: Agent, read name: str, read r: Run) {
+    if log.begin(ag.lg, log.LOG_INFO, "job run") {
+        log.kv_str(ag.lg, "job", name)
+        log.kv_str(ag.lg, "status", status_name(r.status))
+        log.kv_i64(ag.lg, "code", r.code as i64)
+        log.kv_i64(ag.lg, "ms", r.duration_ms)
+        log.kv_i64(ag.lg, "seq", r.seq)
+        log.kv_bool(ag.lg, "recorded", r.recorded)
+        ship_log(ag)
+    }
+}
+
+// Write the run as ONE batch: the record, the job's latest pointer, the counter.
+fn persist(mut ag: Agent, read name: str, mut r: Run) {
+    r.recorded = false
+    r.seq = 0
+    if kv.is_open(ag.store) == false {
+        metrics.inc(ag.m, ag.m_unrecorded, 1)
+        return
+    }
+    let seq: i64 = last_seq(ag) + 1
+    var key: String = string_new()
+    string_push(key, KEY_RUN)
+    push_seq(key, seq)
+    var lastk: String = string_new()
+    string_push(lastk, KEY_LAST)
+    string_push(lastk, name)
+    var seqv: String = string_new()
+    push_i64(seqv, seq)
+    var seqp: String = string_new()
+    push_seq(seqp, seq)
+
+    // The record, through `std/json`'s writer so the preview is escaped by the one table.
+    let pv: str = string_view(ag.preview)
+    let ev: str = string_view(ag.why)
+    let cap: usize = 256 + name.len + pv.len * 6 + ev.len * 6
+    var raw: *mut u8 = alloc(u8, cap)
+    var b: []u8 = slice(u8, raw, cap)
+    var sk: sink.Sink = sink.new()
+    var w: json.Writer = json.writer()
+    json.begin_object(w, sk, b)
+    json.key(w, sk, b, "seq")
+    json.put_i64(w, sk, b, seq)
+    json.key(w, sk, b, "job")
+    json.put_str(w, sk, b, name)
+    json.key(w, sk, b, "status")
+    json.put_str(w, sk, b, status_name(r.status))
+    json.key(w, sk, b, "code")
+    json.put_i64(w, sk, b, r.code as i64)
+    json.key(w, sk, b, "started_at")
+    json.put_i64(w, sk, b, r.started_at)
+    json.key(w, sk, b, "duration_ms")
+    json.put_i64(w, sk, b, r.duration_ms)
+    json.key(w, sk, b, "out_bytes")
+    json.put_i64(w, sk, b, r.out_bytes)
+    json.key(w, sk, b, "output")
+    json.put_str(w, sk, b, pv)
+    json.key(w, sk, b, "error")
+    json.put_str(w, sk, b, ev)
+    json.end_object(w, sk, b)
+
+    var wrote: bool = false
+    if sink.overflowed(sk) == false {
+        var bt: kv.Batch = kv.batch()
+        kv.batch_put(bt, string_view(key), sink.view(sk, b))
+        kv.batch_put(bt, string_view(lastk), string_view(seqp))
+        kv.batch_put(bt, KEY_SEQ, string_view(seqv))
+        wrote = true
+        kv.commit(ag.store, bt) catch { wrote = false }
+        // **Synced before it is reported recorded.** A committed batch sits in the C
+        // library's buffer until a sync or a close, and a `jagent serve` that is killed —
+        // the ordinary end of a service — would take every run since the last close with
+        // it. Measured: the CLI test's API run was answered `recorded=true` and was not in
+        // the file after the kill. A run is rare and a history is the point, so the device
+        // flush is paid per run, and `recorded` means what a reader of the file will find.
+        if wrote { kv.sync(ag.store) catch { wrote = false } }
+    }
+    free_ptr(raw)
+    string_free(seqp)
+    string_free(seqv)
+    string_free(lastk)
+    string_free(key)
+    if wrote {
+        r.recorded = true
+        r.seq = seq
+    } else {
+        metrics.inc(ag.m, ag.m_unrecorded, 1)
+    }
+}
+
+fn count_status(mut ag: Agent, s: i32) {
+    if s == RUN_SUCCESS { metrics.inc(ag.m, ag.m_ok, 1) }
+    if s == RUN_FAILURE { metrics.inc(ag.m, ag.m_fail, 1) }
+    if s == RUN_TIMEOUT { metrics.inc(ag.m, ag.m_timeout, 1) }
+    if s == RUN_CONFIG_ERROR { metrics.inc(ag.m, ag.m_cfgerr, 1) }
+}
+
+// Copy up to the preview's remaining room from `chunk`.
+fn take_preview(mut ag: Agent, pv: *mut u8, mut pn: usize, read chunk: []u8) -> usize {
+    var n: usize = pn
+    var i: usize = 0
+    for i < chunk.len and n < JAGENT_PREVIEW_CAP {
+        unsafe { (pv + n).* = chunk[i] }
+        n = n + 1
+        i = i + 1
+    }
+    return n
+}
+
+// The preview bytes as text. A cut that split a multi-byte character is trimmed back to
+// the last whole one; bytes that were never text read as a marker rather than a trap.
+fn fix_preview(mut ag: Agent, pv: *mut u8, pn: usize) {
+    string_free(ag.preview)
+    ag.preview = string_new()
+    var n: usize = pn
+    var tries: usize = 0
+    for tries < 4 {
+        let r = try_from_utf8(slice(u8, pv, n))
+        if is_err(r) == false {
+            string_push(ag.preview, unwrap(r))
+            return
+        }
+        if n == 0 { break }
+        n = n - 1
+        tries = tries + 1
+    }
+    string_push(ag.preview, "<output is not utf-8>")
+}
+
+// Run job `ji`: start it apart in a group, drain its output under the timeout, reap it,
+// sweep the group, and report. `blk` is the clock the wait is charged to.
+fn execute(mut ag: Agent, mut sp: sysproc.Spawner, mut blk: time.Clock, ji: usize) -> Run {
+    var r: Run = no_run()
+    r.status = RUN_FAILURE
+    r.started_at = ag.wall()
+    let t0: i64 = time.read_nanos(ag.clock)
+    string_free(ag.preview)
+    ag.preview = string_new()
+    set_error(ag, "")
+    let timeout_ns: i64 = job_timeout_ms(ag, ji) * 1000000
+
+    var g: sandbox.Group = sandbox.no_group()
+    if sandbox.open_group(g) == false {
+        set_error(ag, "could not open a process group")
+        r.duration_ms = (time.read_nanos(ag.clock) - t0) / 1000000
+        return r
+    }
+    var cmd: String = string_new()
+    string_push(cmd, job_command(ag, ji))
+    var ch: sysproc.Child = sysproc.start_piped_at(sp, string_view(cmd), "", "", true) catch sysproc.no_child()
+    string_free(cmd)
+    if sysproc.is_live(ch) == false {
+        sandbox.release_group(g)
+        if sysproc.can_start(sp) {
+            set_error(ag, "could not start the command")
+        } else {
+            set_error(ag, "the spawner refused to start a process")
+        }
+        r.duration_ms = (time.read_nanos(ag.clock) - t0) / 1000000
+        return r
+    }
+    if sandbox.join_group(g, ch) == false {
+        // A child that could not be grouped is not left running ungrouped — the outcome
+        // the group exists to rule out, and cheap here: on Windows it is still suspended.
+        sysproc.terminate(ch)
+        sysproc.wait(ch)
+        sysproc.release(ch)
+        sandbox.release_group(g)
+        set_error(ag, "could not place the command in a process group")
+        r.duration_ms = (time.read_nanos(ag.clock) - t0) / 1000000
+        return r
+    }
+    sysproc.resume(ch)
+    // No stdin. A filter would otherwise wait for EOF that never comes.
+    sysproc.close_input(ch)
+
+    var raw: *mut u8 = alloc(u8, JAGENT_CHUNK)
+    var buf: []u8 = slice(u8, raw, JAGENT_CHUNK)
+    var pv: *mut u8 = alloc(u8, JAGENT_PREVIEW_CAP)
+    var pn: usize = 0
+    var waited: i64 = 0
+    var timed_out: bool = false
+    var reading: bool = true
+    for reading {
+        if sysproc.output_ready(ch) {
+            let n: i64 = sysproc.read_output(ch, buf)
+            if n <= 0 {
+                reading = false
+            } else {
+                r.out_bytes = r.out_bytes + n
+                pn = take_preview(ag, pv, pn, buf[0 .. n as usize])
+            }
+        } else {
+            if waited >= timeout_ns {
+                timed_out = true
+                reading = false
+            } else {
+                var sl: i64 = JAGENT_POLL_NANOS
+                let left: i64 = timeout_ns - waited
+                if sl > left { sl = left }
+                waited = waited + time.wait(blk, sl)
+            }
+        }
+    }
+    fix_preview(ag, pv, pn)
+    free_ptr(pv)
+    free_ptr(raw)
+
+    var st: sysproc.Status = sysproc.last_status(ch)
+    if timed_out {
+        // The child first, so the status reported is its own; then the tree.
+        sysproc.terminate(ch)
+        st = sysproc.wait_or_kill(ch, blk, 0)
+    } else {
+        var left2: i64 = timeout_ns - waited
+        if left2 < 0 { left2 = 0 }
+        st = sysproc.wait_or_kill(ch, blk, left2)
+    }
+    var gone: bool = sandbox.group_empty(g)
+    if gone == false {
+        sandbox.terminate_group(g)
+        gone = sandbox.wait_group_empty(g, blk, JAGENT_REAP_NANOS)
+    }
+    sandbox.release_group(g)
+    r.tree_reaped = gone
+
+    r.code = sysproc.code_of(st)
+    if timed_out {
+        r.status = RUN_TIMEOUT
+        var e: String = string_new()
+        string_push(e, "timed out after ")
+        push_i64(e, job_timeout_ms(ag, ji))
+        string_push(e, " ms")
+        set_error(ag, string_view(e))
+        string_free(e)
+    } else {
+        if sysproc.is_exited(st) and r.code == 0 {
+            r.status = RUN_SUCCESS
+        } else {
+            r.status = RUN_FAILURE
+            var e2: String = string_new()
+            if sysproc.is_signalled(st) {
+                string_push(e2, "killed by signal ")
+                push_i64(e2, r.code as i64)
+            } else {
+                string_push(e2, "exit code ")
+                push_i64(e2, r.code as i64)
+            }
+            set_error(ag, string_view(e2))
+            string_free(e2)
+        }
+    }
+    r.duration_ms = (time.read_nanos(ag.clock) - t0) / 1000000
+    return r
+}
+
+// Run the job called `name` now, and record it. Every recorded status counts as one unit
+// of the service's work, accepted before and completed after — which is what makes a
+// draining agent refuse a run rather than take one it will not finish.
+pub fn run_job(mut ag: Agent, mut sp: sysproc.Spawner, mut blk: time.Clock, read name: str) -> Run {
+    var r: Run = no_run()
+    let ji: i32 = find_job(ag, name)
+    if ji < 0 {
+        metrics.inc(ag.m, ag.m_missing, 1)
+        set_error(ag, "no such job")
+        string_free(ag.preview)
+        ag.preview = string_new()
+        ag.last_status = RUN_NO_SUCH_JOB
+        return r
+    }
+    if service.accept(ag.svc, ag.m) == false {
+        r.status = RUN_CONFIG_ERROR
+        set_error(ag, "the agent is not accepting work")
+        ag.last_status = r.status
+        return r
+    }
+    if job_kind(ag, ji as usize) != JOB_COMMAND {
+        r.status = RUN_CONFIG_ERROR
+        r.started_at = ag.wall()
+        set_error(ag, "unknown job kind")
+        string_free(ag.preview)
+        ag.preview = string_new()
+    } else {
+        r = execute(ag, sp, blk, ji as usize)
+    }
+    metrics.inc(ag.m, ag.m_runs, 1)
+    count_status(ag, r.status)
+    metrics.observe(ag.m, ag.m_dur, r.duration_ms)
+    persist(ag, name, r)
+    service.completed(ag.svc, ag.m, r.status == RUN_SUCCESS)
+    note_run(ag, name, r)
+    ag.last_status = r.status
+    return r
+}
+
+// One scheduler step: run every job whose interval has come due on the agent's clock,
+// and schedule its next. Returns how many ran. A job with no interval never runs here.
+pub fn tick(mut ag: Agent, mut sp: sysproc.Spawner, mut blk: time.Clock) -> i64 {
+    let t: i64 = time.read_nanos(ag.clock)
+    var ran: i64 = 0
+    var i: usize = 0
+    let n: usize = job_count(ag)
+    for i < n {
+        let iv: i64 = list.get(i64, ag.intervals, i)
+        if iv > 0 {
+            if list.get(i64, ag.due, i) <= t {
+                var nm: String = string_new()
+                string_push(nm, job_name(ag, i))
+                run_job(ag, sp, blk, string_view(nm))
+                string_free(nm)
+                list.set(i64, ag.due, i, t + iv * 1000000)
+                ran = ran + 1
+            }
+        }
+        i = i + 1
+    }
+    return ran
+}
+
+// ---- the service's two questions ------------------------------------------------------------------
+
+pub fn is_ready(read ag: Agent) -> bool { return service.is_ready(ag.svc) }
+pub fn is_live(read ag: Agent) -> bool { return service.is_live(ag.svc) }
+
+// Stop accepting runs; finish what is in flight. From an API request, a signal, or a test.
+pub fn begin_drain(mut ag: Agent) -> bool { return service.begin_drain(ag.svc) }
+
+// Stop, and say why: `service.SVC_CLEAN`, `SVC_ABANDONED` or `SVC_FAILED`.
+pub fn halt(mut ag: Agent) -> i32 { return service.halt(ag.svc, ag.m, ag.clock) }
+
+pub fn runs_total(read ag: Agent) -> i64 { return metrics.current(ag.m, ag.m_runs) }
+pub fn runs_unrecorded(read ag: Agent) -> i64 { return metrics.current(ag.m, ag.m_unrecorded) }
+pub fn http_requests(read ag: Agent) -> i64 { return metrics.current(ag.m, ag.m_http) }
+
+// ---- rendering ---------------------------------------------------------------------------------
+
+// The service's health line: `phase=… ready=… live=… inflight=…`.
+pub fn render_health(mut ag: Agent, mut dst: String) {
+    var raw: *mut u8 = alloc(u8, 256)
+    var b: []u8 = slice(u8, raw, 256)
+    var sk: sink.Sink = sink.new()
+    service.render_health(sk, b, ag.svc)
+    string_push(dst, sink.view(sk, b))
+    free_ptr(raw)
+}
+
+// Every metric, in name order.
+pub fn render_metrics(mut ag: Agent, mut dst: String) -> bool {
+    var raw: *mut u8 = alloc(u8, JAGENT_LINE_CAP)
+    var b: []u8 = slice(u8, raw, JAGENT_LINE_CAP)
+    var sk: sink.Sink = sink.new()
+    metrics.render(sk, b, ag.m)
+    let whole: bool = sink.overflowed(sk) == false
+    if whole { string_push(dst, sink.view(sk, b)) }
+    free_ptr(raw)
+    return whole
+}
+
+// One run record from its stored JSON, as one line. False when the value is not a record
+// this module wrote — damage, reported rather than skipped silently.
+fn render_record(read ag: Agent, read v: str, mut dst: String) -> bool {
+    var d: json.Doc = json.parse(ag.a, v)
+    if json.parsed(d) == false { return false }
+    let root: usize = json.root(d) as usize
+    let seq: isize = json.get(d, root, "seq")
+    let job: isize = json.get(d, root, "job")
+    let st: isize = json.get(d, root, "status")
+    let code: isize = json.get(d, root, "code")
+    let at: isize = json.get(d, root, "started_at")
+    let ms: isize = json.get(d, root, "duration_ms")
+    let ob: isize = json.get(d, root, "out_bytes")
+    let outn: isize = json.get(d, root, "output")
+    let er: isize = json.get(d, root, "error")
+    if seq < 0 or job < 0 or st < 0 or code < 0 or at < 0 or ms < 0 or outn < 0 or er < 0 { return false }
+    string_push(dst, "#")
+    push_i64(dst, json.as_i64(d, seq as usize))
+    string_push(dst, " job=")
+    string_push(dst, json.as_str(d, job as usize))
+    string_push(dst, " status=")
+    string_push(dst, json.as_str(d, st as usize))
+    string_push(dst, " code=")
+    push_i64(dst, json.as_i64(d, code as usize))
+    string_push(dst, " started_at=")
+    push_i64(dst, json.as_i64(d, at as usize))
+    string_push(dst, " duration_ms=")
+    push_i64(dst, json.as_i64(d, ms as usize))
+    if ob >= 0 {
+        string_push(dst, " out_bytes=")
+        push_i64(dst, json.as_i64(d, ob as usize))
+    }
+    string_push(dst, " output=")
+    push_quoted(dst, json.as_str(d, outn as usize))
+    let ev: str = json.as_str(d, er as usize)
+    if ev.len > 0 {
+        string_push(dst, " error=")
+        push_quoted(dst, ev)
+    }
+    string_push(dst, "\n")
+    return true
+}
+
+// Does stored record `v` belong to `name`? Parsed rather than substring-matched, so a job
+// whose name is a prefix of another's (`db` and `db-backup`) filters exactly.
+fn record_is_for(read ag: Agent, read v: str, read name: str) -> bool {
+    var d: json.Doc = json.parse(ag.a, v)
+    if json.parsed(d) == false { return false }
+    let job: isize = json.get(d, json.root(d) as usize, "job")
+    if job < 0 { return false }
+    return str_eq(json.as_str(d, job as usize), name)
+}
+
+// The most recent `limit` run records — of one job when `name` is non-empty, of every job
+// otherwise — oldest first, one line each. Returns how many were rendered.
+pub fn render_logs(mut ag: Agent, read name: str, limit: usize, mut dst: String) -> usize {
+    if kv.is_open(ag.store) == false { return 0 }
+    var hits: List(i64) = list.make(i64, ag.a)
+    let n: usize = kv.slots(ag.store)
+    var i: usize = 0
+    for i < n {
+        if kv.slot_live(ag.store, i) {
+            let k: str = kv.slot_key(ag.store, i)
+            if str.has_prefix(k, KEY_RUN) {
+                var keep: bool = true
+                if name.len > 0 { keep = record_is_for(ag, kv.slot_val(ag.store, i), name) }
+                if keep { list.push(i64, hits, i as i64) }
+            }
+        }
+        i = i + 1
+    }
+    let total: usize = list.len(i64, hits)
+    var from: usize = 0
+    if total > limit { from = total - limit }
+    var shown: usize = 0
+    var j: usize = from
+    for j < total {
+        let slot: usize = list.get(i64, hits, j) as usize
+        if render_record(ag, kv.slot_val(ag.store, slot), dst) { shown = shown + 1 }
+        j = j + 1
+    }
+    list.free(i64, hits)
+    return shown
+}
+
+// The last run of `name`, as a record line, or "none" — through the `last:` pointer, so
+// it costs two lookups whatever the history's size.
+fn render_last(mut ag: Agent, read name: str, mut dst: String) {
+    if kv.is_open(ag.store) == false {
+        string_push(dst, "none (store closed)\n")
+        return
+    }
+    var lk: String = string_new()
+    string_push(lk, KEY_LAST)
+    string_push(lk, name)
+    if kv.has(ag.store, string_view(lk)) == false {
+        string_free(lk)
+        string_push(dst, "none\n")
+        return
+    }
+    var rk: String = string_new()
+    string_push(rk, KEY_RUN)
+    string_push(rk, kv.get(ag.store, string_view(lk)))
+    string_free(lk)
+    if kv.has(ag.store, string_view(rk)) == false {
+        string_free(rk)
+        string_push(dst, "none (pointer to a missing record)\n")
+        return
+    }
+    if render_record(ag, kv.get(ag.store, string_view(rk)), dst) == false {
+        string_push(dst, "none (damaged record)\n")
+    }
+    string_free(rk)
+}
+
+// One job's line for a listing.
+fn render_job_line(read ag: Agent, i: usize, mut dst: String) {
+    string_push(dst, job_name(ag, i))
+    string_push(dst, " kind=")
+    string_push(dst, kind_name(job_kind(ag, i)))
+    string_push(dst, " timeout_ms=")
+    push_i64(dst, job_timeout_ms(ag, i))
+    string_push(dst, " interval_ms=")
+    push_i64(dst, job_interval_ms(ag, i))
+    string_push(dst, "\n")
+}
+
+// Every configured job, one line each, in file order.
+pub fn render_jobs(read ag: Agent, mut dst: String) {
+    var i: usize = 0
+    let n: usize = job_count(ag)
+    for i < n {
+        render_job_line(ag, i, dst)
+        i = i + 1
+    }
+}
+
+// One job in full: its definition and its last run. False for a job that does not exist.
+pub fn render_job(mut ag: Agent, read name: str, mut dst: String) -> bool {
+    let ji: i32 = find_job(ag, name)
+    if ji < 0 { return false }
+    let i: usize = ji as usize
+    string_push(dst, "name=")
+    string_push(dst, name)
+    string_push(dst, "\nkind=")
+    string_push(dst, kind_name(job_kind(ag, i)))
+    string_push(dst, "\ncommand=")
+    push_quoted(dst, job_command(ag, i))
+    string_push(dst, "\ntimeout_ms=")
+    push_i64(dst, job_timeout_ms(ag, i))
+    string_push(dst, "\ninterval_ms=")
+    push_i64(dst, job_interval_ms(ag, i))
+    string_push(dst, "\nlast=")
+    render_last(ag, name, dst)
+    return true
+}
+
+// What `jagent status` prints: the configuration, the store, every job with its last run.
+pub fn render_status(mut ag: Agent, mut dst: String) {
+    string_push(dst, "config=")
+    string_push(dst, string_view(ag.cfg_name))
+    string_push(dst, " valid=")
+    push_bool(dst, ag.valid)
+    string_push(dst, " generation=")
+    push_i64(dst, ag.generation)
+    string_push(dst, " faults=")
+    push_i64(dst, ag.fault_count)
+    string_push(dst, "\nstore=")
+    string_push(dst, string_view(ag.store_path))
+    string_push(dst, " open=")
+    push_bool(dst, kv.is_open(ag.store))
+    string_push(dst, " runs=")
+    push_i64(dst, last_seq(ag))
+    string_push(dst, "\nserver host=")
+    if host_is_loopback(ag) { string_push(dst, "127.0.0.1") } else { string_push(dst, "0.0.0.0") }
+    string_push(dst, " port=")
+    push_i64(dst, port(ag))
+    string_push(dst, " tls=")
+    push_bool(dst, tls_wanted(ag))
+    string_push(dst, "\n")
+    render_health(ag, dst)
+    string_push(dst, "jobs=")
+    push_i64(dst, job_count(ag) as i64)
+    string_push(dst, "\n")
+    var i: usize = 0
+    let n: usize = job_count(ag)
+    for i < n {
+        string_push(dst, "  ")
+        render_job_line(ag, i, dst)
+        string_push(dst, "    last=")
+        var nm: String = string_new()
+        string_push(nm, job_name(ag, i))
+        render_last(ag, string_view(nm), dst)
+        string_free(nm)
+        i = i + 1
+    }
+}
+
+// One run, as the CLI and the API report it.
+pub fn render_run(mut ag: Agent, read name: str, read r: Run, mut dst: String) {
+    string_push(dst, "job=")
+    string_push(dst, name)
+    string_push(dst, " status=")
+    string_push(dst, status_name(r.status))
+    if r.status == RUN_NO_SUCH_JOB {
+        string_push(dst, "\n")
+        return
+    }
+    string_push(dst, " code=")
+    push_i64(dst, r.code as i64)
+    string_push(dst, " seq=")
+    push_i64(dst, r.seq)
+    string_push(dst, " recorded=")
+    push_bool(dst, r.recorded)
+    string_push(dst, " started_at=")
+    push_i64(dst, r.started_at)
+    string_push(dst, " duration_ms=")
+    push_i64(dst, r.duration_ms)
+    string_push(dst, " out_bytes=")
+    push_i64(dst, r.out_bytes)
+    string_push(dst, " output=")
+    push_quoted(dst, str.trim_end(string_view(ag.preview)))
+    let ev: str = string_view(ag.why)
+    if ev.len > 0 {
+        string_push(dst, " error=")
+        push_quoted(dst, ev)
+    }
+    string_push(dst, "\n")
+}
+
+// ---- the HTTP API ----------------------------------------------------------------------------------
+//
+// Handlers are `std/httpd`'s fn-pointer-plus-context shape, and the context is a `Serve`:
+// the agent's cell, the spawner and the clock a `POST …/run` spends. The agent itself is
+// reached through its cell BY ADDRESS — `(p + 0).*` in argument position passes the place,
+// not a copy — so a handler mutates the one agent every other handler sees.
+
+pub struct Serve {
+    ag: *mut Agent,
+    sp: sysproc.Spawner,
+    blk: time.Clock,
+}
+
+// The context every handler is given. `cell` must hold the agent for as long as the server
+// runs; the caller frees the context with `free_serve` after `httpd.stop`.
+pub fn serve_ctx(cell: *mut Agent, take sp: sysproc.Spawner, take blk: time.Clock) -> *mut Serve {
+    var p: *mut Serve = alloc(Serve, 1)
+    unsafe { (p + 0).* = Serve{ ag: cell, sp: sp, blk: blk } }
+    return p
+}
+
+pub fn free_serve(p: *mut Serve) {
+    free_ptr(p as *mut u8)
+}
+
+fn ctx_of(ctx: *mut u8) -> *mut Serve {
+    return ctx as *mut Serve
+}
+
+fn count_request(p: *mut Serve) {
+    var s: Serve = unsafe { (p + 0).* }
+    unsafe { metrics.inc((s.ag + 0).*.m, (s.ag + 0).*.m_http, 1) }
+}
+
+fn h_health(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    let p: *mut Serve = ctx_of(ctx)
+    count_request(p)
+    var s: Serve = unsafe { (p + 0).* }
+    var body: String = string_new()
+    unsafe { render_health((s.ag + 0).*, body) }
+    var live: bool = false
+    unsafe { live = is_live((s.ag + 0).*) }
+    var st: i32 = 200
+    if live == false { st = 503 }
+    httpd.respond(x, st, "text/plain; charset=utf-8", string_view(body))
+    string_free(body)
+    return 0
+}
+
+fn h_metrics(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    let p: *mut Serve = ctx_of(ctx)
+    count_request(p)
+    var s: Serve = unsafe { (p + 0).* }
+    var body: String = string_new()
+    unsafe { render_metrics((s.ag + 0).*, body) }
+    httpd.respond(x, 200, "text/plain; charset=utf-8", string_view(body))
+    string_free(body)
+    return 0
+}
+
+fn h_jobs(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    let p: *mut Serve = ctx_of(ctx)
+    count_request(p)
+    var s: Serve = unsafe { (p + 0).* }
+    var body: String = string_new()
+    unsafe { render_jobs((s.ag + 0).*, body) }
+    httpd.respond(x, 200, "text/plain; charset=utf-8", string_view(body))
+    string_free(body)
+    return 0
+}
+
+fn respond_no_job(mut x: httpd.Exchange, read name: str) {
+    var body: String = string_new()
+    string_push(body, "no such job: ")
+    string_push(body, name)
+    string_push(body, "\n")
+    httpd.respond(x, 404, "text/plain; charset=utf-8", string_view(body))
+    string_free(body)
+}
+
+fn h_job(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    let p: *mut Serve = ctx_of(ctx)
+    count_request(p)
+    var s: Serve = unsafe { (p + 0).* }
+    var nm: String = string_new()
+    string_push(nm, httpd.param(x, "name"))
+    var body: String = string_new()
+    var found: bool = false
+    unsafe { found = render_job((s.ag + 0).*, string_view(nm), body) }
+    if found {
+        httpd.respond(x, 200, "text/plain; charset=utf-8", string_view(body))
+    } else {
+        respond_no_job(x, string_view(nm))
+    }
+    string_free(body)
+    string_free(nm)
+    return 0
+}
+
+// `POST /jobs/:name/run`. Any other method is 405 — the route is registered for every
+// method so the answer can be the right one rather than a routing 404.
+fn h_run(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    let p: *mut Serve = ctx_of(ctx)
+    count_request(p)
+    var s: Serve = unsafe { (p + 0).* }
+    if str_eq(httpd.method(x), "POST") == false {
+        httpd.set_header(x, "Allow", "POST")
+        httpd.respond(x, 405, "text/plain; charset=utf-8", "use POST to run a job\n")
+        return 0
+    }
+    var nm: String = string_new()
+    string_push(nm, httpd.param(x, "name"))
+    var ji: i32 = 0 - 1
+    unsafe { ji = find_job((s.ag + 0).*, string_view(nm)) }
+    if ji < 0 {
+        respond_no_job(x, string_view(nm))
+        string_free(nm)
+        return 0
+    }
+    var r: Run = no_run()
+    unsafe { r = run_job((s.ag + 0).*, s.sp, s.blk, string_view(nm)) }
+    // The spawner's counters and the clock's reads moved; put them back.
+    unsafe { (p + 0).* = s }
+    var body: String = string_new()
+    unsafe { render_run((s.ag + 0).*, string_view(nm), r, body) }
+    httpd.respond(x, 200, "text/plain; charset=utf-8", string_view(body))
+    string_free(body)
+    string_free(nm)
+    return 0
+}
+
+const JAGENT_LOG_LIMIT: usize = 20
+
+fn h_logs(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    let p: *mut Serve = ctx_of(ctx)
+    count_request(p)
+    var s: Serve = unsafe { (p + 0).* }
+    var body: String = string_new()
+    unsafe { render_logs((s.ag + 0).*, "", JAGENT_LOG_LIMIT, body) }
+    httpd.respond(x, 200, "text/plain; charset=utf-8", string_view(body))
+    string_free(body)
+    return 0
+}
+
+fn h_logs_of(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    let p: *mut Serve = ctx_of(ctx)
+    count_request(p)
+    var s: Serve = unsafe { (p + 0).* }
+    var nm: String = string_new()
+    string_push(nm, httpd.param(x, "name"))
+    var ji: i32 = 0 - 1
+    unsafe { ji = find_job((s.ag + 0).*, string_view(nm)) }
+    if ji < 0 {
+        respond_no_job(x, string_view(nm))
+        string_free(nm)
+        return 0
+    }
+    var body: String = string_new()
+    unsafe { render_logs((s.ag + 0).*, string_view(nm), JAGENT_LOG_LIMIT, body) }
+    httpd.respond(x, 200, "text/plain; charset=utf-8", string_view(body))
+    string_free(body)
+    string_free(nm)
+    return 0
+}
+
+// Register the API on `sv`:
+//
+//   GET  /health            the service's two questions
+//   GET  /metrics           every counter, gauge and histogram, name-ordered
+//   GET  /jobs              the job table
+//   GET  /jobs/:name        one job and its last run (404 for an unknown name)
+//   POST /jobs/:name/run    run it now; the run's summary (404 unknown, 405 other methods)
+//   GET  /logs              the last 20 runs, oldest first
+//   GET  /logs/:name        the last 20 runs of one job (404 for an unknown name)
+//
+// Plain text, one fact per line; a client that wants JSON reads the store's records,
+// which already are.
+pub fn install(mut sv: httpd.Server, p: *mut Serve) {
+    let c: *mut u8 = p as *mut u8
+    httpd.route(sv, "GET", "/health", httpd.handler(c, &h_health))
+    httpd.route(sv, "GET", "/metrics", httpd.handler(c, &h_metrics))
+    httpd.route(sv, "GET", "/jobs", httpd.handler(c, &h_jobs))
+    httpd.route(sv, "GET", "/jobs/:name", httpd.handler(c, &h_job))
+    httpd.route(sv, "*", "/jobs/:name/run", httpd.handler(c, &h_run))
+    httpd.route(sv, "GET", "/logs", httpd.handler(c, &h_logs))
+    httpd.route(sv, "GET", "/logs/:name", httpd.handler(c, &h_logs_of))
+}

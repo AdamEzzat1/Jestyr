@@ -129,17 +129,19 @@ import "fs"
 // `std/sysnet` unifies its socket signatures — C converts implicitly at the call, and one
 // width across the module means no truncation to reason about.
 //
-// This `close` is libc's. `std/file` and `std/sysdir` each declare a Jestyr `close`, so the
-// canonicaliser has already renamed both and the bare name is free — see `runtime.fire_due`
-// for the case where it was not. **This module's own closing operation is therefore called
-// `close_watch`**, because a Jestyr `close` HERE would collide with the extern in its own
-// module, which is the one arrangement neither the canonicaliser nor the loader can fix.
+// This `close` is libc's, and it is bound under a DECLARED ALIAS: `std/sysnet` binds the
+// same symbol bare, and an extern's bare name is reserved program-wide, so the first program
+// to watch a directory AND serve a socket (`std/jagent`) was refused with `duplicate
+// definition of close`. `std/sysproc` already aliases it as `sys_close`, and two aliases of
+// one spelling collide the same way, hence this module's own. **This module's own closing
+// operation is still called `close_watch`**, because a Jestyr `close` here would collide
+// with `sysnet`'s bare binding in any program that links both.
 
 @cfg(posix) extern "sys/inotify.h" fn inotify_init1(flags: i32) -> i64
 @cfg(posix) extern "sys/inotify.h" fn inotify_add_watch(fd: i64, path: cstr, mask: u32) -> i32
 @cfg(posix) extern "sys/inotify.h" fn inotify_rm_watch(fd: i64, wd: i32) -> i32
 @cfg(posix) extern "sys/uio.h" fn readv(fd: i64, iov: cptr, n: i32) -> i64
-@cfg(posix) extern "unistd.h" fn close(fd: i64) -> i32
+@cfg(posix) extern "unistd.h" fn watch_close = "close"(fd: i64) -> i32
 
 // ---- Windows bindings ---------------------------------------------------------
 //
@@ -151,7 +153,9 @@ import "fs"
 @cfg(windows) extern "windows.h" fn FindFirstChangeNotificationA(path: cstr, subtree: i32, filter: u32) -> cptr
 @cfg(windows) extern "windows.h" fn FindNextChangeNotification(h: cptr) -> i32
 @cfg(windows) extern "windows.h" fn FindCloseChangeNotification(h: cptr) -> i32
-@cfg(windows) extern "windows.h" fn WaitForSingleObject(h: cptr, ms: u32) -> i32
+// Aliased for `watch_close`'s reason: `std/sysproc` binds `WaitForSingleObject` bare, and a
+// program that supervises a child while watching a directory holds both.
+@cfg(windows) extern "windows.h" fn watch_wait = "WaitForSingleObject"(h: cptr, ms: u32) -> i32
 
 // ---- what a change can be -----------------------------------------------------
 //
@@ -354,7 +358,7 @@ const WATCH_ERROR_INVALID_NAME: i32 = 123
     if wd < 0 { code = syserr.last_raw() }
     cstring.free(c)
     if wd < 0 {
-        close(fd)
+        watch_close(fd)
         return err(WatchFailed(code))
     }
 
@@ -399,7 +403,7 @@ const WATCH_ERROR_INVALID_NAME: i32 = 123
 @cfg(posix) pub fn close_watch(mut w: Watcher) !{ WatchFailed(i32), WatchRefused } {
     if w.open == false { return }
     inotify_rm_watch(w.fd, w.wd)
-    let rc: i32 = close(w.fd)
+    let rc: i32 = watch_close(w.fd)
     var code: i32 = 0
     if rc != 0 { code = syserr.last_raw() }
     free_ptr(w.buf)
@@ -463,7 +467,7 @@ const WATCH_ERROR_INVALID_NAME: i32 = 123
     var h: cptr = null
     unsafe { h = (cell + 0).* }
     if h == null { return 0 }
-    let rc: i32 = WaitForSingleObject(h, ms as u32)
+    let rc: i32 = watch_wait(h, ms as u32)
     if rc != WATCH_WAIT_SIGNALED { return 0 }
 
     // Signaled. The handle stays signaled until `drain` re-arms it, so nothing is lost by
@@ -659,7 +663,7 @@ fn copy_name(buf: *mut u32, at: usize, len: usize, mut names: []u8, to: usize) {
     if evs.len == 0 { return ok(0) }
     var h: cptr = null
     unsafe { h = (w.cell + 0).* }
-    if WaitForSingleObject(h, 0) != WATCH_WAIT_SIGNALED { return ok(0) }
+    if watch_wait(h, 0) != WATCH_WAIT_SIGNALED { return ok(0) }
     evs[0] = Change{ kind: WATCH_RESCAN, name_off: 0, name_len: 0 }
     if FindNextChangeNotification(h) == 0 { return err(WatchFailed(syserr.last_raw())) }
     return ok(1)

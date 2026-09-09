@@ -113,8 +113,13 @@ import "syserr"
 @cfg(posix) extern "sys/socket.h" fn listen(s: i64, backlog: i32) -> i32
 @cfg(windows) extern "winsock2.h" fn listen(s: i64, backlog: i32) -> i32
 
-@cfg(posix) extern "sys/socket.h" fn accept(s: i64, addr: cptr, len: cptr) -> i64
-@cfg(windows) extern "winsock2.h" fn accept(s: i64, addr: cptr, len: cptr) -> i64
+// Bound under a DECLARED ALIAS, unlike its neighbours: an extern's bare name is reserved in
+// every module that links it, and `std/service` exports a Jestyr `accept` — the verb its
+// whole lifecycle argument turns on. The first program to hold both (`std/jagent`, a
+// service with an HTTP API) was refused with `duplicate definition of accept` one module
+// away from either cause. The alias keeps the C symbol and frees the name.
+@cfg(posix) extern "sys/socket.h" fn sys_accept = "accept"(s: i64, addr: cptr, len: cptr) -> i64
+@cfg(windows) extern "winsock2.h" fn sys_accept = "accept"(s: i64, addr: cptr, len: cptr) -> i64
 
 @cfg(posix) extern "sys/socket.h" fn connect(s: i64, addr: cptr, len: i32) -> i32
 @cfg(windows) extern "winsock2.h" fn connect(s: i64, addr: cptr, len: i32) -> i32
@@ -465,7 +470,7 @@ pub fn accept_one(mut n: Net, read l: Socket) -> Socket !{ NetFailed(i32), NetRe
         return err(NetRefused)
     }
     if is_open(l) == false { return err(NetRefused) }
-    let fd: i64 = accept(l.fd, null, null)
+    let fd: i64 = sys_accept(l.fd, null, null)
     if fd == NET_INVALID { return err(NetFailed(syserr.last_raw())) }
     n.opened = n.opened + 1
     return ok(Socket{ fd: fd })

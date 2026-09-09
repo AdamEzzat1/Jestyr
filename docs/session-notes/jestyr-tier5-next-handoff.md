@@ -8,7 +8,13 @@ defects — one session at a time). §2 is the parallel work (library breadth �
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1373 passed / 0 failed / 3 ignored** (full ladder after the TAIL work — `jc add`, httpd
+**1375 passed / 0 failed / 3 ignored** (full ladder after the EDGE AGENT — `std/jagent`,
+`jagent_cli`, `jagent_test` 13 inside `io_suites_pass`, the pinned demo transcript and the CLI
+test with a real `serve`; 1003 s under load. The first full run had three load flakes —
+`io_suites_pass`, the CLI test, `jplugin`'s 6 s ceiling — and the CLI failure orphaned a
+`jagent serve` on the ladder's output pipe; the fix was a `Reap` Drop guard in the Rust test
+and 10 s job timeouts in every jagent config so a slow `cmd.exe` start is not a false timeout.)
+Previously **1373** (full ladder after the TAIL work — `jc add`, httpd
 request-body streaming, plugin adopting sandbox's groups, and the two serial compiler items
 that closed the register's last defects; 747 s. The Jestyr-level suites grew inside
 `io_suites_pass` rather than as new Rust tests: `plugin_test` 10 → 11, `httpd_test` 8 → 12,
@@ -947,6 +953,65 @@ successor should not re-derive:
   long-runner spends its whole budget. The test suite's `drive` is for quick children only.
 * Not built: a supervision tree (a tree is a supervisor whose children are supervisors),
   graceful signal-then-kill shutdown, dependency order, per-child stdout capture.
+
+### ~~The edge agent~~ — **DONE: `std/jagent` + `jagent_cli` (2026-09-08)**
+
+The first CONSUMER of the tier — a program that needs six of its modules at once — and the
+first program to hold `sysnet`, `sysproc`, `syswatch` and `service` in one closure. Library,
+command, 13 tests (registered), a pinned demo, a CLI test with a real `serve`, a bench
+script, `docs/jagent.md`. No reseed (nothing in the sixteen moved; the drift guard says so).
+What a successor should not re-derive:
+
+* **Four extern collisions were waiting for exactly this closure**, and the checker names
+  them one module away from either cause (`duplicate definition of accept` at
+  `service.jtr:140`, pointing at a Jestyr fn that never touched C). An extern's bare name
+  is reserved program-wide, so the SECOND binder of a C symbol must use the declared-alias
+  form — and two aliases of one spelling collide the same way (`sysproc` already had
+  `sys_close`, so `syswatch` needed `watch_close`). `sys_accept` in `sysnet`, `watch_close`
+  + `watch_wait` in `syswatch`, `pipe_poll` in `sysproc`. The extern sweep counts aliases,
+  so `WaitForSingleObject` is still three bindings, one signature. Every consumer of the
+  four modules still checks. **Before combining two `sys` modules for the first time, grep
+  both for `extern` and expect the pair to disagree about a name.**
+* **A stale `target/release/jestyrc.exe` reproduces A13 exactly** — bare
+  `jestyr_impl_Drop__Writer__drop` undefined at link — and cost an hour of reading cgen
+  before the binary's date was checked. The source was right; `cargo build --release` first.
+* **The handler context reaches the agent BY ADDRESS**: `unsafe { f((cell + 0).*, x) }` with
+  a `mut` parameter passes the place, not a copy — measured with a probe: no temporary, no
+  drop, and a `Drop`-bearing struct moves out of and back into a raw cell without a double
+  free. That is what lets `httpd`'s fn-pointer handlers mutate one `@move` agent. The rule
+  the probe established: a deref in `mut`-argument position is a place; a `var x = (p).*`
+  is a MOVE out of the cell, so it owes a move back on every path or the cell is stale.
+* **A run waits on a clock the CALLER spends, not the agent's** (`std/supervise`'s two
+  clocks): the agent's manual clock makes every recorded duration and timestamp a chosen
+  number while the children are real. Under one clock a manual agent would spin its own
+  timeout to the end instantly, before the child had printed a byte.
+* **The sleeper is `sleep 2 || ping -n 3 127.0.0.1 > nul`** — `sh` never reaches the `||`,
+  `cmd.exe` always does — so the suite carries no `@cfg` and owes no allowlist entry. A
+  `@cfg` pair in a test file would have put it under the byte-identity gate for nothing.
+* **`std/config` needs a declared schema and the job names are the file's**: the load is a
+  scan of the `[job.NAME]` headers that declares, then `ini.load`. A refused section's keys
+  then come back from `std/ini` as unknown — two faults for one bad header, both right.
+* **`echo` differs by one byte between the shells**, so the demo's transcript test picks
+  `out_bytes` and the escaped preview by `cfg!(windows)`; everything else is exact.
+* **`error`, `record`, `out`, `take` are keywords** — a struct field named `error` is six
+  parse errors none of which says so. Add `record` to the recorded list.
+* **The C runtime buffers stdout when piped** (`print_str` never flushes), so a test that
+  spawns `jagent serve` cannot read "listening on …" from its stdout; the CLI test picks the
+  port itself and writes it into the file.
+* **`kv.commit` is not durable until `kv.sync`, and the CLI test caught it.** The run
+  answered `recorded=true` over the API was absent from the file after `serve` was killed —
+  `std/kv` appends through the C library's buffer and leaves the flush to the caller, as its
+  header says. `persist` now syncs before it reports; ~0.9 ms per run here. A service that
+  ends by being killed needs every durable claim checked BY killing it.
+* **Cost of `cmd.exe`**: a trivial job is ~83 ms end to end here, all of it the shell's
+  start; `/health` measures at 15 ms because `serve_for(sv, net, 1)` rounds to Windows'
+  timer tick — the poll's granularity, not the server's work (`docs/jagent.md`).
+* Not built: TLS in `httpd` (the schema already declares `tls_cert`/`tls_key`), an API
+  token, concurrent runs, per-job cwd/env/jail, retries, retention. Windows-verified only.
+* **One flake seen once, not reproduced**: the suite's first run after a rebuild reported
+  three failures whose names were not captured; fourteen runs since were green. If it
+  recurs, the candidates are the three timing cases (the watcher, the 300 ms timeout, the
+  loopback API) — capture the FAIL lines before touching a deadline.
 
 ### Compiler defects and gaps — OPEN
 

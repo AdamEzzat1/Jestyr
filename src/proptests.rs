@@ -2892,6 +2892,303 @@ mod supervise_policy {
     }
 }
 
+/// **`jagent` — configured jobs, a durable history, and the API that reports them.**
+///
+/// `examples/std/jagent_demo.jtr` is `std/jagent`'s consumer, driven the way the CLI drives
+/// it minus the argv and the real clock: a manual clock and a fixed wall clock make every
+/// duration 0 and every `started_at` the one number the demo chose, while the children are
+/// real (`echo healthy`, `exit 3` through the shell) and the API is a real `std/httpd` on a
+/// loopback socket. The transcript's centre is three refusals that leave nothing behind: a
+/// job nobody configured writes no history (the counter stays at 2), a reload with a bad
+/// value keeps all four jobs and the generation, and `agent.tls = true` is refused with the
+/// reason rather than served in plaintext. The shutdown says `failed`, not `clean`, because
+/// the flaky job failed and `std/service` ranks that first.
+///
+/// `echo` ends its line differently under `cmd.exe` and `sh`, so the two byte counts and the
+/// escaped previews are the one platform-shaped part of the transcript, chosen by `cfg!`.
+#[cfg(all(test, feature = "c-oracle"))]
+mod jagent_edge {
+    use super::*;
+
+    #[test]
+    fn jagent_runs_records_serves_and_reloads() {
+        let exe = super::c_oracle::build_exe("examples/std/jagent_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the jagent demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        // `healthy` + the shell's line ending, as bytes and as the JSON-escaped preview.
+        let (hb, bb, nl) = if cfg!(windows) { (9, 6, "\\r\\n") } else { (8, 5, "\\n") };
+        let want = format!(
+            "-- jagent --\n\
+             config\nzz_jagent_demo/agent.ini\n\
+             loaded\n\
+             ts=0 level=info msg=config file=zz_jagent_demo/agent.ini outcome=loaded jobs=4 faults=0 generation=1\n\
+             jobs\n\
+             health-check kind=command timeout_ms=10000 interval_ms=0\n\
+             rotate-log kind=command timeout_ms=10000 interval_ms=0\n\
+             flaky kind=command timeout_ms=10000 interval_ms=0\n\
+             beat kind=command timeout_ms=10000 interval_ms=500\n\
+             store opened\ntrue\n\
+             -- jagent run health-check --\n\
+             job=health-check status=success code=0 seq=1 recorded=true started_at=1700000000 duration_ms=0 out_bytes={hb} output=\"healthy\"\n\
+             ts=0 level=info msg=\"job run\" job=health-check status=success code=0 ms=0 seq=1 recorded=true\n\
+             -- jagent run flaky --\n\
+             job=flaky status=failure code=3 seq=2 recorded=true started_at=1700000000 duration_ms=0 out_bytes=0 output=\"\" error=\"exit code 3\"\n\
+             -- jagent run nope --\n\
+             job=nope status=no-such-job\n\
+             the history is still at\n2\n\
+             -- the schedule --\n\
+             at t+0 the beat is not due; jobs run\n0\n\
+             at t+500ms it runs; jobs run\n1\n\
+             -- jagent status --\n\
+             config=zz_jagent_demo/agent.ini valid=true generation=1 faults=0\n\
+             store=zz_jagent_demo/history.db open=true runs=3\n\
+             server host=127.0.0.1 port=0 tls=false\n\
+             phase=ready ready=true live=true inflight=0\n\
+             jobs=4\n\
+             \x20 health-check kind=command timeout_ms=10000 interval_ms=0\n\
+             \x20   last=#1 job=health-check status=success code=0 started_at=1700000000 duration_ms=0 out_bytes={hb} output=\"healthy{nl}\"\n\
+             \x20 rotate-log kind=command timeout_ms=10000 interval_ms=0\n\
+             \x20   last=none\n\
+             \x20 flaky kind=command timeout_ms=10000 interval_ms=0\n\
+             \x20   last=#2 job=flaky status=failure code=3 started_at=1700000000 duration_ms=0 out_bytes=0 output=\"\" error=\"exit code 3\"\n\
+             \x20 beat kind=command timeout_ms=10000 interval_ms=500\n\
+             \x20   last=#3 job=beat status=success code=0 started_at=1700000000 duration_ms=0 out_bytes={bb} output=\"beat{nl}\"\n\
+             -- jagent logs health-check --\n\
+             #1 job=health-check status=success code=0 started_at=1700000000 duration_ms=0 out_bytes={hb} output=\"healthy{nl}\"\n\
+             -- jagent serve --\n\
+             listening on loopback\ntrue\n\
+             GET /health\n200\n\
+             phase=ready ready=true live=true inflight=0\n\
+             GET /jobs/flaky\n200\n\
+             name=flaky\nkind=command\ncommand=\"exit 3\"\ntimeout_ms=10000\ninterval_ms=0\n\
+             last=#2 job=flaky status=failure code=3 started_at=1700000000 duration_ms=0 out_bytes=0 output=\"\" error=\"exit code 3\"\n\
+             POST /jobs/health-check/run\n200\n\
+             job=health-check status=success code=0 seq=4 recorded=true started_at=1700000000 duration_ms=0 out_bytes={hb} output=\"healthy\"\n\
+             GET /logs/health-check\n200\n\
+             #1 job=health-check status=success code=0 started_at=1700000000 duration_ms=0 out_bytes={hb} output=\"healthy{nl}\"\n\
+             #4 job=health-check status=success code=0 started_at=1700000000 duration_ms=0 out_bytes={hb} output=\"healthy{nl}\"\n\
+             GET /jobs/nope\n404\n\
+             no such job: nope\n\
+             GET /jobs/health-check/run\n405\n\
+             use POST to run a job\n\
+             GET /metrics\n200\n\
+             counter jagent_config_reloads 1\n\
+             counter jagent_http_requests 7\n\
+             gauge jagent_jobs 4\n\
+             histogram jagent_run_ms le 10 4\n\
+             histogram jagent_run_ms le 100 0\n\
+             histogram jagent_run_ms le 1000 0\n\
+             histogram jagent_run_ms le 10000 0\n\
+             histogram jagent_run_ms le 60000 0\n\
+             histogram jagent_run_ms le 600000 0\n\
+             histogram jagent_run_ms le +Inf 0\n\
+             histogram jagent_run_ms sum 0\n\
+             histogram jagent_run_ms count 4\n\
+             counter jagent_runs_config_error 0\n\
+             counter jagent_runs_failure 1\n\
+             counter jagent_runs_no_such_job 1\n\
+             counter jagent_runs_success 3\n\
+             counter jagent_runs_timeout 0\n\
+             counter jagent_runs_total 4\n\
+             counter jagent_runs_unrecorded 0\n\
+             counter service_accepted 4\n\
+             counter service_completed 3\n\
+             counter service_failed 1\n\
+             gauge service_inflight 0\n\
+             counter service_refused 0\n\
+             -- a reload that fails keeps the jobs whole --\n\
+             rejected\n\
+             faults\n1\n\
+             error[E-INI]: refused by the schema\n\
+             \x20 --> zz_jagent_demo/agent.ini:3:1\n\
+             \x20  |\n\
+             \x203 | timeout_ms = soon\n\
+             \x20  | ^^^^^^^^^^ not an integer\n\
+             jobs still configured\n4\n\
+             generation\n1\n\
+             -- tls is refused, not faked --\n\
+             loaded\n\
+             serve would refuse because\n\
+             agent.tls = true, but this build cannot serve TLS: std/httpd has no TLS hook (docs/jagent.md)\n\
+             -- shutdown --\n\
+             a draining agent refuses a run\n\
+             config-error\n\
+             and it stopped because (one job failed, and failure outranks clean)\n\
+             failed\n\
+             phase=stopped ready=false live=false inflight=0\n\
+             -- the check --\n\
+             children started here, runs recorded in all\n3\n4\n\
+             no scratch left behind\ntrue"
+        );
+        assert_eq!(out.trim_end(), want, "the jagent demo's transcript changed:\n{out}");
+
+        // Anti-vacuity: the history counter must stay at 2 across the missing job (a run
+        // that wrote nothing), the job table must survive the rejected reload at 4, and no
+        // step may print `false`.
+        assert!(!out.contains("\nfalse\n"), "every step must have succeeded:\n{out}");
+        assert_eq!(out.matches("status=no-such-job").count(), 1, "one refused run:\n{out}");
+        assert!(!std::path::Path::new("zz_jagent_demo").exists(), "the demo must clean up after itself");
+    }
+}
+
+/// **`jagent`, the command: `status`, `run`, `logs`, a refusal, and a real `serve`.**
+///
+/// `examples/std/jagent_cli.jtr` is the binary; this runs it with arguments in a scratch
+/// directory holding the fixture configuration. `status` before and after a run, `run` of a
+/// present job (exit 0, recorded as #1) and of a job that does not exist (exit 1, the history
+/// unchanged), `logs` reading the record back, usage on no arguments (exit 2), and
+/// `agent.tls = true` refused before a socket is bound (exit 2). Then `serve` on a port this
+/// test chose: the process is started, `/health` and `POST /jobs/health-check/run` are asked
+/// over a plain TCP socket, and the process is killed. Results are on stdout and the agent's
+/// log records on stderr, which is what lets the stdout assertions be exact.
+#[cfg(all(test, feature = "c-oracle"))]
+mod jagent_command {
+    use super::*;
+    use std::io::{Read, Write};
+
+    fn run_cli(exe: &std::path::Path, dir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
+        let out = std::process::Command::new(exe).current_dir(dir).args(args).output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
+            String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n"),
+        )
+    }
+
+    fn http(port: u16, req: &str) -> String {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn jagent_cli_runs_status_logs_and_serves() {
+        let exe = super::c_oracle::build_exe("examples/std/jagent_cli.jtr");
+        let dir = std::env::temp_dir().join(format!("jestyr_jagent_cli_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy("examples/std/fixtures/jagent.ini", dir.join("jagent.ini")).unwrap();
+
+        // Usage, before anything is loaded.
+        let (code, _, err) = run_cli(&exe, &dir, &[]);
+        assert_eq!(code, 2, "no command is a usage error");
+        assert!(err.contains("usage: jagent"), "{err}");
+
+        let (code, out, err) = run_cli(&exe, &dir, &["status"]);
+        assert_eq!(code, 0, "status: {err}");
+        assert!(out.starts_with("config=jagent.ini valid=true generation=1 faults=0\nstore=jagent.db open=true runs=0\n"), "{out}");
+        assert!(out.contains("jobs=3\n  health-check kind=command timeout_ms=10000 interval_ms=0\n    last=none\n"), "{out}");
+        assert!(err.contains("msg=config") && err.contains("outcome=loaded"), "the log record goes to stderr: {err}");
+        assert!(!out.contains("level=info"), "and not to stdout: {out}");
+
+        let (code, out, err) = run_cli(&exe, &dir, &["run", "health-check"]);
+        assert_eq!(code, 0, "run: {err}");
+        assert!(out.starts_with("job=health-check status=success code=0 seq=1 recorded=true started_at="), "{out}");
+        assert!(out.contains(" output=\"healthy\"\n"), "{out}");
+        assert!(err.contains("msg=\"job run\" job=health-check status=success"), "{err}");
+
+        let (code, out, err) = run_cli(&exe, &dir, &["run", "nope"]);
+        assert_eq!(code, 1, "a missing job is exit 1");
+        assert!(out.is_empty(), "and prints no summary: {out}");
+        assert!(err.contains("jagent: no such job"), "{err}");
+
+        let (code, out, _) = run_cli(&exe, &dir, &["-c", "jagent.ini", "logs", "health-check"]);
+        assert_eq!(code, 0);
+        assert!(out.starts_with("#1 job=health-check status=success code=0 started_at="), "{out}");
+        assert_eq!(out.lines().count(), 1, "one run so far, and the missing job wrote none:\n{out}");
+
+        let (code, out, _) = run_cli(&exe, &dir, &["logs", "rotate-log"]);
+        assert_eq!(code, 0);
+        assert_eq!(out.trim_end(), "(no runs recorded)");
+
+        let (code, out, _) = run_cli(&exe, &dir, &["status"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("store=jagent.db open=true runs=1\n"), "{out}");
+        assert!(out.contains("    last=#1 job=health-check status=success"), "{out}");
+
+        // A configuration this build cannot serve is refused before a socket is bound.
+        let base = std::fs::read_to_string(dir.join("jagent.ini")).unwrap();
+        std::fs::write(dir.join("tls.ini"), base.replace("tls = false", "tls = true")).unwrap();
+        let (code, _, err) = run_cli(&exe, &dir, &["-c", "tls.ini", "serve"]);
+        assert_eq!(code, 2, "tls=true is refused: {err}");
+        assert!(err.contains("cannot serve TLS"), "{err}");
+
+        // A file that does not load: exit 1 with the fault on stderr.
+        std::fs::write(dir.join("bad.ini"), "[job.x]\ncommand = echo x\ntimeout_ms = soon\n").unwrap();
+        let (code, _, err) = run_cli(&exe, &dir, &["-c", "bad.ini", "run", "x"]);
+        assert_eq!(code, 1);
+        assert!(err.contains("bad.ini:3:1") && err.contains("not an integer"), "{err}");
+
+        // **serve.** A port this test chose, so nothing has to parse the process's stdout
+        // (the C runtime buffers it when piped).
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        std::fs::write(dir.join("serve.ini"), base.replace("port = 0", &format!("port = {port}"))).unwrap();
+        // **The served process is killed on EVERY exit from this test, a panic included.**
+        // A failed assertion between the spawn and the kill would otherwise leave `jagent
+        // serve` running with this harness's pipes inherited, and anything capturing the
+        // ladder's output would wait on the orphan before it saw EOF — which is exactly
+        // what happened on the first ladder run: one assertion failed, the ladder finished,
+        // and its output sat behind the orphan until the process was killed by hand. The
+        // `std/plugin` lesson, one layer up.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Reap(
+            std::process::Command::new(&exe)
+                .current_dir(&dir)
+                .args(["-c", "serve.ini", "serve"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let started = std::time::Instant::now();
+        let mut up = false;
+        while started.elapsed() < std::time::Duration::from_secs(10) {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(up, "jagent serve must start listening on {port} within 10s");
+
+        let health = http(port, "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(health.starts_with("HTTP/1.1 200 "), "{health}");
+        assert!(health.ends_with("phase=ready ready=true live=true inflight=0\n"), "{health}");
+        let ran = http(port, "POST /jobs/health-check/run HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(ran.starts_with("HTTP/1.1 200 "), "{ran}");
+        assert!(ran.contains("job=health-check status=success code=0 seq=2 recorded=true"), "a second record, after the CLI's #1:\n{ran}");
+        let missing = http(port, "GET /jobs/nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(missing.starts_with("HTTP/1.1 404 "), "{missing}");
+        let logs = http(port, "GET /logs/health-check HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(logs.contains("\n#1 job=health-check") && logs.contains("\n#2 job=health-check"), "{logs}");
+
+        child.0.kill().unwrap();
+        let _ = child.0.wait();
+
+        // The run over the API was recorded in the same store the CLI reads — and it is
+        // there after a KILL, which is what `recorded=true` promises.
+        let (code, out, _) = run_cli(&exe, &dir, &["logs", "health-check"]);
+        assert_eq!(code, 0);
+        assert_eq!(out.lines().count(), 2, "two runs in the history: one by `run`, one over the API:\n{out}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// **`jcrypto` — one message hashed by two SHA-256s, MACed, signed, and tampered with.**
 ///
 /// `examples/std/crypto_demo.jtr` is `std/crypto`'s consumer. The fixed message goes through
@@ -20914,6 +21211,21 @@ fn main() -> i32 {
             // both places the sequence can still fail after the candidate exists: a
             // TAMPERED archive (the fetch) and a read-only handle (the staging write).
             ("jcadd_test", 3),
+            // **The edge agent, end to end: real children, a real store, real loopback
+            // sockets.** A load declares its own schema from the file's `[job.NAME]` headers
+            // and a bad file is rejected WHOLE with `file:line:col`; a missing job writes no
+            // history where a present one writes three keys in one batch, read back after a
+            // reopen and straight out of the `kv` file; a failing command is a failure with
+            // its code and the log filter is by parsed name (`bad` never matches `bad-too`);
+            // a ~2s command under a 300ms timeout is killed with its whole process tree
+            // CONFIRMED gone, beside the same command given time to finish; a store that
+            // cannot open leaves the run unrecorded AND counted; every API endpoint over
+            // loopback with the counters read behind the wire; wrong methods, unknown paths
+            // and a non-HTTP request refused by status with the agent untouched; a config
+            // edit reloaded through the real watcher and a broken edit rejected through it;
+            // the scheduler on a manual clock; TLS declared unsupported and `serve` refusing
+            // it; and the status/run summaries exact on a manual clock and a fixed wall.
+            ("jagent_test", 13),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

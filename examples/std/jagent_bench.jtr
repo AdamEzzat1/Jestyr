@@ -1,0 +1,306 @@
+// examples/std/jagent_bench.jtr — what `jagent`'s operations cost, measured rather than
+// guessed.
+//
+//   jestyrc run examples/std/jagent_bench.jtr
+//
+// Not a test: it prints numbers and exits 0. The numbers are recorded in `docs/jagent.md`
+// with the machine they came from; this file is how to get new ones. Each measurement is
+// a loop over the real path — a real child through the shell, a real store on disk, a real
+// socket — timed on `time.host()`, so a slow machine prints slow numbers rather than
+// failing.
+//
+// What is measured, and what is not:
+//
+//   * a configuration load (`load_text`, ten jobs, the two-pass scan plus `std/ini`)
+//   * a trivial command job (`exit 0`) end to end: start, drain, reap, sweep, record
+//   * the history write on its own: one `std/kv` batch of the three keys a run writes,
+//     with a record the size a run produces — the cost `run_job` pays over the child
+//   * `GET /health` over loopback, on a fresh connection each time and on one kept alive
+//   * storage growth: the store file's size after N recorded entries, and the bytes per entry
+//   * resource cleanup after repeated runs: every child released and every group emptied,
+//     asserted by the spawner's counter and `tree_reaped` — process memory is NOT measured
+//     here, because nothing in the language reads it; `docs/jagent.md` says how it was
+//     observed by hand
+//
+// The bench does not pass or fail on a number: the tree has no established threshold
+// harness for wall-clock figures, and a threshold that flakes on a loaded runner would be
+// worse than a number a reader compares against the recorded one.
+
+import "fs"
+import "http"
+import "httpc"
+import "httpd"
+import "jagent"
+import "kv"
+import "log"
+import "mem"
+import "runtime"
+import "str"
+import "sysfs"
+import "sysnet"
+import "syspoll"
+import "sysproc"
+import "time"
+import "writer"
+
+const JB_ROOT: str = "zz_jagent_bench"
+const JB_STORE: str = "zz_jagent_bench/history.db"
+const JB_GROWTH: str = "zz_jagent_bench/growth.db"
+const JB_CAP: usize = 16384
+
+fn nothing() { }
+
+fn quiet_logger() -> log.Logger {
+    return log.make(time.manual(0), writer.to_buffer(), log.LOG_INFO, log.LOG_LOGFMT)
+}
+
+fn scrub(mut h: fs.Fs, read a: Allocator) {
+    fs.erase(h, JB_STORE)
+    fs.erase(h, JB_GROWTH)
+    let gone: bool = sysfs.remove_dir(h, a, JB_ROOT) catch false
+}
+
+fn push_num(mut s: String, v: i64) {
+    if v < 0 {
+        string_push(s, "-")
+        push_num(s, 0 - v)
+        return
+    }
+    if v >= 10 { push_num(s, v / 10) }
+    let d: i64 = v % 10
+    if d == 0 { string_push(s, "0") }
+    if d == 1 { string_push(s, "1") }
+    if d == 2 { string_push(s, "2") }
+    if d == 3 { string_push(s, "3") }
+    if d == 4 { string_push(s, "4") }
+    if d == 5 { string_push(s, "5") }
+    if d == 6 { string_push(s, "6") }
+    if d == 7 { string_push(s, "7") }
+    if d == 8 { string_push(s, "8") }
+    if d == 9 { string_push(s, "9") }
+}
+
+// `label: <per> <unit> per op over <n> ops (<total> ms total)`
+fn report(read label: str, n: i64, total_ns: i64, read unit: str, div: i64) {
+    var s: String = string_new()
+    string_push(s, label)
+    string_push(s, ": ")
+    push_num(s, total_ns / n / div)
+    string_push(s, " ")
+    string_push(s, unit)
+    string_push(s, " per op over ")
+    push_num(s, n)
+    string_push(s, " ops (")
+    push_num(s, total_ns / 1000000)
+    string_push(s, " ms total)")
+    print_str(string_view(s))
+    string_free(s)
+}
+
+fn ten_jobs(mut dst: String) {
+    string_push(dst, "[agent]\nstore = zz_jagent_bench/history.db\n")
+    var i: i64 = 0
+    for i < 10 {
+        string_push(dst, "[job.j")
+        push_num(dst, i)
+        string_push(dst, "]\ncommand = echo job ")
+        push_num(dst, i)
+        string_push(dst, "\ntimeout_ms = 1000\n")
+        i = i + 1
+    }
+}
+
+fn file_size(read a: Allocator, mut h: fs.Fs, read p: str) -> i64 {
+    let m: sysfs.Meta = sysfs.metadata(h, a, p) catch sysfs.missing()
+    return m.bytes as i64
+}
+
+fn answered(read cl: httpc.Client, ms: i64) -> bool {
+    if httpc.pending(cl) > 0 { return true }
+    var p: runtime.Poller = syspoll.host()
+    var fds: *mut i64 = alloc(i64, 1)
+    var rdy: *mut u8 = alloc(u8, 1)
+    unsafe { (fds + 0).* = httpc.fd(cl) }
+    unsafe { (rdy + 0).* = 0 as u8 }
+    let got: i64 = runtime.ask(p, fds, rdy, 1, ms * 1000000)
+    var r: u8 = 0
+    unsafe { r = (rdy + 0).* }
+    free_ptr(rdy)
+    free_ptr(fds)
+    if got <= 0 { return false }
+    return (r as i32) != 0
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h, a)
+    let made: bool = sysfs.make_dir(h, a, JB_ROOT) catch false
+    var clk: time.Clock = time.host()
+    var sp: sysproc.Spawner = sysproc.host()
+
+    print_str("-- jagent bench --")
+
+    // ---- configuration load ----
+    var cfg: String = string_new()
+    ten_jobs(cfg)
+    var ag: jagent.Agent = jagent.make(a, time.host(), quiet_logger())
+    let n_load: i64 = 200
+    let t0: i64 = time.read_nanos(clk)
+    var i: i64 = 0
+    for i < n_load {
+        // Alternate two texts so no load is answered `same`.
+        if i % 2 == 0 {
+            jagent.load_text(ag, "bench.ini", string_view(cfg))
+        } else {
+            jagent.load_text(ag, "bench.ini", "[agent]\nstore = zz_jagent_bench/history.db\n[job.only]\ncommand = echo one\n")
+        }
+        i = i + 1
+    }
+    report("config load, ten jobs", n_load, time.read_nanos(clk) - t0, "us", 1000)
+    jagent.load_text(ag, "bench.ini", "[agent]\nstore = zz_jagent_bench/history.db\n[job.trivial]\ncommand = exit 0\ntimeout_ms = 5000\n")
+    jagent.open_store(ag, h)
+
+    // ---- a trivial job, end to end ----
+    let n_run: i64 = 20
+    let t1: i64 = time.read_nanos(clk)
+    var reaped: i64 = 0
+    i = 0
+    for i < n_run {
+        let r: jagent.Run = jagent.run_job(ag, sp, clk, "trivial")
+        if r.tree_reaped { reaped = reaped + 1 }
+        i = i + 1
+    }
+    report("trivial command job (exit 0), recorded", n_run, time.read_nanos(clk) - t1, "ms", 1000000)
+    var s: String = string_new()
+    string_push(s, "children started, trees confirmed reaped: ")
+    push_num(s, sysproc.started(sp))
+    string_push(s, ", ")
+    push_num(s, reaped)
+    print_str(string_view(s))
+    string_free(s)
+
+    // ---- the history write on its own ----
+    //
+    // The same three keys a run writes, with a record of the size a run produces, into a
+    // fresh store: this is what `run_job` pays over the child.
+    var store: kv.Store = kv.closed()
+    kv.open(h, a, JB_GROWTH, store) catch nothing()
+    let rec: str = "{\"seq\":1,\"job\":\"health-check\",\"status\":\"success\",\"code\":0,\"started_at\":1700000000,\"duration_ms\":12,\"out_bytes\":9,\"output\":\"healthy\\r\\n\",\"error\":\"\"}"
+    let n_rec: i64 = 1000
+    let t2: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_rec {
+        var key: String = string_new()
+        string_push(key, "run:")
+        push_num(key, 1000000 + i)
+        var seqv: String = string_new()
+        push_num(seqv, i + 1)
+        var b: kv.Batch = kv.batch()
+        kv.batch_put(b, string_view(key), rec)
+        kv.batch_put(b, "last:health-check", string_view(key))
+        kv.batch_put(b, "seq", string_view(seqv))
+        kv.commit(store, b) catch nothing()
+        // Synced per entry, as `run_job` does: `recorded` means the bytes reached the disk.
+        kv.sync(store) catch nothing()
+        string_free(seqv)
+        string_free(key)
+        i = i + 1
+    }
+    let t_rec: i64 = time.read_nanos(clk) - t2
+    report("history entry (one kv batch of three keys, synced)", n_rec, t_rec, "us", 1000)
+    let grown: i64 = file_size(a, h, JB_GROWTH)
+    var g: String = string_new()
+    string_push(g, "storage after ")
+    push_num(g, n_rec)
+    string_push(g, " entries: ")
+    push_num(g, grown)
+    string_push(g, " bytes, ")
+    push_num(g, grown / n_rec)
+    string_push(g, " bytes per entry (record + pointer + counter, framed); live bytes ")
+    push_num(g, kv.live_bytes(store))
+    string_push(g, ", dead bytes ")
+    push_num(g, kv.dead_bytes(store))
+    print_str(string_view(g))
+    string_free(g)
+    let compacted: i64 = kv.compact(h, a, store) catch 0 - 1
+    var g2: String = string_new()
+    string_push(g2, "after compaction: ")
+    push_num(g2, file_size(a, h, JB_GROWTH))
+    string_push(g2, " bytes for ")
+    push_num(g2, compacted)
+    string_push(g2, " live keys")
+    print_str(string_view(g2))
+    string_free(g2)
+    kv.close(store)
+
+    // ---- GET /health over loopback ----
+    var cell: *mut jagent.Agent = alloc(jagent.Agent, 1)
+    unsafe { (cell + 0).* = ag }
+    var ctx: *mut jagent.Serve = jagent.serve_ctx(cell, sysproc.host(), time.host())
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = httpd.make(a, time.host(), quiet_logger(), false, 4, 8192)
+    httpd.start(sv, net, sysnet.loopback(0), 8)
+    jagent.install(sv, ctx)
+    let addr: sysnet.SocketAddr = sysnet.loopback(httpd.port(sv))
+
+    let n_http: i64 = 100
+    var ok_fresh: i64 = 0
+    let t3: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_http {
+        var cl: httpc.Client = httpc.dial(net, addr, JB_CAP)
+        httpc.request(cl, "GET", "/health", "", "")
+        httpd.serve_for(sv, net, 0)
+        var rounds: i64 = 0
+        for answered(cl, 0) == false and rounds < 1000 {
+            httpd.serve_for(sv, net, 1)
+            rounds = rounds + 1
+        }
+        if httpc.read_response(cl) == http.HTTP_OK {
+            if httpc.status(cl) == 200 { ok_fresh = ok_fresh + 1 }
+        }
+        httpc.hangup(cl)
+        httpd.serve_for(sv, net, 0)
+        i = i + 1
+    }
+    report("GET /health, a fresh connection each time", n_http, time.read_nanos(clk) - t3, "us", 1000)
+
+    var ok_keep: i64 = 0
+    var cl2: httpc.Client = httpc.dial(net, addr, JB_CAP)
+    let t4: i64 = time.read_nanos(clk)
+    i = 0
+    for i < n_http {
+        httpc.request(cl2, "GET", "/health", "", "")
+        var rounds2: i64 = 0
+        for answered(cl2, 0) == false and rounds2 < 1000 {
+            httpd.serve_for(sv, net, 1)
+            rounds2 = rounds2 + 1
+        }
+        if httpc.read_response(cl2) == http.HTTP_OK {
+            if httpc.status(cl2) == 200 { ok_keep = ok_keep + 1 }
+        }
+        i = i + 1
+    }
+    report("GET /health, one kept-alive connection", n_http, time.read_nanos(clk) - t4, "us", 1000)
+    httpc.hangup(cl2)
+    var okl: String = string_new()
+    string_push(okl, "200s received: ")
+    push_num(okl, ok_fresh)
+    string_push(okl, " fresh, ")
+    push_num(okl, ok_keep)
+    string_push(okl, " kept-alive")
+    print_str(string_view(okl))
+    string_free(okl)
+
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    var back: jagent.Agent = unsafe { (cell + 0).* }
+    jagent.free(back)
+    jagent.free_serve(ctx)
+    free_ptr(cell as *mut u8)
+    string_free(cfg)
+    scrub(h, a)
+    return 0
+}
