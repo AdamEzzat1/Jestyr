@@ -21467,7 +21467,14 @@ fn main() -> i32 {
             // (+1: the API served over TLS through `std/httpds` — the fixture certificate,
             // a request with the token answered 200, one without 401, and plaintext at the
             // TLS port answered with nothing.)
-            ("jagent_test", 15),
+            // (+5, v3: an http-check against a probe server on a spawned thread — 200
+            // against 200, 418 against 200 and against 418, an unreachable port, a target
+            // that never answers timing out on the socket; a command's cwd and env with
+            // their controls; retries as ONE record carrying the attempts, success after a
+            // retry against a first-attempt failure, every attempt failing; groups run in
+            // order with no group record and not confused with jobs; retention pruning the
+            // oldest runs but never a job's latest, the counter never reused, compaction.)
+            ("jagent_test", 20),
             // The operator's layer over the agent: the discovery order (flag, environment,
             // working directory); `init` writing a starter that loads and refusing to replace
             // a file whose bytes are then unchanged; `doctor` passing on a healthy scratch

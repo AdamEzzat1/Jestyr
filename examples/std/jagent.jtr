@@ -86,6 +86,8 @@
 import "config"
 import "diag"
 import "fs"
+import "http"
+import "httpc"
 import "httpd"
 import "ini"
 import "json"
@@ -98,6 +100,7 @@ import "sandbox"
 import "service"
 import "sink"
 import "str"
+import "sysnet"
 import "sysproc"
 import "syswatch"
 import "time"
@@ -127,15 +130,21 @@ pub const RUN_NO_SUCH_JOB: i32 = 4    // not recorded
     return "?"
 }
 
-// Job kinds. One today; the table has the column so the second costs an arm, not a
-// redesign.
+// Job kinds. `command` runs through the shell; `http-check` is a GET through `std/httpc`
+// whose exit code is the response status against `expect_status`.
 pub const JOB_COMMAND: i32 = 0
 pub const JOB_UNKNOWN: i32 = 1
+pub const JOB_HTTP_CHECK: i32 = 2
 
 @no_alloc @no_os pub fn kind_name(k: i32) -> str {
     if k == JOB_COMMAND { return "command" }
+    if k == JOB_HTTP_CHECK { return "http-check" }
     return "unknown"
 }
+
+// The most retries a job may declare: a bound on how long one run can take beyond its
+// timeout, so a misconfiguration cannot make a run last an hour.
+pub const JAGENT_MAX_RETRIES: i64 = 10
 
 // What a load or a reload did.
 pub const JA_LOADED: i32 = 0       // applied; the generation advanced
@@ -193,11 +202,13 @@ const KEY_LAST: str = "last:"
     pub out_bytes: i64,       // every byte the command wrote, not just the preview
     pub recorded: bool,
     pub tree_reaped: bool,    // true when the process group was CONFIRMED empty afterwards
+                              // (vacuously true for an http-check: nothing was spawned)
+    pub attempts: i32,        // 1 plus the retries taken; the record carries it
 }
 
 @no_alloc @no_os pub fn no_run() -> Run {
     return Run{ status: RUN_NO_SUCH_JOB, code: 0, seq: 0, started_at: 0, duration_ms: 0,
-                out_bytes: 0, recorded: false, tree_reaped: false }
+                out_bytes: 0, recorded: false, tree_reaped: false, attempts: 0 }
 }
 
 // ---- the agent --------------------------------------------------------------------------
@@ -232,6 +243,25 @@ const KEY_LAST: str = "last:"
     timeouts: List(i64),      // ms
     intervals: List(i64),     // ms; 0 = not scheduled
     due: List(i64),           // the next scheduled start, on the agent's clock
+    expects: List(i64),       // http-check: the status that is success
+    cwds: String,             // command: the working directory, "" = inherit
+    cwofs: List(i32),
+    cwlen: List(i32),
+    envs: String,             // command: one NAME=value appended to the environment, "" = none
+    enofs: List(i32),
+    enlen: List(i32),
+    retries: List(i64),       // attempts beyond the first
+    backoffs: List(i64),      // ms between attempts
+    // groups: a name and the job INDICES it lists, flattened
+    gnames: String,
+    gnofs: List(i32),
+    gnlen: List(i32),
+    gjobs: List(i32),
+    gofs: List(i32),
+    glen: List(i32),
+    // retention
+    max_runs: i64,            // 0 = keep everything
+    compact_after: i64,       // dead bytes that trigger a compaction; 0 = never
     // history
     store: kv.Store,
     store_path: String,
@@ -247,6 +277,9 @@ const KEY_LAST: str = "last:"
     m_unrecorded: i32,
     m_http: i32,
     m_unauth: i32,
+    m_retries: i32,
+    m_pruned: i32,
+    m_compactions: i32,
     m_reloads: i32,
     m_dur: i32,
     m_jobs: i32,
@@ -263,6 +296,9 @@ impl Drop for Agent {
         string_free(self.faults)
         string_free(self.names)
         string_free(self.cmds)
+        string_free(self.cwds)
+        string_free(self.envs)
+        string_free(self.gnames)
         string_free(self.store_path)
         string_free(self.preview)
         string_free(self.why)
@@ -304,6 +340,13 @@ pub fn make(read a: Allocator, take clk: time.Clock, take lg: log.Logger) -> Age
         cmds: string_new(), cofs: list.make(i32, a), clen: list.make(i32, a),
         kinds: list.make(i32, a), timeouts: list.make(i64, a), intervals: list.make(i64, a),
         due: list.make(i64, a),
+        expects: list.make(i64, a),
+        cwds: string_new(), cwofs: list.make(i32, a), cwlen: list.make(i32, a),
+        envs: string_new(), enofs: list.make(i32, a), enlen: list.make(i32, a),
+        retries: list.make(i64, a), backoffs: list.make(i64, a),
+        gnames: string_new(), gnofs: list.make(i32, a), gnlen: list.make(i32, a),
+        gjobs: list.make(i32, a), gofs: list.make(i32, a), glen: list.make(i32, a),
+        max_runs: 0, compact_after: 0,
         store: kv.closed(), store_path: string_new(),
         w: syswatch.closed(),
         m_runs: metrics.counter(m, "jagent_runs_total"),
@@ -315,6 +358,9 @@ pub fn make(read a: Allocator, take clk: time.Clock, take lg: log.Logger) -> Age
         m_unrecorded: metrics.counter(m, "jagent_runs_unrecorded"),
         m_http: metrics.counter(m, "jagent_http_requests"),
         m_unauth: metrics.counter(m, "jagent_http_unauthorized"),
+        m_retries: metrics.counter(m, "jagent_run_retries"),
+        m_pruned: metrics.counter(m, "jagent_history_pruned"),
+        m_compactions: metrics.counter(m, "jagent_history_compactions"),
         m_reloads: metrics.counter(m, "jagent_config_reloads"),
         m_dur: m_dur,
         m_jobs: metrics.gauge(m, "jagent_jobs"),
@@ -467,6 +513,80 @@ pub fn job_kind(read ag: Agent, i: usize) -> i32 {
     return list.get(i32, ag.kinds, i)
 }
 
+// An http-check's URL — the same column a command job keeps its command in.
+pub fn job_url(read ag: Agent, i: usize) -> read str { return job_command(ag, i) }
+
+pub fn job_expect_status(read ag: Agent, i: usize) -> i64 {
+    if i >= job_count(ag) { return 0 }
+    return list.get(i64, ag.expects, i)
+}
+
+// A command job's working directory ("" inherits) and its one extra `NAME=value` ("" none).
+pub fn job_cwd(read ag: Agent, i: usize) -> read str {
+    let v: str = string_view(ag.cwds)
+    if i >= job_count(ag) { return v[0 .. 0] }
+    let o: usize = list.get(i32, ag.cwofs, i) as usize
+    let n: usize = list.get(i32, ag.cwlen, i) as usize
+    return v[o .. o + n]
+}
+
+pub fn job_env(read ag: Agent, i: usize) -> read str {
+    let v: str = string_view(ag.envs)
+    if i >= job_count(ag) { return v[0 .. 0] }
+    let o: usize = list.get(i32, ag.enofs, i) as usize
+    let n: usize = list.get(i32, ag.enlen, i) as usize
+    return v[o .. o + n]
+}
+
+pub fn job_retries(read ag: Agent, i: usize) -> i64 {
+    if i >= job_count(ag) { return 0 }
+    return list.get(i64, ag.retries, i)
+}
+
+pub fn job_backoff_ms(read ag: Agent, i: usize) -> i64 {
+    if i >= job_count(ag) { return 0 }
+    return list.get(i64, ag.backoffs, i)
+}
+
+// ---- groups ----
+
+@no_alloc @no_os pub fn group_count(read ag: Agent) -> usize { return list.len(i32, ag.gofs) }
+
+pub fn group_name(read ag: Agent, g: usize) -> read str {
+    let v: str = string_view(ag.gnames)
+    if g >= group_count(ag) { return v[0 .. 0] }
+    let o: usize = list.get(i32, ag.gnofs, g) as usize
+    let n: usize = list.get(i32, ag.gnlen, g) as usize
+    return v[o .. o + n]
+}
+
+pub fn group_size(read ag: Agent, g: usize) -> usize {
+    if g >= group_count(ag) { return 0 }
+    return list.get(i32, ag.glen, g) as usize
+}
+
+// The job INDEX of member `k` of group `g`, in file order.
+pub fn group_job(read ag: Agent, g: usize, k: usize) -> usize {
+    if k >= group_size(ag, g) { return 0 }
+    let o: usize = list.get(i32, ag.gofs, g) as usize
+    return list.get(i32, ag.gjobs, o + k) as usize
+}
+
+pub fn find_group(read ag: Agent, read name: str) -> i32 {
+    var g: usize = 0
+    let n: usize = group_count(ag)
+    for g < n {
+        if str_eq(group_name(ag, g), name) { return g as i32 }
+        g = g + 1
+    }
+    return 0 - 1
+}
+
+// ---- retention ----
+
+@no_alloc @no_os pub fn history_max_runs(read ag: Agent) -> i64 { return ag.max_runs }
+@no_alloc @no_os pub fn compact_after_dead_bytes(read ag: Agent) -> i64 { return ag.compact_after }
+
 pub fn job_timeout_ms(read ag: Agent, i: usize) -> i64 {
     if i >= job_count(ag) { return 0 }
     return list.get(i64, ag.timeouts, i)
@@ -607,6 +727,11 @@ struct Cand {
     nofs: List(i32),
     nlen: List(i32),
     hdr: List(i32),
+    // `[group.NAME]` headers, the same way
+    gnames: String,
+    gnofs: List(i32),
+    gnlen: List(i32),
+    ghdr: List(i32),
 }
 
 fn cand_name(read c: Cand, i: usize) -> read str {
@@ -614,6 +739,23 @@ fn cand_name(read c: Cand, i: usize) -> read str {
     let o: usize = list.get(i32, c.nofs, i) as usize
     let n: usize = list.get(i32, c.nlen, i) as usize
     return v[o .. o + n]
+}
+
+fn cand_group(read c: Cand, i: usize) -> read str {
+    let v: str = string_view(c.gnames)
+    let o: usize = list.get(i32, c.gnofs, i) as usize
+    let n: usize = list.get(i32, c.gnlen, i) as usize
+    return v[o .. o + n]
+}
+
+fn name_ok(read nm: str) -> bool {
+    if nm.len == 0 { return false }
+    var i: usize = 0
+    for i < nm.len {
+        if name_byte_ok(nm[i] as i32) == false { return false }
+        i = i + 1
+    }
+    return true
 }
 
 // Pass one: the section headers. Every `[job.NAME]` becomes a row; a header that is not a
@@ -667,6 +809,31 @@ fn scan_jobs(read text: str, read fname: str, mut c: Cand, mut faults: String, r
                         string_push(c.names, nm)
                     }
                 }
+                if str.has_prefix(inner, "group.") {
+                    let gm: str = inner[6 .. inner.len]
+                    var gfine: bool = name_ok(gm)
+                    if gfine == false {
+                        fault_at(faults, fname, text, at, "a group section needs a name of letters, digits, `-` and `_`: `[group.NAME]`")
+                    }
+                    if gfine {
+                        var k2: usize = 0
+                        let ng: usize = list.len(i32, c.gnofs)
+                        for k2 < ng {
+                            if str_eq(cand_group(c, k2), gm) {
+                                fault_at(faults, fname, text, at, "this group is declared twice")
+                                gfine = false
+                            }
+                            k2 = k2 + 1
+                        }
+                    }
+                    if gfine {
+                        let g0: str = string_view(c.gnames)
+                        list.push(i32, c.gnofs, g0.len as i32)
+                        list.push(i32, c.gnlen, gm.len as i32)
+                        list.push(i32, c.ghdr, at as i32)
+                        string_push(c.gnames, gm)
+                    }
+                }
             }
         }
         at = e + 1
@@ -684,10 +851,14 @@ fn declare_all(mut cfg: config.Config, read c: Cand) {
     // SECRET by declaration: `std/config` renders it as `****` on every path, so nothing
     // that prints the configuration can print the token by forgetting to.
     config.declare(cfg, "agent.token", config.CFG_STR, true)
+    config.declare(cfg, "agent.history_max_runs", config.CFG_INT, false)
+    config.declare(cfg, "agent.compact_after_dead_bytes", config.CFG_INT, false)
     config.apply(cfg, "agent.host", "127.0.0.1", config.CFG_DEFAULT)
     config.apply(cfg, "agent.port", "0", config.CFG_DEFAULT)
     config.apply(cfg, "agent.tls", "false", config.CFG_DEFAULT)
     config.apply(cfg, "agent.store", "jagent.db", config.CFG_DEFAULT)
+    config.apply(cfg, "agent.history_max_runs", "0", config.CFG_DEFAULT)
+    config.apply(cfg, "agent.compact_after_dead_bytes", "0", config.CFG_DEFAULT)
     var t: String = string_new()
     push_i64(t, JAGENT_DEFAULT_TIMEOUT_MS)
     var i: usize = 0
@@ -697,7 +868,19 @@ fn declare_all(mut cfg: config.Config, read c: Cand) {
         declare_job_key(cfg, c, i, "command", config.CFG_STR, "")
         declare_job_key(cfg, c, i, "timeout_ms", config.CFG_INT, string_view(t))
         declare_job_key(cfg, c, i, "interval_ms", config.CFG_INT, "0")
+        declare_job_key(cfg, c, i, "url", config.CFG_STR, "")
+        declare_job_key(cfg, c, i, "expect_status", config.CFG_INT, "200")
+        declare_job_key(cfg, c, i, "cwd", config.CFG_STR, "")
+        declare_job_key(cfg, c, i, "env", config.CFG_STR, "")
+        declare_job_key(cfg, c, i, "retries", config.CFG_INT, "0")
+        declare_job_key(cfg, c, i, "backoff_ms", config.CFG_INT, "0")
         i = i + 1
+    }
+    var g: usize = 0
+    let ng: usize = list.len(i32, c.gnofs)
+    for g < ng {
+        declare_group_key(cfg, c, g)
+        g = g + 1
     }
     string_free(t)
 }
@@ -712,6 +895,68 @@ fn declare_job_key(mut cfg: config.Config, read c: Cand, i: usize, read leaf: st
     config.declare(cfg, string_view(key), k, false)
     if dflt.len > 0 { config.apply(cfg, string_view(key), dflt, config.CFG_DEFAULT) }
     string_free(key)
+}
+
+// A group has one key: `group.<name>.jobs`, a comma-separated list of job names.
+fn declare_group_key(mut cfg: config.Config, read c: Cand, g: usize) {
+    var key: String = string_new()
+    string_push(key, "group.")
+    string_push(key, cand_group(c, g))
+    string_push(key, ".jobs")
+    config.declare(cfg, string_view(key), config.CFG_STR, false)
+    string_free(key)
+}
+
+fn group_key(read c: Cand, g: usize, read cfg: config.Config) -> i32 {
+    var k: String = string_new()
+    string_push(k, "group.")
+    string_push(k, cand_group(c, g))
+    string_push(k, ".jobs")
+    let id: i32 = config.by_name(cfg, string_view(k))
+    string_free(k)
+    return id
+}
+
+// Call `f` for every comma-separated, trimmed, non-empty item of `list_text`... spelled as
+// a count-and-index pair instead, because a closure is not a thing this subset has: the
+// number of items, and the k-th item.
+fn list_item_count(read s: str) -> usize {
+    // A never-pushed `String` views as a str with no bytes behind it; slicing that, even
+    // `[0 .. 0]`, is what the runtime's boundary check refuses.
+    if s.len == 0 { return 0 }
+    var n: usize = 0
+    var at: usize = 0
+    for at <= s.len {
+        var e: usize = at
+        for e < s.len {
+            if (s[e] as i32) == 44 { break }
+            e = e + 1
+        }
+        let item: str = str.trimmed(s[at .. e])
+        if item.len > 0 { n = n + 1 }
+        at = e + 1
+    }
+    return n
+}
+
+fn list_item(read s: str, want: usize) -> read str {
+    if s.len == 0 { return s }
+    var n: usize = 0
+    var at: usize = 0
+    for at <= s.len {
+        var e: usize = at
+        for e < s.len {
+            if (s[e] as i32) == 44 { break }
+            e = e + 1
+        }
+        let item: str = str.trimmed(s[at .. e])
+        if item.len > 0 {
+            if n == want { return item }
+            n = n + 1
+        }
+        at = e + 1
+    }
+    return s[0 .. 0]
 }
 
 // Every `std/ini` problem, rendered with a caret against the file's own text.
@@ -775,23 +1020,63 @@ fn check_semantics(read c: Cand, read cfg: config.Config, read fname: str, read 
         fault_at(faults, fname, text, 0, "agent.port must be 0..65535")
         n_faults = n_faults + 1
     }
+    if config.get_int(cfg, config.by_name(cfg, "agent.history_max_runs")) < 0 {
+        fault_at(faults, fname, text, 0, "agent.history_max_runs may not be negative (0 keeps everything)")
+        n_faults = n_faults + 1
+    }
+    if config.get_int(cfg, config.by_name(cfg, "agent.compact_after_dead_bytes")) < 0 {
+        fault_at(faults, fname, text, 0, "agent.compact_after_dead_bytes may not be negative (0 never compacts)")
+        n_faults = n_faults + 1
+    }
     var i: usize = 0
     let n: usize = list.len(i32, c.nofs)
     for i < n {
         let hdr: usize = list.get(i32, c.hdr, i) as usize
         let kid: i32 = job_key(c, i, "kind", cfg)
-        if config.value_is(cfg, kid, "command") == false {
-            fault_at(faults, fname, text, hdr, "unknown job kind; only `command` is supported")
+        let is_cmd: bool = config.value_is(cfg, kid, "command")
+        let is_http: bool = config.value_is(cfg, kid, "http-check")
+        if is_cmd == false and is_http == false {
+            fault_at(faults, fname, text, hdr, "unknown job kind; `command` and `http-check` are supported")
             n_faults = n_faults + 1
         }
-        let cid: i32 = job_key(c, i, "command", cfg)
-        var has_cmd: bool = config.is_set(cfg, cid)
-        if has_cmd {
-            if config.value_is(cfg, cid, "") { has_cmd = false }
+        if is_cmd {
+            let cid: i32 = job_key(c, i, "command", cfg)
+            if key_is_set(cfg, cid) == false {
+                fault_at(faults, fname, text, hdr, "a command job needs a non-empty `command`")
+                n_faults = n_faults + 1
+            }
+            let eid: i32 = job_key(c, i, "env", cfg)
+            if key_is_set(cfg, eid) {
+                var ev: String = string_new()
+                value_of(cfg, eid, ev)
+                let evs: str = string_view(ev)
+                let eq: isize = str.index_of(evs, "=")
+                if eq <= 0 {
+                    fault_at(faults, fname, text, hdr, "`env` must be one `NAME=value`")
+                    n_faults = n_faults + 1
+                }
+                string_free(ev)
+            }
         }
-        if has_cmd == false {
-            fault_at(faults, fname, text, hdr, "a command job needs a non-empty `command`")
-            n_faults = n_faults + 1
+        if is_http {
+            let uid: i32 = job_key(c, i, "url", cfg)
+            var fine_url: bool = key_is_set(cfg, uid)
+            if fine_url {
+                var uv: String = string_new()
+                value_of(cfg, uid, uv)
+                fine_url = str.has_prefix(string_view(uv), "http://")
+                string_free(uv)
+            }
+            if fine_url == false {
+                fault_at(faults, fname, text, hdr, "an http-check needs a `url` starting with `http://` (https is not checked; see docs/jagent.md)")
+                n_faults = n_faults + 1
+            }
+            let xid: i32 = job_key(c, i, "expect_status", cfg)
+            let xv: i64 = config.get_int(cfg, xid)
+            if xv < 100 or xv > 599 {
+                fault_at(faults, fname, text, hdr, "`expect_status` must be an HTTP status, 100..599")
+                n_faults = n_faults + 1
+            }
         }
         let tid: i32 = job_key(c, i, "timeout_ms", cfg)
         if config.get_int(cfg, tid) <= 0 {
@@ -803,9 +1088,73 @@ fn check_semantics(read c: Cand, read cfg: config.Config, read fname: str, read 
             fault_at(faults, fname, text, hdr, "`interval_ms` may not be negative")
             n_faults = n_faults + 1
         }
+        let rid: i32 = job_key(c, i, "retries", cfg)
+        let rv: i64 = config.get_int(cfg, rid)
+        if rv < 0 or rv > JAGENT_MAX_RETRIES {
+            fault_at(faults, fname, text, hdr, "`retries` must be 0..10")
+            n_faults = n_faults + 1
+        }
+        let bid: i32 = job_key(c, i, "backoff_ms", cfg)
+        if config.get_int(cfg, bid) < 0 {
+            fault_at(faults, fname, text, hdr, "`backoff_ms` may not be negative")
+            n_faults = n_faults + 1
+        }
         i = i + 1
     }
+    // Groups: every member is a configured job, the list is not empty, and a group does
+    // not share a name with a job — the two are addressed by different commands, and one
+    // name meaning two things is the confusion the check exists to rule out.
+    var g: usize = 0
+    let ng: usize = list.len(i32, c.gnofs)
+    for g < ng {
+        let ghdr: usize = list.get(i32, c.ghdr, g) as usize
+        var same: bool = false
+        var j: usize = 0
+        for j < n {
+            if str_eq(cand_name(c, j), cand_group(c, g)) { same = true }
+            j = j + 1
+        }
+        if same {
+            fault_at(faults, fname, text, ghdr, "a group may not share its name with a job")
+            n_faults = n_faults + 1
+        }
+        let gid: i32 = group_key(c, g, cfg)
+        var members: String = string_new()
+        if key_is_set(cfg, gid) { value_of(cfg, gid, members) }
+        let mv: str = string_view(members)
+        let cnt: usize = list_item_count(mv)
+        if cnt == 0 {
+            // ASCII only: the faults are counted with `str.count_of`, which slices at byte
+            // offsets and asserts on a multi-byte character (an ellipsis cost an afternoon).
+            fault_at(faults, fname, text, ghdr, "a group needs `jobs = name, name, ...` with at least one job")
+            n_faults = n_faults + 1
+        }
+        var k: usize = 0
+        for k < cnt {
+            let item: str = list_item(mv, k)
+            var found: bool = false
+            var j2: usize = 0
+            for j2 < n {
+                if str_eq(cand_name(c, j2), item) { found = true }
+                j2 = j2 + 1
+            }
+            if found == false {
+                fault_at(faults, fname, text, ghdr, "a group names a job that is not configured")
+                n_faults = n_faults + 1
+            }
+            k = k + 1
+        }
+        string_free(members)
+        g = g + 1
+    }
     return n_faults
+}
+
+// Set, and not to the empty string.
+fn key_is_set(read cfg: config.Config, id: i32) -> bool {
+    if id < 0 { return false }
+    if config.is_set(cfg, id) == false { return false }
+    return config.value_is(cfg, id, "") == false
 }
 
 // Replace the live job table from the applied candidate. Scheduled jobs start their
@@ -826,6 +1175,17 @@ fn adopt(mut ag: Agent, read c: Cand) {
     list.truncate(i64, ag.timeouts, 0)
     list.truncate(i64, ag.intervals, 0)
     list.truncate(i64, ag.due, 0)
+    list.truncate(i64, ag.expects, 0)
+    string_free(ag.cwds)
+    ag.cwds = string_new()
+    list.truncate(i32, ag.cwofs, 0)
+    list.truncate(i32, ag.cwlen, 0)
+    string_free(ag.envs)
+    ag.envs = string_new()
+    list.truncate(i32, ag.enofs, 0)
+    list.truncate(i32, ag.enlen, 0)
+    list.truncate(i64, ag.retries, 0)
+    list.truncate(i64, ag.backoffs, 0)
     var i: usize = 0
     let n: usize = list.len(i32, c.nofs)
     for i < n {
@@ -834,20 +1194,82 @@ fn adopt(mut ag: Agent, read c: Cand) {
         list.push(i32, ag.nofs, v0.len as i32)
         list.push(i32, ag.nlen, nm.len as i32)
         string_push(ag.names, nm)
+        let kid: i32 = job_key(c, i, "kind", ag.cfg)
+        var kind: i32 = JOB_COMMAND
+        if config.value_is(ag.cfg, kid, "http-check") { kind = JOB_HTTP_CHECK }
+        // The command column holds the command, or the URL for an http-check.
         let v1: str = string_view(ag.cmds)
         let start: usize = v1.len
-        value_of(ag.cfg, job_key(c, i, "command", ag.cfg), ag.cmds)
+        if kind == JOB_HTTP_CHECK {
+            value_of(ag.cfg, job_key(c, i, "url", ag.cfg), ag.cmds)
+        } else {
+            value_of(ag.cfg, job_key(c, i, "command", ag.cfg), ag.cmds)
+        }
         let v2: str = string_view(ag.cmds)
         list.push(i32, ag.cofs, start as i32)
         list.push(i32, ag.clen, (v2.len - start) as i32)
-        list.push(i32, ag.kinds, JOB_COMMAND)
+        list.push(i32, ag.kinds, kind)
         list.push(i64, ag.timeouts, config.get_int(ag.cfg, job_key(c, i, "timeout_ms", ag.cfg)))
         let iv: i64 = config.get_int(ag.cfg, job_key(c, i, "interval_ms", ag.cfg))
         list.push(i64, ag.intervals, iv)
         list.push(i64, ag.due, t + iv * 1000000)
+        list.push(i64, ag.expects, config.get_int(ag.cfg, job_key(c, i, "expect_status", ag.cfg)))
+        let c0: str = string_view(ag.cwds)
+        let cstart: usize = c0.len
+        let cwid: i32 = job_key(c, i, "cwd", ag.cfg)
+        if key_is_set(ag.cfg, cwid) { value_of(ag.cfg, cwid, ag.cwds) }
+        let c1: str = string_view(ag.cwds)
+        list.push(i32, ag.cwofs, cstart as i32)
+        list.push(i32, ag.cwlen, (c1.len - cstart) as i32)
+        let e0: str = string_view(ag.envs)
+        let estart: usize = e0.len
+        let eid: i32 = job_key(c, i, "env", ag.cfg)
+        if key_is_set(ag.cfg, eid) { value_of(ag.cfg, eid, ag.envs) }
+        let e1: str = string_view(ag.envs)
+        list.push(i32, ag.enofs, estart as i32)
+        list.push(i32, ag.enlen, (e1.len - estart) as i32)
+        list.push(i64, ag.retries, config.get_int(ag.cfg, job_key(c, i, "retries", ag.cfg)))
+        list.push(i64, ag.backoffs, config.get_int(ag.cfg, job_key(c, i, "backoff_ms", ag.cfg)))
         i = i + 1
     }
+    // Groups: names, and each member resolved to its job index — the check guaranteed it.
+    string_free(ag.gnames)
+    ag.gnames = string_new()
+    list.truncate(i32, ag.gnofs, 0)
+    list.truncate(i32, ag.gnlen, 0)
+    list.truncate(i32, ag.gjobs, 0)
+    list.truncate(i32, ag.gofs, 0)
+    list.truncate(i32, ag.glen, 0)
+    var g: usize = 0
+    let ng: usize = list.len(i32, c.gnofs)
+    for g < ng {
+        let gm: str = cand_group(c, g)
+        let g0: str = string_view(ag.gnames)
+        list.push(i32, ag.gnofs, g0.len as i32)
+        list.push(i32, ag.gnlen, gm.len as i32)
+        string_push(ag.gnames, gm)
+        var members: String = string_new()
+        value_of(ag.cfg, group_key(c, g, ag.cfg), members)
+        let mv: str = string_view(members)
+        let cnt: usize = list_item_count(mv)
+        list.push(i32, ag.gofs, list.len(i32, ag.gjobs) as i32)
+        list.push(i32, ag.glen, cnt as i32)
+        var k: usize = 0
+        for k < cnt {
+            let item: str = list_item(mv, k)
+            var j: usize = 0
+            for j < n {
+                if str_eq(cand_name(c, j), item) { list.push(i32, ag.gjobs, j as i32) }
+                j = j + 1
+            }
+            k = k + 1
+        }
+        string_free(members)
+        g = g + 1
+    }
     metrics.set_gauge(ag.m, ag.m_jobs, n as i64)
+    ag.max_runs = config.get_int(ag.cfg, config.by_name(ag.cfg, "agent.history_max_runs"))
+    ag.compact_after = config.get_int(ag.cfg, config.by_name(ag.cfg, "agent.compact_after_dead_bytes"))
     string_free(ag.store_path)
     ag.store_path = string_new()
     value_of(ag.cfg, config.by_name(ag.cfg, "agent.store"), ag.store_path)
@@ -877,7 +1299,8 @@ pub fn load_text(mut ag: Agent, read fname: str, read text: str) -> i32 {
     string_push(ag.cfg_name, fname)
 
     var faults: String = string_new()
-    var c: Cand = Cand{ names: string_new(), nofs: list.make(i32, ag.a), nlen: list.make(i32, ag.a), hdr: list.make(i32, ag.a) }
+    var c: Cand = Cand{ names: string_new(), nofs: list.make(i32, ag.a), nlen: list.make(i32, ag.a), hdr: list.make(i32, ag.a),
+                        gnames: string_new(), gnofs: list.make(i32, ag.a), gnlen: list.make(i32, ag.a), ghdr: list.make(i32, ag.a) }
     scan_jobs(text, fname, c, faults, ag.a)
     var cfg: config.Config = config.make(ag.a)
     declare_all(cfg, c)
@@ -899,9 +1322,10 @@ pub fn load_text(mut ag: Agent, read fname: str, read text: str) -> i32 {
     if n_faults > 0 {
         config.free(cfg)
         string_free(c.names)
+        string_free(c.gnames)
         ag.rejections = ag.rejections + 1
-        note_load(ag, JA_REJECTED, n_faults)
-        return JA_REJECTED
+            note_load(ag, JA_REJECTED, n_faults)
+            return JA_REJECTED
     }
     config.free(ag.cfg)
     ag.cfg = cfg
@@ -1165,6 +1589,8 @@ fn persist(mut ag: Agent, read name: str, mut r: Run) {
     json.put_i64(w, sk, b, r.duration_ms)
     json.key(w, sk, b, "out_bytes")
     json.put_i64(w, sk, b, r.out_bytes)
+    json.key(w, sk, b, "attempts")
+    json.put_i64(w, sk, b, r.attempts as i64)
     json.key(w, sk, b, "output")
     json.put_str(w, sk, b, pv)
     json.key(w, sk, b, "error")
@@ -1245,6 +1671,7 @@ fn execute(mut ag: Agent, mut sp: sysproc.Spawner, mut blk: time.Clock, ji: usiz
     var r: Run = no_run()
     r.status = RUN_FAILURE
     r.started_at = ag.wall()
+    r.attempts = 1
     let t0: i64 = time.read_nanos(ag.clock)
     string_free(ag.preview)
     ag.preview = string_new()
@@ -1259,12 +1686,29 @@ fn execute(mut ag: Agent, mut sp: sysproc.Spawner, mut blk: time.Clock, ji: usiz
     }
     var cmd: String = string_new()
     string_push(cmd, job_command(ag, ji))
-    var ch: sysproc.Child = sysproc.start_piped_at(sp, string_view(cmd), "", "", true) catch sysproc.no_child()
+    // The working directory and the one extra variable are the process's at creation, which
+    // is the only time it can be given them (`sysproc`'s argument); "" inherits.
+    var cwd: String = string_new()
+    string_push(cwd, job_cwd(ag, ji))
+    var env1: String = string_new()
+    string_push(env1, job_env(ag, ji))
+    var ch: sysproc.Child = sysproc.start_piped_at(sp, string_view(cmd), string_view(cwd), string_view(env1), true) catch sysproc.no_child()
+    string_free(env1)
+    string_free(cwd)
     string_free(cmd)
     if sysproc.is_live(ch) == false {
         sandbox.release_group(g)
         if sysproc.can_start(sp) {
-            set_error(ag, "could not start the command")
+            if job_cwd(ag, ji).len > 0 {
+                var e0: String = string_new()
+                string_push(e0, "could not start the command (cwd `")
+                string_push(e0, job_cwd(ag, ji))
+                string_push(e0, "` may not exist)")
+                set_error(ag, string_view(e0))
+                string_free(e0)
+            } else {
+                set_error(ag, "could not start the command")
+            }
         } else {
             set_error(ag, "the spawner refused to start a process")
         }
@@ -1366,9 +1810,180 @@ fn execute(mut ag: Agent, mut sp: sysproc.Spawner, mut blk: time.Clock, ji: usiz
     return r
 }
 
+// ---- an http-check ----
+
+const JAGENT_HTTP_CAP: usize = 8192
+
+// Split `http://host[:port]/path` into its host and path; returns the port (80 when
+// absent), or -1 when the URL is not that shape.
+fn split_url(read url: str, mut host: String, mut path: String) -> i64 {
+    if str.has_prefix(url, "http://") == false { return 0 - 1 }
+    let rest: str = url[7 .. url.len]
+    var e: usize = 0
+    for e < rest.len {
+        if (rest[e] as i32) == 47 { break }
+        e = e + 1
+    }
+    let hp: str = rest[0 .. e]
+    if e < rest.len { string_push(path, rest[e .. rest.len]) } else { string_push(path, "/") }
+    let colon: isize = str.index_of(hp, ":")
+    var port: i64 = 80
+    if colon >= 0 {
+        string_push(host, hp[0 .. colon as usize])
+        let ps: str = hp[(colon as usize) + 1 .. hp.len]
+        if ps.len == 0 { return 0 - 1 }
+        port = 0
+        var i: usize = 0
+        for i < ps.len {
+            let d: i64 = (ps[i] as i64) - 48
+            if d < 0 or d > 9 { return 0 - 1 }
+            port = port * 10 + d
+            i = i + 1
+        }
+        if port < 1 or port > 65535 { return 0 - 1 }
+    } else {
+        string_push(host, hp)
+    }
+    let hv: str = string_view(host)
+    if hv.len == 0 { return 0 - 1 }
+    return port
+}
+
+// `localhost` or a dotted quad, as a host-order address; -1 for anything else. There is
+// no resolver in the tree, and an edge agent's checks are of things it can name by
+// address — stated in the docs rather than answered with a hang.
+fn ipv4_of(read host: str) -> i64 {
+    if str_eq(host, "localhost") { return 2130706433 }
+    var parts: i64 = 0
+    var acc: i64 = 0
+    var v: i64 = 0
+    var digits: usize = 0
+    var i: usize = 0
+    for i < host.len {
+        let b: i64 = host[i] as i64
+        if b == 46 {
+            if digits == 0 or acc > 255 { return 0 - 1 }
+            v = v * 256 + acc
+            parts = parts + 1
+            acc = 0
+            digits = 0
+        } else {
+            if b < 48 or b > 57 { return 0 - 1 }
+            acc = acc * 10 + (b - 48)
+            digits = digits + 1
+        }
+        i = i + 1
+    }
+    if digits == 0 or acc > 255 or parts != 3 { return 0 - 1 }
+    return v * 256 + acc
+}
+
+// One GET through `std/httpc`: success when the status is `expect_status`, failure with
+// the status when it is not, timeout when nothing came back within `timeout_ms` (the
+// socket's receive and send are bounded by it), failure with the reason when the request
+// could not be made. The preview is `status=N expected=M`; there is no process, so the
+// tree is vacuously reaped.
+fn execute_http(mut ag: Agent, mut blk: time.Clock, ji: usize) -> Run {
+    var r: Run = no_run()
+    r.status = RUN_FAILURE
+    r.started_at = ag.wall()
+    r.attempts = 1
+    r.tree_reaped = true
+    let t0: i64 = time.read_nanos(ag.clock)
+    string_free(ag.preview)
+    ag.preview = string_new()
+    set_error(ag, "")
+    var host: String = string_new()
+    var path: String = string_new()
+    let port: i64 = split_url(job_url(ag, ji), host, path)
+    var ip: i64 = 0 - 1
+    if port > 0 { ip = ipv4_of(string_view(host)) }
+    if port <= 0 or ip < 0 {
+        r.status = RUN_CONFIG_ERROR
+        set_error(ag, "url must be http://<ipv4-or-localhost>[:port]/path")
+        string_free(path)
+        string_free(host)
+        r.duration_ms = (time.read_nanos(ag.clock) - t0) / 1000000
+        return r
+    }
+    let timeout_ms: i64 = job_timeout_ms(ag, ji)
+    var net: sysnet.Net = sysnet.host()
+    var cl: httpc.Client = httpc.dial(net, sysnet.addr(ip as u32, port as u16), JAGENT_HTTP_CAP)
+    if httpc.is_open(cl) == false {
+        var e: String = string_new()
+        string_push(e, "could not connect to ")
+        string_push(e, string_view(host))
+        string_push(e, ":")
+        push_i64(e, port)
+        set_error(ag, string_view(e))
+        string_free(e)
+    } else {
+        let sock: sysnet.Socket = sysnet.adopt(httpc.fd(cl))
+        sysnet.set_io_timeout(sock, timeout_ms)
+        // The wait is real whatever the agent's clock says, so it is measured on the
+        // caller's — the same two clocks a command job keeps apart.
+        let tb0: i64 = time.read_nanos(blk)
+        httpc.request(cl, "GET", string_view(path), "", "")
+        let o: i32 = httpc.read_response(cl)
+        let spent_ms: i64 = (time.read_nanos(blk) - tb0) / 1000000
+        if o == http.HTTP_OK {
+            let st: i64 = httpc.status(cl) as i64
+            let want: i64 = job_expect_status(ag, ji)
+            string_push(ag.preview, "status=")
+            push_i64(ag.preview, st)
+            string_push(ag.preview, " expected=")
+            push_i64(ag.preview, want)
+            let pv: str = string_view(ag.preview)
+            r.out_bytes = pv.len as i64
+            r.code = st as i32
+            if st == want {
+                r.status = RUN_SUCCESS
+            } else {
+                var e2: String = string_new()
+                string_push(e2, "unexpected status ")
+                push_i64(e2, st)
+                set_error(ag, string_view(e2))
+                string_free(e2)
+            }
+        } else {
+            if spent_ms >= timeout_ms {
+                r.status = RUN_TIMEOUT
+                var e3: String = string_new()
+                string_push(e3, "timed out after ")
+                push_i64(e3, timeout_ms)
+                string_push(e3, " ms")
+                set_error(ag, string_view(e3))
+                string_free(e3)
+            } else {
+                var e4: String = string_new()
+                string_push(e4, "no response (")
+                string_push(e4, http.outcome_name(o))
+                string_push(e4, ")")
+                set_error(ag, string_view(e4))
+                string_free(e4)
+            }
+        }
+        httpc.hangup(cl)
+    }
+    sysnet.shutdown(net)
+    string_free(path)
+    string_free(host)
+    r.duration_ms = (time.read_nanos(ag.clock) - t0) / 1000000
+    return r
+}
+
+// One attempt of job `ji`, by its kind.
+fn attempt(mut ag: Agent, mut sp: sysproc.Spawner, mut blk: time.Clock, ji: usize) -> Run {
+    if job_kind(ag, ji) == JOB_HTTP_CHECK { return execute_http(ag, blk, ji) }
+    return execute(ag, sp, blk, ji)
+}
+
 // Run the job called `name` now, and record it. Every recorded status counts as one unit
 // of the service's work, accepted before and completed after — which is what makes a
-// draining agent refuse a run rather than take one it will not finish.
+// draining agent refuse a run rather than take one it will not finish. A job with
+// `retries` is attempted again after `backoff_ms` on the caller's clock until it succeeds
+// or the attempts are spent; ONE record is written, carrying the attempts, the last
+// attempt's status and output, the first attempt's start and the whole duration.
 pub fn run_job(mut ag: Agent, mut sp: sysproc.Spawner, mut blk: time.Clock, read name: str) -> Run {
     var r: Run = no_run()
     let ji: i32 = find_job(ag, name)
@@ -1386,14 +2001,40 @@ pub fn run_job(mut ag: Agent, mut sp: sysproc.Spawner, mut blk: time.Clock, read
         ag.last_status = r.status
         return r
     }
-    if job_kind(ag, ji as usize) != JOB_COMMAND {
+    let kind: i32 = job_kind(ag, ji as usize)
+    if kind != JOB_COMMAND and kind != JOB_HTTP_CHECK {
         r.status = RUN_CONFIG_ERROR
         r.started_at = ag.wall()
+        r.attempts = 1
         set_error(ag, "unknown job kind")
         string_free(ag.preview)
         ag.preview = string_new()
     } else {
-        r = execute(ag, sp, blk, ji as usize)
+        let t_first: i64 = time.read_nanos(ag.clock)
+        let max_attempts: i64 = 1 + job_retries(ag, ji as usize)
+        var attempts: i64 = 0
+        var started_at: i64 = 0
+        var done: bool = false
+        for done == false {
+            attempts = attempts + 1
+            r = attempt(ag, sp, blk, ji as usize)
+            if attempts == 1 { started_at = r.started_at }
+            if r.status == RUN_SUCCESS or attempts >= max_attempts {
+                done = true
+            } else {
+                metrics.inc(ag.m, ag.m_retries, 1)
+                // The backoff, in slices, on the clock the caller spends.
+                var left: i64 = job_backoff_ms(ag, ji as usize) * 1000000
+                for left > 0 {
+                    var sl: i64 = 50000000
+                    if sl > left { sl = left }
+                    left = left - time.wait(blk, sl)
+                }
+            }
+        }
+        r.attempts = attempts as i32
+        r.started_at = started_at
+        r.duration_ms = (time.read_nanos(ag.clock) - t_first) / 1000000
     }
     metrics.inc(ag.m, ag.m_runs, 1)
     count_status(ag, r.status)
@@ -1444,6 +2085,7 @@ pub fn runs_total(read ag: Agent) -> i64 { return metrics.current(ag.m, ag.m_run
 pub fn runs_unrecorded(read ag: Agent) -> i64 { return metrics.current(ag.m, ag.m_unrecorded) }
 pub fn http_requests(read ag: Agent) -> i64 { return metrics.current(ag.m, ag.m_http) }
 pub fn http_unauthorized(read ag: Agent) -> i64 { return metrics.current(ag.m, ag.m_unauth) }
+pub fn retries_total(read ag: Agent) -> i64 { return metrics.current(ag.m, ag.m_retries) }
 
 // ---- rendering ---------------------------------------------------------------------------------
 
@@ -1500,6 +2142,15 @@ fn render_record(read ag: Agent, read v: str, mut dst: String) -> bool {
     if ob >= 0 {
         string_push(dst, " out_bytes=")
         push_i64(dst, json.as_i64(d, ob as usize))
+    }
+    // Attempts appear when there was more than one: a single attempt is the common case
+    // and the line stays as it always was.
+    let atn: isize = json.get(d, root, "attempts")
+    if atn >= 0 {
+        if json.as_i64(d, atn as usize) > 1 {
+            string_push(dst, " attempts=")
+            push_i64(dst, json.as_i64(d, atn as usize))
+        }
     }
     string_push(dst, " output=")
     push_quoted(dst, json.as_str(d, outn as usize))
@@ -1615,15 +2266,217 @@ pub fn render_job(mut ag: Agent, read name: str, mut dst: String) -> bool {
     string_push(dst, name)
     string_push(dst, "\nkind=")
     string_push(dst, kind_name(job_kind(ag, i)))
-    string_push(dst, "\ncommand=")
-    push_quoted(dst, job_command(ag, i))
+    if job_kind(ag, i) == JOB_HTTP_CHECK {
+        string_push(dst, "\nurl=")
+        push_quoted(dst, job_url(ag, i))
+        string_push(dst, "\nexpect_status=")
+        push_i64(dst, job_expect_status(ag, i))
+    } else {
+        string_push(dst, "\ncommand=")
+        push_quoted(dst, job_command(ag, i))
+        if job_cwd(ag, i).len > 0 {
+            string_push(dst, "\ncwd=")
+            push_quoted(dst, job_cwd(ag, i))
+        }
+        if job_env(ag, i).len > 0 {
+            string_push(dst, "\nenv=")
+            push_quoted(dst, job_env(ag, i))
+        }
+    }
     string_push(dst, "\ntimeout_ms=")
     push_i64(dst, job_timeout_ms(ag, i))
     string_push(dst, "\ninterval_ms=")
     push_i64(dst, job_interval_ms(ag, i))
+    if job_retries(ag, i) > 0 {
+        string_push(dst, "\nretries=")
+        push_i64(dst, job_retries(ag, i))
+        string_push(dst, "\nbackoff_ms=")
+        push_i64(dst, job_backoff_ms(ag, i))
+    }
     string_push(dst, "\nlast=")
     render_last(ag, name, dst)
     return true
+}
+
+// Every group: `name jobs=a, b, c`, one line each, in file order.
+pub fn render_groups(read ag: Agent, mut dst: String) {
+    var g: usize = 0
+    let n: usize = group_count(ag)
+    for g < n {
+        string_push(dst, group_name(ag, g))
+        string_push(dst, " jobs=")
+        var k: usize = 0
+        let sz: usize = group_size(ag, g)
+        for k < sz {
+            if k > 0 { string_push(dst, ", ") }
+            string_push(dst, job_name(ag, group_job(ag, g, k)))
+            k = k + 1
+        }
+        string_push(dst, "\n")
+        g = g + 1
+    }
+}
+
+// Run every member of group `name`, in file order, each recorded as its own run — there is
+// no group record, because a group is a way of asking, not a thing that ran. The summary
+// goes to `dst`: `group=NAME jobs=N success=S failure=F`, then one indented run line per
+// member. Returns the failures, or -1 for a group that does not exist.
+pub fn run_group(mut ag: Agent, mut sp: sysproc.Spawner, mut blk: time.Clock, read name: str, mut dst: String) -> i64 {
+    let gi: i32 = find_group(ag, name)
+    if gi < 0 { return 0 - 1 }
+    let g: usize = gi as usize
+    var lines: String = string_new()
+    var fine: i64 = 0
+    var bad: i64 = 0
+    var k: usize = 0
+    let sz: usize = group_size(ag, g)
+    for k < sz {
+        var nm: String = string_new()
+        string_push(nm, job_name(ag, group_job(ag, g, k)))
+        let r: Run = run_job(ag, sp, blk, string_view(nm))
+        if r.status == RUN_SUCCESS { fine = fine + 1 } else { bad = bad + 1 }
+        string_push(lines, "  ")
+        render_run(ag, string_view(nm), r, lines)
+        string_free(nm)
+        k = k + 1
+    }
+    string_push(dst, "group=")
+    string_push(dst, name)
+    string_push(dst, " jobs=")
+    push_i64(dst, sz as i64)
+    string_push(dst, " success=")
+    push_i64(dst, fine)
+    string_push(dst, " failure=")
+    push_i64(dst, bad)
+    string_push(dst, "\n")
+    string_push(dst, string_view(lines))
+    string_free(lines)
+    return bad
+}
+
+// ---- retention ----
+
+// What `maintain` did.
+@copy pub struct Maint {
+    pub pruned: i64,       // run records deleted
+    pub compacted: bool,
+    pub reclaimed: i64,    // dead bytes the compaction reclaimed
+}
+
+@no_alloc @no_os pub fn no_maint() -> Maint {
+    return Maint{ pruned: 0, compacted: false, reclaimed: 0 }
+}
+
+// Is `key` (a `run:<seq>` key) some job's latest run? Those are kept whatever the bound,
+// so a `last:` pointer never dangles and `status` never says "missing record".
+fn is_latest_of_any(read ag: Agent, read key: str) -> bool {
+    var i: usize = 0
+    let n: usize = job_count(ag)
+    for i < n {
+        var lk: String = string_new()
+        string_push(lk, KEY_LAST)
+        string_push(lk, job_name(ag, i))
+        var hit: bool = false
+        if kv.has(ag.store, string_view(lk)) {
+            var rk: String = string_new()
+            string_push(rk, KEY_RUN)
+            string_push(rk, kv.get(ag.store, string_view(lk)))
+            hit = str_eq(string_view(rk), key)
+            string_free(rk)
+        }
+        string_free(lk)
+        if hit { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// How many run records are live.
+pub fn history_runs(read ag: Agent) -> i64 {
+    if kv.is_open(ag.store) == false { return 0 }
+    var n: i64 = 0
+    var i: usize = 0
+    let total: usize = kv.slots(ag.store)
+    for i < total {
+        if kv.slot_live(ag.store, i) {
+            if str.has_prefix(kv.slot_key(ag.store, i), KEY_RUN) { n = n + 1 }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+pub fn history_dead_bytes(read ag: Agent) -> i64 {
+    if kv.is_open(ag.store) == false { return 0 }
+    return kv.dead_bytes(ag.store)
+}
+
+pub fn history_live_bytes(read ag: Agent) -> i64 {
+    if kv.is_open(ag.store) == false { return 0 }
+    return kv.live_bytes(ag.store)
+}
+
+// Apply the retention policy: delete the OLDEST run records beyond `history_max_runs` that
+// are not any job's latest (one batch, synced), then compact when the dead bytes have
+// reached `compact_after_dead_bytes`. Sequence numbers are never reused — `seq` is a
+// counter, not a count — so `logs` and `last:` stay exact. Nothing to do answers zeros.
+pub fn maintain(mut ag: Agent, mut f: fs.Fs) -> Maint {
+    var m: Maint = no_maint()
+    if kv.is_open(ag.store) == false { return m }
+    if ag.max_runs > 0 {
+        var excess: i64 = history_runs(ag) - ag.max_runs
+        if excess > 0 {
+            var bt: kv.Batch = kv.batch()
+            var n_del: i64 = 0
+            var i: usize = 0
+            let total: usize = kv.slots(ag.store)
+            for i < total and excess > 0 {
+                if kv.slot_live(ag.store, i) {
+                    let k: str = kv.slot_key(ag.store, i)
+                    if str.has_prefix(k, KEY_RUN) {
+                        if is_latest_of_any(ag, k) == false {
+                            kv.batch_del(bt, k)
+                            n_del = n_del + 1
+                            excess = excess - 1
+                        }
+                    }
+                }
+                i = i + 1
+            }
+            if n_del > 0 {
+                var wrote: bool = true
+                kv.commit(ag.store, bt) catch { wrote = false }
+                if wrote { kv.sync(ag.store) catch nothing() }
+                if wrote {
+                    m.pruned = n_del
+                    metrics.inc(ag.m, ag.m_pruned, n_del)
+                }
+            }
+        }
+    }
+    if ag.compact_after > 0 {
+        if kv.dead_bytes(ag.store) >= ag.compact_after {
+            let before: i64 = kv.dead_bytes(ag.store)
+            let n: i64 = kv.compact(f, ag.a, ag.store) catch 0 - 1
+            if n >= 0 {
+                m.compacted = true
+                m.reclaimed = before
+                metrics.inc(ag.m, ag.m_compactions, 1)
+            }
+        }
+    }
+    return m
+}
+
+// Compact now, whatever the threshold — `jagent compact`. Returns the dead bytes reclaimed,
+// or -1 when the store is closed or the compaction failed.
+pub fn compact_now(mut ag: Agent, mut f: fs.Fs) -> i64 {
+    if kv.is_open(ag.store) == false { return 0 - 1 }
+    let before: i64 = kv.dead_bytes(ag.store)
+    let n: i64 = kv.compact(f, ag.a, ag.store) catch 0 - 1
+    if n < 0 { return 0 - 1 }
+    metrics.inc(ag.m, ag.m_compactions, 1)
+    return before
 }
 
 // What `jagent status` prints: the configuration, the store, every job with its last run.
@@ -1691,6 +2544,10 @@ pub fn render_run(mut ag: Agent, read name: str, read r: Run, mut dst: String) {
     push_i64(dst, r.duration_ms)
     string_push(dst, " out_bytes=")
     push_i64(dst, r.out_bytes)
+    if r.attempts > 1 {
+        string_push(dst, " attempts=")
+        push_i64(dst, r.attempts as i64)
+    }
     string_push(dst, " output=")
     push_quoted(dst, str.trim_end(string_view(ag.preview)))
     let ev: str = string_view(ag.why)

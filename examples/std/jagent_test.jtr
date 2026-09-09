@@ -1170,3 +1170,450 @@ fn push_num(mut s: String, v: i64) {
     if d == 8 { string_push(s, "8") }
     if d == 9 { string_push(s, "9") }
 }
+
+// ---- http-check -----------------------------------------------------------------------------
+
+fn h_ok(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    httpd.respond(x, 200, "text/plain", "ok\n")
+    return 0
+}
+
+fn h_teapot(ctx: *mut u8, mut x: httpd.Exchange) -> i32 {
+    httpd.respond(x, 418, "text/plain", "short and stout\n")
+    return 0
+}
+
+// A probe target on its own thread: `/ok` is 200, `/teapot` is 418. Serves until `answers`
+// requests are answered or ten seconds pass; returns how many it answered.
+fn probe_server(port: i64, answers: i64) -> i64 {
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var sv: httpd.Server = httpd.make(a, time.host(), quiet_logger(), false, 4, 8192)
+    httpd.route(sv, "GET", "/ok", httpd.handler(null, &h_ok))
+    httpd.route(sv, "GET", "/teapot", httpd.handler(null, &h_teapot))
+    if httpd.start(sv, net, sysnet.loopback(port as u16), 4) == false {
+        httpd.free(sv)
+        sysnet.shutdown(net)
+        return 0 - 1
+    }
+    var clk: time.Clock = time.host()
+    let t0: i64 = time.read_nanos(clk)
+    for httpd.served(sv) < answers and time.read_nanos(clk) - t0 < 10000000000 {
+        httpd.serve_for(sv, net, 50)
+    }
+    let n: i64 = httpd.served(sv)
+    httpd.stop(sv, net)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    return n
+}
+
+// A listener that accepts one connection and never answers it, for `ms`.
+fn stall_server(port: i64, ms: i64) -> i64 {
+    var net: sysnet.Net = sysnet.host()
+    var lis: sysnet.Socket = sysnet.listen_on(net, sysnet.loopback(port as u16), 4) catch sysnet.closed()
+    if sysnet.is_open(lis) == false { return 0 - 1 }
+    var conn: sysnet.Socket = sysnet.accept_one(net, lis) catch sysnet.closed()
+    var clk: time.Clock = time.host()
+    time.wait(clk, ms * 1000000)
+    sysnet.close_socket(conn) catch nothing()
+    sysnet.close_socket(lis) catch nothing()
+    sysnet.shutdown(net)
+    return 1
+}
+
+// A free loopback port: bound, read, released.
+fn free_port(mut net: sysnet.Net) -> i64 {
+    var l: sysnet.Socket = sysnet.listen_on(net, sysnet.loopback(0), 1) catch sysnet.closed()
+    let bound: sysnet.SocketAddr = sysnet.local_addr(l) catch sysnet.addr(0, 0)
+    sysnet.close_socket(l) catch nothing()
+    return bound.port as i64
+}
+
+// Wait until something answers `port`, or give up after five seconds.
+fn wait_listening(mut net: sysnet.Net, port: i64) -> bool {
+    var clk: time.Clock = time.host()
+    let t0: i64 = time.read_nanos(clk)
+    for time.read_nanos(clk) - t0 < 5000000000 {
+        var s: sysnet.Socket = sysnet.connect_to(net, sysnet.loopback(port as u16)) catch sysnet.closed()
+        if sysnet.is_open(s) {
+            sysnet.close_socket(s) catch nothing()
+            return true
+        }
+        time.wait(clk, 20000000)
+    }
+    return false
+}
+
+fn http_cfg(port: i64, mut dst: String) {
+    string_push(dst, "[agent]\nstore = zz_jagent/history.db\n[job.site]\nkind = http-check\nurl = http://127.0.0.1:")
+    push_num(dst, port)
+    string_push(dst, "/ok\nexpect_status = 200\ntimeout_ms = 5000\n[job.teapot]\nkind = http-check\nurl = http://localhost:")
+    push_num(dst, port)
+    string_push(dst, "/teapot\ntimeout_ms = 5000\n[job.strict]\nkind = http-check\nurl = http://127.0.0.1:")
+    push_num(dst, port)
+    string_push(dst, "/teapot\nexpect_status = 418\ntimeout_ms = 5000\n[job.down]\nkind = http-check\nurl = http://127.0.0.1:1/ok\ntimeout_ms = 2000\n")
+}
+
+@test fn an_http_check_records_the_status_against_its_expectation() -> bool {
+    var raw: *mut u8 = alloc(u8, JT_CAP)
+    var rep: []u8 = slice(u8, raw, JT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    var net: sysnet.Net = sysnet.host()
+    let port: i64 = free_port(net)
+    var cfg: String = string_new()
+    http_cfg(port, cfg)
+    var ag: jagent.Agent = agent_with(a, string_view(cfg))
+    string_free(cfg)
+    test.eq_usize(c, rep, "four checks configured", jagent.job_count(ag), 4)
+    test.eq_i64(c, rep, "of the http kind", jagent.job_kind(ag, 0) as i64, jagent.JOB_HTTP_CHECK as i64)
+    test.is_true(c, rep, "with the url in the command column", contains(jagent.job_url(ag, 0), "/ok"))
+    test.eq_i64(c, rep, "the default expectation", jagent.job_expect_status(ag, 1), 200)
+    jagent.set_wall(ag, &fixed_wall)
+    jagent.open_store(ag, h)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+
+    var served: i64 = 0
+    var r1: jagent.Run = jagent.no_run()
+    var r2: jagent.Run = jagent.no_run()
+    var r3: jagent.Run = jagent.no_run()
+    var p1: String = string_new()
+    var p2: String = string_new()
+    var e2: String = string_new()
+    concurrent {
+        let hs = spawn probe_server(port, 3)
+        test.is_true(c, rep, "the probe target came up", wait_listening(net, port))
+        r1 = jagent.run_job(ag, sp, blk, "site")
+        string_push(p1, jagent.last_output(ag))
+        r2 = jagent.run_job(ag, sp, blk, "teapot")
+        string_push(p2, jagent.last_output(ag))
+        string_push(e2, jagent.last_error(ag))
+        r3 = jagent.run_job(ag, sp, blk, "strict")
+        served = await hs
+    }
+    test.eq_i64(c, rep, "the target answered three times", served, 3)
+    test.eq_i64(c, rep, "200 against 200 is success", r1.status as i64, jagent.RUN_SUCCESS as i64)
+    test.eq_i64(c, rep, "the status is the code", r1.code as i64, 200)
+    test.eq_i64(c, rep, "recorded as #1", r1.seq, 1)
+    test.is_true(c, rep, "nothing to reap, vacuously reaped", r1.tree_reaped)
+    test.eq_str(c, rep, "the preview says what was compared", string_view(p1), "status=200 expected=200")
+    test.eq_i64(c, rep, "418 against 200 is failure", r2.status as i64, jagent.RUN_FAILURE as i64)
+    test.eq_i64(c, rep, "with the status as its code", r2.code as i64, 418)
+    test.eq_str(c, rep, "and the reason", string_view(e2), "unexpected status 418")
+    test.eq_str(c, rep, "the preview still says both", string_view(p2), "status=418 expected=200")
+    string_free(e2)
+    string_free(p2)
+    string_free(p1)
+    test.eq_i64(c, rep, "418 against 418 is success — the expectation is what decides", r3.status as i64, jagent.RUN_SUCCESS as i64)
+    test.eq_i64(c, rep, "three records", jagent.last_seq(ag), 3)
+    test.eq_i64(c, rep, "no process was started", sysproc.started(sp), 0)
+    var s: String = string_new()
+    jagent.render_logs(ag, "teapot", 20, s)
+    test.is_true(c, rep, "the log line carries the check", str.has_prefix(string_view(s), "#2 job=teapot status=failure code=418 started_at=1700000000"))
+    test.is_true(c, rep, "with its preview and error", contains(string_view(s), "output=\"status=418 expected=200\" error=\"unexpected status 418\""))
+    string_free(s)
+
+    // Nobody listens on port 1: a failure that names the address, not a hang.
+    let r4: jagent.Run = jagent.run_job(ag, sp, blk, "down")
+    test.eq_i64(c, rep, "an unreachable target is a failure", r4.status as i64, jagent.RUN_FAILURE as i64)
+    test.eq_str(c, rep, "naming it", jagent.last_error(ag), "could not connect to 127.0.0.1:1")
+
+    // A target that accepts and never answers: the timeout, on the socket.
+    let port2: i64 = free_port(net)
+    var cfg2: String = string_new()
+    string_push(cfg2, "[agent]\nstore = zz_jagent/history.db\n[job.slow]\nkind = http-check\nurl = http://127.0.0.1:")
+    push_num(cfg2, port2)
+    string_push(cfg2, "/\ntimeout_ms = 300\n")
+    jagent.load_text(ag, JT_CFG, string_view(cfg2))
+    string_free(cfg2)
+    var r5: jagent.Run = jagent.no_run()
+    var stalled: i64 = 0
+    let t0: i64 = time.read_nanos(blk)
+    concurrent {
+        let hs2 = spawn stall_server(port2, 1500)
+        wait_listening(net, port2)
+        r5 = jagent.run_job(ag, sp, blk, "slow")
+        stalled = await hs2
+    }
+    let spent: i64 = (time.read_nanos(blk) - t0) / 1000000
+    test.eq_i64(c, rep, "the stalling target ran", stalled, 1)
+    test.eq_i64(c, rep, "a target that never answers is a timeout", r5.status as i64, jagent.RUN_TIMEOUT as i64)
+    test.eq_str(c, rep, "after its budget", jagent.last_error(ag), "timed out after 300 ms")
+    test.is_true(c, rep, "and the run did not wait for the target", spent < 3000)
+
+    // The schema: no url, a non-http url, an expectation off the table.
+    var ag2: jagent.Agent = jagent.make(a, time.manual(0), quiet_logger())
+    test.eq_i64(c, rep, "an http-check without a url is rejected", jagent.load_text(ag2, "a.ini", "[job.x]\nkind = http-check\n") as i64, jagent.JA_REJECTED as i64)
+    test.is_true(c, rep, "with the reason", contains(jagent.faults(ag2), "needs a `url` starting with `http://`"))
+    test.eq_i64(c, rep, "an https url is rejected (honestly: not checked)", jagent.load_text(ag2, "a.ini", "[job.x]\nkind = http-check\nurl = https://127.0.0.1/\n") as i64, jagent.JA_REJECTED as i64)
+    test.eq_i64(c, rep, "an expectation off the table is rejected", jagent.load_text(ag2, "a.ini", "[job.x]\nkind = http-check\nurl = http://127.0.0.1/\nexpect_status = 700\n") as i64, jagent.JA_REJECTED as i64)
+    test.is_true(c, rep, "naming the range", contains(jagent.faults(ag2), "100..599"))
+    test.eq_i64(c, rep, "a command job is untouched by the new keys", jagent.load_text(ag2, "a.ini", "[job.x]\ncommand = echo x\n") as i64, jagent.JA_LOADED as i64)
+    jagent.free(ag2)
+
+    jagent.free(ag)
+    sysnet.shutdown(net)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- cwd, env, retries, groups, retention -----------------------------------------------------
+
+@test fn a_command_runs_in_its_cwd_with_its_env() -> bool {
+    var raw: *mut u8 = alloc(u8, JT_CAP)
+    var rep: []u8 = slice(u8, raw, JT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    let made: bool = sysfs.make_dir(h, a, "zz_jagent/sub") catch false
+    fs.put(h, "zz_jagent/sub/marker.txt", "marker-here")
+    // `type` is cmd.exe's, `cat` is sh's; whichever the shell has prints the file. The
+    // variable is spelled both ways, so each shell expands its own and leaves the other.
+    let text: str = "[agent]\nstore = zz_jagent/history.db\n[job.here]\ncommand = type marker.txt || cat marker.txt\ncwd = zz_jagent/sub\n[job.there]\ncommand = type marker.txt || cat marker.txt\n[job.mode]\ncommand = echo %JAGENT_MODE%$JAGENT_MODE\nenv = JAGENT_MODE=prod\n[job.nomode]\ncommand = echo %JAGENT_MODE%$JAGENT_MODE\n[job.nowhere]\ncommand = echo x\ncwd = zz_jagent/absent\n"
+    var ag: jagent.Agent = agent_with(a, text)
+    test.eq_str(c, rep, "the cwd is read", jagent.job_cwd(ag, 0), "zz_jagent/sub")
+    test.eq_str(c, rep, "and empty when unset", jagent.job_cwd(ag, 1), "")
+    test.eq_str(c, rep, "the env is read", jagent.job_env(ag, 2), "JAGENT_MODE=prod")
+    jagent.open_store(ag, h)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+
+    let r1: jagent.Run = jagent.run_job(ag, sp, blk, "here")
+    test.eq_i64(c, rep, "in its cwd the file is found", r1.status as i64, jagent.RUN_SUCCESS as i64)
+    test.is_true(c, rep, "and printed", contains(jagent.last_output(ag), "marker-here"))
+    let r2: jagent.Run = jagent.run_job(ag, sp, blk, "there")
+    test.eq_i64(c, rep, "without the cwd the same command fails — the control", r2.status as i64, jagent.RUN_FAILURE as i64)
+    test.is_false(c, rep, "and prints no marker", contains(jagent.last_output(ag), "marker-here"))
+
+    let r3: jagent.Run = jagent.run_job(ag, sp, blk, "mode")
+    test.eq_i64(c, rep, "the variable reaches the child", r3.status as i64, jagent.RUN_SUCCESS as i64)
+    test.is_true(c, rep, "expanded", contains(jagent.last_output(ag), "prod"))
+    let r4: jagent.Run = jagent.run_job(ag, sp, blk, "nomode")
+    test.eq_i64(c, rep, "without it the echo still runs", r4.status as i64, jagent.RUN_SUCCESS as i64)
+    test.is_false(c, rep, "but nothing expands to prod — the control", contains(jagent.last_output(ag), "prod"))
+
+    let r5: jagent.Run = jagent.run_job(ag, sp, blk, "nowhere")
+    test.is_true(c, rep, "a cwd that does not exist fails the run", r5.status as i64 != jagent.RUN_SUCCESS as i64)
+    test.is_true(c, rep, "and says which", contains(jagent.last_error(ag), "zz_jagent/absent") or contains(jagent.last_error(ag), "exit code"))
+
+    var s: String = string_new()
+    jagent.render_job(ag, "here", s)
+    test.is_true(c, rep, "the job's page shows its cwd", contains(string_view(s), "\ncwd=\"zz_jagent/sub\"\n"))
+    string_free(s)
+    s = string_new()
+    jagent.render_job(ag, "mode", s)
+    test.is_true(c, rep, "and its env", contains(string_view(s), "\nenv=\"JAGENT_MODE=prod\"\n"))
+    string_free(s)
+    test.eq_i64(c, rep, "an env without `=` is refused", jagent.load_text(ag, JT_CFG, "[job.x]\ncommand = echo x\nenv = JAGENT_MODE\n") as i64, jagent.JA_REJECTED as i64)
+
+    jagent.free(ag)
+    fs.erase(h, "zz_jagent/sub/marker.txt")
+    let gone: bool = sysfs.remove_dir(h, a, "zz_jagent/sub") catch false
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn retries_make_one_record_carrying_the_attempts() -> bool {
+    var raw: *mut u8 = alloc(u8, JT_CAP)
+    var rep: []u8 = slice(u8, raw, JT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    let gone0: bool = sysfs.remove_dir(h, a, "zz_jagent_once") catch false
+    // `mkdir` fails in both shells when the directory exists: the first attempt makes it
+    // and exits 3, the second finds it there and echoes. Success after a retry, by design.
+    let text: str = "[agent]\nstore = zz_jagent/history.db\n[job.second-time]\ncommand = (mkdir zz_jagent_once && exit 3) || echo again\nretries = 2\nbackoff_ms = 100\n[job.first-time]\ncommand = (mkdir zz_jagent_once && exit 3) || echo again\n[job.never]\ncommand = exit 4\nretries = 2\nbackoff_ms = 50\n"
+    var ag: jagent.Agent = agent_with(a, text)
+    test.eq_i64(c, rep, "retries are read", jagent.job_retries(ag, 0), 2)
+    test.eq_i64(c, rep, "and the backoff", jagent.job_backoff_ms(ag, 0), 100)
+    test.eq_i64(c, rep, "zero when unset", jagent.job_retries(ag, 1), 0)
+    jagent.open_store(ag, h)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+
+    let t0: i64 = time.read_nanos(blk)
+    let r1: jagent.Run = jagent.run_job(ag, sp, blk, "second-time")
+    let spent: i64 = (time.read_nanos(blk) - t0) / 1000000
+    test.eq_i64(c, rep, "success after a retry", r1.status as i64, jagent.RUN_SUCCESS as i64)
+    test.eq_i64(c, rep, "two attempts", r1.attempts as i64, 2)
+    test.eq_i64(c, rep, "two children", sysproc.started(sp), 2)
+    test.is_true(c, rep, "the backoff was waited", spent >= 100)
+    test.eq_i64(c, rep, "ONE record", jagent.last_seq(ag), 1)
+    var s: String = string_new()
+    jagent.render_run(ag, "second-time", r1, s)
+    // (The second attempt's output starts with mkdir's own complaint, then `again`.)
+    test.is_true(c, rep, "the summary carries the attempts", contains(string_view(s), " attempts=2 output=\""))
+    test.is_true(c, rep, "and the second attempt's output", contains(string_view(s), "again"))
+    string_free(s)
+    s = string_new()
+    jagent.render_logs(ag, "second-time", 20, s)
+    test.eq_usize(c, rep, "one log line", test.line_count(string_view(s)), 1)
+    test.is_true(c, rep, "with the attempts in the record", contains(string_view(s), " attempts=2 "))
+    string_free(s)
+
+    // The control: the same command with no retries fails on its first attempt.
+    let gone1: bool = sysfs.remove_dir(h, a, "zz_jagent_once") catch false
+    let r2: jagent.Run = jagent.run_job(ag, sp, blk, "first-time")
+    test.eq_i64(c, rep, "without retries the first attempt is the run", r2.status as i64, jagent.RUN_FAILURE as i64)
+    test.eq_i64(c, rep, "exit 3", r2.code as i64, 3)
+    test.eq_i64(c, rep, "one attempt", r2.attempts as i64, 1)
+    s = string_new()
+    jagent.render_run(ag, "first-time", r2, s)
+    test.is_false(c, rep, "and a single attempt is not spelled", contains(string_view(s), "attempts="))
+    string_free(s)
+
+    // Every attempt fails: the attempts are spent, one record, the last attempt's outcome.
+    let r3: jagent.Run = jagent.run_job(ag, sp, blk, "never")
+    test.eq_i64(c, rep, "all attempts failing is a failure", r3.status as i64, jagent.RUN_FAILURE as i64)
+    test.eq_i64(c, rep, "three attempts", r3.attempts as i64, 3)
+    test.eq_i64(c, rep, "exit 4", r3.code as i64, 4)
+    test.eq_i64(c, rep, "still one record per run", jagent.last_seq(ag), 3)
+    test.eq_i64(c, rep, "retries counted as a metric", jagent.retries_total(ag), 3)
+    test.eq_i64(c, rep, "a retry count off the table is refused", jagent.load_text(ag, JT_CFG, "[job.x]\ncommand = echo x\nretries = 11\n") as i64, jagent.JA_REJECTED as i64)
+
+    jagent.free(ag)
+    let gone2: bool = sysfs.remove_dir(h, a, "zz_jagent_once") catch false
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+const JT_GROUPS: str = "[agent]\nstore = zz_jagent/history.db\n[job.health-check]\ncommand = echo healthy\n[job.rotate-log]\ncommand = echo rotated\n[job.flaky]\ncommand = exit 3\n[group.daily]\njobs = health-check, rotate-log, flaky\n[group.quick]\njobs = health-check\n"
+
+@test fn groups_run_their_jobs_in_order_and_are_not_jobs() -> bool {
+    var raw: *mut u8 = alloc(u8, JT_CAP)
+    var rep: []u8 = slice(u8, raw, JT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    var ag: jagent.Agent = agent_with(a, JT_GROUPS)
+    jagent.set_wall(ag, &fixed_wall)
+    test.eq_usize(c, rep, "two groups", jagent.group_count(ag), 2)
+    test.eq_str(c, rep, "in file order", jagent.group_name(ag, 0), "daily")
+    test.eq_usize(c, rep, "with three members", jagent.group_size(ag, 0), 3)
+    test.eq_usize(c, rep, "resolved to job indices, in order", jagent.group_job(ag, 0, 2), 2)
+    test.eq_i64(c, rep, "found by name", jagent.find_group(ag, "quick") as i64, 1)
+    test.eq_i64(c, rep, "a job's name is not a group", jagent.find_group(ag, "health-check") as i64, 0 - 1)
+    test.eq_i64(c, rep, "and a group's name is not a job", jagent.find_job(ag, "daily") as i64, 0 - 1)
+    var s: String = string_new()
+    jagent.render_groups(ag, s)
+    test.eq_str(c, rep, "the listing", string_view(s), "daily jobs=health-check, rotate-log, flaky\nquick jobs=health-check\n")
+    string_free(s)
+
+    jagent.open_store(ag, h)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+    s = string_new()
+    test.eq_i64(c, rep, "one failure in daily", jagent.run_group(ag, sp, blk, "daily", s), 1)
+    test.is_true(c, rep, "the summary counts", str.has_prefix(string_view(s), "group=daily jobs=3 success=2 failure=1\n"))
+    test.is_true(c, rep, "then each member, in order", contains(string_view(s), "\n  job=health-check status=success code=0 seq=1 "))
+    test.is_true(c, rep, "second", contains(string_view(s), "\n  job=rotate-log status=success code=0 seq=2 "))
+    test.is_true(c, rep, "third", contains(string_view(s), "\n  job=flaky status=failure code=3 seq=3 "))
+    test.eq_i64(c, rep, "three children — every member ran, not just the first", sysproc.started(sp), 3)
+    test.eq_i64(c, rep, "three records, no group record", jagent.last_seq(ag), 3)
+    string_free(s)
+    s = string_new()
+    test.eq_i64(c, rep, "a group that does not exist", jagent.run_group(ag, sp, blk, "nope", s), 0 - 1)
+    test.eq_str(c, rep, "writes nothing", string_view(s), "")
+    test.eq_i64(c, rep, "and runs nothing", sysproc.started(sp), 3)
+    string_free(s)
+
+    // The schema: an unknown member, a name shared with a job, an empty list.
+    var ag2: jagent.Agent = jagent.make(a, time.manual(0), quiet_logger())
+    test.eq_i64(c, rep, "an unknown member is rejected", jagent.load_text(ag2, "a.ini", "[job.x]\ncommand = echo x\n[group.g]\njobs = x, y\n") as i64, jagent.JA_REJECTED as i64)
+    test.is_true(c, rep, "with the reason", contains(jagent.faults(ag2), "names a job that is not configured"))
+    test.eq_i64(c, rep, "a group named like a job is rejected", jagent.load_text(ag2, "a.ini", "[job.x]\ncommand = echo x\n[group.x]\njobs = x\n") as i64, jagent.JA_REJECTED as i64)
+    test.is_true(c, rep, "saying so", contains(jagent.faults(ag2), "may not share its name with a job"))
+    test.eq_i64(c, rep, "an empty group is rejected", jagent.load_text(ag2, "a.ini", "[job.x]\ncommand = echo x\n[group.g]\n") as i64, jagent.JA_REJECTED as i64)
+    test.eq_i64(c, rep, "a group declared twice is rejected", jagent.load_text(ag2, "a.ini", "[job.x]\ncommand = echo x\n[group.g]\njobs = x\n[group.g]\njobs = x\n") as i64, jagent.JA_REJECTED as i64)
+    test.eq_i64(c, rep, "and the good one loads", jagent.load_text(ag2, "a.ini", "[job.x]\ncommand = echo x\n[group.g]\njobs = x\n") as i64, jagent.JA_LOADED as i64)
+    jagent.free(ag2)
+
+    jagent.free(ag)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn retention_prunes_the_oldest_runs_and_keeps_every_latest() -> bool {
+    var raw: *mut u8 = alloc(u8, JT_CAP)
+    var rep: []u8 = slice(u8, raw, JT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    let text: str = "[agent]\nstore = zz_jagent/history.db\nhistory_max_runs = 3\ncompact_after_dead_bytes = 1\n[job.health-check]\ncommand = echo healthy\n[job.rotate-log]\ncommand = echo rotated\n"
+    var ag: jagent.Agent = agent_with(a, text)
+    test.eq_i64(c, rep, "the bound is read", jagent.history_max_runs(ag), 3)
+    test.eq_i64(c, rep, "and the threshold", jagent.compact_after_dead_bytes(ag), 1)
+    jagent.open_store(ag, h)
+    var sp: sysproc.Spawner = sysproc.host()
+    var blk: time.Clock = time.host()
+
+    // Nothing to do on an empty history.
+    let m0: jagent.Maint = jagent.maintain(ag, h)
+    test.eq_i64(c, rep, "nothing pruned", m0.pruned, 0)
+    // rotate-log runs first and only once; then health-check four times. Its ONE run is
+    // the oldest record and the job's latest at once: it must survive.
+    jagent.run_job(ag, sp, blk, "rotate-log")
+    var i: i64 = 0
+    for i < 4 {
+        jagent.run_job(ag, sp, blk, "health-check")
+        i = i + 1
+    }
+    test.eq_i64(c, rep, "five records", jagent.history_runs(ag), 5)
+    let m1: jagent.Maint = jagent.maintain(ag, h)
+    test.eq_i64(c, rep, "two pruned: the oldest health-checks, #2 and #3", m1.pruned, 2)
+    test.eq_i64(c, rep, "three remain", jagent.history_runs(ag), 3)
+    var s: String = string_new()
+    jagent.render_logs(ag, "", 20, s)
+    test.is_true(c, rep, "rotate-log's only run, #1, survives as its latest", str.has_prefix(string_view(s), "#1 job=rotate-log"))
+    test.is_true(c, rep, "then #4", contains(string_view(s), "\n#4 job=health-check"))
+    test.is_true(c, rep, "and #5", contains(string_view(s), "\n#5 job=health-check"))
+    test.is_false(c, rep, "#2 is gone", contains(string_view(s), "#2 job="))
+    test.is_false(c, rep, "#3 is gone", contains(string_view(s), "#3 job="))
+    string_free(s)
+    test.eq_i64(c, rep, "the counter did not move back", jagent.last_seq(ag), 5)
+    let r6: jagent.Run = jagent.run_job(ag, sp, blk, "health-check")
+    test.eq_i64(c, rep, "the next run is #6, never a reused number", r6.seq, 6)
+    s = string_new()
+    jagent.render_status(ag, s)
+    test.is_true(c, rep, "status still finds every latest", contains(string_view(s), "last=#1 job=rotate-log"))
+    test.is_true(c, rep, "including the new one", contains(string_view(s), "last=#6 job=health-check"))
+    string_free(s)
+    // The compaction: the pruned records are dead bytes over the threshold of 1.
+    test.is_true(c, rep, "dead bytes are there to reclaim", jagent.history_dead_bytes(ag) > 0)
+    let m2: jagent.Maint = jagent.maintain(ag, h)
+    test.eq_i64(c, rep, "one more pruned (#4)", m2.pruned, 1)
+    test.is_true(c, rep, "and compacted", m2.compacted)
+    test.is_true(c, rep, "reclaiming something", m2.reclaimed > 0)
+    test.eq_i64(c, rep, "no dead bytes after", jagent.history_dead_bytes(ag), 0)
+    test.eq_i64(c, rep, "three records after the compaction", jagent.history_runs(ag), 3)
+    test.is_true(c, rep, "the store is still open and readable", jagent.store_is_open(ag))
+    // Survives a reopen: the compacted file replays.
+    jagent.close_store(ag)
+    test.is_true(c, rep, "reopens", jagent.open_store(ag, h))
+    test.eq_i64(c, rep, "with its three records", jagent.history_runs(ag), 3)
+    test.eq_i64(c, rep, "and the counter", jagent.last_seq(ag), 6)
+    test.is_true(c, rep, "compact_now on a clean store reclaims nothing", jagent.compact_now(ag, h) == 0)
+    test.eq_i64(c, rep, "a negative bound is refused", jagent.load_text(ag, JT_CFG, "[agent]\nhistory_max_runs = -1\n[job.x]\ncommand = echo x\n") as i64, jagent.JA_REJECTED as i64)
+
+    jagent.free(ag)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
