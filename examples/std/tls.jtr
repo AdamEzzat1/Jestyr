@@ -292,6 +292,19 @@ pub fn write_all(read s: Session, read data: str) -> bool {
     return true
 }
 
+// `write_all` for bytes that are not text — a response body, say. Same contract.
+pub fn write_bytes(read s: Session, read data: []u8) -> bool {
+    if s.established == false { return false }
+    var off: usize = 0
+    for off < data.len {
+        let chunk: []u8 = data[off .. data.len]
+        let n: i32 = SSL_write(s.ssl, chunk.ptr as cptr, chunk.len as i32)
+        if n <= 0 { return false }
+        off = off + (n as usize)
+    }
+    return true
+}
+
 // Read into `buf`. Returns the byte count, 0 when the peer shut the session down cleanly,
 // -1 on any failure (a peer that vanished without a close-notify is a failure, not a close —
 // the distinction TLS adds over TCP, and the reason truncation attacks fail).

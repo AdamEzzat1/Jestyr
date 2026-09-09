@@ -1,0 +1,180 @@
+// std/httpds.jtr — `std/httpd` over TLS: a listener whose connections are `std/tls`
+// sessions, answering through the server's own routes and middleware.
+//
+// TIER: `sys`, and it LINKS OpenSSL (through `std/tls`) — which is why this is a module of
+// its own rather than a flag on `httpd`: every program that imports `httpd` would otherwise
+// carry `-lssl -lcrypto`, and most of them serve loopback plaintext. A program that wants
+// TLS imports this; a program that does not never sees it.
+//
+// ─── The shape, and its bound ─────────────────────────────────────────────────────────
+//
+// `std/tls` blocks — its handshake, its reads and its writes, exactly as `sysnet`'s do —
+// and `httpd` is a poll loop that must never block on one peer. So a TLS connection here is
+// served WHOLE, on the calling thread, inside one `step`: accept, handshake, read one
+// request, answer it through `httpd.answer_bytes`, close-notify, close. Three things make
+// that honest rather than a hang waiting to happen:
+//
+//   * every blocking call on the connection is bounded by a socket timeout
+//     (`sysnet.set_io_timeout`, `timeout_ms` at `start`) — a peer that connects and never
+//     completes the handshake, or never sends its request, costs the loop that long and no
+//     longer;
+//   * **one request per connection**: `Connection: close` is forced on every answer, so an
+//     idle keep-alive peer cannot hold the loop either;
+//   * the poll happens BEFORE the accept, so a `step` with nothing pending returns at once.
+//
+// What that costs is stated: while one TLS connection is being served, no other connection
+// — TLS or the plaintext server's, if the same loop drives both — is. It is the right shape
+// for an operator's API on an edge box with a handful of clients, and the wrong one for a
+// busy service; the day `std/tls` grows a non-blocking mode (its header names the day), the
+// session moves into `httpd`'s connection table and this module becomes a constructor.
+//
+// ─── What is not here ─────────────────────────────────────────────────────────────────
+//
+// No streamed request bodies (buffered whole, bounded by the buffer and `max_body`), no
+// client certificates, no ALPN, no session resumption — each is `std/tls`'s to grow.
+//
+// Run the tests:  jestyrc test examples/std/jagent_test.jtr  (the consumer's suite drives it)
+
+import "httpd"
+import "mem"
+import "runtime"
+import "syspoll"
+import "sysnet"
+import "tls"
+
+const HTTPDS_DEFAULT_CAP: usize = 65536
+
+@move pub struct TlsServer {
+    ctx: tls.Context,
+    lis: sysnet.Socket,
+    listening: bool,
+    poller: runtime.Poller,
+    timeout_ms: i64,
+    cap: usize,
+    accepted: i64,
+    handshakes_failed: i64,
+    served: i64,
+    refused: i64,
+}
+
+// A server whose context is loaded from `cert_pem` and `key_pem` (files, PEM). Check
+// `context_loaded`; when it is false, `tls.last_error` says why (read it at once — the
+// queue drains).
+pub fn make(read a: Allocator, read cert_pem: str, read key_pem: str) -> TlsServer {
+    return TlsServer{ ctx: tls.server_context(a, cert_pem, key_pem), lis: sysnet.closed(), listening: false,
+                      poller: syspoll.host(), timeout_ms: 5000, cap: HTTPDS_DEFAULT_CAP,
+                      accepted: 0, handshakes_failed: 0, served: 0, refused: 0 }
+}
+
+@no_alloc @no_os pub fn context_loaded(read t: TlsServer) -> bool { return tls.context_is_open(t.ctx) }
+@no_alloc @no_os pub fn is_listening(read t: TlsServer) -> bool { return t.listening }
+@no_alloc @no_os pub fn accepted(read t: TlsServer) -> i64 { return t.accepted }
+@no_alloc @no_os pub fn handshakes_failed(read t: TlsServer) -> i64 { return t.handshakes_failed }
+@no_alloc @no_os pub fn served(read t: TlsServer) -> i64 { return t.served }
+@no_alloc @no_os pub fn refused(read t: TlsServer) -> i64 { return t.refused }
+
+// Listen on `addr`. `timeout_ms` bounds every blocking call on a connection — the handshake,
+// the request's arrival, the response's departure.
+pub fn start(mut t: TlsServer, mut net: sysnet.Net, read addr: sysnet.SocketAddr, backlog: i32, timeout_ms: i64) -> bool {
+    if tls.context_is_open(t.ctx) == false { return false }
+    if t.listening { return false }
+    t.lis = sysnet.listen_on(net, addr, backlog) catch sysnet.closed()
+    t.listening = sysnet.is_open(t.lis)
+    if timeout_ms > 0 { t.timeout_ms = timeout_ms }
+    return t.listening
+}
+
+pub fn port(read t: TlsServer) -> u16 {
+    if t.listening == false { return 0 }
+    let a: sysnet.SocketAddr = sysnet.local_addr(t.lis) catch sysnet.addr(0, 0)
+    return a.port
+}
+
+pub fn stop(mut t: TlsServer, mut net: sysnet.Net) {
+    if t.listening {
+        sysnet.close_socket(t.lis) catch nothing()
+        t.listening = false
+    }
+}
+
+pub fn free(mut t: TlsServer) {
+    tls.free_context(t.ctx)
+}
+
+fn nothing() { }
+
+// The transport hook `httpd` writes through: the session, by address.
+fn tls_write(ctx: *mut u8, read b: []u8) -> bool {
+    let p: *mut tls.Session = ctx as *mut tls.Session
+    var fine: bool = false
+    unsafe { fine = tls.write_bytes((p + 0).*, b) }
+    return fine
+}
+
+// Is the listener readable within `wait_ms`?
+fn pending(read t: TlsServer, wait_ms: i64) -> bool {
+    var fds: *mut i64 = alloc(i64, 1)
+    var rdy: *mut u8 = alloc(u8, 1)
+    unsafe { (fds + 0).* = t.lis.fd }
+    unsafe { (rdy + 0).* = 0 as u8 }
+    let got: i64 = runtime.ask(t.poller, fds, rdy, 1, wait_ms * 1000000)
+    var r: u8 = 0
+    unsafe { r = (rdy + 0).* }
+    free_ptr(rdy)
+    free_ptr(fds)
+    if got <= 0 { return false }
+    return (r as i32) != 0
+}
+
+// One round: wait up to `wait_ms` for a connection, then serve ONE whole — handshake, one
+// request through `sv`'s middleware and routes, close. Returns the requests answered (0 or
+// 1), or -1 when not listening. `sv` need not be listening itself: its routes, middleware
+// and buffers are what is used.
+pub fn step(mut t: TlsServer, mut sv: httpd.Server, mut net: sysnet.Net, wait_ms: i64) -> i64 {
+    if t.listening == false { return 0 - 1 }
+    if pending(t, wait_ms) == false { return 0 }
+    var conn: sysnet.Socket = sysnet.accept_one(net, t.lis) catch sysnet.closed()
+    if sysnet.is_open(conn) == false { return 0 }
+    t.accepted = t.accepted + 1
+    sysnet.set_io_timeout(conn, t.timeout_ms)
+
+    var cell: *mut tls.Session = alloc(tls.Session, 1)
+    unsafe { (cell + 0).* = tls.server_session(t.ctx, conn.fd) }
+    var up: bool = false
+    unsafe { up = tls.is_established((cell + 0).*) }
+    var answered: i64 = 0
+    if up == false {
+        t.handshakes_failed = t.handshakes_failed + 1
+    } else {
+        var raw: *mut u8 = alloc(u8, t.cap)
+        var buf: []u8 = slice(u8, raw, t.cap)
+        var have: usize = 0
+        var reading: bool = true
+        for reading {
+            var win: []u8 = buf[have .. t.cap]
+            var n: isize = 0
+            unsafe { n = tls.read_into((cell + 0).*, win) }
+            if n <= 0 {
+                reading = false
+            } else {
+                have = have + (n as usize)
+                // One request, one connection: `served` is 0 and the bound is always hit.
+                let r: httpd.Answered = httpd.answer_bytes(sv, buf[0 .. have], conn.fd, cell as *mut u8, &tls_write, 0, have >= t.cap, true)
+                if r.consumed > 0 {
+                    answered = 1
+                    t.served = t.served + 1
+                    reading = false
+                }
+                if r.consumed < 0 {
+                    t.refused = t.refused + 1
+                    reading = false
+                }
+            }
+        }
+        free_ptr(raw)
+        unsafe { tls.shutdown((cell + 0).*) }
+    }
+    free_ptr(cell as *mut u8)
+    sysnet.close_socket(conn) catch nothing()
+    return answered
+}

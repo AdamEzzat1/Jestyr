@@ -180,7 +180,13 @@ pub struct Exchange {
     keep_alive: bool,
     obuf: *mut u8,
     ocap: usize,
+    // The transport hook: when `wctx` is non-null every response byte goes through `wfn`
+    // instead of the descriptor. `std/httpds` sets it to a TLS session; nothing else does.
+    wctx: *mut u8,
+    wfn: fn(*mut u8, read []u8) -> bool,
 }
+
+@no_alloc @no_os fn no_write(ctx: *mut u8, read b: []u8) -> bool { return false }
 
 // ---- reading the request ----
 
@@ -325,6 +331,11 @@ pub fn set_header(mut x: Exchange, read name: str, read value: str) -> bool {
 }
 
 fn send_bytes_out(mut x: Exchange, read b: []u8) -> bool {
+    if x.wctx != null {
+        let fine: bool = x.wfn(x.wctx, b)
+        if fine { x.bytes_out = x.bytes_out + (b.len as i64) }
+        return fine
+    }
     let s: sysnet.Socket = sysnet.adopt(x.fd)
     let n: usize = sysnet.send_all(s, b) catch 0
     x.bytes_out = x.bytes_out + (n as i64)
@@ -950,7 +961,15 @@ fn wants_keep_alive(read b: []u8, read hs: []http.Header, read req: http.Request
 // request and what the handler is shown are the same view, decided in one place.
 fn build_exchange(mut sv: Server, i: usize, read req: http.Request, nhs: usize, streamed: i64) -> Exchange {
     let c: Conn = conn_at(sv.conns, i)
-    let b: []u8 = slice(u8, c.buf, c.have)
+    return build_exchange_from(sv, c.buf, c.have, req, nhs, streamed, c.fd, c.served, null, &no_write)
+}
+
+// The exchange over bytes at `buf[0 .. have]`, whatever transport they came by. `served` is
+// how many requests the connection has answered before this one (the keep-alive bound);
+// `wctx`/`wfn` the transport hook, null for the descriptor.
+fn build_exchange_from(mut sv: Server, buf: *mut u8, have: usize, read req: http.Request, nhs: usize, streamed: i64,
+                       fd: i64, served: i64, wctx: *mut u8, wfn: fn(*mut u8, read []u8) -> bool) -> Exchange {
+    let b: []u8 = slice(u8, buf, have)
     let hs: []http.Header = slice(http.Header, sv.hs, nhs)
 
     // Split the target at `?`.
@@ -966,16 +985,113 @@ fn build_exchange(mut sv: Server, i: usize, read req: http.Request, nhs: usize, 
     }
 
     var keep: bool = wants_keep_alive(b, hs, req)
-    if c.served + 1 >= sv.max_requests { keep = false }
+    if served + 1 >= sv.max_requests { keep = false }
 
     let pv: str = string_view(sv.r.pats)
-    return Exchange{ buf: c.buf, have: c.have, req: req, hs: sv.hs, nhs: nhs,
+    return Exchange{ buf: buf, have: have, req: req, hs: sv.hs, nhs: nhs,
                      bbuf: null, blen: 0, streamed: streamed,
                      route: 0 - 1, params: list.make(i32, mem.system_allocator()),
                      pats: pv.ptr as *mut u8, plen: pv.len,
                      path: http.span(req.target.off, qoff - req.target.off), query: qspan,
-                     fd: c.fd, status: 0, hdrs: string_new(), sent: false, streaming: false,
-                     bytes_out: 0, keep_alive: keep, obuf: sv.obuf, ocap: sv.ocap }
+                     fd: fd, status: 0, hdrs: string_new(), sent: false, streaming: false,
+                     bytes_out: 0, keep_alive: keep, obuf: sv.obuf, ocap: sv.ocap,
+                     wctx: wctx, wfn: wfn }
+}
+
+// A minimal response through the transport hook — `send_plain`'s twin for bytes that did
+// not come over a descriptor.
+fn plain_via(mut sv: Server, wctx: *mut u8, wfn: fn(*mut u8, read []u8) -> bool, status: i32, read text: str) {
+    var ob: []u8 = slice(u8, sv.obuf, sv.ocap)
+    var s: Sink = sink.new()
+    http.begin_response(s, ob, status, reason_for(status))
+    http.put_header(s, ob, "Content-Type", "text/plain")
+    http.put_content_length(s, ob, text.len)
+    http.put_header(s, ob, "Connection", "close")
+    http.end_headers(s, ob)
+    sink.put_str(s, ob, text)
+    wfn(wctx, ob[0 .. sink.written(s)])
+}
+
+// What one answer through another transport reported.
+@copy pub struct Answered {
+    pub consumed: i64,     // bytes of the input the message took; 0 incomplete; -1 refused
+    pub keep: bool,        // the client asked to keep the connection, and the bound allows it
+    pub status: i32,       // the status written, 0 when nothing was
+}
+
+// Answer ONE request that arrived through ANOTHER transport — `std/httpds` reads TLS records
+// into its own buffer and hands the bytes here. `b` is what has arrived so far; `fd` is the
+// descriptor for the access log's sake only (nothing is read from or written to it); every
+// response byte goes through `wfn(wctx, …)`; `served` is how many requests this connection
+// has answered before, for the keep-alive bound; `full` says the caller's buffer can grow no
+// further, so an incomplete message is refused rather than waited for; `close` forces
+// `Connection: close` on the answer. `consumed` is how
+// many bytes the answered message took; 0 means incomplete (read more); -1 means refused,
+// with the error response already written through the hook — close. Bodies are buffered
+// whole: a route registered with a body sink is answered from the buffer, its sink not
+// consulted, and a body over `max_body` is 413 as on the descriptor path.
+pub fn answer_bytes(mut sv: Server, read b: []u8, fd: i64, wctx: *mut u8, wfn: fn(*mut u8, read []u8) -> bool,
+                    served: i64, full: bool, close: bool) -> Answered {
+    var ans: Answered = Answered{ consumed: 0, keep: false, status: 0 }
+    if b.len == 0 { return ans }
+    var hs: []http.Header = slice(http.Header, sv.hs, HTTPD_HEADERS)
+    var h: http.Head = http.empty_head()
+    let ho: i32 = http.parse_head(b, hs, h)
+    if ho == http.HTTP_INCOMPLETE {
+        if full {
+            sv.bad = sv.bad + 1
+            plain_via(sv, wctx, wfn, 431, "request too large")
+            ans.consumed = 0 - 1
+            ans.status = 431
+        }
+        return ans
+    }
+    if ho != http.HTTP_OK {
+        sv.bad = sv.bad + 1
+        var st: i32 = 400
+        if ho == http.HTTP_TOO_LARGE { st = 431 }
+        plain_via(sv, wctx, wfn, st, http.outcome_name(ho))
+        ans.consumed = 0 - 1
+        ans.status = st
+        return ans
+    }
+    if h.length > sv.max_body {
+        sv.oversize = sv.oversize + 1
+        plain_via(sv, wctx, wfn, 413, "body too large")
+        ans.consumed = 0 - 1
+        ans.status = 413
+        return ans
+    }
+    var req: http.Request = http.empty_request()
+    let o: i32 = http.body_from_head(b, h, req)
+    if o == http.HTTP_INCOMPLETE {
+        if full {
+            sv.oversize = sv.oversize + 1
+            plain_via(sv, wctx, wfn, 413, "body too large")
+            ans.consumed = 0 - 1
+            ans.status = 413
+        }
+        return ans
+    }
+    if o != http.HTTP_OK {
+        sv.bad = sv.bad + 1
+        var st2: i32 = 400
+        if o == http.HTTP_TOO_LARGE { st2 = 431 }
+        plain_via(sv, wctx, wfn, st2, http.outcome_name(o))
+        ans.consumed = 0 - 1
+        ans.status = st2
+        return ans
+    }
+    let t0: i64 = time.read_nanos(sv.clock)
+    var x: Exchange = build_exchange_from(sv, b.ptr as *mut u8, b.len, req, req.headers, 0, fd, served, wctx, wfn)
+    // `close` forces `Connection: close` on the answer — a transport that serves one
+    // request per connection says so on the wire rather than leaving the client to find out.
+    if close { x.keep_alive = false }
+    dispatch(sv, x, b, req, t0)
+    ans.consumed = req.total as i64
+    ans.keep = x.keep_alive
+    ans.status = x.status
+    return ans
 }
 
 // Answer one complete request at the front of connection `i`'s buffer. Returns true when the
@@ -986,7 +1102,27 @@ fn answer(mut sv: Server, i: usize, read req: http.Request, nhs: usize, streamed
     let t0: i64 = time.read_nanos(sv.clock)
     let b: []u8 = slice(u8, c.buf, c.have)
     var x: Exchange = build_exchange(sv, i, req, nhs, streamed)
+    dispatch(sv, x, b, req, t0)
 
+    // Consume the request: whatever follows is the next one.
+    let rest: usize = c.have - req.total
+    var j: usize = 0
+    var cb: []u8 = slice(u8, c.buf, sv.bufcap)
+    for j < rest {
+        cb[j] = cb[req.total + j]
+        j = j + 1
+    }
+    c.have = rest
+    c.served = c.served + 1
+    c.last = time.read_nanos(sv.clock)
+    conn_set(sv.conns, i, c)
+    return x.keep_alive
+}
+
+// Everything after the exchange is built — the chunked decode, the middleware, the route, the
+// fallbacks, the access log — shared by the descriptor path and the bytes-in path, so what a
+// transport cannot change is decided once.
+fn dispatch(mut sv: Server, mut x: Exchange, read b: []u8, read req: http.Request, t0: i64) {
     // A chunked body is decoded once, up front, into its own buffer.
     if req.chunked {
         var dec: *mut u8 = alloc(u8, req.body.len + 1)
@@ -1029,22 +1165,8 @@ fn answer(mut sv: Server, i: usize, read req: http.Request, nhs: usize, streamed
     access_log(sv, x, (t1 - t0) / 1000000)
     sv.served = sv.served + 1
 
-    // Consume the request: whatever follows is the next one.
-    let rest: usize = c.have - req.total
-    var j: usize = 0
-    var cb: []u8 = slice(u8, c.buf, sv.bufcap)
-    for j < rest {
-        cb[j] = cb[req.total + j]
-        j = j + 1
-    }
-    c.have = rest
-    c.served = c.served + 1
-    c.last = t1
-    conn_set(sv.conns, i, c)
-
     if x.bbuf != null { free_ptr(x.bbuf) }
     string_free(x.hdrs)
-    return x.keep_alive
 }
 
 // ---- streaming a request body in --------------------------------------------------------

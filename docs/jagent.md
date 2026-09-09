@@ -19,7 +19,8 @@ built to grow: one job kind today, a table with the column for the next one.
 | the command | `examples/std/jagent_cli.jtr` |
 | the project: build plan and page | `tools/jagent/build.jestyr`, `tools/jagent/README.md` |
 | the pinned demo | `examples/std/jagent_demo.jtr` (`jagent_runs_records_serves_and_reloads`) |
-| the suites | `examples/std/jagent_test.jtr` (14), `examples/std/jagent_ops_test.jtr` (12) — registered in `io_suites_pass` |
+| the suites | `examples/std/jagent_test.jtr` (15), `examples/std/jagent_ops_test.jtr` (12) — registered in `io_suites_pass` |
+| the TLS listener | `examples/std/httpds.jtr` — `std/httpd` over `std/tls`, one request per connection, every blocking call bounded |
 | the command's own tests | `jagent_cli_runs_status_logs_and_serves` (a real `serve`, killed after), `jagent_cli_init_doctor_and_ask`, `jagent_build_plan_names_the_binary` |
 | the benchmark script | `examples/std/jagent_bench.jtr` |
 | the demo configuration | `examples/std/fixtures/jagent.ini` |
@@ -86,7 +87,7 @@ jagent ask "check my machine"
 | `jagent [-c cfg] logs [<job>]` | the last 20 runs of one job, or of every job, oldest first | 0; 1 for a job that does not exist |
 | `jagent [-c cfg] jobs` | the job table, one line each | 0 |
 | `jagent [-c cfg] schedule <job>` | run it every `interval_ms` until SIGINT/SIGTERM | 0; 1 when any run failed, or the job has no interval |
-| `jagent [-c cfg] serve` | the API, the reload, the schedule, until SIGINT/SIGTERM | 0 for a clean halt; 1 for a failed/abandoned one; 2 when refused (`tls = true`) |
+| `jagent [-c cfg] serve` | the API (plain, or TLS when `tls = true`), the reload, the schedule, until SIGINT/SIGTERM | 0 for a clean halt; 1 for a failed/abandoned one; 2 when refused (`tls = true` without both files, or a certificate that does not load) |
 | `jagent [-c cfg] check` | load the configuration and say so: `config: ok path=… jobs=N` | 0; 1 with the faults on stderr and nothing on stdout |
 | `jagent [-c cfg] config validate` | as `check` | as `check` |
 | `jagent [-c cfg] config show` | the configuration text in force, secrets redacted (`token = ****`) | 0; 1 when it did not load |
@@ -135,7 +136,8 @@ timeout_ms = 10000
 |---|---|---|
 | `agent.host` | `127.0.0.1`, `localhost`, or `0.0.0.0` (every interface — `doctor` warns) | `127.0.0.1` |
 | `agent.port` | 0 asks the platform; `serve` prints the port it got | `0` |
-| `agent.tls` | `true` is REFUSED — see "Security" | `false` |
+| `agent.tls` | `true` serves the API over TLS through `std/httpds` — see "Security" | `false` |
+| `agent.tls_cert`, `agent.tls_key` | the certificate and its private key, PEM files; both required when `tls = true`, else `serve` refuses (exit 2) | unset |
 | `agent.store` | the history file, relative to the working directory, created by the first run | `jagent.db` |
 | `agent.token` | a bearer token every API request but `GET /health` must carry; declared **secret**, so every rendering prints `****` | unset: no gate |
 | `job.NAME.kind` | `command`, the only kind today | `command` |
@@ -176,7 +178,7 @@ config: ok path=jagent.ini jobs=1
 store: ok path=jagent.db present=false note=created-by-the-first-run
 sysproc: ok spawn=true timeout=true tree_reaped=true children=2
 http: ok host=127.0.0.1 port=0 bound=60309
-tls: unsupported requested=false
+tls: supported requested=false
 auth: missing risk=local-only
 reload: ok watched=true dir=.
 schedule: ok scheduled=0 of=1
@@ -190,7 +192,7 @@ result: ok warnings=0 errors=0
 | `store` | a present store is opened, `kv.sync`ed, its run count read, and closed; an absent one is **not created** — its directory is checked instead | `reason=cannot-open`, `cannot-sync`, `directory-missing` — errors |
 | `sysproc` | on an agent of its own with no store: a job that must print `jagent-doctor`, then a job that must be killed at 200 ms with its tree confirmed reaped | any half false — an error; `--no-probes` skips it (`skipped reason=no-probes`) |
 | `http` | `agent.host:agent.port` is bound and released; `bound=` is the port the platform gave | `reason=cannot-bind` — an error; `warning=remote-bind-unauthenticated` on `0.0.0.0` with no token |
-| `tls` | what this build can do, and what the file asks | `requested=true serve=refused` — an error, because `serve` exits 2 |
+| `tls` | what the file asks and, when it asks, whether the certificate and key LOAD (a context is built and freed, nothing bound) | `loaded=false reason=tls_cert-or-tls_key-unset`, or `loaded=false reason=<OpenSSL's words>` — errors, because `serve` would exit 2 |
 | `auth` | whether `agent.token` is set | `present kind=bearer exempt=GET/health` when it is; otherwise `missing` with `risk=remote-exposed` on `0.0.0.0` — a warning — or `risk=local-only` on loopback |
 | `reload` | the watcher over the configuration's directory is opened and closed | `watched=false` — a warning |
 | `schedule` | how many jobs declare an interval | never; the load already refused a bad one |
@@ -409,21 +411,35 @@ that returns them: the agent can *compare* the token (`token_matches`, constant-
 configuration file, so the file's permissions are the token's; `init` writes the key
 commented out with that said beside it.
 
-**Plaintext HTTP carries the token in the clear.** A bearer token over an unencrypted
-connection is readable by anyone on the path, which on loopback is the machine's own
-processes and on `0.0.0.0` is the network. Until TLS lands (below), a remote bind with a
-token is protected against a *caller* who lacks it, not against a *listener*; the honest
-deployment for a token over the network is a TLS-terminating proxy in front of `serve`, or
-loopback plus an SSH tunnel.
+**Plaintext HTTP carries the token in the clear**, so a token over the network wants TLS.
+A bearer token over an unencrypted connection is readable by anyone on the path, which on
+loopback is the machine's own processes and on `0.0.0.0` is the network. Without TLS a
+remote bind with a token is protected against a *caller* who lacks it, not against a
+*listener*.
 
-**TLS is not served, and `tls = true` is refused rather than faked.** `std/tls` exists and
-works (a real handshake over loopback, `tls_test`), but `std/httpd` reads its sockets through
-`std/sysnet` directly and has no hook for a session in between; wiring one is a change to
-the server, not to this agent. So `serve` under `agent.tls = true` exits 2 with the reason,
-`doctor` reports `tls: unsupported requested=true serve=refused` as an error,
-`jagent.tls_supported()` answers false so a caller can ask first, and the suites pin all
-three. The gap is stated here rather than served in plaintext under a setting that says
-otherwise.
+**TLS is served, through `std/httpds`.** `tls = true` with `tls_cert` and `tls_key` (PEM
+files; the certificate and key are checked against each other at load) makes `serve` an
+HTTPS listener over the same routes and middleware — the token gate included — and
+`jagent.tls_supported()` answers true. `serve` refuses (exit 2, with the reason) when either
+file is unset or when OpenSSL will not load them; `doctor` reports the same as
+`tls: supported requested=true cert=… key=… loaded=true|false`, building the context and
+freeing it without binding. The Jestyr suite drives a real round trip: a client trusting the
+fixture certificate gets the job table with the token and 401 without it, and a client
+speaking plaintext at the TLS port gets nothing back.
+
+**What TLS costs here, stated.** `std/tls` blocks (its header says why: no non-blocking
+mode in `sysnet` yet), and `std/httpd` is a poll loop that must never block on one peer. So
+`httpds` serves each TLS connection *whole*, on the serve thread: accept, handshake, one
+request, close — with **every blocking call bounded by a socket timeout (5 s in the
+command)** and **`Connection: close` forced on every answer**. A peer that connects and
+never finishes the handshake, or never sends its request, costs the loop up to that bound
+and no longer; an idle keep-alive peer cannot hold it at all. While one TLS connection is
+served, no other is; the scheduler and the reload run between connections. That is the
+right shape for an operator's API on an edge box with a handful of clients and the wrong
+one for a busy service; the day `std/tls` grows a non-blocking mode, the session moves
+into `httpd`'s connection table and the bound goes. The plaintext listener is unchanged.
+No client certificates, no ALPN, no session resumption, no streamed request bodies over
+TLS.
 
 ## Performance
 
@@ -481,7 +497,8 @@ by the record size per run until a `compact` — which is the shape `std/kv` doc
   arm in `execute`, and a check at load.
 - **No concurrency.** A run blocks the API for its duration, bounded by its timeout. Two
   scheduled jobs due in the same tick run one after the other.
-- **No TLS**, so the bearer token travels in the clear (above). **One token, one scope**:
+- **TLS is one request per connection, served whole on the loop, every blocking call
+  bounded at 5 s** (above). **One token, one scope**:
   every gated route is all-or-nothing; no per-route scopes, no read-only token, no rotation
   without a reload of the file. **No `--format json`.** **No `bench` subcommand**:
   `jagent_bench.jtr` is a script, and folding it into the command would move measurement
@@ -527,10 +544,9 @@ name is a compiler intrinsic; the convention is `has`.
 
 ## Next steps toward a production-grade edge agent
 
-1. **TLS in `std/httpd`**: a `tls.Session` per connection, read/write through it instead of
-   `sysnet`, and the `tls_cert`/`tls_key` keys the schema already declares. `tls_supported()`
-   becomes true and nothing in this agent changes — and the bearer token stops travelling in
-   the clear, which is the reason this is now first.
+1. **Non-blocking TLS**: a `WANT_READ`/`WANT_WRITE` mode in `std/tls` over a non-blocking
+   `sysnet`, so the session can live in `httpd`'s connection table, keep-alive returns over
+   TLS, and one slow peer stops costing the loop its bound.
 2. **Token scopes**: a read-only token beside the full one, so a dashboard can read `/logs`
    without being able to `POST …/run`; the middleware already has the request, so a scope is
    a second declared secret and a method check.

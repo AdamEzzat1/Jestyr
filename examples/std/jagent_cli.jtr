@@ -42,6 +42,7 @@
 import "env"
 import "fs"
 import "httpd"
+import "httpds"
 import "jagent"
 import "jagent_ops"
 import "log"
@@ -52,6 +53,7 @@ import "sysignal"
 import "sysnet"
 import "sysproc"
 import "time"
+import "tls"
 import "writer"
 
 fn nothing() { }
@@ -187,6 +189,24 @@ fn cmd_schedule(mut ag: jagent.Agent, mut h: fs.Fs, mut sp: sysproc.Spawner, rea
     return 0
 }
 
+// Every blocking call on a TLS connection — the handshake, the request, the response — is
+// bounded by this; a peer that stalls costs the loop this long and no longer.
+const JC_TLS_TIMEOUT_MS: i64 = 5000
+
+fn listening_line(read ag: jagent.Agent, port: i64, read cfg: str, watching: bool, tls: bool) {
+    var line: String = string_new()
+    string_push(line, "jagent: listening on ")
+    if tls { string_push(line, "https://") } else { string_push(line, "http://") }
+    if jagent.host_is_loopback(ag) { string_push(line, "127.0.0.1:") } else { string_push(line, "0.0.0.0:") }
+    push_num(line, port)
+    string_push(line, " (config ")
+    string_push(line, cfg)
+    if watching { string_push(line, ", watched") } else { string_push(line, ", not watched") }
+    if tls { string_push(line, ", one request per connection)") } else { string_push(line, ")") }
+    print_str(string_view(line))
+    string_free(line)
+}
+
 fn cmd_serve(mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> i32 {
     let a: Allocator = mem.system_allocator()
     let why: str = jagent.serve_refusal(ag)
@@ -202,12 +222,47 @@ fn cmd_serve(mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> i32 {
     if jagent.host_is_loopback(ag) == false and jagent.token_required(ag) == false {
         eprint_str("jagent: warning: agent.host = 0.0.0.0 exposes an unauthenticated API to every interface; set agent.token")
     }
+    let tls_on: bool = jagent.tls_wanted(ag)
+    var cert: String = string_new()
+    var key: String = string_new()
+    if tls_on {
+        jagent.tls_cert(ag, cert)
+        jagent.tls_key(ag, key)
+    }
     var net: sysnet.Net = sysnet.host()
+    // The routes and middleware live on an `httpd.Server` either way; over TLS it never
+    // binds — `httpds` reads the connection and hands the bytes to its dispatch.
     var sv: httpd.Server = httpd.make(a, time.host(), stderr_logger(), true, 16, 65536)
+    var ts: httpds.TlsServer = httpds.make(a, string_view(cert), string_view(key))
     var addr: sysnet.SocketAddr = sysnet.loopback(jagent.port(ag) as u16)
     if jagent.host_is_loopback(ag) == false { addr = sysnet.any_addr(jagent.port(ag) as u16) }
-    if httpd.start(sv, net, addr, 16) == false {
+    var bound: bool = false
+    var port: i64 = 0
+    if tls_on {
+        if httpds.context_loaded(ts) == false {
+            eprint_str("jagent: refusing to serve: the TLS certificate or key did not load")
+            var oe: String = string_new()
+            tls.last_error(oe)
+            if string_view(oe).len > 0 { eprint_str(string_view(oe)) }
+            string_free(oe)
+            httpds.free(ts)
+            httpd.free(sv)
+            sysnet.shutdown(net)
+            string_free(key)
+            string_free(cert)
+            return 2
+        }
+        bound = httpds.start(ts, net, addr, 16, JC_TLS_TIMEOUT_MS)
+        port = httpds.port(ts) as i64
+    } else {
+        bound = httpd.start(sv, net, addr, 16)
+        port = httpd.port(sv) as i64
+    }
+    string_free(key)
+    string_free(cert)
+    if bound == false {
         eprint_str("jagent: could not bind the address")
+        httpds.free(ts)
         httpd.free(sv)
         sysnet.shutdown(net)
         return 1
@@ -216,16 +271,7 @@ fn cmd_serve(mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> i32 {
     jagent_ops.dir_of(cfg, dir)
     let watching: bool = jagent.watch(ag, h, string_view(dir))
     string_free(dir)
-
-    var line: String = string_new()
-    string_push(line, "jagent: listening on ")
-    if jagent.host_is_loopback(ag) { string_push(line, "127.0.0.1:") } else { string_push(line, "0.0.0.0:") }
-    push_num(line, httpd.port(sv) as i64)
-    string_push(line, " (config ")
-    string_push(line, cfg)
-    if watching { string_push(line, ", watched)") } else { string_push(line, ", not watched)") }
-    print_str(string_view(line))
-    string_free(line)
+    listening_line(ag, port, cfg, watching, tls_on)
 
     // The agent moves into a cell; every handler and this loop reach it by address.
     var cell: *mut jagent.Agent = alloc(jagent.Agent, 1)
@@ -238,7 +284,11 @@ fn cmd_serve(mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> i32 {
     var blk: time.Clock = time.host()
 
     for sysignal.shutdown_requested(sig) == false {
-        httpd.serve_for(sv, net, 200)
+        if tls_on {
+            httpds.step(ts, sv, net, 200)
+        } else {
+            httpd.serve_for(sv, net, 200)
+        }
         unsafe { jagent.poll_config((cell + 0).*, h) }
         unsafe { jagent.tick((cell + 0).*, sp, blk) }
     }
@@ -253,7 +303,8 @@ fn cmd_serve(mut ag: jagent.Agent, mut h: fs.Fs, read cfg: str) -> i32 {
     string_push(bye, service.exit_name(why2))
     print_str(string_view(bye))
     string_free(bye)
-    httpd.stop(sv, net)
+    if tls_on { httpds.stop(ts, net) } else { httpd.stop(sv, net) }
+    httpds.free(ts)
     httpd.free(sv)
     sysnet.shutdown(net)
     jagent.free(back)

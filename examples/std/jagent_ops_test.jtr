@@ -41,6 +41,8 @@ const JO_OPEN: str = "[agent]\nhost = 0.0.0.0\nport = 0\nstore = zz_jagent_ops/h
 
 const JO_TLS: str = "[agent]\ntls = true\nstore = zz_jagent_ops/history.db\n[job.health-check]\ncommand = echo healthy\n"
 
+const JO_TLS_OK: str = "[agent]\ntls = true\ntls_cert = examples/std/fixtures/tls_test_cert.pem\ntls_key = examples/std/fixtures/tls_test_key.pem\nstore = zz_jagent_ops/history.db\n[job.health-check]\ncommand = echo healthy\n"
+
 const JO_BAD: str = "[job.x]\ncommand = echo x\ntimeout_ms = soon\n"
 
 // Every interface, but behind a token.
@@ -60,6 +62,8 @@ fn scrub(mut h: fs.Fs, read a: Allocator) {
     fs.erase(h, "zz_jagent_ops/tls.ini")
     fs.erase(h, "zz_jagent_ops/nodir.ini")
     fs.erase(h, "zz_jagent_ops/token.ini")
+    fs.erase(h, "zz_jagent_ops/tls_ok.ini")
+    fs.erase(h, "zz_jagent_ops/tls_bad.ini")
     let gone: bool = sysfs.remove_dir(h, a, JO_ROOT) catch false
 }
 
@@ -212,7 +216,7 @@ fn agent_with_history(read a: Allocator, mut h: fs.Fs) -> jagent.Agent {
     test.is_true(c, rep, "the probes ran and were reaped", has_text(t, "\nsysproc: ok spawn=true timeout=true tree_reaped=true children=2\n"))
     test.is_true(c, rep, "the address bound", has_text(t, "\nhttp: ok host=127.0.0.1 port=0 bound="))
     test.is_false(c, rep, "with no warning on loopback", has_text(t, "warning="))
-    test.is_true(c, rep, "tls stated", has_text(t, "\ntls: unsupported requested=false\n"))
+    test.is_true(c, rep, "tls stated", has_text(t, "\ntls: supported requested=false\n"))
     test.is_true(c, rep, "auth stated", has_text(t, "\nauth: missing risk=local-only\n"))
     test.is_true(c, rep, "the watcher opened", has_text(t, "\nreload: ok watched=true dir=zz_jagent_ops\n"))
     test.is_true(c, rep, "the schedule counted", has_text(t, "\nschedule: ok scheduled=0 of=2\n"))
@@ -346,9 +350,21 @@ fn agent_with_history(read a: Allocator, mut h: fs.Fs) -> jagent.Agent {
 
     var r3: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, "zz_jagent_ops/tls.ini", false)
     let t3: str = jagent_ops.report_text(r3)
-    test.is_true(c, rep, "tls requested of a build without it", has_text(t3, "\ntls: unsupported requested=true serve=refused\n"))
+    test.is_true(c, rep, "tls requested without its files", has_text(t3, "\ntls: supported requested=true loaded=false reason=tls_cert-or-tls_key-unset\n"))
     test.is_false(c, rep, "is a failure, because serve would refuse", jagent_ops.is_ok(r3))
     test.eq_i64(c, rep, "one error", jagent_ops.errors(r3), 1)
+
+    // With the fixture certificate and key the context LOADS; with a wrong path it does not,
+    // and OpenSSL's reason is on the line.
+    fs.put(h, "zz_jagent_ops/tls_ok.ini", JO_TLS_OK)
+    var r4: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, "zz_jagent_ops/tls_ok.ini", false)
+    test.is_true(c, rep, "the certificate and key load", has_text(jagent_ops.report_text(r4), "\ntls: supported requested=true cert=examples/std/fixtures/tls_test_cert.pem key=examples/std/fixtures/tls_test_key.pem loaded=true\n"))
+    test.is_true(c, rep, "and the check passes", jagent_ops.is_ok(r4))
+    fs.put(h, "zz_jagent_ops/tls_bad.ini", "[agent]\ntls = true\ntls_cert = examples/std/fixtures/zz_no_such_cert.pem\ntls_key = examples/std/fixtures/tls_test_key.pem\nstore = zz_jagent_ops/history.db\n[job.x]\ncommand = echo x\n")
+    var r5: jagent_ops.Report = jagent_ops.doctor(a, h, sp, blk, "zz_jagent_ops/tls_bad.ini", false)
+    test.is_true(c, rep, "a missing certificate does not load", has_text(jagent_ops.report_text(r5), " loaded=false reason="))
+    test.is_false(c, rep, "and fails the check", jagent_ops.is_ok(r5))
+    test.eq_i64(c, rep, "as one error", jagent_ops.errors(r5), 1)
 
     scrub(h, a)
     let ok: bool = test_report.finish(c, rep)

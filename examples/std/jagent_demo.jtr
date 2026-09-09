@@ -216,11 +216,13 @@ fn main() -> i32 {
     print_int(jagent.generation(back) as i32)
 
     // ---- tls ----
-    print_str("-- tls is refused, not faked --")
+    print_str("-- tls without its certificate is refused, not served in plaintext --")
     fs.put(h, JD_CFG, "[agent]\ntls = true\nstore = zz_jagent_demo/history.db\n[job.health-check]\ncommand = echo healthy\n")
     print_str(jagent.load_name(jagent.reload(back, h)))
     print_str("serve would refuse because")
     print_str(jagent.serve_refusal(back))
+    print_str("this build serves tls")
+    print_bool(jagent.tls_supported())
 
     // ---- shutdown ----
     print_str("-- shutdown --")

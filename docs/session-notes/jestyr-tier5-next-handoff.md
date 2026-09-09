@@ -1068,9 +1068,21 @@ test and the plan pinned. What a successor should not re-derive:
   than through `config.render`, so comments and order survive. A mutant that made the
   middleware always `NEXT` was watched failing the token test. Stated, not solved: the token
   travels in the clear until `httpd` speaks TLS.
+* **TLS (2026-09-09, after the token)**: `std/httpds`, not a flag on `httpd`, because `tls`
+  links OpenSSL and every `httpd` consumer would have carried it. `std/tls` BLOCKS and
+  `httpd` polls, so a TLS connection is served whole on the loop with every blocking call
+  bounded by `sysnet.set_io_timeout` (new; `timeval` of two longs on 64-bit POSIX, `DWORD`
+  ms on Windows) and `Connection: close` forced — the bound is the honesty, and it is in the
+  docs as a cost. `httpd`'s seam: `wctx`/`wfn` on the Exchange (a fn-pointer field, so it
+  MUST be set in every literal — `no_write` is the default), `answer_bytes` + `Answered`,
+  and `dispatch` extracted so the two paths cannot diverge. `out` is a KEYWORD (a local
+  named `out` is five parse errors none of which says so); `parse_i64` is jagent-private.
+  The test's client runs on a `spawn`ed thread with plain-integer arguments, `tls_test`'s
+  shape; the plaintext-at-the-TLS-port control proves the listener is not the plain one.
+  Untested on Linux: the `timeval` layout is asserted, not measured.
 * Not built: `--format json` (hand-rolled argv; text is the contract), a `bench` subcommand,
   an installer, an SCM entry point (`docs/jagent-windows-service.md` lists what one needs),
-  TLS, token scopes. The Linux ladder has not run any of it.
+  non-blocking TLS / keep-alive over TLS, token scopes. The Linux ladder has not run any of it.
 
 ### Compiler defects and gaps — OPEN
 

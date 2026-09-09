@@ -7,6 +7,29 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/httpds` — `std/httpd` over TLS, and `jagent serve` speaks it.** A module of its
+  own so that only a program that wants TLS links OpenSSL. `std/tls` blocks and `httpd` is a
+  poll loop, so a TLS connection is served WHOLE on the calling thread — accept, handshake,
+  ONE request through the server's own middleware and routes, close-notify, close — with
+  every blocking call bounded by a socket timeout (`sysnet.set_io_timeout`, new: `SO_RCVTIMEO`
+  / `SO_SNDTIMEO`, a `timeval` on POSIX and a `DWORD` on Windows) and `Connection: close`
+  forced on every answer, so neither a stalled handshake nor an idle keep-alive peer can hold
+  the loop past the bound. Stated as the cost it is: one TLS connection at a time. `httpd`
+  gained the seam this needed and nothing else: a transport hook on the exchange (`wctx`,
+  `wfn` — every response byte goes through it when set), `answer_bytes` (one request from
+  bytes that arrived by another transport, through the same `dispatch` the descriptor path
+  now shares), and `Answered`. `tls` gained `write_bytes`. In `jagent`: `tls_supported()` is
+  true, `tls_cert`/`tls_key` are read, `serve_refusal` refuses `tls = true` without both
+  files, the command serves `https://` through `httpds` (5 s bound) or refuses with
+  OpenSSL's reason when the files do not load, `doctor` says `tls: supported requested=true
+  cert=… key=… loaded=true|false reason=…`, `ask` says "TLS is on". Tests: `jagent_test` +1 —
+  a real round trip on a spawned client thread trusting the fixture certificate: 200 with
+  the job table over TLS with the token, 401 without, and plaintext at the TLS port answered
+  with nothing; the refusal test rewritten for the new rule; `jagent_ops_test` covers the
+  three doctor outcomes; the CLI test starts `serve` over TLS and proves the port is not
+  plaintext. A mutant whose write hook dropped the bytes was watched failing. Not built:
+  non-blocking TLS, keep-alive over TLS, client certificates, ALPN, streamed bodies over TLS.
+
 - **A bearer token on `jagent`'s API.** `agent.token`, declared SECRET in `std/config` (so
   every rendering prints `****` — `config show` says `token = ****`, and there is no accessor
   for the bytes, only `token_required` and a constant-time `token_matches`), gates every route

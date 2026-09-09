@@ -404,6 +404,54 @@ fn reuse_flag_buf() -> *mut u8 {
     free_ptr(one)
 }
 
+// ---- blocking bounded ---------------------------------------------------------------
+//
+// `SO_RCVTIMEO` / `SO_SNDTIMEO`: a blocking receive or send on the socket returns with an
+// error once `ms` have passed with nothing moved. Every operation in this module blocks
+// (the header says so), and a caller that must hand a descriptor to something ELSE that
+// blocks — `std/tls`'s handshake is the case — has no other way to bound it. The values
+// differ by platform in NUMBER and in SHAPE: `struct timeval` (two longs — the 64-bit
+// Linux the tree targets) on POSIX, a `DWORD` of milliseconds on Windows.
+
+const NET_SO_RCVTIMEO_POSIX: i32 = 20
+const NET_SO_SNDTIMEO_POSIX: i32 = 21
+const NET_SO_RCVTIMEO_WIN: i32 = 4102     // 0x1006
+const NET_SO_SNDTIMEO_WIN: i32 = 4101     // 0x1005
+
+// `n` little-endian bytes of `v` at `p + off`.
+fn put_le(p: *mut u8, off: usize, v: i64, n: usize) {
+    var i: usize = 0
+    var t: i64 = v
+    for i < n {
+        unsafe { (p + off + i).* = (t & 255) as u8 }
+        t = t >> (8 as u64)
+        i = i + 1
+    }
+}
+
+// Bound every blocking receive and send on `s` to `ms` milliseconds. False when the
+// socket is closed or the platform refused.
+@cfg(posix) pub fn set_io_timeout(read s: Socket, ms: i64) -> bool {
+    if is_open(s) == false { return false }
+    var tv: *mut u8 = alloc(u8, 16)
+    put_le(tv, 0, ms / 1000, 8)
+    put_le(tv, 8, (ms % 1000) * 1000, 8)
+    let r1: i32 = setsockopt(s.fd, NET_SOL_SOCKET_POSIX, NET_SO_RCVTIMEO_POSIX, tv as cptr, 16)
+    let r2: i32 = setsockopt(s.fd, NET_SOL_SOCKET_POSIX, NET_SO_SNDTIMEO_POSIX, tv as cptr, 16)
+    free_ptr(tv)
+    return r1 == 0 and r2 == 0
+}
+
+@cfg(windows) pub fn set_io_timeout(read s: Socket, ms: i64) -> bool {
+    if is_open(s) == false { return false }
+    var dw: *mut u8 = alloc(u8, 4)
+    put_le(dw, 0, ms, 4)
+    let r1: i32 = setsockopt(s.fd, NET_SOL_SOCKET_WIN, NET_SO_RCVTIMEO_WIN, dw as cptr, 4)
+    let r2: i32 = setsockopt(s.fd, NET_SOL_SOCKET_WIN, NET_SO_SNDTIMEO_WIN, dw as cptr, 4)
+    free_ptr(dw)
+    return r1 == 0 and r2 == 0
+}
+
 // ---- the operations ----------------------------------------------------------------
 
 // Bind and listen on `a`. `backlog` is the kernel's pending-connection queue.

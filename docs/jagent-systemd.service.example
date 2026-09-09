@@ -17,9 +17,11 @@
 #   - NO restart on exit 2: the configuration must change first, so a restart loop
 #     would only repeat the refusal;
 #   - the API's bearer token is `agent.token` IN THE CONFIGURATION FILE, so the file's
-#     permissions are the token's: owned by the service user, mode 0600. Until `httpd`
-#     speaks TLS the token crosses the network in the clear on a 0.0.0.0 bind — keep
-#     `agent.host = 127.0.0.1` and put a TLS proxy or an SSH tunnel in front.
+#     permissions are the token's: owned by the service user, mode 0600. On a 0.0.0.0
+#     bind set `tls = true` with `tls_cert`/`tls_key` (PEM, readable by the service
+#     user) so the token does not cross the network in the clear; `jagent doctor`
+#     says whether they load. TLS here is one request per connection, each bounded
+#     at 5 s — an operator's API, not a busy service's.
 
 [Unit]
 Description=jagent, the Jestyr edge agent

@@ -65,11 +65,12 @@
 //
 // ─── What it does NOT do ───────────────────────────────────────────────────────────────
 //
-// **No TLS.** `std/tls` exists and `std/httpd` does not speak it — the server reads its
-// sockets through `std/sysnet` directly and has no hook for a session in between. So
-// `agent.tls = true` is honoured by REFUSING to serve, with a reason (`serve_refusal`),
-// rather than by serving plaintext under a setting that says otherwise. `tls_supported`
-// answers false so a caller can ask before trying.
+// **TLS is the command's, not this module's.** `agent.tls = true` with `tls_cert` and
+// `tls_key` is served by `jagent_cli` through `std/httpds` — one request per connection,
+// every blocking call bounded — over the same routes and middleware `install` registers;
+// this module only checks the setting is complete (`serve_refusal`) and answers
+// `tls_supported`. A `tls = true` without both files is REFUSED with the reason rather
+// than served in plaintext under a setting that says otherwise.
 //
 // **One job kind.** `kind = command` is the only value accepted today; the kind is a
 // column in the job table and a check at load time, so a second kind is a new constant,
@@ -517,10 +518,22 @@ pub fn host_is_loopback(read ag: Agent) -> bool {
 
 pub fn tls_wanted(read ag: Agent) -> bool { return agent_bool(ag, "agent.tls") }
 
-// Whether this build can serve TLS. It cannot — see the header — and the answer is a
-// function rather than a constant so a build that grows the hook changes exactly one
-// place and every caller learns.
-@no_alloc @no_os pub fn tls_supported() -> bool { return false }
+// Whether this build can serve TLS. It can, through `std/httpds` (one request per
+// connection, every blocking call bounded — its header says what that costs); the answer
+// stays a function so a caller asks rather than assumes.
+@no_alloc @no_os pub fn tls_supported() -> bool { return true }
+
+// `agent.tls_cert` / `agent.tls_key`, appended to `dst`; false when unset or empty.
+pub fn tls_cert(read ag: Agent, mut dst: String) -> bool { return agent_path(ag, "agent.tls_cert", dst) }
+pub fn tls_key(read ag: Agent, mut dst: String) -> bool { return agent_path(ag, "agent.tls_key", dst) }
+
+fn agent_path(read ag: Agent, read key: str, mut dst: String) -> bool {
+    let id: i32 = config.by_name(ag.cfg, key)
+    if id < 0 { return false }
+    if config.is_set(ag.cfg, id) == false { return false }
+    if config.value_is(ag.cfg, id, "") { return false }
+    return value_of(ag.cfg, id, dst)
+}
 
 // Why `serve` would refuse to start, or "" when it would not. Asked by the CLI before it
 // binds a socket, so a configuration that asks for something the agent cannot honour is
@@ -529,7 +542,15 @@ pub fn serve_refusal(read ag: Agent) -> str {
     if ag.valid == false { return "no valid configuration is loaded" }
     if tls_wanted(ag) {
         if tls_supported() == false {
-            return "agent.tls = true, but this build cannot serve TLS: std/httpd has no TLS hook (docs/jagent.md)"
+            return "agent.tls = true, but this build cannot serve TLS (docs/jagent.md)"
+        }
+        var cert: String = string_new()
+        var key: String = string_new()
+        let both: bool = tls_cert(ag, cert) and tls_key(ag, key)
+        string_free(key)
+        string_free(cert)
+        if both == false {
+            return "agent.tls = true, but tls_cert and tls_key are not both set: cannot serve TLS without a certificate and its key (docs/jagent.md)"
         }
     }
     return ""

@@ -3009,10 +3009,11 @@ mod jagent_edge {
              \x20  | ^^^^^^^^^^ not an integer\n\
              jobs still configured\n4\n\
              generation\n1\n\
-             -- tls is refused, not faked --\n\
+             -- tls without its certificate is refused, not served in plaintext --\n\
              loaded\n\
              serve would refuse because\n\
-             agent.tls = true, but this build cannot serve TLS: std/httpd has no TLS hook (docs/jagent.md)\n\
+             agent.tls = true, but tls_cert and tls_key are not both set: cannot serve TLS without a certificate and its key (docs/jagent.md)\n\
+             this build serves tls\ntrue\n\
              -- shutdown --\n\
              a draining agent refuses a run\n\
              config-error\n\
@@ -3200,6 +3201,52 @@ mod jagent_command {
         assert_eq!(code, 0);
         assert_eq!(out.lines().count(), 2, "two runs in the history: one by `run`, one over the API:\n{out}");
 
+        // **serve over TLS.** The fixture certificate and key by absolute path; the served
+        // port answers plaintext HTTP with NOTHING — the handshake fails and the connection
+        // closes — which is what proves the listener is TLS and not the plain one under a
+        // different name. (The Rust side has no TLS client; the round trip over TLS is the
+        // Jestyr suite's `the_api_is_served_over_tls_one_request_per_connection`.)
+        let here = std::env::current_dir().unwrap();
+        let cert = here.join("examples/std/fixtures/tls_test_cert.pem");
+        let key = here.join("examples/std/fixtures/tls_test_key.pem");
+        let tport = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        std::fs::write(
+            dir.join("tls-served.ini"),
+            base.replace("port = 0", &format!("port = {tport}\ntls = true\ntls_cert = {}\ntls_key = {}", cert.display(), key.display()))
+                .replace("tls = false\n", ""),
+        )
+        .unwrap();
+        let mut tchild = Reap(
+            std::process::Command::new(&exe)
+                .current_dir(&dir)
+                .args(["-c", "tls-served.ini", "serve"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let started = std::time::Instant::now();
+        let mut tup = false;
+        while started.elapsed() < std::time::Duration::from_secs(10) {
+            if let Ok(Some(status)) = tchild.0.try_wait() {
+                panic!("jagent serve over TLS exited early with {status:?}");
+            }
+            if std::net::TcpStream::connect(("127.0.0.1", tport)).is_ok() {
+                tup = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(tup, "jagent serve over TLS must start listening on {tport} within 10s");
+        let plain = http(tport, "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(plain.is_empty(), "plaintext at the TLS port must get nothing back, not a plaintext answer: {plain:?}");
+        assert!(tchild.0.try_wait().unwrap().is_none(), "and the server survives a failed handshake");
+        tchild.0.kill().unwrap();
+        let _ = tchild.0.wait();
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3285,7 +3332,7 @@ mod jagent_command {
         );
         assert!(
             out.ends_with(
-                "tls: unsupported requested=false\n\
+                "tls: supported requested=false\n\
                  auth: missing risk=local-only\n\
                  reload: ok watched=true dir=.\n\
                  schedule: ok scheduled=0 of=1\n\
@@ -21417,7 +21464,10 @@ fn main() -> i32 {
             // it; and the status/run summaries exact on a manual clock and a fixed wall.
             // (+1: a bearer token gates every route but GET /health — 401 before routing,
             // constant-time compare, counted, redacted from the rendered configuration.)
-            ("jagent_test", 14),
+            // (+1: the API served over TLS through `std/httpds` — the fixture certificate,
+            // a request with the token answered 200, one without 401, and plaintext at the
+            // TLS port answered with nothing.)
+            ("jagent_test", 15),
             // The operator's layer over the agent: the discovery order (flag, environment,
             // working directory); `init` writing a starter that loads and refusing to replace
             // a file whose bytes are then unchanged; `doctor` passing on a healthy scratch

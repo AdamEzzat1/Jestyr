@@ -48,6 +48,7 @@
 
 import "fs"
 import "httpd"
+import "httpds"
 import "jagent"
 import "json"
 import "log"
@@ -56,6 +57,7 @@ import "sysfs"
 import "sysnet"
 import "sysproc"
 import "time"
+import "tls"
 import "writer"
 
 // ---- discovery ----------------------------------------------------------------------
@@ -378,15 +380,47 @@ fn doc_http(mut r: Report, read a: Allocator, read ag: jagent.Agent) {
     string_push(r.text, "\n")
 }
 
-fn doc_tls(mut r: Report, read ag: jagent.Agent, loaded: bool) {
+// TLS: what the build can do, what the file asks, and — when it asks — whether the
+// certificate and key LOAD (a context is built and freed; nothing is bound).
+fn doc_tls(mut r: Report, read ag: jagent.Agent, loaded: bool, read a: Allocator) {
     string_push(r.text, "tls: ")
     if jagent.tls_supported() { string_push(r.text, "supported") } else { string_push(r.text, "unsupported") }
     if loaded {
         string_push(r.text, " requested=")
         push_bool(r.text, jagent.tls_wanted(ag))
-        if jagent.tls_wanted(ag) and jagent.tls_supported() == false {
-            string_push(r.text, " serve=refused")
-            r.errors = r.errors + 1
+        if jagent.tls_wanted(ag) {
+            if jagent.tls_supported() == false {
+                string_push(r.text, " serve=refused")
+                r.errors = r.errors + 1
+            } else {
+                var cert: String = string_new()
+                var key: String = string_new()
+                let both: bool = jagent.tls_cert(ag, cert) and jagent.tls_key(ag, key)
+                if both == false {
+                    string_push(r.text, " loaded=false reason=tls_cert-or-tls_key-unset")
+                    r.errors = r.errors + 1
+                } else {
+                    var ts: httpds.TlsServer = httpds.make(a, string_view(cert), string_view(key))
+                    string_push(r.text, " cert=")
+                    string_push(r.text, string_view(cert))
+                    string_push(r.text, " key=")
+                    string_push(r.text, string_view(key))
+                    string_push(r.text, " loaded=")
+                    push_bool(r.text, httpds.context_loaded(ts))
+                    if httpds.context_loaded(ts) == false {
+                        var why: String = string_new()
+                        tls.last_error(why)
+                        string_push(r.text, " reason=")
+                        let w: str = str.trimmed(string_view(why))
+                        if w.len > 0 { string_push(r.text, w) } else { string_push(r.text, "openssl-refused") }
+                        string_free(why)
+                        r.errors = r.errors + 1
+                    }
+                    httpds.free(ts)
+                }
+                string_free(key)
+                string_free(cert)
+            }
         }
     }
     string_push(r.text, "\n")
@@ -465,7 +499,7 @@ pub fn doctor(read a: Allocator, mut h: fs.Fs, mut sp: sysproc.Spawner, mut blk:
     } else {
         string_push(r.text, "http: skipped reason=no-config\n")
     }
-    doc_tls(r, ag, loaded)
+    doc_tls(r, ag, loaded, a)
     doc_auth(r, ag, loaded)
     if loaded {
         doc_reload(r, ag, h, cfg)
@@ -759,19 +793,19 @@ fn answer_summary(mut ag: jagent.Agent, mut h: fs.Fs, read a: Allocator, mut dst
         i = i + 1
     }
     if jagent.tls_wanted(ag) {
-        string_push(dst, "TLS is requested and this build cannot serve it; `jagent serve` will refuse.\n")
+        string_push(dst, "TLS is on; the API binds to ")
     } else {
         string_push(dst, "TLS is off; the API binds to ")
-        if jagent.host_is_loopback(ag) {
-            string_push(dst, "loopback (127.0.0.1)")
-        } else {
-            string_push(dst, "every interface (0.0.0.0)")
-        }
-        if jagent.token_required(ag) {
-            string_push(dst, " with a bearer token.\n")
-        } else {
-            string_push(dst, " without authentication.\n")
-        }
+    }
+    if jagent.host_is_loopback(ag) {
+        string_push(dst, "loopback (127.0.0.1)")
+    } else {
+        string_push(dst, "every interface (0.0.0.0)")
+    }
+    if jagent.token_required(ag) {
+        string_push(dst, " with a bearer token.\n")
+    } else {
+        string_push(dst, " without authentication.\n")
     }
     if jagent.host_is_loopback(ag) == false and jagent.token_required(ag) == false {
         string_push(dst, "WARNING: anything that reaches this machine can run its jobs.\n")

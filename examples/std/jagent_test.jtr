@@ -21,6 +21,7 @@ import "fs"
 import "http"
 import "httpc"
 import "httpd"
+import "httpds"
 import "jagent"
 import "kv"
 import "log"
@@ -36,6 +37,7 @@ import "sysproc"
 import "test"
 import "test_report"
 import "time"
+import "tls"
 import "writer"
 
 const JT_CAP: usize = 16384
@@ -904,19 +906,175 @@ const JT_BEARER: str = "Authorization: Bearer s3cret-token\r\n"
 
 // ---- tls, drain, rendering --------------------------------------------------------------------
 
-@test fn tls_is_declared_unsupported_and_serve_refuses_it() -> bool {
+const JT_CERT: str = "examples/std/fixtures/tls_test_cert.pem"
+const JT_KEY: str = "examples/std/fixtures/tls_test_key.pem"
+
+// The API's configuration for the TLS round trip: the fixture certificate (self-signed for
+// `localhost`) and a token, so both gates are crossed in one request.
+const JT_TLS: str = "[agent]\nhost = 127.0.0.1\nport = 0\ntls = true\ntls_cert = examples/std/fixtures/tls_test_cert.pem\ntls_key = examples/std/fixtures/tls_test_key.pem\ntoken = s3cret-token\nstore = zz_jagent/history.db\n\n[job.health-check]\ncommand = echo healthy\ntimeout_ms = 10000\n"
+
+// The CLIENT, on its own thread. `with_token` 1 sends the bearer; `plain` 1 is the control
+// that speaks plaintext HTTP at the TLS port. Returns the HTTP status, plus 1000 when the
+// job table came back; for the plain control, the bytes received (0: closed on it).
+fn tls_client(port: i64, with_token: i64, plain: i64) -> i64 {
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+    var sock: sysnet.Socket = sysnet.connect_to(net, sysnet.loopback(port as u16)) catch sysnet.closed()
+    if sysnet.is_open(sock) == false { return 0 - 1 }
+    var code: i64 = 0
+    var raw: *mut u8 = alloc(u8, JT_CAP)
+    var buf: []u8 = slice(u8, raw, JT_CAP)
+    if plain == 1 {
+        let req: str = "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        let rb: []u8 = slice(u8, req.ptr as *mut u8, req.len)
+        sysnet.send_all(sock, rb) catch 0
+        let n: usize = sysnet.recv_bytes(sock, buf) catch 0
+        code = n as i64
+    } else {
+        var ctx: tls.Context = tls.client_context()
+        tls.trust(ctx, a, JT_CERT)
+        var s: tls.Session = tls.client_session(ctx, a, sock.fd, "localhost")
+        if tls.is_established(s) {
+            var req: String = string_new()
+            string_push(req, "GET /jobs HTTP/1.1\r\nHost: x\r\n")
+            if with_token == 1 { string_push(req, "Authorization: Bearer s3cret-token\r\n") }
+            string_push(req, "Connection: close\r\n\r\n")
+            tls.write_all(s, string_view(req))
+            string_free(req)
+            var got: String = string_new()
+            var reading: bool = true
+            for reading {
+                let n2: isize = tls.read_into(s, buf)
+                if n2 <= 0 {
+                    reading = false
+                } else {
+                    string_push(got, from_utf8(buf[0 .. n2 as usize]))
+                }
+            }
+            let v: str = string_view(got)
+            if str.has_prefix(v, "HTTP/1.1 ") and v.len >= 12 {
+                code = ((v[9] as i64) - 48) * 100 + ((v[10] as i64) - 48) * 10 + ((v[11] as i64) - 48)
+            }
+            if contains(v, "health-check kind=command") { code = code + 1000 }
+            string_free(got)
+            tls.shutdown(s)
+        } else {
+            code = 100 + (tls.outcome(s) as i64)
+        }
+        tls.free_context(ctx)
+    }
+    free_ptr(raw)
+    sysnet.close_socket(sock) catch nothing()
+    sysnet.shutdown(net)
+    return code
+}
+
+@test fn the_api_is_served_over_tls_one_request_per_connection() -> bool {
+    var raw: *mut u8 = alloc(u8, JT_CAP)
+    var rep: []u8 = slice(u8, raw, JT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    setup(h, a)
+    var ag: jagent.Agent = agent_with(a, JT_TLS)
+    test.is_true(c, rep, "the file asks for tls", jagent.tls_wanted(ag))
+    test.eq_str(c, rep, "and nothing refuses it", jagent.serve_refusal(ag), "")
+    jagent.open_store(ag, h)
+    var cell: *mut jagent.Agent = alloc(jagent.Agent, 1)
+    unsafe { (cell + 0).* = ag }
+    var ctx: *mut jagent.Serve = jagent.serve_ctx(cell, sysproc.host(), time.host())
+    var net: sysnet.Net = sysnet.host()
+    // The routes live on an `httpd.Server` that never binds; `httpds` does the listening.
+    var sv: httpd.Server = httpd.make(a, time.host(), quiet_logger(), false, 4, 8192)
+    jagent.install(sv, ctx)
+    var ts: httpds.TlsServer = httpds.make(a, JT_CERT, JT_KEY)
+    test.is_true(c, rep, "the certificate and key load", httpds.context_loaded(ts))
+    test.is_true(c, rep, "and the listener binds", httpds.start(ts, net, sysnet.loopback(0), 4, 3000))
+    let port: i64 = httpds.port(ts) as i64
+    test.is_true(c, rep, "on a real port", port > 0)
+
+    // With the token: the job table, over TLS.
+    var client: i64 = 0
+    concurrent {
+        let hd = spawn tls_client(port, 1, 0)
+        var rounds: i64 = 0
+        for httpds.served(ts) < 1 and rounds < 200 {
+            httpds.step(ts, sv, net, 50)
+            rounds = rounds + 1
+        }
+        client = await hd
+    }
+    test.eq_i64(c, rep, "200 with the job table, over TLS", client, 1200)
+
+    // Without it: the gate is the same gate — 401 over TLS.
+    var client2: i64 = 0
+    concurrent {
+        let hd2 = spawn tls_client(port, 0, 0)
+        var rounds2: i64 = 0
+        for httpds.served(ts) < 2 and rounds2 < 200 {
+            httpds.step(ts, sv, net, 50)
+            rounds2 = rounds2 + 1
+        }
+        client2 = await hd2
+    }
+    test.eq_i64(c, rep, "401 without the token", client2, 401)
+
+    // The control: plaintext HTTP at the TLS port is not answered in plaintext — the
+    // handshake fails, the connection closes, and the client gets nothing.
+    var client3: i64 = 0
+    concurrent {
+        let hd3 = spawn tls_client(port, 0, 1)
+        var rounds3: i64 = 0
+        for httpds.handshakes_failed(ts) < 1 and rounds3 < 200 {
+            httpds.step(ts, sv, net, 50)
+            rounds3 = rounds3 + 1
+        }
+        client3 = await hd3
+    }
+    test.eq_i64(c, rep, "plaintext gets no bytes back", client3, 0)
+    test.eq_i64(c, rep, "three connections", httpds.accepted(ts), 3)
+    test.eq_i64(c, rep, "two answered", httpds.served(ts), 2)
+    test.eq_i64(c, rep, "one handshake failed", httpds.handshakes_failed(ts), 1)
+    var reqs: i64 = 0
+    unsafe { reqs = jagent.http_requests((cell + 0).*) }
+    test.eq_i64(c, rep, "one routed request counted by the agent", reqs, 1)
+    var un: i64 = 0
+    unsafe { un = jagent.http_unauthorized((cell + 0).*) }
+    test.eq_i64(c, rep, "and one refusal", un, 1)
+
+    httpds.stop(ts, net)
+    httpds.free(ts)
+    httpd.free(sv)
+    sysnet.shutdown(net)
+    var back: jagent.Agent = unsafe { (cell + 0).* }
+    jagent.free(back)
+    jagent.free_serve(ctx)
+    free_ptr(cell as *mut u8)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn tls_needs_both_files_and_a_draining_agent_refuses_runs() -> bool {
     var raw: *mut u8 = alloc(u8, JT_CAP)
     var rep: []u8 = slice(u8, raw, JT_CAP)
     var c: test.Check = test.new()
     let a: Allocator = mem.system_allocator()
     var ag: jagent.Agent = jagent.make(a, time.manual(0), quiet_logger())
 
-    test.is_false(c, rep, "this build does not serve TLS", jagent.tls_supported())
+    test.is_true(c, rep, "this build serves TLS", jagent.tls_supported())
     test.is_true(c, rep, "with nothing loaded, serving is refused", jagent.serve_refusal(ag).len > 0)
     jagent.load_text(ag, "agent.ini", "[agent]\ntls = true\ntls_cert = c.pem\ntls_key = k.pem\n[job.x]\ncommand = echo x\n")
     test.is_true(c, rep, "the file asked for tls", jagent.tls_wanted(ag))
-    test.is_true(c, rep, "and serving is refused", jagent.serve_refusal(ag).len > 0)
-    test.is_true(c, rep, "with the reason", contains(jagent.serve_refusal(ag), "cannot serve TLS"))
+    test.eq_str(c, rep, "with both files named, nothing refuses (whether they load is the command's to find out)", jagent.serve_refusal(ag), "")
+    var cp: String = string_new()
+    test.is_true(c, rep, "the certificate path is readable", jagent.tls_cert(ag, cp))
+    test.eq_str(c, rep, "verbatim", string_view(cp), "c.pem")
+    string_free(cp)
+    jagent.load_text(ag, "agent.ini", "[agent]\ntls = true\ntls_cert = c.pem\n[job.x]\ncommand = echo x\n")
+    test.is_true(c, rep, "tls without its key is refused", jagent.serve_refusal(ag).len > 0)
+    test.is_true(c, rep, "with the reason", contains(jagent.serve_refusal(ag), "cannot serve TLS without a certificate and its key"))
     jagent.load_text(ag, "agent.ini", "[agent]\ntls = false\n[job.x]\ncommand = echo x\n")
     test.eq_str(c, rep, "without it, nothing stands in the way", jagent.serve_refusal(ag), "")
     test.eq_i64(c, rep, "a tls value that is not a boolean is refused", jagent.load_text(ag, "agent.ini", "[agent]\ntls = yes\n") as i64, jagent.JA_REJECTED as i64)
