@@ -10,15 +10,17 @@ cargo build --release && cargo test --release --features "c-oracle,selfhost-fixp
 
 **1375 passed / 2 failed / 3 ignored** (full ladder after JAGENT V3 — `std/httpds` (httpd over
 TLS), the v3 runner and the operator's layer; `jagent_test` 20, `jagent_ops_test` 13 inside
-`io_suites_pass`; 698 s. Both failures are LOAD flakes in modules this pass did not touch, and
-both passed together on a rerun (3 s): `kv_durable::jstate_survives_a_torn_batch` — `kv_demo`'s
+`io_suites_pass`; 698 s. Both failures are in modules this pass did not touch, both passed
+together on a rerun (3 s), and both are INTERMITTENT on a quiet machine — not load-only; the
+rates and the base-commit control are under *Known flake* below: `kv_durable::jstate_survives_a_torn_batch` — `kv_demo`'s
 `compact` came back `-1`, the `rename_replace`-over-a-just-closed-file family recorded below,
 its second sighting on this branch and still undiagnosable because the `catch` drops the
 errno — and the recorded known flake `jstatus_serves_a_connection_without_starving_its_timers`
 (the timer step printed `false`), whose own discriminator is repetition on a quiet machine, not
 isolation. The ladder before it, on the same tree, failed `jc_build_matrix` on the port defect
 recorded in §2b (a local named `served`) and `jplugin`'s ceiling; the rename fixed the first.
-A third full ladder was started after the rerun; its count belongs here when it lands.)
+The third full ladder, on the committed tree `a3f8241`, was **1377 passed / 0 failed / 3
+ignored** in 781 s — fully green, neither flake seen.)
 Previously **1377 passed / 0 failed / 3 ignored** (full ladder after the BEARER TOKEN on `jagent`'s API —
 `jagent_test` 14, `jagent_ops_test` 12 inside `io_suites_pass`, `config.value_is_ct`; 1050 s,
 fully green, the two flakes of the previous run not seen.) Previously
@@ -1164,9 +1166,25 @@ repetition on a quiet machine; "passes in isolation" is the wrong discriminator;
 widen the deadline. Seen again on the jagent v3 ladder (2026-09-09): the step `the timer
 fired, not the socket` printed `false` under a full ladder's load. `sysnet_demo` and the poll
 loop in `std/sysnet` are unchanged since `a935310`, which only ADDED `set_io_timeout`.
+**Measured by repetition on the quiet machine, right after the green third ladder (2026-09-09):
+4 of 70 runs on the branch print `false` and a timer count of `0` at that step; 2 of 40 runs
+of the BASE commit's `examples/std` (`ba48107`, extracted with `git archive`, same `jestyrc`)
+do the same.** So the rate is ~5% with nothing else running, it predates this branch, and a
+ladder's load only raises it. The 1 ms timer is losing to the 500 ms budget outright — the
+count is 0, not late — which reads as the poller's wait not being clamped to the deadline on
+some iterations, not as the timer firing slowly. Worth a look in `runtime`'s wait clamp with
+a counter, not a wider deadline.
 
 `kv_durable::jstate_survives_a_torn_batch` (NEW, 2026-09-09): `kv_demo`'s `compact` printed
-`-1` on the same ladder. The demo's `catch 0 - 1` maps EVERY error to `-1`, so the transcript
+`-1` on the same ladder — and 2 of 70 quiet-machine runs in the worktree reproduce it (the
+`-1` at `-- compacting --`, everything before it fine). The base-commit control was 0 of 40,
+BUT it ran from a temp directory while the branch runs sat in the worktree, and a rename over
+a just-closed file is exactly what a directory watcher (Windows Search, the editor's index)
+disturbs — so that control separates DIRECTORIES, not trees; `kv.jtr`, `kv_demo.jtr`,
+`sysfs.jtr`, `alog.jtr` and `fs.jtr` are byte-identical to the base. Run the branch's demo
+from a temp directory before reading anything into the 0.
+
+The demo's `catch 0 - 1` maps EVERY error to `-1`, so the transcript
 cannot say which; the path already seen is `swap_in`'s `rename_replace` of the rewritten file
 over the just-closed store, which `kv.compact` catches into `swapped = false` and reports as
 `KvFailed(-1)` — the same errno-dropping `catch` that `std/kv_test`'s migration flaked through
